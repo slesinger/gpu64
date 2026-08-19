@@ -1,0 +1,33 @@
+# GPU cartridge for the C64
+
+This project utilizes RAD hardware cartridge for the Commodore 64 which provides REU and GeoRAM memory and prg loading capabilities. The cartridge is quite generic card that bridges C64 expansion port TTL levels to Raspberry 3A+ GPIO interface. Due to the generic design it is possible to use it for different purposes, including using the RPI as HDMI interface to screen. The RPI is using bare metal code Circle v49.
+
+This project is to prove a concept of using RPI and its HDMI connection, to keep frame buffer and back buffer in the RPI memory. Additionally, the API (IO address memory space) does not need to be limited to transferring graphics data from C64 to the framebuffer. It can also provide API for graphical operations in 2D and 3D, including high-level OpenGL-like API handling the whole 3D scene. The graphical mode will be 320x200 with 256 colors selectable from a palette of 16 million colors. Having one pixel defined as a single byte is much more practical than using 4 bits per pixel as in the original C64. Ideally, the gpu cartridge will sniff the C64 bus for any operations targeting VICII chip and replicate native C64 graphical operations. The code that will be able to display graphics originally target for VICII chip can be repurposed from the VICE project. The 2D/3D API needs to be designed from scratch getting ideas from existing popular APIs.
+
+These are two separate, mutually exclusive modes, not one merged feature: the 320x200x256 mode is a **pure framebuffer** — no sprite objects, no sprite/background collision detection, none of VIC-II's other stateful hardware features. Sprites and collisions only exist in the VIC-II bus-sniffing/replication mode. See the progress tracker's milestone 7 note for how the two modes stay separate.
+
+## Target hardware configurations
+
+gpu64 must coexist with REU across three deployments, in ascending order of constraint:
+
+1. **RAD cartridge alone**, running in REU mode — RAD's own firmware emulates the REU registers, so gpu64 shares the same firmware process as the REU emulation.
+2. **C64 Ultimate** — REU is software-defined inside the Ultimate; the expansion port is real hardware. gpu64 talks to the same physical bus as a genuine hardware REU would.
+3. **Original C64 with an expansion port multiplier** — a real hardware REU cartridge and the gpu64/RAD cartridge are plugged in side by side, both decoding the same bus simultaneously. This is the tightest constraint: gpu64's IO decoding must never overlap what a real 17xx-series REU chip decodes, or the two will collide on the bus.
+
+## IO address space allocation
+
+The C64 expansion port exposes two 256-byte IO windows to cartridges: **IO1** ($DE00–$DEFF) and **IO2** ($DF00–$DFFF).
+
+GeoRAM emulation is out of scope for gpu64 — gpu64 is only ever active alongside REU mode, never GeoRAM mode.
+
+A real REU (1700/1750/1764 and clones) only decodes 11 registers within IO2, at $DF00–$DF0A (`IO_ADDRESS & 0x1F` in RAD's own REU emulation in [rad_reu.cpp](../Source/Firmware/rad_reu.cpp)). It does not decode IO1, and it does not decode the rest of IO2 ($DF0B–$DFFF) — that range is open bus as far as a real/faithfully-emulated REU is concerned.
+
+Decision: **leave IO1 untouched entirely** (reserved, unused by gpu64) and **give gpu64 the unused remainder of IO2, $DF0B–$DFFF** (245 bytes). This keeps gpu64 out of the 11 bytes REU actually needs, in all three target configurations:
+
+1. RAD-as-REU: RAD's own firmware owns both the REU registers and the gpu64 registers, no real conflict possible, but keeping the split clean matters for the other two cases.
+2. C64 Ultimate: the RAD cartridge's own REU emulation must be switched off (Ultimate supplies REU itself via its software-defined REU); gpu64 then runs standalone against $DF0B–$DFFF while the Ultimate's REU answers $DF00–$DF0A on the same bus.
+3. Original C64 + expansion port multiplier + real hardware REU: same reasoning as (2), with a physical 1750-class chip instead of the Ultimate's software one.
+
+**Open question to verify empirically**: this relies on the Ultimate's (and any real REU's) IO2 decode being a true partial decode of $DF00–$DF0A only, not a full-256-byte mirror of those registers. Real 17xx REUs and the Ultimate's REU are expected to behave this way (1750-compatible), but it should be confirmed on hardware — probe $DF0B+ from a test PRG while the Ultimate's REU is active — before the protocol design leans on it.
+
+Within $DF0B–$DFFF, register layout is TBD as the API is designed (see progress tracker) — likely a small command/status register set plus a data-latch or DMA-style bulk path for pixel/vertex data, rather than one byte per operation.
