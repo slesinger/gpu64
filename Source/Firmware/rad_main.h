@@ -55,6 +55,14 @@
 
 CLogger	*logger;
 
+class CRAD;
+// gpu64: lets the cycle-precise bus-hijack loop (rad_reu.cpp, running inside
+// CRAD::Run()) reach CRAD::showTestPattern() when the C64 writes the gpu64
+// trigger register -- see IO2_ACCESS handling around $DF0B in rad_reu.cpp.
+// Only one CRAD is ever constructed (see main() in rad_main.cpp), so a
+// single global set from the constructor is enough.
+extern CRAD *g_pRAD;
+
 class CRAD
 {
 public:
@@ -78,6 +86,7 @@ public:
 		m_Logger( 5/*m_Options.GetLogLevel()*/, &m_Timer ),
 		m_EMMC( &m_Interrupt, &m_Timer, 0 )
 	{
+		g_pRAD = this;
 	}
 
 	~CRAD( void )
@@ -94,6 +103,13 @@ public:
 	}
 
 	void Run( void );
+
+	// gpu64: draws directly into m_Screen's already-initialized framebuffer,
+	// independent of the C64 bus hijack -- milestone 2 "display basic
+	// pattern" first cut. Public so the C64-triggered path (gpu64_showTestPattern()
+	// in rad_main.cpp, called from the IO2 $DF0B write handler in
+	// rad_reu.cpp) can reach it via g_pRAD, not just CRAD::Run() itself.
+	void showTestPattern( void );
 
 private:
 	static void FIQHandler( void *pParam );
@@ -123,14 +139,11 @@ private:
 	CLogger				m_Logger;
 	CScheduler			m_Scheduler;
 	CEMMCDevice			m_EMMC;
-
-	// gpu64: draws directly into m_Screen's already-initialized framebuffer,
-	// independent of the C64 bus hijack -- milestone 2 "display basic
-	// pattern" first cut. (A separate CBcmFrameBuffer at a custom 320x200
+	// (showTestPattern() declared public above; implementation in
+	// rad_main.cpp. A separate CBcmFrameBuffer at a custom 320x200
 	// resolution was tried first and produced nothing visible -- likely
 	// fighting m_Screen's own already-negotiated HDMI mode; reusing the
 	// framebuffer Circle already proved works avoids that entirely.)
-	void showTestPattern( void );
 };
 
 #endif

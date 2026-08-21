@@ -45,11 +45,21 @@ fixing two hardware bring-up bugs first -- see "Two hardware bring-up
 gotchas" in [docs/hw_testing.md](hw_testing.md): a `KERNEL_MAX_SIZE` too
 small for RAD's real `.bss` (total silent hang, zero diagnostic output) and
 a missing `armstub=rad-prefetch.bin` in `config.txt` (unstable/garbled
-picture, looked exactly like a hardware timing fault but wasn't). Still not
-done: the actual C64→gpu64 trigger PRG and the API address-space write it's
-meant to demonstrate -- what's confirmed so far is that the RPi can draw to
-HDMI and the C64 boots/resets normally with RAD hijacking the bus, not yet
-that the C64 can trigger the pattern itself.
+picture, looked exactly like a hardware timing fault but wasn't).
+
+The C64→gpu64 trigger path is now implemented (not yet hardware-verified):
+[`Source/TestPRG/gpu64_trigger_pattern.a`](../Source/TestPRG/gpu64_trigger_pattern.a)
+is a minimal PRG that does a single `STA $DF0B`. On the firmware side,
+`rad_reu.cpp`'s IO2 write handler (inside `reuUsingPolling()`, the same loop
+that services REU's own $DF00–$DF0A registers) recognizes writes to $DF0B
+and calls `CRAD::showTestPattern()` via a `g_pRAD` global (declared in
+`rad_main.h`, set from `CRAD`'s constructor) -- kept as a free-function
+indirection (`gpu64_showTestPattern()` in `rad_main.cpp`) so `rad_reu.cpp`
+doesn't need to pull in the full Circle/screen include stack. Since the C64
+is DMA-halted for the entire REU polling session, drawing synchronously
+inside the write handler only delays the already-frozen CPU rather than
+risking any bus-timing corruption -- next step is confirming that on real
+hardware.
 
 - IO decoding: gpu64 uses the unused remainder of IO2, $DF0B–$DFFF, leaving REU's 11 registers ($DF00–$DF0A) and all of IO1 alone — coexists with REU in all three target setups (RAD-as-REU, C64 Ultimate with RAD's REU switched off, original C64 + expansion port multiplier with a real hardware REU). See [project_description.md](project_description.md#io-address-space-allocation), including the open item to verify the Ultimate's REU doesn't mirror across the full IO2 page.
 - Trigger PRG just needs a single STA to a $DF0B+ offset to kick off the pattern; no data payload yet.

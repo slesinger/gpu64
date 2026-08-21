@@ -29,6 +29,14 @@
 #include "rad_reu.h"
 #include "linux/kernel.h"
 
+// gpu64: forward-declared rather than pulling in rad_main.h (which drags in
+// the whole Circle screen/HDMI-console stack) -- see rad_main.h for the
+// actual definition/assignment. Used below to reach CRAD::showTestPattern()
+// when the C64 writes the gpu64 trigger register at IO2 $DF0B.
+class CRAD;
+extern CRAD *g_pRAD;
+void gpu64_showTestPattern( CRAD *pRAD );
+
 u32 REU_SIZE_KB = 1024;
 
 REUSTATE reu AAA;
@@ -343,6 +351,22 @@ reuEmulationMainLoop:
 					switch ( addr )
 					{
 					default:
+						// gpu64: unused remainder of IO2 ($DF0B-$DFFF,
+						// masked down to 0x0B-0x1F by the "& 0x1f" above --
+						// REU only ever decodes 0x00-0x0A) is gpu64's own
+						// register window. Milestone 2's trigger register:
+						// any write to $DF0B (addr 0x0B) kicks off the
+						// checkerboard test pattern. The C64 is DMA-halted
+						// for the whole REU polling session (see
+						// reuUsingPolling()'s SET_GPIO(bDMA_OUT)), so the
+						// real-time cost of drawing here (same call already
+						// proven safe as a one-off at boot, see
+						// rad_main.cpp/tee_device.h) only delays the
+						// still-frozen CPU, it doesn't corrupt any bus
+						// timing. See docs/project_description.md's IO
+						// address space allocation section.
+						if ( addr == 0x0B )
+							gpu64_showTestPattern( g_pRAD );
 						break;
 					case 0x00:
 						break;

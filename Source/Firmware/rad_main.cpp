@@ -273,6 +273,19 @@ void CRAD::showTestPattern( void )
 	logger->Write( "gpu64", LogNotice, "showTestPattern: done" );
 }
 
+// gpu64: only one CRAD is ever constructed (see main() below); g_pRAD is set
+// from its constructor (rad_main.h). This wrapper lets rad_reu.cpp's bus-hijack
+// loop trigger the pattern from the C64 side (IO2 $DF0B write) without pulling
+// in rad_main.h's full Circle/screen include stack -- see the forward
+// declaration in rad_reu.cpp.
+CRAD *g_pRAD = nullptr;
+
+void gpu64_showTestPattern( CRAD *pRAD )
+{
+	if ( pRAD )
+		pRAD->showTestPattern();
+}
+
 void CRAD::Run( void )
 {
 	showTestPattern();
