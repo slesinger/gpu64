@@ -227,13 +227,18 @@ void CRAD::showTestPattern( void )
 	CActLED bootLED;
 	bootLED.Blink( 2, 200, 200 );
 
-	unsigned w = m_Screen.GetWidth();
-	unsigned h = m_Screen.GetHeight();
+	unsigned wFull = m_Screen.GetWidth();
+	unsigned hFull = m_Screen.GetHeight();
+
+	// gpu64: confined to the reserved top-left box (see tee_device.h) so the
+	// pattern never collides with the HDMI on-screen log below it.
+	unsigned w = min( wFull, (unsigned)GPU_OUTPUT_BOX_W );
+	unsigned h = min( hFull, (unsigned)GPU_OUTPUT_BOX_H );
 
 	DELAY( 1 << 24 );
-	bootLED.Blink( min( w, h ) / 100, 120, 200 );
+	bootLED.Blink( min( wFull, hFull ) / 100, 120, 200 );
 
-	logger->Write( "gpu64", LogNotice, "showTestPattern: drawing %ux%u", w, h );
+	logger->Write( "gpu64", LogNotice, "showTestPattern: drawing %ux%u (screen %ux%u)", w, h, wFull, hFull );
 
 	for ( unsigned y = 0; y < h; y++ )
 	{
@@ -273,31 +278,39 @@ void CRAD::Run( void )
 	showTestPattern();
 
 	m_EMMC.Initialize();
+	logger->Write( "gpu64", LogNotice, "Run: bc1 EMMC.Initialize done" );
 
 	EnableIRQs();
 	initSerialOverUSB_IECDevice( &m_Interrupt, &m_Timer, &m_DeviceNameService, false );
+	logger->Write( "gpu64", LogNotice, "Run: bc2 initSerialOverUSB_IECDevice done" );
 
 	gpioInit();
+	logger->Write( "gpu64", LogNotice, "Run: bc3 gpioInit (2nd call) done" );
 
 	setDefaultTimings( AUTO_TIMING_RPI3PLUS_C64C128 );
 	readConfig( logger, DRIVE, FILENAME_CONFIG );
+	logger->Write( "gpu64", LogNotice, "Run: bc4 readConfig done" );
 
 	OUT_GPIO( RESET_OUT );
 	CLR_GPIO( bRESET_OUT );
 	DELAY( 1 << 25 );
 	SET_GPIO( bRESET_OUT );
 	INP_GPIO( RESET_OUT );
+	logger->Write( "gpu64", LogNotice, "Run: bc5 GPIO reset pulse done" );
 
 
 	DisableIRQs();
+	logger->Write( "gpu64", LogNotice, "Run: bc6 DisableIRQs done" );
 
 	register u32 g2;
 
 	// this also initializes timing values
 	REU_SIZE_KB = 128;
 	initREU( mempool );
+	logger->Write( "gpu64", LogNotice, "Run: bc7 initREU done" );
 
 	initHijack();
+	logger->Write( "gpu64", LogNotice, "Run: bc8 initHijack done" );
 
 #ifdef REU_PROTOCOL
 	nReuProtocol = 0;

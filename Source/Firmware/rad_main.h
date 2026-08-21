@@ -36,6 +36,7 @@
 #include <circle/devicenameservice.h>
 #include <circle/screen.h>
 #include <circle/serial.h>
+#include "tee_device.h"
 #include <circle/actled.h>
 #include <circle/interrupt.h>
 #include <circle/timer.h>
@@ -71,6 +72,8 @@ public:
 	// needs to be verified for real.
 	CRAD( void )
 		: m_Screen( m_Options.GetWidth(), m_Options.GetHeight() ),
+		m_HDMIConsole( &m_Screen ),
+		m_TeeLog( &m_Serial, &m_HDMIConsole ),
 		m_Timer( &m_Interrupt ),
 		m_Logger( 5/*m_Options.GetLogLevel()*/, &m_Timer ),
 		m_EMMC( &m_Interrupt, &m_Timer, 0 )
@@ -106,6 +109,15 @@ private:
 	// (polling, no interrupt system) so it can be brought up before
 	// m_Interrupt.Initialize() and survives even if interrupts never work.
 	CSerialDevice		m_Serial;
+	// gpu64: renders logger text directly via SetPixel(), bypassing
+	// CScreenDevice's own text console -- required because that console
+	// (like m_Serial) silently drops writes once IRQs are disabled, which is
+	// true for essentially all of RAD's runtime after boot. See tee_device.h.
+	CHDMIConsole		m_HDMIConsole;
+	// gpu64: fans logger->Write() out to both m_Serial (Tier 1, unchanged)
+	// and m_HDMIConsole (Tier 2 -- visible even once gpioInit() steals the
+	// UART pins for cartridge use, and even with IRQs disabled).
+	CTeeDevice			m_TeeLog;
 	CInterruptSystem	m_Interrupt;
 	CTimer				m_Timer;
 	CLogger				m_Logger;

@@ -106,12 +106,86 @@ Once you're testing against the real bus, use:
   after copying the new `kernel8.img`, power off/on the RPi (or the C64, if the
   RAD is powered from the expansion port) to boot into it.
 
-- **On-screen logging as the console**: with UART unavailable, RAD's own
-  `CLogger`-to-HDMI-screen output (already wired up in `rad_main.cpp` /
-  `c64screen.h`) is the debug channel. Anything you'd normally `printf` to a
-  serial console, log there instead.
+- **On-screen logging as the console**: with UART unavailable, the debug
+  channel is `logger->Write()`, tee'd to HDMI via
+  [`Source/Firmware/tee_device.h`](../Source/Firmware/tee_device.h) --
+  `CTeeDevice` fans every log line out to both `m_Serial` (works on Tier 1,
+  a no-op on Tier 2) and `CHDMIConsole` (works on both). **Important:**
+  neither plain `CSerialDevice::Write()` nor `CScreenDevice::Write()`
+  (Circle's own text console) can be used for this once RAD calls
+  `DisableIRQs()`, which happens early in `CRAD::Run()` and stays disabled
+  for essentially the rest of the program's life (needed for cycle-precise
+  C64 bus timing). With `REALTIME` defined (`Source/Firmware/Circle/sysconfig.h`),
+  both of those classes check `CurrentExecutionLevel()` and silently drop
+  the write whenever the IRQ mask bit is set -- Circle's DAIF-based check
+  can't distinguish "really inside an interrupt handler" from "IRQs are
+  just globally masked", so on-screen logging via the normal console
+  appears to work at boot and then silently goes dark the moment
+  `DisableIRQs()` runs, with no hang and no error. `CHDMIConsole` sidesteps
+  this entirely by blitting text directly via `SetPixel()` (using Circle's
+  `CCharGenerator` font data), which has no such guard -- same mechanism
+  `showTestPattern()` already relies on. It only flushes the cache range for
+  the screen row(s) it actually touched (not the whole framebuffer) --
+  doing a full-framebuffer flush per call was cheap the first time (boot)
+  but expensive enough to blow the per-rasterline timing budget on any
+  later call during live operation, which showed up as bus corruption
+  (garbled characters) in testing before this was narrowed down.
+  Layout: a reserved box top-left (`GPU_OUTPUT_BOX_W` x `GPU_OUTPUT_BOX_H`)
+  for the eventual upscaled C64-passthrough image, log text in the column to
+  its right using the full screen height.
+
+### Two hardware bring-up gotchas that cost real debugging time
+
+**1. `KERNEL_MAX_SIZE` too small for RAD's real `.bss` -- total silent hang,
+zero diagnostic output.** RAD's static buffers (`printOutputFile`, `filesAll`,
+`vsf`, `mempool`, `sort`, `previewImage`, etc.) add up to ~98MB, well past
+Circle's stock 64MB `KERNEL_MAX_SIZE` default. Circle places the kernel
+stack, exception stacks, and MMU translation tables at fixed offsets
+computed from `MEM_KERNEL_START + KERNEL_MAX_SIZE` (`memorymap.h`) -- with
+the old 64MB cap those landed *inside* RAD's real `.bss` range, so crt0's
+`.bss`-zeroing at boot silently corrupted the stack/page tables before a
+single instruction of application code (not even the earliest possible
+serial log line) could run. Fixed by raising `KERNEL_MAX_SIZE` to 160MB in
+[`Source/Firmware/Circle/sysconfig.h`](../Source/Firmware/Circle/sysconfig.h).
+This required a full clean rebuild of Circle's base `lib/` (not just the
+app) -- the offsets are baked into `libcircle.a` at compile time, and
+`tools/build.sh`'s dependency tracking doesn't catch a `sysconfig.h` change
+for that base build, so bumping this again would need a manual
+`rm -f lib/*.o lib/*.d lib/*.a` + rebuild.
+
+**2. `armstub=rad-prefetch.bin` must be uncommented in `config.txt`.**
+[`Source/Firmware/ARM STUB/rad-prefetch.S`](<../Source/Firmware/ARM STUB/rad-prefetch.S>)
+is a custom armstub (runs at EL3, before Circle's kernel even loads) that
+disables L1 data prefetching, tunes L2 cache read/write latency, and
+disables cache-coherency broadcast (`SMPEN`) -- all things that otherwise
+introduce unpredictable timing jitter into RAD's cycle-counted bus-hijack
+loop (`RESTART_CYCLE_COUNTER`/`WAIT_UP_TO_CYCLE`, raw `PMCCNTR_EL0` reads).
+With the stock RPi armstub (i.e. this line commented out, which is how this
+particular SD card's `config.txt` was found), the picture and RAD menu are
+unstable/garbled even though the hardware itself is fine -- confirmed by
+reproducing perfectly stable behavior with the *stock, non-gpu64* firmware
+once this line was commented out, and stable behavior returning the moment
+it was uncommented again. This looked exactly like a hardware bus-timing
+problem (bad solder joint, undervoltage, bus contention) and cost real time
+to rule out as one -- check this line first next time.
 
 ### Open item
+
+**RAD's Mahoney-technique digi music (SID `$D418` writes once per raster
+line, see `rad_hijack.cpp`) is silent on real hardware, even though
+`music.wav` loads and converts correctly** -- confirmed via the on-screen
+log: `readFile()` returns the full 3219278-byte file, the raw bytes start
+with the `RIFF` header as expected, and the post-`convertWAV2RAW_inplace()`
+samples are real PCM data centered near 0x80, not blank/silent. The
+equalizer animates and the C64's audio-out is confirmed connected and
+otherwise working (original, non-gpu64 firmware plays music fine on this
+same hardware). So the write path has good data -- the open question is
+whether the SID register writes are reaching the chip correctly, or
+whether `SIDType`/`supportDAC` auto-detection (`detectSID()`,
+`rad_hijack.cpp` ~line 2585) is picking the wrong playback branch. Next
+step: log the detected `SIDType`/`hasSIDKick`/`supportDAC` values via the
+on-screen log and compare against what the original firmware detects on
+the same hardware.
 
 [project_description.md](project_description.md#io-address-space-allocation)
 already flags that the Ultimate's (and any real REU's) IO2 decode needs

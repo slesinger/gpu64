@@ -32,6 +32,7 @@
 
 #include <SDCard/emmc.h>
 #include <fatfs/ff.h>
+#include "linux/kernel.h"	// for sprintf() (freestanding build, no libc)
 
 extern int readFile( CLogger *logger, const char *DRIVE, const char *FILENAME, u8 *data, u32 *size );
 extern int getFileSize( CLogger *logger, const char *DRIVE, const char *FILENAME, u32 *size );
@@ -51,16 +52,20 @@ extern void strupr( char *d, char *s );
 // gpioInit() below reprograms GPIO14/15 to their cartridge-latch ALT
 // functions (OE_Dx/LATCH_A0), so serial output goes dark again after this
 // macro returns -- expected, not a bug; it's evidence the code reached that
-// point. m_Logger is pointed at m_Serial explicitly (bypassing
-// m_Options.GetLogDevice(), which defaults to "tty1" i.e. the screen) so
-// logger->Write() calls actually reach the UART instead of only the HDMI text
-// console.
+// point. Once the UART is gone (Tier 2: SD card in the real cartridge) --
+// and once DisableIRQs() is called further down in Run(), which also makes
+// m_Serial itself go silent -- the only debug channel left is m_HDMIConsole
+// (SetPixel-based, immune to both problems). m_Logger is pointed at
+// m_TeeLog (bypassing m_Options.GetLogDevice(), which defaults to "tty1"
+// i.e. m_Screen's own text console -- unusable here for the same IRQ reason)
+// which fans every logger->Write() out to both m_Serial and m_HDMIConsole.
+// See tee_device.h.
 #define STANDARD_SETUP_TIMER_INTERRUPT_CYCLECOUNTER_GPIO										\
 	boolean bOK = TRUE;																			\
 	if ( bOK ) bOK = m_Serial.Initialize( 115200 );												\
 	if ( bOK ) bOK = m_Screen.Initialize();														\
 	if ( bOK ) { 																				\
-		bOK = m_Logger.Initialize( &m_Serial ); 												\
+		bOK = m_Logger.Initialize( &m_TeeLog ); 												\
 	}																							\
 	if ( bOK ) bOK = m_Interrupt.Initialize(); 													\
 	if ( bOK ) bOK = m_Timer.Initialize();														\
