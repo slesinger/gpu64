@@ -30,6 +30,7 @@
 #include <string.h>
 #include "rad_iecdevice.h"
 #include "protocol.h"
+#include "helpers.h"
 
 extern CLogger *logger;
 
@@ -858,6 +859,22 @@ StatusType sendGIF( const uint8_t *buffer, uint32_t nBytes, int32_t x, int32_t y
 #define PRINTER_DRIVER_NL10		1
 #define PRINTER_DRIVER_NL10_PDF	2
 
+// The NL10/PDF/BMP printer-emulation driver (Printer/drv-nl10.h and its
+// implementation) is not part of this repository -- it's an unrelated
+// legacy RAD feature (IECBuddy printer emulation) that gpu64 doesn't need.
+// Define RAD_IEC_PRINTER_SUPPORT and supply Printer/drv-nl10.h yourself if
+// you want that feature back; otherwise printing is compiled out below and
+// the rest of IECBuddy (file sync, disk swapping) is unaffected.
+#define PRINTER_OUTPUT_MAX_SIZE	( 32 * 1024 * 1024 )
+char		printOutputFilename[ 1024 ];
+uint8_t 	printOutputFile[ PRINTER_OUTPUT_MAX_SIZE ];
+uint32_t 	printOutputPos, printOutputSize;
+// Normally advanced by the (not-built-in, see RAD_IEC_PRINTER_SUPPORT above)
+// printer driver as it paginates a print job; 0 pages exist without it.
+int			writtenPages = 0;
+
+#ifdef RAD_IEC_PRINTER_SUPPORT
+
 #include "Printer/drv-nl10.h"
 
 // ------------ Printer data file reader class
@@ -958,11 +975,6 @@ void PrinterDataFile::ReadHeader()
 #define PRINTER_DRIVER_ASCII	0
 #define PRINTER_DRIVER_NL10		1
 #define PRINTER_DRIVER_NL10_PDF	2
-
-#define PRINTER_OUTPUT_MAX_SIZE	( 32 * 1024 * 1024 )
-char		printOutputFilename[ 1024 ];
-uint8_t 	printOutputFile[ PRINTER_OUTPUT_MAX_SIZE ];
-uint32_t 	printOutputPos, printOutputSize;
 
 char *strdup( const char *s )
 {
@@ -1130,7 +1142,20 @@ void print_data_raw( uint8_t *pdata, uint32_t len )
 	drv_nl10_shutdown();
 }
 
+#else // !RAD_IEC_PRINTER_SUPPORT
 
+void print_data( uint8_t *pdata, uint32_t len, char *filename )
+{
+	extern CLogger *logger;
+	logger->Write( "[IECBuddy]", LogNotice, "print job ignored (printer driver not built in)" );
+}
+
+void print_data_raw( uint8_t *pdata, uint32_t len )
+{
+	printOutputPos = printOutputSize = 0;
+}
+
+#endif // RAD_IEC_PRINTER_SUPPORT
 
 
 
@@ -1638,11 +1663,11 @@ void updateIECFavorites( IECSYNCFILE *syncFav, u32 *nSyncFav, IECSYNCFILE *syncI
 	// 0. check if this file is a disk image
 	char *fn = (char *)syncIEC[ filePos ].filename;
 
-	if ( strstr( fn, ".d64" ) > 0 || strstr( fn, ".D64" ) > 0 ||
-		 strstr( fn, ".d71" ) > 0 || strstr( fn, ".D71" ) > 0 ||
-		 strstr( fn, ".d81" ) > 0 || strstr( fn, ".D81" ) > 0 ||
-		 strstr( fn, ".g64" ) > 0 || strstr( fn, ".G64" ) > 0 ||
-		 strstr( fn, ".g71" ) > 0 || strstr( fn, ".G71" ) > 0 )
+	if ( strstr( fn, ".d64" ) != nullptr || strstr( fn, ".D64" ) != nullptr ||
+		 strstr( fn, ".d71" ) != nullptr || strstr( fn, ".D71" ) != nullptr ||
+		 strstr( fn, ".d81" ) != nullptr || strstr( fn, ".D81" ) != nullptr ||
+		 strstr( fn, ".g64" ) != nullptr || strstr( fn, ".G64" ) != nullptr ||
+		 strstr( fn, ".g71" ) != nullptr || strstr( fn, ".G71" ) != nullptr )
 	{
 		// ok, it's a disk image
 	} else

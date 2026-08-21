@@ -35,6 +35,8 @@
 #include <circle/koptions.h>
 #include <circle/devicenameservice.h>
 #include <circle/screen.h>
+#include <circle/serial.h>
+#include <circle/actled.h>
 #include <circle/interrupt.h>
 #include <circle/timer.h>
 #include <circle/logger.h>
@@ -55,10 +57,20 @@ CLogger	*logger;
 class CRAD
 {
 public:
+	// gpu64: m_CPUThrottle (CCPUThrottle) removed entirely -- its constructor
+	// unconditionally does mailbox property-tag round trips
+	// (GetClockRate/GetTemperature) and ends by calling SetSpeed() itself. On
+	// this board (RPi 3 Model A+, this exact GPU firmware) that mailbox
+	// exchange hangs forever, before ANY of our code -- including the
+	// earliest possible serial log line -- can run. Proven by reproducing the
+	// identical silent hang in an otherwise fully-working stock Circle sample
+	// just by adding this same member+call (mailbox calls for the
+	// framebuffer, by contrast, work fine on this board -- it's specific to
+	// these particular property tags). CPU speed is left at whatever the GPU
+	// firmware defaults to for now; revisit once cycle-accurate bus timing
+	// needs to be verified for real.
 	CRAD( void )
-		//: m_CPUThrottle(CPUSpeedLow),
-		: m_CPUThrottle(CPUSpeedMaximum),
-		m_Screen( m_Options.GetWidth(), m_Options.GetHeight() ),
+		: m_Screen( m_Options.GetWidth(), m_Options.GetHeight() ),
 		m_Timer( &m_Interrupt ),
 		m_Logger( 5/*m_Options.GetLogLevel()*/, &m_Timer ),
 		m_EMMC( &m_Interrupt, &m_Timer, 0 )
@@ -86,13 +98,27 @@ private:
 	CMemorySystem		m_Memory;
 	CKernelOptions		m_Options;
 	CDeviceNameService	m_DeviceNameService;
-	CCPUThrottle		m_CPUThrottle;
 	CScreenDevice		m_Screen;
+	// gpu64: Tier 1 bring-up -- CRAD previously never instantiated a serial
+	// device at all, so CLogger's default log target ("tty1", i.e. m_Screen)
+	// meant every logger->Write() only ever reached the HDMI screen, never
+	// GPIO14/15, regardless of anything wired to the UART pins. Default
+	// (polling, no interrupt system) so it can be brought up before
+	// m_Interrupt.Initialize() and survives even if interrupts never work.
+	CSerialDevice		m_Serial;
 	CInterruptSystem	m_Interrupt;
 	CTimer				m_Timer;
 	CLogger				m_Logger;
 	CScheduler			m_Scheduler;
 	CEMMCDevice			m_EMMC;
+
+	// gpu64: draws directly into m_Screen's already-initialized framebuffer,
+	// independent of the C64 bus hijack -- milestone 2 "display basic
+	// pattern" first cut. (A separate CBcmFrameBuffer at a custom 320x200
+	// resolution was tried first and produced nothing visible -- likely
+	// fighting m_Screen's own already-negotiated HDMI mode; reusing the
+	// framebuffer Circle already proved works avoids that entirely.)
+	void showTestPattern( void );
 };
 
 #endif

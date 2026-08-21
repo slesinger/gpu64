@@ -397,7 +397,7 @@ void setStatusMessage( char *msg, const char *tmp )
 	if ( l > 40 ) l = 40;
 
 	for ( int i = 0; i < l; i++ )
-		msg[ ( 40 - l ) / 2 + i ] = toupper( tmp[ i ] );
+		msg[ ( 40 - l ) / 2 + i ] = ( tmp[ i ] >= 'a' && tmp[ i ] <= 'z' ) ? tmp[ i ] - 'a' + 'A' : tmp[ i ];
 #endif
 }
 

@@ -211,8 +211,67 @@ u32 temperature;
 	} while ( !done );
 
 
+// gpu64: draw a checkerboard test pattern directly into m_Screen's already-
+// initialized framebuffer (proven working by the fact CRAD::Initialize()
+// returned TRUE), scaled to whatever resolution it actually negotiated.
+void CRAD::showTestPattern( void )
+{
+	// gpu64 debug checkpoint: no UART, no confirmed HDMI yet, so use the
+	// ACT LED itself as a crude status channel -- distinct from the later
+	// hijack-loop breathing pattern, this fires once, early, right after
+	// power-on. 2 blinks = entered the function; then a pause; then a
+	// blink count equal to min(w,h)/100 reports the framebuffer dimensions
+	// we actually got (e.g. 19 blinks for a 1920-wide buffer) so we can
+	// tell whether m_Screen's framebuffer looks sane at all without any
+	// other output channel.
+	CActLED bootLED;
+	bootLED.Blink( 2, 200, 200 );
+
+	unsigned w = m_Screen.GetWidth();
+	unsigned h = m_Screen.GetHeight();
+
+	DELAY( 1 << 24 );
+	bootLED.Blink( min( w, h ) / 100, 120, 200 );
+
+	logger->Write( "gpu64", LogNotice, "showTestPattern: drawing %ux%u", w, h );
+
+	for ( unsigned y = 0; y < h; y++ )
+	{
+		for ( unsigned x = 0; x < w; x++ )
+		{
+			boolean bLit = ( ( x / 20 ) + ( y / 20 ) ) & 1;
+			if ( !bLit )
+			{
+				m_Screen.SetPixel( x, y, BLACK_COLOR );
+				continue;
+			}
+			// rainbow gradient across the lit squares, cycling through the
+			// full 15-bit RGB565-ish COLOR16 range
+			u8 r = (u8)( ( x * 31 ) / w );
+			u8 g = (u8)( ( y * 31 ) / h );
+			u8 b = (u8)( ( ( x + y ) * 31 / ( w + h ) ) );
+			m_Screen.SetPixel( x, y, COLOR16( r, g, b ) );
+		}
+	}
+
+	// The CPU writes above only land in cache until explicitly cleaned to
+	// DRAM -- the GPU/HVS scans out framebuffer memory directly and isn't
+	// cache-coherent with the ARM core, so without this the display just
+	// keeps showing whatever was there before (black), no matter what
+	// SetPixel() does.
+	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
+	CleanDataCacheRange( (u64)(uintptr)pFB->GetBuffer(), pFB->GetSize() );
+
+	DELAY( 1 << 24 );
+	bootLED.Blink( 9, 200, 200 );	// 9 blinks = drawing + cache-clean finished, function returning
+
+	logger->Write( "gpu64", LogNotice, "showTestPattern: done" );
+}
+
 void CRAD::Run( void )
 {
+	showTestPattern();
+
 	m_EMMC.Initialize();
 
 	EnableIRQs();
@@ -307,7 +366,9 @@ void CRAD::Run( void )
 
 
 	hijacking:
-		temperature = m_CPUThrottle.GetTemperature();
+		// gpu64: m_CPUThrottle removed (see rad_main.h) -- its mailbox calls hang
+		// on this board. temperature is only used for the on-screen menu display.
+		temperature = 0;
 
 		SyncDataAndInstructionCache();
 		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)hijackC64, 1024 * 10 );

@@ -37,24 +37,39 @@ extern int readFile( CLogger *logger, const char *DRIVE, const char *FILENAME, u
 extern int getFileSize( CLogger *logger, const char *DRIVE, const char *FILENAME, u32 *size );
 extern int writeFile( CLogger *logger, const char *DRIVE, const char *FILENAME, u8 *data, u32 size );
 
+// no libc <ctype.h>/<string.h> equivalents in this freestanding build
+extern unsigned char toupper( unsigned char c );
+extern char *strupr( unsigned char *s );
+extern void strupr( char *d, char *s );
+
 #define ROMH_ACCESS			(!(g2 & bROMH))
 #define CPU_RESET			(!(g2&bRESET_OUT)) 
 
+// gpu64: m_Serial is brought up FIRST, before m_Screen/anything else that can
+// fail, so the earliest possible boot log reaches GPIO14/15 -- this is the
+// Tier 1 (bare RPi + UART) debug channel from docs/hw_testing.md. Note that
+// gpioInit() below reprograms GPIO14/15 to their cartridge-latch ALT
+// functions (OE_Dx/LATCH_A0), so serial output goes dark again after this
+// macro returns -- expected, not a bug; it's evidence the code reached that
+// point. m_Logger is pointed at m_Serial explicitly (bypassing
+// m_Options.GetLogDevice(), which defaults to "tty1" i.e. the screen) so
+// logger->Write() calls actually reach the UART instead of only the HDMI text
+// console.
 #define STANDARD_SETUP_TIMER_INTERRUPT_CYCLECOUNTER_GPIO										\
 	boolean bOK = TRUE;																			\
-	m_CPUThrottle.SetSpeed( CPUSpeedMaximum );													\
+	if ( bOK ) bOK = m_Serial.Initialize( 115200 );												\
 	if ( bOK ) bOK = m_Screen.Initialize();														\
 	if ( bOK ) { 																				\
-		CDevice *pTarget = m_DeviceNameService.GetDevice( m_Options.GetLogDevice(), FALSE );	\
-		if ( pTarget == 0 )	pTarget = &m_Screen;												\
-		bOK = m_Logger.Initialize( pTarget ); 													\
+		bOK = m_Logger.Initialize( &m_Serial ); 												\
 	}																							\
 	if ( bOK ) bOK = m_Interrupt.Initialize(); 													\
 	if ( bOK ) bOK = m_Timer.Initialize();														\
 	/* initialize ARM cycle counters (for accurate timing) */ 									\
 	initCycleCounter(); 																		\
+	logger->Write( "gpu64", LogNotice, "boot: serial+screen+interrupt+timer up, entering gpioInit()" ); \
 	/* initialize GPIOs */ 																		\
-	gpioInit(); 																				
+	gpioInit(); 																				\
+	logger->Write( "gpu64", LogNotice, "boot: gpioInit() returned" );
 
 #define min(a,b) (((a)<(b))?(a):(b))
 #define max(a,b) (((a)>(b))?(a):(b))
