@@ -111,9 +111,11 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
 - **RAD's menu music (SID digi playback) is silent on real hardware**,
   despite `music.wav` loading and converting correctly (confirmed via the
   on-screen log) and the C64's audio-out being confirmed working with the
-  original, non-gpu64 firmware on the same hardware. See the "Open item" at
-  the end of [docs/hw_testing.md](hw_testing.md) for what's been ruled out
-  and the suggested next diagnostic step (log `SIDType`/`hasSIDKick`/
-  `supportDAC`).
+  original, non-gpu64 firmware on the same hardware. `detectSID()` now logs
+  `SIDType`/`hasSIDKick`/`supportDAC` on-screen, and a likely root cause was
+  found by inspection: `SIDType` is never assigned anywhere in this vendored
+  firmware, so the Mahoney-technique lookup table always defaults to
+  `lookup8580` regardless of the real chip. See the "Open item" at the end
+  of [docs/hw_testing.md](hw_testing.md) for the full writeup and next step.
 
 ## To be continued...

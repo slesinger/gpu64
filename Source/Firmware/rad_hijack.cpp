@@ -2657,6 +2657,31 @@ restartHijacking:
 				SIDKickVersion[ 0 ] = 0;
 		}
 #endif
+		// gpu64: on-screen diagnostic for the open "SID digi music is silent
+		// on real hardware" investigation (docs/hw_testing.md's Open item) --
+		// confirms what RAD's own SID/SIDKick auto-detection actually saw on
+		// this hardware, to compare against what the original firmware
+		// detects on the same setup.
+		//
+		// Note found while adding this: SIDType (declared just above, static
+		// u8 SIDType = 0) is never assigned anywhere in this file or the rest
+		// of the firmware -- it's read at line ~1084/1991/2701 and used at
+		// mahoneyLUT's assignment below, but nothing ever sets it away from
+		// its zero-initialized default. That means mahoneyLUT is currently
+		// always lookup8580, regardless of whether the real chip is a 6581
+		// or 8580 -- Mahoney's technique needs the chip-correct table, so a
+		// 6581 board silently getting the 8580 table is a plausible
+		// contributor to (or full explanation of) the reported silence, on
+		// top of/instead of the SIDType==0 case already being the intended
+		// fallback path when no SIDKick is present. Worth checking on
+		// hardware: does RAD's original (non-gpu64) firmware have SID
+		// chip-type detection logic that's just missing from this vendored
+		// copy, or was it always a stub?
+		extern CLogger *logger;
+		if ( logger )
+			logger->Write( "gpu64", LogNotice,
+				"detectSID: SIDType=%u hasSIDKick=%u supportDAC=%u",
+				SIDType, hasSIDKick, supportDAC );
 	}
 
 	memset( font_logo, 0, 0x1000 );

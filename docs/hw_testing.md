@@ -182,10 +182,29 @@ otherwise working (original, non-gpu64 firmware plays music fine on this
 same hardware). So the write path has good data -- the open question is
 whether the SID register writes are reaching the chip correctly, or
 whether `SIDType`/`supportDAC` auto-detection (`detectSID()`,
-`rad_hijack.cpp` ~line 2585) is picking the wrong playback branch. Next
-step: log the detected `SIDType`/`hasSIDKick`/`supportDAC` values via the
-on-screen log and compare against what the original firmware detects on
-the same hardware.
+`rad_hijack.cpp` ~line 2585) is picking the wrong playback branch.
+
+**Update:** `detectSID()` now logs the detected `SIDType`/`hasSIDKick`/
+`supportDAC` values on-screen the first time it runs -- not yet run on
+hardware to see the actual numbers, that's still the next step. But reading
+the surrounding code while adding that log turned up a likely root cause:
+`SIDType` (a file-static `u8` in `rad_hijack.cpp`, zero-initialized) is
+**never assigned anywhere** in this vendored firmware -- it's only ever
+compared against, never set. That means `mahoneyLUT` (assigned from
+`SIDType == (6581 & 255) ? lookup6581 : lookup8580` right after the
+detection block) always resolves to `lookup8580`, regardless of which chip
+is actually on the board. Mahoney's technique needs the chip-correct
+nonlinearity table, so if this hardware has a 6581, silently getting the
+8580 table would plausibly produce exactly this symptom (SID writes with
+good data, audio-out confirmed working, still silent/wrong) -- on top of,
+or instead of, the already-understood `SIDType == 0 && !supportDAC`
+fallback path being taken whenever no SIDKick is present (that part is
+working as designed). Next step once on hardware again: check the new log
+line's `SIDType` value (expected: always 0, confirming this), then check
+whether RAD's actual upstream/original (non-gpu64) firmware has real 6581
+vs. 8580 detection logic that just isn't present in this vendored copy --
+if so, port it in; if this vendored copy never had it, that's a
+pre-existing upstream gap unrelated to gpu64's changes.
 
 [project_description.md](project_description.md#io-address-space-allocation)
 already flags that the Ultimate's (and any real REU's) IO2 decode needs
