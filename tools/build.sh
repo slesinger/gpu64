@@ -13,8 +13,10 @@
 #      Makefiles resolve paths like "../Rules.mk" via the *physical* cwd,
 #      so a symlink there breaks the build -- rsync is used instead of cp so
 #      repeat builds stay incremental) and builds kernel8.img there.
-#   5. If SDCARD is set (a mounted RAD SD card's root), copies kernel8.img
-#      onto it -- see docs/hw_testing.md for how to make that a one-liner.
+#   5. If SDCARD is set (a mounted RAD SD card's root), copies the built image
+#      onto it under the name config.txt's "kernel=" line asks for (RAD cards
+#      use kernel_rad.img, not kernel8.img) and verifies the copy -- see
+#      docs/hw_testing.md for how to make that a one-liner.
 #
 # Usage:
 #   tools/build.sh                      # build kernel8.img
@@ -119,7 +121,31 @@ if [ -n "${SDCARD:-}" ]; then
 		echo "error: SDCARD=$SDCARD is not a directory" >&2
 		exit 1
 	fi
-	cp "$KERNEL_IMG" "$SDCARD/kernel8.img"
+	# The Pi's bootloader loads whatever config.txt's "kernel=" line names, NOT
+	# necessarily kernel8.img. RAD's own SD cards set "kernel=kernel_rad.img",
+	# so deploying to kernel8.img writes a file the Pi never reads -- the
+	# hardware silently keeps running the previous firmware. That cost a long
+	# debugging detour (see docs/progress_tracker.md): three rounds of "the
+	# code I just added produces no output at all" on code that was fine,
+	# because it was never actually on the machine. Always honour config.txt.
+	KERNEL_NAME="kernel8.img"
+	if [ -f "$SDCARD/config.txt" ]; then
+		CFG_KERNEL="$(sed -n 's/^[[:space:]]*kernel=\([^[:space:]#]\+\).*/\1/p' "$SDCARD/config.txt" | tail -n 1)"
+		if [ -n "$CFG_KERNEL" ]; then
+			KERNEL_NAME="$CFG_KERNEL"
+		fi
+	else
+		echo "warning: no config.txt on $SDCARD -- assuming the Pi loads $KERNEL_NAME" >&2
+	fi
+
+	cp "$KERNEL_IMG" "$SDCARD/$KERNEL_NAME"
 	sync
-	echo "==> deployed to $SDCARD/kernel8.img"
+
+	# Verify the bytes actually landed. vfat + removable media makes a silent
+	# short/failed write plausible enough to be worth one cmp.
+	if ! cmp -s "$KERNEL_IMG" "$SDCARD/$KERNEL_NAME"; then
+		echo "error: $SDCARD/$KERNEL_NAME does not match the build after copy" >&2
+		exit 1
+	fi
+	echo "==> deployed to $SDCARD/$KERNEL_NAME (per config.txt kernel=), verified"
 fi
