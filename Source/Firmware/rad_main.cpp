@@ -676,6 +676,27 @@ void CRAD::Run( void )
 			extern u8 gpu64ApiActive;
 			logger->Write( "gpu64", LogNotice, "Run: entering reuUsingPolling, gpu64ApiActive=%d", (int)gpu64ApiActive );
 
+			// gpu64: multicore feasibility spike (docs/milestone6_3d_design.md)
+			// -- one-shot proof, right before core 0 hands control to the
+			// cycle-critical loop, that cores 1-3 are alive and actually
+			// streaming through their stress buffers: sample their pass
+			// counters, wait a known interval, sample again. This runs
+			// during setup, before reuUsingPolling() takes over, so it costs
+			// nothing inside the cycle-critical path itself. This is only a
+			// liveness check, NOT the real test -- see the class comment in
+			// gpu64_multicore.h and progress_tracker.md for what actually
+			// answers the multicore feasibility question (re-running
+			// milestone 3's mirror/trigger checks while this runs).
+			u32 before[ 4 ] = {
+				CGpu64MultiCore::s_PassCounter[ 0 ], CGpu64MultiCore::s_PassCounter[ 1 ],
+				CGpu64MultiCore::s_PassCounter[ 2 ], CGpu64MultiCore::s_PassCounter[ 3 ] };
+			DELAY( 1 << 24 );
+			logger->Write( "gpu64", LogNotice,
+				"Run: multicore stress-loop pass delta core1=%u core2=%u core3=%u (0 means that core never ran)",
+				(unsigned)( CGpu64MultiCore::s_PassCounter[ 1 ] - before[ 1 ] ),
+				(unsigned)( CGpu64MultiCore::s_PassCounter[ 2 ] - before[ 2 ] ),
+				(unsigned)( CGpu64MultiCore::s_PassCounter[ 3 ] - before[ 3 ] ) );
+
 			reuUsingPolling();
 		} else
 		///////////////////////////////////////////////////////////////////////

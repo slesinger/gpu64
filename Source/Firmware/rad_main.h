@@ -52,6 +52,7 @@
 #include "lowlevel_arm64.h"
 #include "gpio_defs.h"
 #include "helpers.h"
+#include "gpu64_multicore.h"
 
 CLogger	*logger;
 
@@ -84,7 +85,13 @@ public:
 		m_TeeLog( &m_Serial, &m_HDMIConsole ),
 		m_Timer( &m_Interrupt ),
 		m_Logger( 5/*m_Options.GetLogLevel()*/, &m_Timer ),
-		m_EMMC( &m_Interrupt, &m_Timer, 0 )
+		m_EMMC( &m_Interrupt, &m_Timer, 0 ),
+		// gpu64: multicore feasibility spike (docs/api_design.md,
+		// "Architecture: this needs two cores") -- see gpu64_multicore.h.
+		// Needs m_Memory, so must come after it both here and in the
+		// member declaration order below (C++ constructs members in
+		// declaration order, not initializer-list order).
+		m_MultiCore( &m_Memory )
 	{
 		g_pRAD = this;
 	}
@@ -99,6 +106,21 @@ public:
 		logger = &m_Logger;
 		#endif
 		STANDARD_SETUP_TIMER_INTERRUPT_CYCLECOUNTER_GPIO
+		// gpu64: multicore support -- per Circle's multicore.txt, must be
+		// initialized last. This starts cores 1-3 running
+		// CGpu64MultiCore::Run(); core 0 is untouched and proceeds into
+		// CRAD::Run() -> reuUsingPolling() exactly as before.
+		//
+		// GPU64_MULTICORE_SPIKE_ENABLED: temporarily gated off (2026-08-22)
+		// to isolate a real-hardware regression -- VIC-II garbage appearing
+		// before the RAD menu is even reachable, i.e. before
+		// reuUsingPolling() runs at all. Suspect cores 1-3's stress traffic
+		// is disturbing rad_hijack.cpp's own cycle-sensitive bus work, not
+		// just reuUsingPolling(). Re-enable only once that's confirmed one
+		// way or the other -- see progress_tracker.md.
+		#ifdef GPU64_MULTICORE_SPIKE_ENABLED
+		bOK = m_MultiCore.Initialize() && bOK;
+		#endif
 		return bOK;
 	}
 
@@ -147,6 +169,9 @@ private:
 	CLogger				m_Logger;
 	CScheduler			m_Scheduler;
 	CEMMCDevice			m_EMMC;
+	// gpu64: must come after m_Memory in declaration order (see the
+	// constructor's initializer-list comment above).
+	CGpu64MultiCore		m_MultiCore;
 	// (showTestPattern() declared public above; implementation in
 	// rad_main.cpp. A separate CBcmFrameBuffer at a custom 320x200
 	// resolution was tried first and produced nothing visible -- likely

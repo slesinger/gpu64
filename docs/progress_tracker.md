@@ -203,6 +203,74 @@ Design and implement the first version of the C64→gpu64 command protocol over 
 
 Design questions to settle here: single-byte command + argument bytes vs. a small opcode+length packet; how bulk pixel data crosses the port efficiently (this is the main bottleneck — expansion port bandwidth, not RPi compute); synchronous (C64 polls status) vs. use of the existing NMI/IRQ line for completion signaling.
 
+**Status: register/dispatch protocol design in progress**, see
+[api_design.md](api_design.md) (living document, API reference only). Design
+so far: commands-by-reference over IO2 (payload never crosses the register
+window byte-by-byte, only a space/addr/len reference gpu64 DMA-pulls),
+sticky `CMD_HI` class selector + `CMD_LO` opcode/trigger, a generic 16-byte
+`ARG` block. vblank IRQ confirmed available and reuses REU's own existing
+`bIRQ_OUT` mechanism.
+
+An Opus 5 design review (2026-08-22) of an earlier draft caught a real bug
+in the reasoning, worth recording since it also lived in a source comment
+(`rad_reu.cpp`, near the $DF0B trigger handler, now corrected): the draft
+assumed `reuUsingPolling()` holds the C64 DMA-halted for the entire REU
+session, because `SET_GPIO(bDMA_OUT)` at the top of the loop looked like it
+never got released. That's backwards — `SET_GPIO(bDMA_OUT)` *releases* the
+bus (`handle_transfer.h` brackets each real transfer with `CLR_GPIO` to grab
+it, `SET_GPIO` to release it). The C64 free-runs through the whole loop;
+gpu64 only ever steals the bus in brief, bounded bursts. This is now
+recorded properly in [project_description.md](project_description.md#operating-modes),
+which formalizes gpu64's **three** mutually exclusive operating modes (VIC-II
+mirror, gpu64 API, and C64-VIC-II-only — the last being RAD's existing
+"no memory expansion" launch path, not previously named as a gpu64 mode)
+around the single invariant that the C64 is never DMA-halted for more than
+one bounded burst in any of them.
+
+**Pending — the empirical sanity check the corrected understanding still
+needs** (cheap, needs no new firmware): with milestone 3's already-built
+firmware, enter REU/mirror mode as usual, then on the C64 run
+
+```
+10 POKE 1024,(PEEK(1024)+1)AND255:GOTO10
+```
+
+and watch the HDMI mirror's top-left character. If it visibly cycles
+through values across successive mirror snapshots rather than sitting
+frozen at whatever it was on entry, that's direct proof the C64 keeps
+executing its own instructions (i.e. free-runs) while gpu64's polling loop
+is active — confirming the corrected model on real hardware, not just by
+code reading.
+
+The review also flagged the two-core/continuous-render-loop architecture as
+neither required nor properly scoped for milestone 4 — moved out to
+[milestone6_3d_design.md](milestone6_3d_design.md) accordingly, along with
+resource lifecycle and the mesh/texture memory model. A first multicore
+feasibility spike ([gpu64_multicore.h/.cpp](../Source/Firmware/gpu64_multicore.h))
+also had to be rebuilt after review: the first cut had cores 1-3 spin an
+isolated counter, which can't detect the real risk (the Cortex-A53's shared
+L2 — core 0's timing is a hand-tuned preload schedule that a render loop on
+another core would contend with for cache capacity, not just correctness).
+Rebuilt so cores 1-3 stream writes through a multi-megabyte buffer each.
+
+**Spiked on real hardware (2026-08-22): negative result.** Starting the
+stress cores — even just having them alive, before `reuUsingPolling()` is
+ever reached — produced garbage on the C64's own native VIC-II output
+while navigating RAD's menu. Disabling the spike
+(`GPU64_MULTICORE_SPIKE_ENABLED` left undefined in `rad_main.h`) restored
+clean menu rendering, confirming the multicore startup itself as the
+cause, not `reuUsingPolling()` specifically. Two unconfirmed candidate
+explanations (shared-L2 contention, or a possible cache-coherency
+misconfiguration in the custom armstub's `SMPEN` handling) recorded in
+[milestone6_3d_design.md](milestone6_3d_design.md#architecture-a-second-core-for-the-render-loop)
+along with next steps. Not pursued further now — milestone 4 doesn't need
+multicore, so this doesn't block it; parked as milestone 6's starting
+point.
+
+The DMA-polarity empirical check (the BASIC `POKE`/mirror test above) is
+still outstanding — not yet run, since hardware time so far went to the
+multicore spike instead.
+
 ## 5. Extend VIC-II sniffing
 
 Broaden bus sniffing beyond milestone 3's default text mode: bitmap mode, multicolor mode, sprites (position, shape, color, priority/collision registers), raster IRQ timing, smooth scrolling (fine-scroll X/Y registers), and VIC bank switching via CIA2. Goal: gpu64 can mirror what real C64 demos/games already do on VIC-II without any code changes on the C64 side, by watching $D000–$D02E and the relevant RAM.

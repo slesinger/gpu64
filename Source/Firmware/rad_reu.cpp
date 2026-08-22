@@ -484,15 +484,25 @@ reuEmulationMainLoop:
 						// REU only ever decodes 0x00-0x0A) is gpu64's own
 						// register window. Milestone 2's trigger register:
 						// any write to $DF0B (addr 0x0B) kicks off the
-						// checkerboard test pattern. The C64 is DMA-halted
-						// for the whole REU polling session (see
-						// reuUsingPolling()'s SET_GPIO(bDMA_OUT)), so the
-						// real-time cost of drawing here (same call already
-						// proven safe as a one-off at boot, see
-						// rad_main.cpp/tee_device.h) only delays the
-						// still-frozen CPU, it doesn't corrupt any bus
-						// timing. See docs/project_description.md's IO
-						// address space allocation section.
+						// checkerboard test pattern.
+						//
+						// CORRECTED (milestone 4 design review, see
+						// docs/project_description.md's "Operating modes"):
+						// a previous version of this comment claimed the C64
+						// is DMA-halted for the whole REU polling session via
+						// reuUsingPolling()'s SET_GPIO(bDMA_OUT). That's
+						// backwards -- SET_GPIO(bDMA_OUT) *releases* the bus
+						// (see handle_transfer.h's CLR/SET bracketing of each
+						// transfer, and DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER's
+						// releaseDMA param in lowlevel_dma.h). The C64 free-runs
+						// through this whole loop; gpu64 only steals the bus in
+						// brief bursts. Pending a hardware sanity check (see
+						// progress_tracker.md), so drawing synchronously here
+						// -- proven to work on real hardware, see milestone 2
+						// in progress_tracker.md -- should not be assumed safe
+						// *because the CPU is frozen*; that specific reasoning
+						// no longer holds and needs re-deriving once the
+						// free-running model is confirmed.
 						if ( addr == 0x0B )
 						{
 							gpu64ApiActive = 1;

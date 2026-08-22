@@ -158,7 +158,12 @@
 // single core applications, because this may slow down the system
 // because multiple cores may compete for bus time without use.
 
-//#define ARM_ALLOW_MULTI_CORE
+// gpu64: enabled for the milestone-4 multicore feasibility spike -- see
+// docs/api_design.md's "Architecture: this needs two cores" and
+// gpu64_multicore.h. The upstream warning above (competing for bus time
+// without use) is exactly the real-hardware question this spike exists to
+// answer for a cycle-critical bit-banging core 0.
+#define ARM_ALLOW_MULTI_CORE
 
 #endif
 
