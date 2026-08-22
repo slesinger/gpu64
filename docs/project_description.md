@@ -6,6 +6,16 @@ This project is to prove a concept of using RPI and its HDMI connection, to keep
 
 These are two separate, mutually exclusive modes, not one merged feature: the 320x200x256 mode is a **pure framebuffer** — no sprite objects, no sprite/background collision detection, none of VIC-II's other stateful hardware features. Sprites and collisions only exist in the VIC-II bus-sniffing/replication mode. See the progress tracker's milestone 7 note for how the two modes stay separate.
 
+## Operating modes
+
+gpu64 has **three** mutually exclusive operating modes, not two — all sharing one property that must never be violated: **the C64 is never DMA-halted for anything but a brief, bounded burst.** There is no mode, present or planned, where the cartridge takes the bus for the duration of a session. The C64 always free-runs; the cartridge only ever steals a few cycles at a time, and only when it actually needs to move bytes.
+
+1. **VIC-II mirror mode** (milestone 3, proven on hardware). C64 runs its own program with its native VIC-II fully in charge; gpu64 periodically steals the bus for one brief, predictable burst (`gpu64_mirrorSnapshot()`) to read screen/colour RAM and mirrors it to HDMI. The C64 never notices.
+2. **gpu64 API mode** (milestones 2/4/6 — 2D framebuffer today, 3D later). C64 is fully in charge and only *commands* gpu64 over the IO2 register window; rendering happens GPU-side (see [api_design.md](api_design.md)). A command that carries a payload (e.g. a blit) causes a real DMA-held burst to pull it — bounded, predictable in length, and over the instant the burst completes. Mutually exclusive with mirror mode: engaging the API stops the mirror (`gpu64ApiActive`, see [rad_reu.cpp](../Source/Firmware/rad_reu.cpp)).
+3. **C64 VIC-II only** (existing RAD behaviour, not previously named as a gpu64 mode). gpu64 doesn't touch the bus for graphics at all; the C64's own native video output is the only display in play, HDMI shows nothing. This is RAD's own "no memory expansion" (`meType == None`) launch path — gpu64's code never runs in this mode, so there is trivially no bus interference, but it's worth naming explicitly as the third mode rather than leaving it as an undocumented side effect of a RAD menu setting.
+
+A wrong claim was in circulation during milestone 4 design and is worth recording so it isn't repeated: `reuUsingPolling()`'s `SET_GPIO(bDMA_OUT)` *releases* the bus, it does not hold it — `CLR_GPIO(bDMA_OUT)`/`SET_GPIO(bDMA_OUT)` bracket each individual DMA burst (see `handle_transfer.h`, `gpu64_mirrorSnapshot()`). The C64 free-runs between bursts in every mode above; it always has, since milestone 3.
+
 ## Target hardware configurations
 
 gpu64 must coexist with REU across three deployments, in ascending order of constraint:

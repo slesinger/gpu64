@@ -167,5 +167,5 @@ extern REUSTATE reu AAA;
 extern void resetREU();
 extern void initREU( void *mempool );
 extern __attribute__((optimize("align-functions=256"))) void FIQHandlerREU( void *pParam );
-extern u8 reuUsingPolling();
+extern u8 reuUsingPolling( int step = 0 );
 

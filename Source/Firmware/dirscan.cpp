@@ -90,7 +90,7 @@ void makeFormattedName( REUDIRENTRY *d )
 	int i = 0;
 	while ( i < 1024 && filename[ i ] != 0 )
 	{
-		fn_up[ i ] = toupper( filename[ i ] );
+		fn_up[ i ] = ( filename[ i ] >= 'a' && filename[ i ] <= 'z' ) ? filename[ i ] - 'a' + 'A' : filename[ i ];
 		i ++;
 	}
 	fn_up[ i ] = 0;
@@ -197,7 +197,7 @@ bool ListDirectoryContents( const char *sDir, REUDIRENTRY *d, u32 *n, u32 *nElem
 				nAdditionalEntries ++;
 			} else
 			{
-				if ( strstr( FileInfo.fname, ".reu" ) > 0 || strstr( FileInfo.fname, ".REU" ) > 0 )
+				if ( strstr( FileInfo.fname, ".reu" ) != nullptr || strstr( FileInfo.fname, ".REU" ) != nullptr )
 				{
 					strcpy( (char*)sort[sortCur].path, sDir );
 					strcpy( (char*)sort[sortCur].filename, FileInfo.fname );
@@ -205,7 +205,7 @@ bool ListDirectoryContents( const char *sDir, REUDIRENTRY *d, u32 *n, u32 *nElem
 					sort[ sortCur++ ].f = REUDIR_REUIMAGE;
 					nAdditionalEntries ++;
 				}
-				if ( strstr( FileInfo.fname, ".vsf" ) > 0 || strstr( FileInfo.fname, ".VSF" ) > 0 )
+				if ( strstr( FileInfo.fname, ".vsf" ) != nullptr || strstr( FileInfo.fname, ".VSF" ) != nullptr )
 				{
 					strcpy( (char*)sort[sortCur].path, sDir );
 					strcpy( (char*)sort[sortCur].filename, FileInfo.fname );
@@ -213,7 +213,7 @@ bool ListDirectoryContents( const char *sDir, REUDIRENTRY *d, u32 *n, u32 *nElem
 					sort[ sortCur++ ].f = REUDIR_VSFIMAGE;
 					nAdditionalEntries ++;
 				}
-				if ( strstr( FileInfo.fname, ".georam" ) > 0 || strstr( FileInfo.fname, ".GEORAM" ) > 0 )
+				if ( strstr( FileInfo.fname, ".georam" ) != nullptr || strstr( FileInfo.fname, ".GEORAM" ) != nullptr )
 				{
 					strcpy( (char*)sort[sortCur].path, sDir );
 					strcpy( (char*)sort[sortCur].filename, FileInfo.fname );
@@ -221,7 +221,7 @@ bool ListDirectoryContents( const char *sDir, REUDIRENTRY *d, u32 *n, u32 *nElem
 					sort[ sortCur++ ].f = REUDIR_GEOIMAGE;
 					nAdditionalEntries ++;
 				}
-				if ( strstr( FileInfo.fname, ".prg" ) > 0 || strstr( FileInfo.fname, ".PRG" ) > 0 )
+				if ( strstr( FileInfo.fname, ".prg" ) != nullptr || strstr( FileInfo.fname, ".PRG" ) != nullptr )
 				{
 					strcpy( (char*)sort[sortCur].path, sDir );
 					strcpy( (char*)sort[sortCur].filename, FileInfo.fname );
@@ -230,7 +230,7 @@ bool ListDirectoryContents( const char *sDir, REUDIRENTRY *d, u32 *n, u32 *nElem
 					nAdditionalEntries ++;
 				}
 
-				if ( strstr( FileInfo.fname, ".seq" ) > 0 || strstr( FileInfo.fname, ".SEQ" ) > 0 )
+				if ( strstr( FileInfo.fname, ".seq" ) != nullptr || strstr( FileInfo.fname, ".SEQ" ) != nullptr )
 				{
 					strcpy( (char*)sort[sortCur].path, sDir );
 					strcpy( (char*)sort[sortCur].filename, FileInfo.fname );
@@ -240,11 +240,11 @@ bool ListDirectoryContents( const char *sDir, REUDIRENTRY *d, u32 *n, u32 *nElem
 				}
 				//D64,D71,D81,G64,G71
 				//ZIP
-				if ( strstr( FileInfo.fname, ".d64" ) > 0 || strstr( FileInfo.fname, ".D64" ) > 0 ||
-					 strstr( FileInfo.fname, ".d71" ) > 0 || strstr( FileInfo.fname, ".D71" ) > 0 ||
-					 strstr( FileInfo.fname, ".d81" ) > 0 || strstr( FileInfo.fname, ".D81" ) > 0 ||
-					 strstr( FileInfo.fname, ".g64" ) > 0 || strstr( FileInfo.fname, ".G64" ) > 0 ||
-					 strstr( FileInfo.fname, ".g71" ) > 0 || strstr( FileInfo.fname, ".G71" ) > 0 )
+				if ( strstr( FileInfo.fname, ".d64" ) != nullptr || strstr( FileInfo.fname, ".D64" ) != nullptr ||
+					 strstr( FileInfo.fname, ".d71" ) != nullptr || strstr( FileInfo.fname, ".D71" ) != nullptr ||
+					 strstr( FileInfo.fname, ".d81" ) != nullptr || strstr( FileInfo.fname, ".D81" ) != nullptr ||
+					 strstr( FileInfo.fname, ".g64" ) != nullptr || strstr( FileInfo.fname, ".G64" ) != nullptr ||
+					 strstr( FileInfo.fname, ".g71" ) != nullptr || strstr( FileInfo.fname, ".G71" ) != nullptr )
 				{
 					strcpy( (char*)sort[sortCur].path, sDir );
 					strcpy( (char*)sort[sortCur].filename, FileInfo.fname );
@@ -253,7 +253,7 @@ bool ListDirectoryContents( const char *sDir, REUDIRENTRY *d, u32 *n, u32 *nElem
 					nAdditionalEntries ++;
 				}
 
-				if ( strstr( FileInfo.fname, ".zip" ) > 0 || strstr( FileInfo.fname, ".ZIP" ) > 0 )
+				if ( strstr( FileInfo.fname, ".zip" ) != nullptr || strstr( FileInfo.fname, ".ZIP" ) != nullptr )
 				{
 					strcpy( (char*)sort[sortCur].path, sDir );
 					strcpy( (char*)sort[sortCur].filename, FileInfo.fname );

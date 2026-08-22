@@ -30,6 +30,8 @@
 #define FORCE_RESET_VECTORS
 
 #include "rad_main.h"
+#include "gpu64_font8x8.h"
+#include "build_id.h"
 #include "dirscan.h"
 #include "c64screen.h"
 #include "linux/kernel.h"
@@ -52,6 +54,8 @@ u64 armCycleCounter;
 
 // GeoRAM
 #include "rad_georam.h"
+#include "gpu64_api.h"
+#include "gpu64_vsync.h"
 
 // VSF
 u8 vsf[ 17 * 1024 * 1024 ] = {0};
@@ -66,6 +70,44 @@ void warmCache()
 
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, 1024 * 7 );
 	FORCE_READ_LINEARa( (void*)reuUsingPolling, 1024 * 7, 65536 );
+
+	// gpu64: gpu64_mirrorSnapshot() is called from inside reuUsingPolling()'s
+	// cycle-critical loop but is a separate function, so it isn't covered by
+	// the preload above -- an instruction-cache miss mid-burst could blow the
+	// per-byte DMA_READBYTE timing the same way an uncached reuUsingPolling()
+	// itself would. Size is a guess (matches geoRAMUsingPolling's below);
+	// unverified on real hardware.
+	extern void gpu64_mirrorSnapshot( void );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_mirrorSnapshot, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_mirrorSnapshot, 1024 * 2, 65536 );
+
+	// gpu64: milestone 4's blob transfers are in the same position -- called
+	// from inside the polling loop, not covered by its preload window, and
+	// per-byte cycle-critical once the burst starts.
+	extern u8 gpu64_blobRead( u8, u32, u32, u8 * );
+	extern u8 gpu64_blobWrite( u8, u32, u32, const u8 * );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobRead, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_blobRead, 1024 * 2, 65536 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobWrite, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_blobWrite, 1024 * 2, 65536 );
+
+	// gpu64: the deferred page flip's commit is in the same position again
+	// -- called from the polling loop, outside its preload window. The
+	// PAGE_FLIP dispatch re-warms it every time it queues a flip (see
+	// gpu64_vsyncWarmCommit in rad_reu.cpp), since a dispatch will have
+	// evicted whatever this preloaded; this covers the first one.
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_vsyncCommitFlip, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_vsyncCommitFlip, 1024 * 2, 65536 );
+
+	// gpu64: the API register file is touched inline from the polling loop
+	// on every ARG write and every STATUS/ERRCODE read (see GPU64REGS in
+	// gpu64_api.h), so it wants the same treatment REUSTATE gets above.
+	CACHE_PRELOAD_DATA_CACHE( &gpu64Regs, sizeof( GPU64REGS ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64Regs, sizeof( GPU64REGS ), sizeof( GPU64REGS ) * 8 );
+
+	// gpu64: and the frame-clock state it reads every single pass.
+	CACHE_PRELOAD_DATA_CACHE( &gpu64Vsync, sizeof( GPU64VSYNC ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64Vsync, sizeof( GPU64VSYNC ), sizeof( GPU64VSYNC ) * 8 );
 }
 
 void warmCacheGeoRAM()
@@ -211,8 +253,215 @@ u32 temperature;
 	} while ( !done );
 
 
+// gpu64: the default-state splash -- the "Hondani" wordmark in greys, centred
+// on gpu64's own 320x200x8 framebuffer.
+//
+// This replaces the milestone 1 checkerboard, which existed only to prove the
+// Pi could drive HDMI at all. That question has been answered on hardware for
+// three milestones now, so the boot screen may as well say whose machine this
+// is. Everything here is palette indices, and it deliberately uses only the
+// greys already in the reset C64 palette (see gpu64_fb.cpp) -- black, dark
+// grey, grey, light grey, white -- so it needs no palette of its own and
+// cannot disturb a program's.
+//
+// The glyphs are gpu64_font8x8.h scaled up by GPU64_LOGO_SCALE, outlined by
+// smearing the same mask one scaled pixel in all eight directions first. That
+// is a lot cheaper than carrying a second, larger font, and at 4x the 8x8 VGA
+// face reads as deliberately blocky rather than as a stretched terminal font.
+#define GPU64_LOGO_TEXT		"HONDANI"
+#define GPU64_LOGO_SCALE	4
+
+static void gpu64DrawLogoGlyph( u8 *p, unsigned nPitch, int x0, int y0, char c, u8 nInk, boolean bGradient )
+{
+	const u8 *pGlyph = gpu64Font8x8[ (u8)c ];
+
+	for ( unsigned gy = 0; gy < GPU64_FONT8X8_HEIGHT; gy++ )
+	{
+		u8 bits = pGlyph[ gy ];
+		if ( bits == 0 )
+			continue;
+
+		// Top of the letter catches the light, the bottom falls away --
+		// three flat bands rather than a real ramp, because the reset
+		// palette only has three greys plus white to work with.
+		u8 ink = nInk;
+		if ( bGradient )
+			ink = ( gy < 3 ) ? 1 : ( gy < 6 ? 15 : 12 );
+
+		for ( unsigned gx = 0; gx < 8; gx++ )
+		{
+			if ( !( bits & ( 0x80 >> gx ) ) )
+				continue;
+
+			int px = x0 + (int)gx * GPU64_LOGO_SCALE;
+			int py = y0 + (int)gy * GPU64_LOGO_SCALE;
+
+			for ( int sy = 0; sy < GPU64_LOGO_SCALE; sy++ )
+			{
+				int y = py + sy;
+				if ( y < 0 || y >= (int)GPU64_FB_HEIGHT )
+					continue;
+				for ( int sx = 0; sx < GPU64_LOGO_SCALE; sx++ )
+				{
+					int x = px + sx;
+					if ( x < 0 || x >= (int)GPU64_FB_WIDTH )
+						continue;
+					p[ (size_t)y * nPitch + x ] = ink;
+				}
+			}
+		}
+	}
+}
+
+void CRAD::showTestPattern( void )
+{
+	// gpu64: called both once at boot and again on every C64-side trigger,
+	// so the face colour alternates -- that is what makes a real trigger
+	// visibly distinguishable from the leftover boot-time draw.
+	static unsigned callCount = 0;
+	callCount++;
+	boolean bGradient = ( callCount & 1 ) != 0;
+
+	logger->Write( "gpu64", LogNotice, "showTestPattern: call #%u%s", callCount, bGradient ? " (lit)" : " (flat)" );
+
+	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
+	if ( p == 0 )
+		return;
+	unsigned nPitch = m_Gpu64FB.GetPitch();
+
+	for ( unsigned y = 0; y < GPU64_FB_HEIGHT; y++ )
+		memset( p + (size_t)y * nPitch, 0, GPU64_FB_WIDTH );
+
+	const char *pText = GPU64_LOGO_TEXT;
+	unsigned nChars = strlen( pText );
+	int nGlyphW = 8 * GPU64_LOGO_SCALE;
+	int x0 = ( (int)GPU64_FB_WIDTH  - (int)nChars * nGlyphW ) / 2;
+	int y0 = ( (int)GPU64_FB_HEIGHT - GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE ) / 2;
+
+	// Outline first, face second: eight offset copies in dark grey, then the
+	// glyph itself on top of them.
+	static const int dx[ 8 ] = { -1, 0, 1, -1, 1, -1, 0, 1 };
+	static const int dy[ 8 ] = { -1, -1, -1, 0, 0, 1, 1, 1 };
+
+	for ( unsigned pass = 0; pass < 2; pass++ )
+		for ( unsigned i = 0; i < nChars; i++ )
+		{
+			int cx = x0 + (int)i * nGlyphW;
+
+			if ( pass == 0 )
+			{
+				for ( unsigned d = 0; d < 8; d++ )
+					gpu64DrawLogoGlyph( p, nPitch,
+						cx + dx[ d ] * GPU64_LOGO_SCALE,
+						y0 + dy[ d ] * GPU64_LOGO_SCALE,
+						pText[ i ], 11, FALSE );
+			} else
+				gpu64DrawLogoGlyph( p, nPitch, cx, y0, pText[ i ], 15, bGradient );
+		}
+
+	// A grey rule under the wordmark, the width of the wordmark itself.
+	int ruleY = y0 + GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE + GPU64_LOGO_SCALE * 2;
+	if ( ruleY >= 0 && ruleY + 1 < (int)GPU64_FB_HEIGHT )
+		for ( int x = x0; x < x0 + (int)nChars * nGlyphW; x++ )
+			if ( x >= 0 && x < (int)GPU64_FB_WIDTH )
+			{
+				p[ (size_t)ruleY * nPitch + x ] = 12;
+				p[ (size_t)( ruleY + 1 ) * nPitch + x ] = 11;
+			}
+
+	m_Gpu64FB.CleanPage( m_Gpu64FB.GetDrawPage() );
+}
+
+// gpu64: only one CRAD is ever constructed (see main() below); g_pRAD is set
+// from its constructor (rad_main.h). This wrapper lets rad_reu.cpp's bus-hijack
+// loop trigger the pattern from the C64 side without pulling in rad_main.h's
+// full Circle/screen include stack -- see the forward declaration in
+// rad_reu.cpp.
+CRAD *g_pRAD = nullptr;
+
+void gpu64_showTestPattern( CRAD *pRAD )
+{
+	if ( pRAD )
+		pRAD->showTestPattern();
+}
+
+// gpu64: extern rather than #include "font.h" -- that header is a raw
+// generated .bin-to-array dump with no include guard and no `extern`,
+// designed for exactly one translation unit (rad_hijack.cpp already includes
+// it) to own the storage; including it a second time here would duplicate
+// the 4KB array and fail to link. font_bin only gets mutated as menu-logo
+// scratch space during the earlier hijack/menu phase -- by the time
+// showMirror() runs (during REU emulation, a later phase), that mutation is
+// long done and font_bin is stable to read from.
+extern unsigned char font_bin[ 4096 ];
+
+// gpu64: milestone 3 screen mirror, rendering into the 8bpp framebuffer.
+//
+// This got simpler with milestone 4's display change rather than harder: the
+// C64's 40x25 text at 8x8 pixels per glyph is exactly 320x200, so the mirror
+// is now a 1:1 fit with no upscaling at all (it used to draw at 2x into a
+// COLOR16 framebuffer), and colour RAM's 4-bit values index palette entries
+// 0-15 directly, since the reset palette *is* the C64 palette.
+void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 background )
+{
+	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
+	if ( p == 0 )
+		return;
+	unsigned nPitch = m_Gpu64FB.GetPitch();
+
+	for ( unsigned cy = 0; cy < 25; cy++ )
+	{
+		for ( unsigned cx = 0; cx < 40; cx++ )
+		{
+			unsigned cellIdx = cy * 40 + cx;
+			u8 code = screen[ cellIdx ];
+			const u8 *glyph = &font_bin[ (unsigned)code * 8 ];
+			u8 fg = color[ cellIdx ] & 15;
+
+			for ( unsigned gy = 0; gy < 8; gy++ )
+			{
+				u8 rowBits = glyph[ gy ];
+				u8 *pDst = p + (size_t)( cy * 8 + gy ) * nPitch + cx * 8;
+				for ( unsigned gx = 0; gx < 8; gx++ )
+					pDst[ gx ] = ( rowBits & ( 0x80 >> gx ) ) ? fg : background;
+			}
+		}
+	}
+
+	// $D020 now has somewhere to go: the framebuffer carries a real border
+	// around the 320x200 surface (see GPU64_BORDER_W in gpu64_fb.h). Only
+	// repaint it when it actually changed -- SetBorder() touches both pages
+	// and cleans them, which is far more work than the snapshot itself.
+	if ( border != m_Gpu64FB.GetBorder() )
+		m_Gpu64FB.SetBorder( border );
+
+	m_Gpu64FB.CleanPage( m_Gpu64FB.GetDrawPage() );
+}
+
+// gpu64: same free-function indirection as gpu64_showTestPattern() above --
+// lets rad_reu.cpp's gpu64_mirrorSnapshot() reach CRAD::showMirror() without
+// pulling in the full Circle/screen include stack.
+void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border, u8 background )
+{
+	if ( pRAD )
+		pRAD->showMirror( screen, color, border, background );
+}
+
 void CRAD::Run( void )
 {
+	// gpu64: first thing logged, every boot. The card's config.txt names the
+	// image the Pi loads (kernel_rad.img), which for a long time was NOT the
+	// name build.sh deployed to -- so the hardware silently ran stale
+	// firmware while three rounds of newly added diagnostics "produced no
+	// output". Stamping the build into the log makes that failure mode
+	// self-evident: if this line doesn't match the build you just deployed,
+	// nothing below it is telling you anything about your current source.
+	// GPU64_BUILD_ID is regenerated by tools/build.sh on every run
+	// (Source/Firmware/build_id.h, git-ignored).
+	logger->Write( "gpu64", LogNotice, "Run: bc0 build " GPU64_BUILD_ID );
+
+	showTestPattern();
+
 	m_EMMC.Initialize();
 
 	EnableIRQs();
@@ -307,7 +556,9 @@ void CRAD::Run( void )
 
 
 	hijacking:
-		temperature = m_CPUThrottle.GetTemperature();
+		// gpu64: m_CPUThrottle removed (see rad_main.h) -- its mailbox calls hang
+		// on this board. temperature is only used for the on-screen menu display.
+		temperature = 0;
 
 		SyncDataAndInstructionCache();
 		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)hijackC64, 1024 * 10 );
@@ -424,7 +675,7 @@ void CRAD::Run( void )
 			{
 				// wait for "READY." to appear on screen
 				WAIT_FOR_READY_PROMPT
-				injectAndStartPRG( prgLaunch, prgSize, true ); 
+				injectAndStartPRG( prgLaunch, prgSize, true );
 			} else
 			if ( radSilentMode != 0xffffffff )
 			{
@@ -443,6 +694,39 @@ void CRAD::Run( void )
 			FORCE_READ_LINEARa( (void*)reuUsingPolling, 1024 * 7, 65536 );
 
 			resetREU();
+
+			// gpu64: diagnostic, see the "hijackC64 returned" log above --
+			// this is the last thing logged before reuUsingPolling() takes
+			// over for good (it only logs again once the mirror poll or the
+			// $DF0B trigger fires). gpu64ApiActive is logged specifically
+			// because it used to get stuck at 1 from a previous session (see
+			// resetREU() in rad_reu.cpp, now cleared there too) -- if this
+			// ever prints 1 again right after a fresh resetREU(), that fix
+			// regressed.
+			extern u8 gpu64ApiActive;
+			logger->Write( "gpu64", LogNotice, "Run: entering reuUsingPolling, gpu64ApiActive=%d", (int)gpu64ApiActive );
+
+			// gpu64: multicore feasibility spike (docs/milestone6_3d_design.md)
+			// -- one-shot proof, right before core 0 hands control to the
+			// cycle-critical loop, that cores 1-3 are alive and actually
+			// streaming through their stress buffers: sample their pass
+			// counters, wait a known interval, sample again. This runs
+			// during setup, before reuUsingPolling() takes over, so it costs
+			// nothing inside the cycle-critical path itself. This is only a
+			// liveness check, NOT the real test -- see the class comment in
+			// gpu64_multicore.h and progress_tracker.md for what actually
+			// answers the multicore feasibility question (re-running
+			// milestone 3's mirror/trigger checks while this runs).
+			u32 before[ 4 ] = {
+				CGpu64MultiCore::s_PassCounter[ 0 ], CGpu64MultiCore::s_PassCounter[ 1 ],
+				CGpu64MultiCore::s_PassCounter[ 2 ], CGpu64MultiCore::s_PassCounter[ 3 ] };
+			DELAY( 1 << 24 );
+			logger->Write( "gpu64", LogNotice,
+				"Run: multicore stress-loop pass delta core1=%u core2=%u core3=%u (0 means that core never ran)",
+				(unsigned)( CGpu64MultiCore::s_PassCounter[ 1 ] - before[ 1 ] ),
+				(unsigned)( CGpu64MultiCore::s_PassCounter[ 2 ] - before[ 2 ] ),
+				(unsigned)( CGpu64MultiCore::s_PassCounter[ 3 ] - before[ 3 ] ) );
+
 			reuUsingPolling();
 		} else
 		///////////////////////////////////////////////////////////////////////

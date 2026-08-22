@@ -35,7 +35,17 @@
 // increase this value. The value must be a multiple of 16 KByte.
 
 #ifndef KERNEL_MAX_SIZE
-#define KERNEL_MAX_SIZE		(64 * MEGABYTE)
+// gpu64: RAD's actual .bss (mempool, vsf, filesAll, printOutputFile, sort,
+// previewImage, etc.) adds up to ~98 MB, well past the stock 64 MB default.
+// Circle places the kernel stack, exception stacks, and MMU page tables at
+// fixed offsets computed from MEM_KERNEL_START + KERNEL_MAX_SIZE (see
+// memorymap.h) -- with the old 64 MB cap those all landed INSIDE our real
+// .bss range, so crt0's bss-zeroing at boot silently stomped the stack/page
+// tables before a single instruction of our own code (not even the earliest
+// serial log line) could run. This is the actual root cause of the
+// zero-output silent hang on real hardware; raised with headroom above the
+// ~98 MB actually used.
+#define KERNEL_MAX_SIZE		(160 * MEGABYTE)
 #endif
 
 // HEAP_DEFAULT_NEW defines the default heap to be used for the "new"
@@ -148,7 +158,12 @@
 // single core applications, because this may slow down the system
 // because multiple cores may compete for bus time without use.
 
-//#define ARM_ALLOW_MULTI_CORE
+// gpu64: enabled for the milestone-4 multicore feasibility spike -- see
+// docs/api_design.md's "Architecture: this needs two cores" and
+// gpu64_multicore.h. The upstream warning above (competing for bus time
+// without use) is exactly the real-hardware question this spike exists to
+// answer for a cycle-critical bit-banging core 0.
+#define ARM_ALLOW_MULTI_CORE
 
 #endif
 
