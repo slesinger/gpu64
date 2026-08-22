@@ -1,0 +1,57 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 -- milestone 3 diagnostic PRG: does nothing at all and RTS's
+;      straight back to BASIC. Deliberately does NOT touch GPU64_TRIGGER
+;      ($DF0B) -- unlike gpu64_trigger_pattern.a, this must NOT set
+;      gpu64ApiActive (see rad_reu.cpp), since that flag permanently stops
+;      the milestone-3 mirror poll for the rest of the session.
+;
+;      Purpose: some way to get RAD to actually enter REU emulation (and so
+;      run reuUsingPolling(), the loop the mirror poll lives in) without a
+;      program that overwrites the mirror's own effect on IO2/$DF0B or does
+;      anything else that could confound the test. Launching a plain PRG
+;      (e.g. SMON) from RAD's file list alone was observed on real hardware
+;      to take RAD's "no memory expansion" launch path instead -- which
+;      never calls reuUsingPolling() at all, so neither the trigger nor the
+;      mirror can fire there, regardless of what the PRG itself does. This
+;      PRG doesn't fix that; it's simply harmless to run under whatever
+;      REU-emulation-engaging launch method you already have (e.g. the same
+;      one launcher.prg/game.reu uses), so the periodic
+;      "gpu64_mirrorSnapshot: starting burst" / "showMirror: drew ..." log
+;      lines can be watched in isolation, sitting at READY., without a
+;      trigger PRG's side effect of switching the mirror off.
+;
+;      Assemble with 64tass (matches Source/Firmware/C64Side's convention) --
+;      64tass gpu64_mirror_probe.a -o gpu64_mirror_probe.prg
+;      then LOAD and RUN it from the RAD menu or a real drive.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	* = $0801			; standard BASIC load address
+
+	; minimal "10 SYS 2061" BASIC stub so RUN launches the code below
+	.word next_line
+	.word 10
+	.byte $9e			; SYS token
+	.text "2061"
+	.byte 0
+next_line
+	.word 0				; end of BASIC program (next line link = 0)
+
+	* = $080d			; = 2061, matches the SYS target above
+
+start
+	rts				; do nothing at all -- straight back to BASIC
