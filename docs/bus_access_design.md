@@ -97,6 +97,31 @@ was floated during design discussion -- that approach is rejected per the
 above. Milestone 3's implementation should be scoped as periodic snapshot
 polling, not a permanent bus takeover.
 
+## Status: implemented in milestone 3
+
+This design was implemented and confirmed on real hardware -- see milestone 3
+in [progress_tracker.md](progress_tracker.md) for the implementation and its
+scope decisions. The open questions this section originally listed resolved as
+follows:
+
+- **Polling rate:** a fixed iteration count in `reuUsingPolling()`'s per-cycle
+  loop, tuned to roughly four snapshots per second. Responsive enough to
+  follow typing and directory listings; the adaptive
+  "only poll when nothing else is contending" idea remains parked.
+- **One burst or several:** one burst is enough for text mode -- 1000 bytes of
+  screen RAM, 1000 bytes of colour RAM and two VIC registers, read and
+  released in a single DMA hold. Bitmap and multicolour modes may change this.
+- **VIC bank / charset detection:** not implemented. The mirror assumes the
+  power-on defaults ($0400 screen, $D800 colour). A program that relocates its
+  screen before engaging gpu64's API renders wrong. This is the main
+  correctness gap left in the default-state mirror.
+
+One practical lesson worth keeping with the design: work done between grabbing
+and releasing the bus is not the only cost. Rendering and logging after the
+burst also run with the C64 free-running and `reuUsingPolling()` not servicing
+any bus access, so they belong in the same budget. Cleaning the whole
+framebuffer per snapshot (~3.6MB at 1824x984) was measurably wasteful and is
+now narrowed to the rows actually drawn.
 ## Open questions for whoever implements milestone 3 under this design
 
 - How often to poll in the default state -- frequent enough to feel

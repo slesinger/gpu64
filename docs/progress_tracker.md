@@ -11,7 +11,8 @@ Create a build script using make utility. Discover how to test the image most ea
 **Status: done.** [tools/build.sh](../tools/build.sh) fetches Circle (pinned
 `Step44.3`), overlays gpu64's config onto it, and builds
 `Source/Firmware` into a `kernel8.img`; `SDCARD=<mountpoint> tools/build.sh`
-also deploys it. Verified end-to-end in this environment: clean build from
+also deploys it, under the filename the card's `config.txt` actually boots
+(see "Deploying to the right kernel" in [hw_testing.md](hw_testing.md)). Verified end-to-end in this environment: clean build from
 nothing, and sub-second incremental rebuilds. The vendored source needed
 several real fixes to compile against a standards-strict toolchain (mismatched
 prototypes, pointer/int comparisons, a missing object in the Makefile, two
@@ -95,135 +96,100 @@ this success, both worth remembering for future PRG deploys:
 
 ## 3. Display sniffed current C64 screen buffer
 
-**Design decided, not yet implemented -- see
-[docs/bus_access_design.md](bus_access_design.md) for the full reasoning.**
+**Status: done, confirmed on real hardware** (RAD cartridge + RPi 3A+, live
+C64, REU emulation active). The HDMI screen mirrors the C64's 40x25 text
+screen with correct characters, text colours and background colour, updating
+about four times a second, while the C64 itself is unaffected and stays in
+charge.
+
+### Design
+
 Continuous cycle-by-cycle bus sniffing (the originally imagined approach)
-turned out not to fit this hardware: RAD's board only exposes the full
-16-bit address to the RPi through a multiplexed latch that's cheap to read
-only while the CPU is already DMA-halted, so catching every write to
-arbitrary RAM while the C64 free-runs isn't feasible in software without
-either a permanent bus takeover or a PCB change. Both were rejected --
-**gpu64 must not intercept the C64 bus completely; the C64 stays in charge
-at all times**, and no hardware redesign is being pursued right now.
+does not fit this hardware -- see
+[docs/bus_access_design.md](bus_access_design.md) for the full reasoning.
+RAD's board only exposes the full 16-bit address through a multiplexed latch
+that is cheap to read only while the CPU is already DMA-halted, so catching
+every write to arbitrary RAM while the C64 free-runs is not feasible in
+software without either a permanent bus takeover or a PCB change. Both were
+rejected: **gpu64 must not intercept the C64 bus completely; the C64 stays in
+charge at all times.**
 
-Revised scope, explicitly *not* aiming for cycle-perfect VIC-II replication
-here (that remains milestones 5/7's job, only once the API-driven mode
-exists): periodic, brief DMA-held snapshot polling (same technique already
-used for menu injection and REU/GeoRAM emulation) reads the current VIC-II
-register block, screen RAM, color RAM, and character set, then releases the
-bus back to the C64 -- a poll, not a permanent takeover. Good enough for
-basic legibility (e.g. a directory listing visible on the HDMI screen),
-not for running arbitrary demos. This polling only runs when gpu64's own
-320x200 API (milestone 4) is *not* currently in use by a C64 program --
-the two modes are mutually exclusive at any moment: once a program engages
-the gpu64 command API, snapshot polling stops entirely.
+What was implemented instead is periodic, brief DMA-held snapshot polling --
+the same cycle-stealing technique REU's own Store/Fetch transfers already use,
+not a new kind of bus takeover. This is explicitly *not* aiming for
+cycle-perfect VIC-II replication (that remains milestones 5/7's job); the bar
+is basic legibility, e.g. reading a directory listing on the HDMI screen.
 
-- Scope: standard text mode only (40x25, one character set, border/background/multicolor text-mode nuances deferred to milestone 5).
-- Needs VIC bank detection (CIA2 $DD00) and screen/charset pointers (VIC $D018) as part of each snapshot, not just the power-on default addresses -- see bus_access_design.md's open questions for polling rate and DMA-burst sizing.
-- **Also needs to subsume milestone 2's trigger handler out of `reuUsingPolling()`:** confirmed on real hardware that the $DF0B trigger only works today when REU emulation happens to be separately active, because that's the only loop currently watching IO2 while DMA is held. A standalone gpu64 watch loop (cheap IO2-only decode + passthrough, no REU-specific register/prefetch logic) needs to exist independent of REU emulation for milestone 4's command API to work when no REU is selected -- this is naturally the same loop milestone 3's periodic snapshot polling needs, so implement them together. **Explicitly deferred again for this first cut** (see below) -- REU-active is being kept as a hard precondition for now, by the user's own choice, rather than doing that refactor yet.
+The mirror and gpu64's own framebuffer API are mutually exclusive: once a
+program engages the API, snapshot polling stops entirely. `gpu64ApiActive`
+(rad_reu.cpp) gates this, set by the $DF0B trigger and cleared in
+`resetREU()` on every fresh REU session.
 
-**First implementation done, not yet hardware-verified.** Deployment target
-for this cut, per discussion: (1) C64 Ultimate with its own built-in REU --
-RAD's own REU emulation switched off, gpu64 alone answers $DF0B-$DFFF
-alongside the Ultimate's software REU at $DF00-$DF0A (config #2 in
-project_description.md); (2) a plain C64 with RAD supplying both REU and
-gpu64 (config #1). Config #3 (expansion-port multiplier + a separate real
-REU cartridge) is intentionally not a target right now. The Ultimate side of
-this is unverified on real hardware -- deliberately deferred until both
-modes work in some fundamental way on the bench, since the user doesn't want
-to repeatedly unbox/reseat the Ultimate for incremental testing.
+### Implementation
 
-Scope decisions made for this cut (both deliberate simplifications, not
-oversights):
-- **Fixed default addresses only** -- $0400 screen RAM, $D800 color RAM,
-  $D020/$D021 border/background. No CIA2 $DD00 / VIC $D018 detection yet, so
-  a program that relocates its screen before ever touching gpu64 will render
-  wrong. Can be added later without changing the rendering path.
+- [`gpu64_mirrorSnapshot()`](../Source/Firmware/rad_reu.cpp) grabs a brief DMA
+  burst and reads 1000 bytes of screen RAM, 1000 bytes of colour RAM, and
+  $D020/$D021, then releases the bus.
+- [`CRAD::showMirror()`](../Source/Firmware/rad_main.cpp) renders that into the
+  reserved `GPU_OUTPUT_BOX` at 2x scale (640x400), using gpu64's bundled
+  character ROM copy (`font_bin`) rather than peeking the C64's real char ROM
+  -- which the CPU cannot see when it is banked out anyway -- plus a hardcoded
+  standard C64 16-colour palette (Pepto's values), since colour RAM only ever
+  stores a 4-bit palette index.
+- A counter in `reuUsingPolling()`'s per-cycle loop
+  (`gpu64MirrorPollCounter`/`GPU64_MIRROR_POLL_INTERVAL`) triggers the burst.
+- `gpu64_mirrorSnapshot()` gets its own instruction-cache preload in
+  `warmCache()`, since it is called from inside the cycle-critical loop but is
+  not covered by that function's own 7KB preload window.
+
+### Scope decisions for this cut
+
+Deliberate simplifications, not oversights:
+
+- **Fixed default addresses only** -- $0400 screen RAM, $D800 colour RAM,
+  $D020/$D021. No CIA2 $DD00 / VIC $D018 detection, so a program that
+  relocates its screen renders wrong. Addable later without touching the
+  rendering path.
 - **Fixed-iteration-count poll timer**, not the adaptive
-  "only-poll-when-nothing-else-is-contending" idea floated during design
-  discussion (parked for a later stage) -- a counter inside
-  `reuUsingPolling()`'s existing per-cycle loop
-  (`gpu64MirrorPollCounter`/`GPU64_MIRROR_POLL_INTERVAL` in rad_reu.cpp)
-  triggers a snapshot burst every N passes. N is a placeholder (~1M, guessed
-  at ~1 poll/second) that needs empirical tuning on real hardware, same as
-  this file's other WAIT_CYCLE_*/TIMING_* constants.
+  "only poll when nothing else is contending" idea floated during design
+  (parked for a later stage).
+- **REU emulation must be active.** The mirror lives inside
+  `reuUsingPolling()`, so RAD's "no memory expansion" launch path -- which
+  releases DMA and lets the C64 free-run with no bus-watching code at all --
+  has no mirror and no working $DF0B trigger. Milestone 4's command API will
+  need a standalone gpu64 watch loop independent of REU emulation; that
+  refactor is deliberately deferred.
+- **Ultimate config unverified.** Target configs are (1) a plain C64 with RAD
+  supplying both REU and gpu64, and (2) a C64 Ultimate with its own REU and
+  RAD's switched off. Only (1) has been tested; (2) is deferred until both
+  modes work fundamentally on the bench. Config #3 (expansion-port multiplier
+  plus a separate real REU cartridge) is not a target.
 
-Implementation: [`gpu64_mirrorSnapshot()`](../Source/Firmware/rad_reu.cpp)
-grabs a brief DMA burst -- the same `CLR_GPIO(bDMA_OUT)` +
-`DMA_READBYTE_P1..P3` cycle-stealing technique REU's own Store/Fetch
-transfers already use in handle_transfer.h, not a new kind of bus takeover --
-to read 1000 bytes screen RAM + 1000 bytes color RAM + border/background,
-then hands them to [`CRAD::showMirror()`](../Source/Firmware/rad_main.cpp)
-for rendering into the same `GPU_OUTPUT_BOX` milestone 2's test pattern uses
-(the two are mutually exclusive at any moment, see `gpu64ApiActive`).
-Rendering uses gpu64's own bundled character ROM copy (`font_bin`) rather
-than peeking the C64's real char ROM -- which the CPU can't see when it's
-banked out anyway -- plus a hardcoded standard C64 16-color palette (Pepto's
-commonly-used values), since color RAM only ever stores a 4-bit palette
-index, nothing to sniff there. `gpu64ApiActive` (set by the existing $DF0B
-trigger) gates the poll off once a program engages the gpu64 API.
-**Now cleared in `resetREU()`** (see the hardware-test writeup below) rather
-than never -- milestone 4's real command API may eventually want a more
-deliberate exit, but "clear on every fresh REU session" is the fix for now.
+### Known gaps
 
-Real risk flagged, not yet resolved: `gpu64_mirrorSnapshot()` is a
-substantial new function called from inside `reuUsingPolling()`'s
-cycle-critical loop but isn't covered by that function's own 7KB
-instruction-cache preload window in `warmCache()` -- an icache miss
-mid-burst could blow the per-byte DMA timing the same way an uncached
-`reuUsingPolling()` itself would (this file's own comment: "cache preloading
-is the most crucial part of emulating a REU on a RPi -- changing anything
-below might make everything less stable"). A separate, smaller preload for
-`gpu64_mirrorSnapshot` was added alongside it, sized by guesswork
-(1024*2 bytes) -- unverified.
+- No border rendered. $D020 is captured but not drawn -- the mirror sits at
+  (0,0) with no border area around it.
+- Text mode only. Bitmap, multicolour, sprites and raster effects are
+  milestone 5.
 
-**Hardware test session (2026-08-22) found a real hardware-testing gap, not
-a code bug:** neither `gpu64_mirrorSnapshot: starting burst` nor
-`showMirror: drew ...` appeared at all, even at a fresh boot with nothing
-else running, and independently a memory-test utility failed to detect an
-REU at all -- both symptoms traced to RAD's main menu having a `meType`
-state (0=REU, 1=GeoRAM, 2=None), toggled by the **`T`** key, that's
-completely separate from the REU *size* setting (`+`/`-`, `meSize0`) and
-from whether a `.reu` image is mounted. Whichever `meType` is selected
-decides which of `RUN_MEMEXP+1/+2/+3` a launch takes (see `CRAD::Run()` in
-rad_main.cpp) -- only `meType==0` (REU) ever reaches `reuUsingPolling()` at
-all; `meType==2` (None) is RAD's "no memory expansion" path (releases DMA,
-C64 free-runs, no bus-watching code active whatsoever, matches the
-already-known milestone 2 gap) and was apparently the state actually
-selected throughout this session, regardless of the 1MB size configured or
-an image being mounted. Not yet re-tested with `meType` confirmed on REU --
-this is genuinely still the first real test of whether the mirror fires on
-hardware at all.
+### What the debugging cost, and why
 
-**Follow-up test with `meType` confirmed REU still showed zero log lines,
-for over a minute.** This ruled out the `meType` theory and the poll-interval
-being merely slow, and turned out to be a real bug, root-caused with an
-Opus advisor pass after two wrong guesses: `gpu64ApiActive` (see above) was
-sticky forever, never cleared, and an earlier `launcher.prg` run in the same
-power-on session had almost certainly already latched it -- silently
-disarming the mirror for every REU session afterward, including the
-`gpu64_mirror_probe.prg` test, with no on-screen indication why. Worth
-noting: `IO_ADDRESS`'s 5-bit mask (`& 0x1f`, same partial decode REU's own
-real registers use) means gpu64's trigger isn't only `$DF0B` -- $DF2B,
-$DF4B, $DF6B, $DF8B, $DFAB, $DFCB, and $DFEB all alias onto it too, so an
-REU-detection utility scanning IO2 could trip it by accident, not just a
-deliberate trigger PRG. Fixed by clearing `gpu64ApiActive` in `resetREU()`.
-Two log lines were also added closing the previously-totally-dark stretch
-between `hijackC64()` returning and `reuUsingPolling()` starting (that gap
-had zero logging at all, which is what made this indistinguishable from
-several other silent-forever possibilities without static tracing --
-`WAIT_FOR_READY_PROMPT` never seeing "READY.", `startForcedResetVectors()`'s
-unbounded loop, dirscan.cpp's already-marked-file re-launch trap). Not yet
-re-verified on hardware after this fix -- next hardware session should
-confirm the mirror actually fires now.
+Three things made this milestone take far longer than the code warranted, all
+worth remembering:
 
-**Separate, unexplained finding from the same session, not yet
-investigated:** the C64's own native video (not HDMI) showed garbage after
-sitting idle in RAD's menu for a few minutes. Unlikely to be caused by any
-of gpu64's changes -- the menu-idle loop never reaches `reuUsingPolling()`,
-which is the only place this session's code runs -- but not confirmed
-either way, and not previously known to be pre-existing RAD behavior.
-Logged here so it isn't lost; needs its own investigation.
+1. **Deploys were going to the wrong filename.** The card's `config.txt` sets
+   `kernel=kernel_rad.img`, but `tools/build.sh` deployed to `kernel8.img`, so
+   three rounds of hardware testing measured firmware that predated every fix
+   being tested. See "Deploying to the right kernel" in
+   [hw_testing.md](hw_testing.md).
+2. **`gpu64ApiActive` was sticky.** Set in one place, cleared in none -- once
+   tripped it stayed set for the rest of the power-on session, silently
+   disarming the mirror. Note `IO_ADDRESS`'s 5-bit mask means the trigger is
+   not only $DF0B: $DF2B/$DF4B/$DF6B/$DF8B/$DFAB/$DFCB/$DFEB alias onto it,
+   so an REU-detection utility scanning IO2 can trip it by accident.
+3. **RAD's menu `meType`** (0=REU, 1=GeoRAM, 2=None), toggled by `T`, is
+   separate from the REU size setting and from whether an image is mounted.
+   Only `meType==0` reaches `reuUsingPolling()` at all.
 
 ## 4. Basic 2D GPU API
 
@@ -267,38 +233,31 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
   on-screen log) and the C64's audio-out being confirmed working with the
   original, non-gpu64 firmware on the same hardware. `detectSID()` now logs
   `SIDType`/`hasSIDKick`/`supportDAC` on-screen, and a likely root cause was
-  found by inspection: `SIDType` is never assigned anywhere in this vendored
-  firmware, so the Mahoney-technique lookup table always defaults to
-  `lookup8580` regardless of the real chip. See the "Open item" at the end
-  of [docs/hw_testing.md](hw_testing.md) for the full writeup and next step.
+  found by inspection and since confirmed on hardware: `SIDType` is never
+  assigned anywhere in this vendored firmware and logs as 0, so the
+  Mahoney-technique lookup table always resolves to `lookup8580` regardless
+  of the real chip. See the "Open item" at the end of
+  [docs/hw_testing.md](hw_testing.md) for the full writeup and next step.
+
+- **The C64's own native video (not HDMI) showed garbage** after sitting idle
+  in RAD's menu for a few minutes. Not investigated, and not known to be
+  either pre-existing RAD behaviour or a gpu64 regression -- the menu-idle
+  loop never reaches `reuUsingPolling()`, which is where all of gpu64's own
+  code runs, so a gpu64 cause is unlikely but unproven.
+
+- **Mirror freeze when the on-screen log filled the column, root cause not
+  conclusively identified.** During bring-up the mirror stopped updating
+  after ~14 snapshots, at the moment the log column filled, and the RAD menu
+  button stopped responding too -- meaning `reuUsingPolling()`'s loop itself
+  was stuck, not just the display. Two changes were made afterwards and the
+  mirror was then reported working: the per-snapshot logging (two lines at
+  4/sec, each doing glyph rendering plus a cache clean *inside* the polling
+  loop) was cut to a single line on the first snapshot, and `CHDMIConsole`'s
+  ring wrap was given a visible blank gap. Whether the freeze was caused by
+  the logging cost, by something in the console's wrap path, or by something
+  else that simply correlated with iteration count, was never proven. If it
+  returns, note that the stage-indicator approach (a repainting square whose
+  colour names the last completed step of the snapshot) was what was being
+  built to localise it -- see git history around 028fd01.
 
 ## To be continued...
-
-### Stale-firmware detour (2026-08-22)
-
-Three consecutive hardware test rounds reported "the newly added diagnostics
-produce no output at all": the `gpu64ApiActive` sticky-flag fix, the two flow
-diagnostic log lines around `hijackC64()`, and all eight HDMI checkpoint
-markers. None of them were ever on the machine.
-
-The RAD SD card's `config.txt` sets `kernel=kernel_rad.img`, but
-`tools/build.sh` deployed to `kernel8.img` -- the name Circle's build produces.
-Every deploy wrote a file the Pi's bootloader never reads, so the hardware kept
-booting whatever `kernel_rad.img` last held (hand-copied at 09:50 that day).
-Test PRGs on the card *did* update normally, since RAD reads those at launch
-time, which is what made the symptom look like a firmware bug rather than a
-deployment one.
-
-The decisive tell: the log showed `Run: bc8 initHijack done` and
-`detectSID: ...` but not the `Run: bc8b mark strip ...` line written *between*
-them. No single build can produce that ordering, so the running image had to be
-older than the source.
-
-Fixes: `tools/build.sh` now parses `config.txt`'s `kernel=` line, deploys under
-that name, and `cmp`-verifies the copy; the stale `kernel8.img` was deleted from
-the card; and every boot now logs `Run: bc0 build <git-describe> src:<digest>`
-as its first line, with build.sh printing the same id after a deploy, so a
-mismatch is visible immediately.
-
-None of the milestone-3 mirror work has been validated on hardware yet -- every
-result so far was measured against firmware that predates it.

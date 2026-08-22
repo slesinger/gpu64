@@ -4,7 +4,7 @@
 
 ```
 tools/build.sh                        # build external/Circle/app/Firmware/kernel8.img
-SDCARD=/path/to/mounted/sdcard tools/build.sh   # build + copy kernel8.img onto it
+SDCARD=/path/to/mounted/sdcard tools/build.sh   # build + deploy (see "Deploying to the right kernel")
 ```
 
 The script clones [Circle](https://github.com/rsta2/circle) (pinned to `Step44.3`,
@@ -103,7 +103,7 @@ Once you're testing against the real bus, use:
   plague flimsy ribbon extensions between the two devices.)
 
 - **Power-cycle to reboot**: Circle doesn't support hot-reloading a new kernel;
-  after copying the new `kernel8.img`, power off/on the RPi (or the C64, if the
+  after deploying the new firmware, power off/on the RPi (or the C64, if the
   RAD is powered from the expansion port) to boot into it.
 
 - **On-screen logging as the console**: with UART unavailable, the debug
@@ -168,6 +168,61 @@ once this line was commented out, and stable behavior returning the moment
 it was uncommented again. This looked exactly like a hardware bus-timing
 problem (bad solder joint, undervoltage, bus contention) and cost real time
 to rule out as one -- check this line first next time.
+
+### Deploying to the right kernel
+
+The Pi's bootloader loads whatever the SD card's `config.txt` names in its
+`kernel=` line. RAD's cards set `kernel=kernel_rad.img`, **not** the
+`kernel8.img` that Circle's build produces. `tools/build.sh` originally copied
+to `kernel8.img`, so every deploy wrote a file the Pi never read and the
+hardware silently kept booting the previous firmware.
+
+This cost three consecutive hardware test rounds during milestone 3: a bug fix
+and two sets of newly added diagnostics all "produced no output", because none
+of them were ever on the machine. Test PRGs on the card *did* update normally
+(RAD reads those at launch time), which is what made it look like a firmware
+bug rather than a deployment one. The decisive tell was a log containing two
+lines that bracket a third, newly added line that never appeared -- no single
+build can do that, so the running image had to be older than the source.
+
+Two guards exist now:
+
+- `tools/build.sh` parses `config.txt`'s `kernel=` line, deploys under that
+  name, and `cmp`-verifies the copy afterwards.
+- Every boot logs `Run: bc0 build <git-describe> src:<digest>` as its first
+  line, and `build.sh` prints the same id after deploying. If the two do not
+  match, nothing else in the log says anything about the current source.
+
+The build id is a git description plus a digest of the firmware sources,
+deliberately not a wall-clock timestamp -- a timestamp would differ on every
+invocation and force a rebuild and re-flash even when nothing changed.
+
+### Reading the on-screen log
+
+`CHDMIConsole` (tee_device.h) is a **ring**, not a scrolling console: when it
+reaches the bottom of the column it continues from the top, overwriting the
+oldest lines. A blank one-row gap is cleared ahead of the write head so the
+wrap point is visible -- without it, a full column reads exactly like a frozen
+log, which is how it was first reported from hardware.
+
+Keep logging out of hot paths. Each line does glyph rendering via `SetPixel`
+plus a cache clean, and anything logged from inside `reuUsingPolling()` runs
+with the C64 free-running and no bus access being serviced. The mirror logs
+once, on its first snapshot, for exactly this reason.
+
+### Configuring what RAD starts in
+
+`RAD/rad.cfg`'s `STARTUP` line decides what happens at power-on:
+`MENU` opens RAD's file browser; `REU128K`/`REU1M`/... boot straight into REU
+emulation at that size, with the C64 arriving at READY and gpu64's mirror
+already polling, no menu navigation needed. The menu is then reachable only
+via the RAD button. There is no startup option that also loads a `.reu` image
+file -- the startup path initialises a blank REU.
+
+Note the menu's `T` key cycles a separate `meType` state (REU / GeoRAM /
+None) that is independent of the REU size setting and of whether an image is
+mounted. Only REU reaches `reuUsingPolling()`, so neither gpu64's trigger nor
+its mirror can fire in the other two.
 
 ### Open item
 

@@ -323,12 +323,7 @@ void gpu64_mirrorSnapshot()
 	// from the burst itself hanging/dying partway through. See
 	// gpu64_logMirrorSnapshotStart() in rad_main.cpp.
 	extern void gpu64_logMirrorSnapshotStart( void );
-	extern void gpu64_mark( unsigned idx );
-	extern void gpu64_stage( unsigned s );
-	gpu64_mark( 6 );	// cyan -- the poll counter actually reached its interval
 	gpu64_logMirrorSnapshotStart();
-
-	gpu64_stage( 1 );	// red -- about to grab DMA
 
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
@@ -344,8 +339,6 @@ void gpu64_mirrorSnapshot()
 		gpu64MirrorScreen[ i ] = x;
 	}
 
-	gpu64_stage( 2 );	// orange -- screen RAM read done, DMA still held
-
 	for ( u16 i = 0; i < 1000; i++ )
 	{
 		c_a = 0xD800 + i;
@@ -354,8 +347,6 @@ void gpu64_mirrorSnapshot()
 		DMA_READBYTE_P3( x, false );
 		gpu64MirrorColor[ i ] = x & 0x0F;
 	}
-
-	gpu64_stage( 3 );	// yellow -- colour RAM read done, DMA still held
 
 	c_a = 0xD020;
 	DMA_READBYTE_P1( c_a );
@@ -369,11 +360,7 @@ void gpu64_mirrorSnapshot()
 	DMA_READBYTE_P3( x, true );		// last byte: release DMA back to the C64
 	gpu64MirrorBackground = x & 0x0F;
 
-	gpu64_stage( 4 );	// green -- DMA released back to the C64
-
 	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground );
-
-	gpu64_stage( 5 );	// cyan -- snapshot fully complete
 }
 
 #if 1
@@ -410,15 +397,6 @@ reuEmulationMainLoop:
 	CLR_GPIO( bMPLEX_SEL );
 	WAIT_FOR_CPU_HALFCYCLE
 	BEGIN_CYCLE_COUNTER
-
-	// gpu64: marker 5 (magenta) -- proves the polling loop was actually
-	// entered. Drawn once, here, before the loop, rather than inside it: the
-	// loop is cycle-critical and the C64 is free-running by now, so a repeated
-	// several-thousand-pixel blit in there would be a timing hazard.
-	{
-		extern void gpu64_mark( unsigned idx );
-		gpu64_mark( 5 );
-	}
 
 	while ( 1 )
 	{

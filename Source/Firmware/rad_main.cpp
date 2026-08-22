@@ -227,17 +227,6 @@ u32 temperature;
 // returned TRUE), scaled to whatever resolution it actually negotiated.
 void CRAD::showTestPattern( void )
 {
-	// gpu64 debug checkpoint: no UART, no confirmed HDMI yet, so use the
-	// ACT LED itself as a crude status channel -- distinct from the later
-	// hijack-loop breathing pattern, this fires once, early, right after
-	// power-on. 2 blinks = entered the function; then a pause; then a
-	// blink count equal to min(w,h)/100 reports the framebuffer dimensions
-	// we actually got (e.g. 19 blinks for a 1920-wide buffer) so we can
-	// tell whether m_Screen's framebuffer looks sane at all without any
-	// other output channel.
-	CActLED bootLED;
-	bootLED.Blink( 2, 200, 200 );
-
 	unsigned wFull = m_Screen.GetWidth();
 	unsigned hFull = m_Screen.GetHeight();
 
@@ -245,9 +234,6 @@ void CRAD::showTestPattern( void )
 	// pattern never collides with the HDMI on-screen log below it.
 	unsigned w = min( wFull, (unsigned)GPU_OUTPUT_BOX_W );
 	unsigned h = min( hFull, (unsigned)GPU_OUTPUT_BOX_H );
-
-	DELAY( 1 << 24 );
-	bootLED.Blink( min( wFull, hFull ) / 100, 120, 200 );
 
 	// gpu64: this is called both once at boot and again on every C64-side
 	// trigger ($DF0B write, see rad_reu.cpp) -- with an identical pattern
@@ -292,130 +278,6 @@ void CRAD::showTestPattern( void )
 	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
 	CleanDataCacheRange( (u64)(uintptr)pFB->GetBuffer(), pFB->GetSize() );
 
-	DELAY( 1 << 24 );
-	bootLED.Blink( 9, 200, 200 );	// 9 blinks = drawing + cache-clean finished, function returning
-
-	logger->Write( "gpu64", LogNotice, "showTestPattern: done" );
-}
-
-// gpu64: checkpoint marker strip -- see CRAD::mark()'s declaration in
-// rad_main.h. Squares sit in the band between GPU_OUTPUT_BOX's bottom edge and
-// the screen bottom, left of the log column (HDMI_LOG_X0), so nothing else
-// draws over them. Each index gets its own fixed colour and x position, and a
-// lit square is permanent for the rest of the session -- the tester just reads
-// off how far execution got, even if no log line ever appears.
-#define GPU64_MARK_Y0		( GPU_OUTPUT_BOX_H + 10 )
-#define GPU64_MARK_SIZE		40
-#define GPU64_MARK_PITCH	60
-
-void CRAD::mark( unsigned idx )
-{
-	static const TScreenColor markColor[ 8 ] =
-	{
-		COLOR16( 31, 31, 31 ),	// 0 white
-		COLOR16( 31,  0,  0 ),	// 1 red
-		COLOR16(  0, 31,  0 ),	// 2 green
-		COLOR16(  0,  0, 31 ),	// 3 blue
-		COLOR16( 31, 31,  0 ),	// 4 yellow
-		COLOR16( 31,  0, 31 ),	// 5 magenta
-		COLOR16(  0, 31, 31 ),	// 6 cyan
-		COLOR16( 31, 16,  0 )	// 7 orange
-	};
-
-	unsigned wFull = m_Screen.GetWidth();
-	unsigned hFull = m_Screen.GetHeight();
-
-	unsigned x0 = 10 + ( idx & 7 ) * GPU64_MARK_PITCH;
-	unsigned y0 = GPU64_MARK_Y0;
-
-	// Clamp rather than bail out. The first hardware run of these markers
-	// reported "no squares at all" on a path that other evidence says did
-	// execute, and an earlier revision returned silently whenever the strip
-	// did not fit -- which would produce exactly that symptom on any display
-	// mode shorter than GPU64_MARK_Y0 + GPU64_MARK_SIZE. A clamped square is
-	// still unambiguous; a silently skipped one is indistinguishable from
-	// code that never ran, which is the whole thing these markers exist to
-	// tell apart.
-	if ( wFull < GPU64_MARK_SIZE || hFull < GPU64_MARK_SIZE )
-		return;
-	if ( x0 + GPU64_MARK_SIZE > wFull )
-		x0 = wFull - GPU64_MARK_SIZE;
-	if ( y0 + GPU64_MARK_SIZE > hFull )
-		y0 = hFull - GPU64_MARK_SIZE;
-
-	TScreenColor col = markColor[ idx & 7 ];
-
-	for ( unsigned y = y0; y < y0 + GPU64_MARK_SIZE; y++ )
-		for ( unsigned x = x0; x < x0 + GPU64_MARK_SIZE; x++ )
-			m_Screen.SetPixel( x, y, col );
-
-	// only clean the rows actually touched -- one of the call sites is inside
-	// reuUsingPolling()'s cycle-critical loop, where a full-framebuffer clean
-	// would blow the timing budget (same reasoning as CHDMIConsole::Write()).
-	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
-	u32 nPitch = pFB->GetPitch();
-	CleanDataCacheRange( (u64)(uintptr)( pFB->GetBuffer() + y0 * nPitch ), GPU64_MARK_SIZE * nPitch );
-}
-
-void gpu64_mark( unsigned idx )
-{
-	if ( g_pRAD )
-		g_pRAD->mark( idx );
-}
-
-// gpu64: stage indicator for gpu64_mirrorSnapshot(). Unlike mark(), which
-// latches (each square stays lit forever), this repaints ONE square whose
-// colour says which stage the snapshot last completed -- so when the loop
-// freezes, the colour left on screen names the statement it froze in.
-//
-// Needed because the freeze is a hard hang: the RAD menu button stopped
-// responding, and that check lives in reuUsingPolling()'s loop, so the loop
-// itself is stuck rather than merely failing to draw. The prime suspects are
-// the unbounded BA-wait spins inside DMA_READBYTE_P1/P2 (they loop until the
-// VIC releases the bus, forever if it never does), and those sit between
-// stages 1 and 4.
-//
-// Deliberately small (16x16) and logger-free: stages 2 and 3 are painted
-// while DMA is held. The C64's CPU is stopped then, so the delay is harmless
-// to it, but there is no reason to make it bigger than it needs to be.
-#define GPU64_STAGE_X		600
-#define GPU64_STAGE_SIZE	16
-
-void CRAD::stage( unsigned s )
-{
-	static const TScreenColor stageColor[ 8 ] =
-	{
-		COLOR16(  8,  8,  8 ),	// 0 grey   - idle/never entered
-		COLOR16( 31,  0,  0 ),	// 1 red    - about to grab DMA
-		COLOR16( 31, 16,  0 ),	// 2 orange - screen RAM read done
-		COLOR16( 31, 31,  0 ),	// 3 yellow - colour RAM read done
-		COLOR16(  0, 31,  0 ),	// 4 green  - DMA released
-		COLOR16(  0, 31, 31 ),	// 5 cyan   - showMirror() returned
-		COLOR16(  0,  0, 31 ),	// 6 blue   - unused
-		COLOR16( 31,  0, 31 )	// 7 magenta- unused
-	};
-
-	unsigned wFull = m_Screen.GetWidth();
-	unsigned hFull = m_Screen.GetHeight();
-
-	unsigned x0 = GPU64_STAGE_X, y0 = GPU64_MARK_Y0;
-	if ( x0 + GPU64_STAGE_SIZE > wFull || y0 + GPU64_STAGE_SIZE > hFull )
-		return;
-
-	TScreenColor col = stageColor[ s & 7 ];
-	for ( unsigned y = y0; y < y0 + GPU64_STAGE_SIZE; y++ )
-		for ( unsigned x = x0; x < x0 + GPU64_STAGE_SIZE; x++ )
-			m_Screen.SetPixel( x, y, col );
-
-	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
-	u32 nPitch = pFB->GetPitch();
-	CleanDataCacheRange( (u64)(uintptr)( pFB->GetBuffer() + y0 * nPitch ), GPU64_STAGE_SIZE * nPitch );
-}
-
-void gpu64_stage( unsigned s )
-{
-	if ( g_pRAD )
-		g_pRAD->stage( s );
 }
 
 // gpu64: only one CRAD is ever constructed (see main() below); g_pRAD is set
@@ -429,25 +291,19 @@ CRAD *g_pRAD = nullptr;
 // gpu64_mirrorSnapshot() (rad_reu.cpp) right before it grabs the DMA burst
 // -- see the comment there. Counts calls so the log line makes it obvious
 // this is actually firing repeatedly, not just once.
-// Throttled: at 4 snapshots/sec, logging every one filled the whole log column
-// in about fifteen seconds and buried everything else, and each line is real
-// work inside the polling loop (glyph rendering via SetPixel plus a cache
-// clean). One line every GPU64_MIRROR_LOG_EVERY snapshots is enough to show
-// the poll is alive; the heartbeat square and the ACT LED cover the
-// per-snapshot case without touching the log at all.
-#define GPU64_MIRROR_LOG_EVERY	40
-
-static unsigned gpu64_mirrorSnapshotStartCount = 0;
+// gpu64: one line the first time the mirror polls, then silence. Logging every
+// snapshot (two lines, four times a second) filled the whole log column in
+// about fifteen seconds, and each line is real work inside the polling loop --
+// glyph rendering via SetPixel plus a cache clean -- for no benefit once the
+// mirror is known to be running.
 void gpu64_logMirrorSnapshotStart( void )
 {
-	gpu64_mirrorSnapshotStartCount++;
-	if ( ( gpu64_mirrorSnapshotStartCount % GPU64_MIRROR_LOG_EVERY ) == 1 )
-		logger->Write( "gpu64", LogNotice, "gpu64_mirrorSnapshot: starting burst #%u", gpu64_mirrorSnapshotStartCount );
-}
-
-unsigned gpu64_mirrorSnapshotCount( void )
-{
-	return gpu64_mirrorSnapshotStartCount;
+	static u8 logged = 0;
+	if ( !logged )
+	{
+		logged = 1;
+		logger->Write( "gpu64", LogNotice, "mirror: first snapshot" );
+	}
 }
 
 void gpu64_showTestPattern( CRAD *pRAD )
@@ -538,35 +394,6 @@ void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 backgrou
 		}
 	}
 
-	// gpu64: two heartbeats, deliberately on channels that fail independently.
-	// The mirror was observed freezing after 14 snapshots -- both the mirror
-	// image and the on-screen log stopped at once, which could equally mean
-	// "the polling loop died" or "HDMI writes stopped landing in DRAM". These
-	// tell those apart in a single run: the square is an HDMI write that does
-	// not go through CHDMIConsole, the ACT LED is not HDMI at all.
-	static u8 heartbeat = 0;
-	heartbeat ^= 1;
-
-	unsigned hbX = 500, hbY = GPU64_MARK_Y0;
-	if ( hbX + GPU64_MARK_SIZE <= wFull && hbY + GPU64_MARK_SIZE <= hFull )
-	{
-		TScreenColor hbCol = heartbeat ? COLOR16( 31, 31, 31 ) : COLOR16( 0, 0, 15 );
-		for ( unsigned y = hbY; y < hbY + GPU64_MARK_SIZE; y++ )
-			for ( unsigned x = hbX; x < hbX + GPU64_MARK_SIZE; x++ )
-				m_Screen.SetPixel( x, y, hbCol );
-	}
-
-	// On()/Off() are plain GPIO writes -- unlike CActLED::Blink(), which
-	// sleeps, and must never be called from here (this runs with the C64
-	// free-running and the polling loop not servicing the bus). Own instance
-	// rather than CActLED::Get(): the only other CActLED in this file is
-	// showTestPattern()'s local, which is long destructed by now.
-	static CActLED mirrorLED;
-	if ( heartbeat )
-		mirrorLED.On();
-	else
-		mirrorLED.Off();
-
 	// same cache-clean requirement as showTestPattern() -- SetPixel() writes
 	// only land in cache until explicitly cleaned to DRAM.
 	//
@@ -574,21 +401,11 @@ void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 backgrou
 	// 1824x984x2 a full clean is ~3.6MB per snapshot, four times a second,
 	// all of it spent outside reuUsingPolling()'s loop with the C64
 	// free-running -- a needlessly long window in which no bus access is
-	// being serviced. The mirror occupies rows 0..h and the heartbeat square
-	// its own strip, so clean exactly those two.
+	// being serviced. The mirror only ever touches rows 0..h.
 	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
 	u32 nPitch = pFB->GetPitch();
 	u64 nBuffer = (u64)(uintptr)pFB->GetBuffer();
 	CleanDataCacheRange( nBuffer, h * nPitch );
-	if ( hbY + GPU64_MARK_SIZE <= hFull )
-		CleanDataCacheRange( nBuffer + hbY * nPitch, GPU64_MARK_SIZE * nPitch );
-
-	// throttled for the same reason as the "starting burst" line -- see
-	// GPU64_MIRROR_LOG_EVERY above. Kept in step with that counter so the two
-	// lines still appear as a pair for whichever snapshot does get logged.
-	extern unsigned gpu64_mirrorSnapshotCount( void );
-	if ( ( gpu64_mirrorSnapshotCount() % GPU64_MIRROR_LOG_EVERY ) == 1 )
-		logger->Write( "gpu64", LogNotice, "showMirror: drew 40x25 snapshot (border=%u bg=%u)", border, background );
 }
 
 // gpu64: same free-function indirection as gpu64_showTestPattern() above --
@@ -616,49 +433,31 @@ void CRAD::Run( void )
 	showTestPattern();
 
 	m_EMMC.Initialize();
-	logger->Write( "gpu64", LogNotice, "Run: bc1 EMMC.Initialize done" );
 
 	EnableIRQs();
 	initSerialOverUSB_IECDevice( &m_Interrupt, &m_Timer, &m_DeviceNameService, false );
-	logger->Write( "gpu64", LogNotice, "Run: bc2 initSerialOverUSB_IECDevice done" );
 
 	gpioInit();
-	logger->Write( "gpu64", LogNotice, "Run: bc3 gpioInit (2nd call) done" );
 
 	setDefaultTimings( AUTO_TIMING_RPI3PLUS_C64C128 );
 	readConfig( logger, DRIVE, FILENAME_CONFIG );
-	logger->Write( "gpu64", LogNotice, "Run: bc4 readConfig done" );
 
 	OUT_GPIO( RESET_OUT );
 	CLR_GPIO( bRESET_OUT );
 	DELAY( 1 << 25 );
 	SET_GPIO( bRESET_OUT );
 	INP_GPIO( RESET_OUT );
-	logger->Write( "gpu64", LogNotice, "Run: bc5 GPIO reset pulse done" );
 
 
 	DisableIRQs();
-	logger->Write( "gpu64", LogNotice, "Run: bc6 DisableIRQs done" );
 
 	register u32 g2;
 
 	// this also initializes timing values
 	REU_SIZE_KB = 128;
 	initREU( mempool );
-	logger->Write( "gpu64", LogNotice, "Run: bc7 initREU done" );
 
 	initHijack();
-	logger->Write( "gpu64", LogNotice, "Run: bc8 initHijack done" );
-
-	// gpu64: reference marker 7 (orange), drawn here where logging is known
-	// to still work -- gives the tester a "this is what a lit square looks
-	// like, and this is where to look for the others" reference, so a later
-	// blank strip can be read as "that code never ran" rather than "maybe I
-	// was looking at the wrong part of the screen". The log line alongside it
-	// records the actual framebuffer geometry the strip was placed against.
-	mark( 7 );
-	logger->Write( "gpu64", LogNotice, "Run: bc8b mark strip y0=%u size=%u screen=%ux%u",
-		(unsigned)GPU64_MARK_Y0, (unsigned)GPU64_MARK_SIZE, m_Screen.GetWidth(), m_Screen.GetHeight() );
 
 #ifdef REU_PROTOCOL
 	nReuProtocol = 0;
@@ -746,22 +545,6 @@ void CRAD::Run( void )
 
 		res = hijackC64( false );			// after hijackC64 the CPU is still halted by DMA
 
-		// gpu64: marker 0 (white) -- deliberately BEFORE the log call below,
-		// so a lit square with no matching log line means logging (not the
-		// code path) is what's broken here. See CRAD::mark() for the strip
-		// layout and the full ladder of markers on this path (0..6).
-		mark( 0 );
-
-		// gpu64: diagnostic -- the stretch between here and reuUsingPolling()
-		// starting up had no logging at all, which made a real hardware hang
-		// (found to be gpu64ApiActive getting stuck at 1, see resetREU() in
-		// rad_reu.cpp) indistinguishable from several other silent-forever
-		// possibilities (WAIT_FOR_READY_PROMPT never seeing "READY.",
-		// startForcedResetVectors()'s unbounded loop, dirscan.cpp's
-		// already-marked-file re-launch trap). This one line at least proves
-		// hijackC64() returned and shows what it decided.
-		logger->Write( "gpu64", LogNotice, "Run: hijackC64 returned res=%d radLaunchPRG=%d radLaunchVSF=%d", res, (int)radLaunchPRG, (int)radLaunchVSF );
-
 		WAIT_FOR_CPU_HALFCYCLE
 		WAIT_FOR_VIC_HALFCYCLE
 		RESTART_CYCLE_COUNTER
@@ -834,7 +617,6 @@ void CRAD::Run( void )
 		if ( res == RUN_MEMEXP + 1 )
 		{
 		startREUEmulation:
-			mark( 1 );	// gpu64: red -- REU emulation branch taken
 			REU_SIZE_KB = 128 << meSize0;
 			initREU(mempool);
 			resetREU();
@@ -859,8 +641,6 @@ void CRAD::Run( void )
 
 			reu.isModified = 0;
 
-			mark( 2 );	// gpu64: green -- REU image loaded/initialized, about to wait for "READY."
-
 			if ( radLaunchPRG )
 			{
 				// wait for "READY." to appear on screen
@@ -873,8 +653,6 @@ void CRAD::Run( void )
 				WAIT_FOR_READY_PROMPT
 				injectMessage( false );
 			}
-
-			mark( 3 );	// gpu64: blue -- PRG injected/started, about to warm caches
 
 			SyncDataAndInstructionCache();
 			warmCache();
@@ -896,7 +674,6 @@ void CRAD::Run( void )
 			// ever prints 1 again right after a fresh resetREU(), that fix
 			// regressed.
 			extern u8 gpu64ApiActive;
-			mark( 4 );	// gpu64: yellow -- last checkpoint before reuUsingPolling() takes over
 			logger->Write( "gpu64", LogNotice, "Run: entering reuUsingPolling, gpu64ApiActive=%d", (int)gpu64ApiActive );
 
 			reuUsingPolling();
