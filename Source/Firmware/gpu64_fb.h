@@ -18,7 +18,6 @@
 #define _gpu64_fb_h
 
 #include <circle/bcmframebuffer.h>
-#include <circle/chargenerator.h>
 #include <circle/types.h>
 
 // The drawing surface. All API coordinates are in this space, with (0,0) at
@@ -44,13 +43,15 @@
 // whatever that entry holds. See docs/api_design.md.
 #define GPU64_LOG_INK		255
 
-// Log overlay geometry: Circle's own CCharGenerator glyphs are 8 wide and 16
-// tall (its GetCharHeight() adds 3 rows of leading, which we drop -- at 200
-// pixels tall those 3 rows would cost us two whole lines).
+// Log overlay geometry. This used to use Circle's CCharGenerator, whose only
+// face is 8x16 -- 40 columns by 12 rows on a 200-pixel-tall surface, which
+// made the log unreadable on a real display: boot messages wrapped, and 12
+// lines of scrollback is nothing. gpu64_font8x8.h carries the same Linux
+// console font family at half the height, so the same text now gets 25 rows.
 #define GPU64_LOG_CHAR_W	8
-#define GPU64_LOG_CHAR_H	16
+#define GPU64_LOG_CHAR_H	8
 #define GPU64_LOG_COLS		( GPU64_FB_WIDTH / GPU64_LOG_CHAR_W )	// 40
-#define GPU64_LOG_ROWS		( GPU64_FB_HEIGHT / GPU64_LOG_CHAR_H )	// 12
+#define GPU64_LOG_ROWS		( GPU64_FB_HEIGHT / GPU64_LOG_CHAR_H )	// 25
 
 class CGpu64FrameBuffer
 {
@@ -74,8 +75,21 @@ public:
 	void SetDrawPage( u8 nPage );
 	// Swaps draw and visible page. Returns FALSE if the mailbox call failed.
 	boolean Flip( void );
+	// The two halves of Flip(), for the vblank-deferred case. PrepareFlip()
+	// does everything expensive -- the log overlay and the cache clean --
+	// and runs during the command dispatch, where the C64 is halted anyway.
+	// CommitFlip() is then just the SetVirtualOffset the frame boundary is
+	// actually waiting for, which is what the bus-watch loop runs.
+	void PrepareFlip( void );
+	boolean CommitFlip( void );
 	// Back to the reset arrangement: page 0 drawn and visible.
 	void ResetPages( void );
+
+	// Blocks until the display's next vertical sync. A mailbox round-trip
+	// to the VideoCore, so this is boot- and setup-time only -- see
+	// gpu64_vsync.h. Exposed because the frame clock is calibrated against
+	// it and m_pFB is private.
+	boolean WaitForVSync( void );
 
 	// --- drawing (all act on the draw page, all clip) -------------------
 	void Clear( u8 nColor );
@@ -119,13 +133,14 @@ private:
 	void LogChar( char c );
 
 	CBcmFrameBuffer	*m_pFB;
-	CCharGenerator	m_CharGen;
 	u8		*m_pBuffer;
 	unsigned	m_nPitch;
 	boolean		m_bInitialized;
 
 	u8		m_nDrawPage;
 	u8		m_nVisiblePage;
+	// Page PrepareFlip() readied and CommitFlip() will make visible.
+	u8		m_nPendingVisible;
 
 	u8		m_nBorder;
 

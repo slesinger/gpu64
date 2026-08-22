@@ -3,6 +3,7 @@
  owns the display rather than sharing CScreenDevice's.
 */
 #include "gpu64_fb.h"
+#include "gpu64_font8x8.h"
 #include <circle/synchronize.h>
 #include <circle/util.h>
 
@@ -50,6 +51,7 @@ CGpu64FrameBuffer::CGpu64FrameBuffer( void )
 	m_bInitialized( FALSE ),
 	m_nDrawPage( 0 ),
 	m_nVisiblePage( 0 ),
+	m_nPendingVisible( 0 ),
 	m_nBorder( 0 ),
 	m_bLogEnabled( TRUE ),
 	m_nLogRow( 0 ),
@@ -186,32 +188,59 @@ void CGpu64FrameBuffer::SetDrawPage( u8 nPage )
 		m_nDrawPage = nPage;
 }
 
+void CGpu64FrameBuffer::PrepareFlip( void )
+{
+	if ( !m_bInitialized )
+		return;
+
+	m_nPendingVisible = m_nDrawPage;
+
+	// The log overlay is baked into page pixels, so it has to be re-applied
+	// to whichever page is about to be shown -- otherwise a program that
+	// draws its frame into the back page would flip the log away.
+	//
+	// This is the whole cost of a flip apart from the mailbox call, and it
+	// deliberately happens here rather than in CommitFlip(): a deferred flip
+	// commits from inside the bus-watch loop, and the less that path does
+	// while holding the C64 halted, the better.
+	DrawLogOverlay( m_nPendingVisible );
+	CleanPage( m_nPendingVisible );
+}
+
+boolean CGpu64FrameBuffer::CommitFlip( void )
+{
+	if ( !m_bInitialized )
+		return FALSE;
+
+	if ( !m_pFB->SetVirtualOffset( 0, m_nPendingVisible * GPU64_FB_TOTAL_H ) )
+		return FALSE;
+
+	m_nDrawPage = m_nVisiblePage;
+	m_nVisiblePage = m_nPendingVisible;
+	return TRUE;
+}
+
 boolean CGpu64FrameBuffer::Flip( void )
 {
 	if ( !m_bInitialized )
 		return FALSE;
 
-	u8 nNewVisible = m_nDrawPage;
+	PrepareFlip();
+	return CommitFlip();
+}
 
-	// The log overlay is baked into page pixels, so it has to be re-applied
-	// to whichever page is about to be shown -- otherwise a program that
-	// draws its frame into the back page would flip the log away.
-	DrawLogOverlay( nNewVisible );
-	CleanPage( nNewVisible );
-
-	if ( !m_pFB->SetVirtualOffset( 0, nNewVisible * GPU64_FB_TOTAL_H ) )
+boolean CGpu64FrameBuffer::WaitForVSync( void )
+{
+	if ( !m_bInitialized )
 		return FALSE;
-
-	m_nDrawPage = m_nVisiblePage;
-	m_nVisiblePage = nNewVisible;
-	return TRUE;
+	return m_pFB->WaitForVerticalSync();
 }
 
 void CGpu64FrameBuffer::ResetPages( void )
 {
 	if ( !m_bInitialized )
 		return;
-	m_nDrawPage = m_nVisiblePage = 0;
+	m_nDrawPage = m_nVisiblePage = m_nPendingVisible = 0;
 	m_pFB->SetVirtualOffset( 0, 0 );
 }
 
@@ -395,12 +424,24 @@ void CGpu64FrameBuffer::LogChar( char c )
 	if ( c == '\n' || m_nLogCol >= GPU64_LOG_COLS )
 	{
 		m_nLogCol = 0;
-		m_nLogRow++;
-		if ( m_nLogRow >= GPU64_LOG_ROWS )
-			m_nLogRow = 0;
 
-		// Blank the line we are about to write into, so the ring's wrap is
-		// visible as a gap rather than as new text mixed with old.
+		if ( m_nLogRow + 1 < GPU64_LOG_ROWS )
+			m_nLogRow++;
+		else
+		{
+			// Scroll, rather than wrap. This used to be a ring: the write
+			// point moved back to row 0 and the line about to be written was
+			// blanked, so the wrap was at least visible as a gap. On a real
+			// display that reads as broken -- the newest line sits at the
+			// top with older lines below it, and there is no cue that the
+			// bottom of the screen is the *oldest* text rather than the end
+			// of the boot sequence. A terminal scroll is what everyone
+			// expects, and it costs one memmove of a 1000-byte array per
+			// line, on a path that already repaints the whole overlay.
+			memmove( &m_LogText[ 0 ][ 0 ], &m_LogText[ 1 ][ 0 ],
+				 (size_t)( GPU64_LOG_ROWS - 1 ) * GPU64_LOG_COLS );
+		}
+
 		for ( unsigned i = 0; i < GPU64_LOG_COLS; i++ )
 			m_LogText[ m_nLogRow ][ i ] = ' ';
 
@@ -432,25 +473,63 @@ void CGpu64FrameBuffer::DrawLogOverlay( unsigned nPage )
 	if ( p == 0 )
 		return;
 
-	// Glyph pixels only, in the one reserved palette entry -- the space
-	// around each glyph is left alone, so whatever the program drew shows
-	// through. One colour is all we reserve; see docs/api_design.md.
+	// Each row that holds any text is painted as an opaque band: the whole
+	// 320-pixel line is cleared first, then the glyphs go on top.
+	//
+	// Drawing glyph pixels alone -- which is what this did -- leaves no way
+	// to erase. Nothing here knows what was underneath a pixel it lit, so a
+	// line that scrolls up leaves its old glyphs behind and the log reads as
+	// doubled text. Clearing whole rows is the only erase available without
+	// keeping a shadow copy of the page.
+	//
+	// Rows with no text are left alone, so an overlay that only fills part
+	// of the screen still lets the rest show through -- which is what the
+	// milestone 3 mirror wants. Nothing is reserved for the background: it
+	// clears to palette index 0, the same entry a program is free to
+	// repaint, exactly as GPU64_LOG_INK is.
 	for ( unsigned row = 0; row < GPU64_LOG_ROWS; row++ )
 	{
-		for ( unsigned col = 0; col < GPU64_LOG_COLS; col++ )
+		unsigned col;
+		for ( col = 0; col < GPU64_LOG_COLS; col++ )
+			if ( m_LogText[ row ][ col ] != ' ' && m_LogText[ row ][ col ] != 0 )
+				break;
+		if ( col == GPU64_LOG_COLS )
+			continue;
+
+		for ( unsigned gy = 0; gy < GPU64_LOG_CHAR_H; gy++ )
+			memset( p + (size_t)( row * GPU64_LOG_CHAR_H + gy ) * m_nPitch, 0, GPU64_FB_WIDTH );
+
+		for ( col = 0; col < GPU64_LOG_COLS; col++ )
 		{
 			char c = m_LogText[ row ][ col ];
 			if ( c == ' ' || c == 0 )
 				continue;
 
+			const u8 *pGlyph = gpu64Font8x8[ (u8)c ];
+
 			for ( unsigned gy = 0; gy < GPU64_LOG_CHAR_H; gy++ )
 			{
+				u8 bits = pGlyph[ gy ];
+				if ( bits == 0 )
+					continue;
+
 				u8 *pDst = p + (size_t)( row * GPU64_LOG_CHAR_H + gy ) * m_nPitch
 					     + col * GPU64_LOG_CHAR_W;
 				for ( unsigned gx = 0; gx < GPU64_LOG_CHAR_W; gx++ )
-					if ( m_CharGen.GetPixel( c, gx, gy ) )
+					if ( bits & ( 0x80 >> gx ) )
 						pDst[ gx ] = GPU64_LOG_INK;
 			}
 		}
 	}
+}
+
+// gpu64: free-function indirection for the bus-watch loop, the same pattern
+// gpu64_showTestPattern()/gpu64_showMirror() use in rad_main.cpp -- it lets
+// rad_reu.cpp commit a deferred page flip without including this header and
+// the Circle framebuffer stack behind it.
+boolean gpu64_commitFlip( void )
+{
+	if ( g_pGpu64FB == 0 )
+		return FALSE;
+	return g_pGpu64FB->CommitFlip();
 }

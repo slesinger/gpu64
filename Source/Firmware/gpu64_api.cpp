@@ -4,6 +4,7 @@
 */
 #include "gpu64_api.h"
 #include "gpu64_fb.h"
+#include "gpu64_vsync.h"
 #include <circle/util.h>
 
 // gpu64: set once a program actually drives the API, which stops the
@@ -43,6 +44,9 @@ void gpu64_apiReset( void )
 	sId[ 0 ] = sId[ 1 ] = 0;
 	for ( unsigned i = 0; i < GPU64_ARG_COUNT; i++ )
 		sArg[ i ] = 0;
+	// The frame clock's calibration survives -- it describes the display,
+	// not the session -- but nothing else about the vblank state does.
+	gpu64_vsyncResetState();
 }
 
 // --- argument accessors -------------------------------------------------
@@ -129,21 +133,43 @@ static u8 doSystem( u8 op )
 
 	case 0x01:					// RESET_STATE
 		sStatus = 0;
+		gpu64_vsyncResetState();
 		if ( pFB ) pFB->ResetPages();
 		return GPU64_ERR_OK;
 
 	case 0x02:					// VBLANK_ARM
 		if ( sArg[ 0 ] > 1 )
 			return GPU64_ERR_BAD_ARGS;
-		// No vblank event source exists in the bus-watch loop yet, so
-		// arming would promise an interrupt that never arrives.
 		if ( sArg[ 0 ] == 1 )
-			return GPU64_ERR_UNSUPPORTED;
-		sStatus &= ~GPU64_STATUS_VBLANK_ARMED;
+		{
+			if ( !gpu64Vsync.calibrated )
+				return GPU64_ERR_UNSUPPORTED;
+			// Arming is a setup-time command, so it is the natural place to
+			// pay for a re-anchor: the extrapolated clock is at its most
+			// accurate right after one, and the up-to-one-frame halt this
+			// costs happens once rather than per frame. See gpu64_vsync.h.
+			gpu64_vsyncReanchor();
+			gpu64Vsync.armed = 1;
+			sStatus |= GPU64_STATUS_VBLANK_ARMED;
+		} else
+		{
+			gpu64Vsync.armed = 0;
+			sStatus &= ~GPU64_STATUS_VBLANK_ARMED;
+			// Disarming while the line is still held would leave the C64
+			// with an IRQ it can no longer explain.
+			if ( gpu64Vsync.irqAsserted )
+				gpu64Vsync.irqReleaseReq = 1;
+			gpu64Vsync.irqRequest = 0;
+		}
 		return GPU64_ERR_OK;
 
 	case 0x03:					// VBLANK_ACK
 		sStatus &= ~GPU64_STATUS_VBLANK_PENDING;
+		// Releasing bIRQ_OUT is the bus-watch loop's job -- it owns every
+		// GPIO in the cartridge and is the only place that knows whether
+		// REU is holding the same line. This just asks.
+		if ( gpu64Vsync.irqAsserted )
+			gpu64Vsync.irqReleaseReq = 1;
 		return GPU64_ERR_OK;
 
 	case 0x04:					// SET_DRAW_PAGE
@@ -155,9 +181,31 @@ static u8 doSystem( u8 op )
 	case 0x05:					// PAGE_FLIP
 		if ( sArg[ 0 ] > 1 )
 			return GPU64_ERR_BAD_ARGS;
+		if ( pFB == 0 )
+			return GPU64_ERR_UNSUPPORTED;
 		if ( sArg[ 0 ] == 1 )
-			return GPU64_ERR_UNSUPPORTED;	// see VBLANK_ARM above
-		if ( pFB ) pFB->Flip();
+		{
+			if ( !gpu64Vsync.calibrated )
+				return GPU64_ERR_UNSUPPORTED;
+			// One flip can be outstanding at a time. Asking for a second
+			// changes nothing, per the spec's "a failed dispatch does
+			// nothing" rule -- the queued one still lands on its own
+			// boundary. The C64 polls STATUS bit0 to know when.
+			if ( gpu64Vsync.flipPending )
+				return GPU64_ERR_BUSY;
+			// Everything expensive about a flip happens now, while the C64
+			// is halted for this dispatch anyway; the loop is then left
+			// with only the SetVirtualOffset to do at the boundary.
+			pFB->PrepareFlip();
+			// Warm the commit path now, while the bus is held for this
+			// dispatch -- see gpu64_vsyncWarmCommit() in rad_reu.cpp for
+			// why it cannot be done at the point of use.
+			gpu64_vsyncWarmCommit();
+			gpu64Vsync.flipPending = 1;
+			sStatus |= GPU64_STATUS_BUSY;
+			return GPU64_ERR_OK;
+		}
+		pFB->Flip();
 		return GPU64_ERR_OK;
 
 	case 0x06:					// GET_INFO
@@ -181,6 +229,11 @@ static u8 doSystem( u8 op )
 		info[ 11 ] = 0x01;				// class 0 implemented, class 1 not
 		info[ 12 ] = GPU64_BORDER_W;			// border width, each side
 		info[ 13 ] = GPU64_BORDER_H;			// border height, each side
+		// Measured frame period in microseconds, 0 if the frame clock could
+		// not be calibrated -- which is also how a program can tell in
+		// advance that every vblank feature will return UNSUPPORTED.
+		info[ 14 ] = (u8)( gpu64Vsync.periodUs & 0xff );
+		info[ 15 ] = (u8)( ( gpu64Vsync.periodUs >> 8 ) & 0xff );
 		return gpu64_blobWrite( space, addr, 16, info );
 	}
 
@@ -193,6 +246,17 @@ static u8 doSystem( u8 op )
 			return GPU64_ERR_BAD_ARGS;
 		if ( pFB ) pFB->LogEnable( sArg[ 0 ] ? TRUE : FALSE );
 		return GPU64_ERR_OK;
+
+	case 0x09:					// VBLANK_SYNC
+		// The escape hatch for a long-running program: the frame clock is an
+		// extrapolation and drifts over minutes (gpu64_vsync.h), so this
+		// re-pins it to a real vsync. Costs up to one frame of C64 halt, so
+		// it is an occasional housekeeping call, not a per-frame one.
+		if ( !gpu64Vsync.calibrated )
+			return GPU64_ERR_UNSUPPORTED;
+		if ( gpu64Vsync.flipPending )
+			return GPU64_ERR_BUSY;
+		return gpu64_vsyncReanchor() ? GPU64_ERR_OK : GPU64_ERR_UNSUPPORTED;
 	}
 
 	return GPU64_ERR_BAD_OPCODE;
@@ -614,6 +678,21 @@ void gpu64_apiDispatch( u8 op )
 	if ( res == GPU64_ERR_OK )
 	{
 		sStatus &= ~GPU64_STATUS_ERROR;
+
+		// gpu64: the log overlay is a bring-up aid for the default state.
+		// Once a program owns the screen it should not have firmware text
+		// painted over its output on every flip -- and PrepareFlip() was
+		// walking 25 rows of glyphs per frame to do it. So the first
+		// successful command of a session hides it, on the same "a program
+		// engaged the API" transition that stops the mirror. LOG_ENABLE
+		// itself is exempt, so a program that explicitly asks for the log
+		// as its first command gets it.
+		if ( !gpu64ApiActive && op != 0x07 )
+		{
+			CGpu64FrameBuffer *pFB = g_pGpu64FB;
+			if ( pFB ) pFB->LogEnable( FALSE );
+		}
+
 		// A successful dispatch is what counts as "a program engaged the
 		// API" -- deliberately not any write into the window, so an REU
 		// detection routine scanning IO2 can't disarm the mirror by

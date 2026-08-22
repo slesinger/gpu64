@@ -29,6 +29,12 @@
 #include "rad_reu.h"
 #include "linux/kernel.h"
 #include "gpu64_api.h"
+#include "gpu64_vsync.h"
+
+// gpu64: reaching CGpu64FrameBuffer::CommitFlip() from the bus-watch loop
+// without including gpu64_fb.h, which pulls in Circle's framebuffer and
+// character-generator headers -- the same reasoning as g_pRAD above.
+boolean gpu64_commitFlip( void );
 
 // gpu64: forward-declared rather than pulling in rad_main.h (which drags in
 // the whole Circle screen/HDMI-console stack) -- see rad_main.h for the
@@ -359,6 +365,62 @@ void gpu64_mirrorSnapshot()
 	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground );
 }
 
+// gpu64: commits a vblank-deferred PAGE_FLIP, at the frame boundary the C64
+// asked for. Everything else a boundary does is inlined into the loop
+// (gpu64_vsyncAdvance(), gpu64_vsync.h) precisely so this is the only call
+// on the path -- and this one only happens when a flip is actually pending.
+//
+// The commit is bracketed in a DMA hold, exactly like the command dispatch
+// and the mirror snapshot. SetVirtualOffset() is a mailbox round-trip to the
+// VideoCore whose cost nobody has measured (it was open question 1 in
+// docs/milestone4_2d_api_design.md), and this runs while the C64 is
+// free-running through the loop -- so without the hold, a slow mailbox call
+// would silently eat the C64's next IO2 access, which is milestone 4's
+// bug #2 all over again. With the hold, the cost stops mattering for
+// correctness and only makes the burst longer.
+//
+// This function's instruction cache is warmed by gpu64_vsyncWarmCommit()
+// below, called from the PAGE_FLIP dispatch that queues the flip -- i.e.
+// while the bus is already held, rather than here where warming would itself
+// be the unprotected delay it is meant to prevent. Same __attribute__ pair
+// as gpu64_mirrorSnapshot() above.
+__attribute__( ( optimize( "align-functions=256" ) ) )
+__attribute__( ( section( "section_polling" ) ) )
+void gpu64_vsyncCommitFlip( void )
+{
+	// The WAIT_FOR_*_HALFCYCLE macros sample the GPIO bank into a variable
+	// they expect to be called g2, same as gpu64_mirrorSnapshot() above.
+	register u32 g2;
+	(void)g2;
+
+	WAIT_FOR_VIC_HALFCYCLE
+	RESTART_CYCLE_COUNTER
+	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
+	CLR_GPIO( bDMA_OUT );
+
+	gpu64_commitFlip();
+
+	WAIT_FOR_CPU_HALFCYCLE
+	WAIT_FOR_VIC_HALFCYCLE
+	RESTART_CYCLE_COUNTER
+	SET_GPIO( bDMA_OUT );
+
+	gpu64Vsync.flipPending = 0;
+	gpu64Regs.status &= ~GPU64_STATUS_BUSY;
+}
+
+// gpu64: called from the PAGE_FLIP dispatch, with the bus held, to warm the
+// commit path before the loop needs it. The dispatch that queues a flip is
+// the biggest instruction-cache consumer in the system and will have evicted
+// whatever warmCache() preloaded at REU start -- see the general rule in
+// docs/progress_tracker.md. Doing it here rather than at the point of use is
+// what keeps the loop's own exposure to a single short call.
+void gpu64_vsyncWarmCommit( void )
+{
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_vsyncCommitFlip, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_vsyncCommitFlip, 1024 * 2, 1024 * 2 );
+}
+
 // gpu64: milestone 4 blob transfers -- the "commands by reference" half of
 // the API (docs/api_design.md). A C64-space transfer is the same brief,
 // bounded DMA burst gpu64_mirrorSnapshot() above already proves on hardware,
@@ -570,6 +632,22 @@ reuEmulationMainLoop:
 		{
 			gpu64MirrorPollCounter = 0;
 			gpu64_mirrorSnapshot();
+		}
+
+		// gpu64: the frame clock (gpu64_vsync.h). Only meaningful once a
+		// program has engaged the API -- the mirror above has no use for a
+		// vblank and shares the loop pass with this. The common case is the
+		// inlined test alone: one MMIO read and a compare.
+		if ( gpu64ApiActive )
+		{
+			register u32 gpu64Now = gpu64_vsyncNow();
+			if ( gpu64_vsyncDue( gpu64Now ) )
+			{
+				gpu64_vsyncAdvance( gpu64Now );
+				gpu64Regs.status |= GPU64_STATUS_VBLANK_PENDING;
+				if ( gpu64Vsync.flipPending )
+					gpu64_vsyncCommitFlip();
+			}
 		}
 
 		SET_GPIO( bDIR_Dx );
@@ -825,6 +903,43 @@ reuEmulationMainLoop:
 			reu.irqRelease = 1;
 			write32( ARM_GPIO_GPCLR0, bIRQ_OUT );
 			OUT_GPIO_IRQ();
+		}
+
+		// gpu64: the vblank IRQ, shaped exactly like REU's above -- same
+		// physical line, same "only assert when nobody else is pulling it
+		// low" guard. The difference is the release: REU lets go when the
+		// C64 reads the register that explains the interrupt, whereas
+		// gpu64's is explicit, on VBLANK_ACK (see doSystem() $03), because
+		// nothing gpu64 exposes is read-to-clear.
+		//
+		// Gated on gpu64ApiActive, like the frame clock at the top of the
+		// loop: nothing here can have anything to do until a program has
+		// engaged the API, and the loop's tail is the part that has to be
+		// finished before the next WAIT_FOR_VIC_HALFCYCLE. One byte test
+		// (and gpu64ApiActive is already hot -- the mirror above reads it
+		// every pass) beats two struct loads on every pass of a loop that
+		// runs a million times a second while nothing is happening.
+		if ( gpu64ApiActive && gpu64Vsync.irqRequest && !CPU_IRQ_LOW )
+		{
+			gpu64Vsync.irqRequest = 0;
+			gpu64Vsync.irqAsserted = 1;
+			write32( ARM_GPIO_GPCLR0, bIRQ_OUT );
+			OUT_GPIO_IRQ();
+		}
+
+		if ( gpu64ApiActive && gpu64Vsync.irqReleaseReq )
+		{
+			gpu64Vsync.irqReleaseReq = 0;
+			gpu64Vsync.irqAsserted = 0;
+			// Only drive the pin back up if REU is not also holding it
+			// down; if it is, REU's own release path owns the line and
+			// letting go here would cancel an interrupt the C64 has not
+			// acknowledged yet.
+			if ( !reu.irqRelease )
+			{
+				write32( ARM_GPIO_GPSET0, bIRQ_OUT );
+				INP_GPIO_IRQ();
+			}
 		}
 
 		// cache preloading is the most crucial part of emulating a REU on a RPi

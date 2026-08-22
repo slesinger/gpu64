@@ -317,26 +317,30 @@ milestone6_3d_design.md alongside textures and meshes, which is also why
 
 ## Open questions
 
-1. **Deferred `PAGE_FLIP` and `STATUS.busy`.** Every other class-0 command
-   completes inside the write handler, so `busy` is never observably set. A
-   vblank-deferred flip is the one command that outlives its dispatch —
-   which means either the C64 polls `busy`, or the handler blocks on
-   `WaitForVerticalSync()` for up to a frame, which the cycle-
-   predictability rule forbids. Under architecture A the deferred flip is
-   just a queued `SetVirtualOffset`, so polling `busy` is cheap and
-   correct — but whether a mailbox call is cheap enough to make from inside
-   the bus-watch loop at all is unmeasured.
-2. **Log overlay legibility.** One reserved colour with a transparent glyph
-   background means the log can be unreadable over busy content. Revisit
-   only if it actually bites during bring-up; the fix (a second reserved
-   entry for a background box) is cheap but costs a palette slot.
-3. **Deferred/vblank work generally.** Nothing in the loop knows where the
-   raster is, so anything phrased as "at the next vblank" is unimplementable
-   as specified today. `UNSUPPORTED` ($06) marks those rather than faking
-   them. An event source is the prerequisite, and it is a milestone 6
-   question (see [milestone6_3d_design.md](milestone6_3d_design.md)).
+1. **The deferred flip's mailbox cost.** `SetVirtualOffset` measured 71 µs
+   best and ~900 µs typically over 256 flips on real hardware. It runs
+   inside a DMA hold so it is safe, but that is 5% of the C64's cycles for a
+   program that flips every frame. Writing the display offset directly
+   instead of through the mailbox would remove nearly all of it.
 
-Resolved by the hardware bring-up (see
-[progress_tracker.md](progress_tracker.md#hardware-bring-up-four-rounds-four-bugs)):
-write-direction DMA is proven end to end, and the whole class-0 dispatcher
-has executed on a real C64.
+## Resolved
+
+- **Log overlay legibility.** A transparent glyph background made the log
+  unreadable over busy content, and gave the overlay no way to erase itself
+  — scrolled text ghosted. Rows that hold text are now painted opaque over
+  palette index 0, and the overlay hides itself entirely once a program
+  engages the API. No extra palette entry was reserved.
+- **Vblank, and the deferred `PAGE_FLIP` / `STATUS.busy` contract.** Both
+  rested on the premise that knowing where the raster is costs a blocking
+  mailbox call. Too narrow: **you only have to ask the VideoCore once.** The
+  frame period is measured at boot against the free-running ARM system
+  timer, and the loop then finds the next boundary with one MMIO read and a
+  compare — the same cost as the GPIO samples it already takes twice per
+  pass. Both clocks derive from the same 19.2 MHz crystal, so the
+  extrapolation holds; it drifts slowly, which is what `VBLANK_SYNC` is for.
+  `STATUS.busy` now has a real user: set by a deferred flip, cleared when it
+  lands, which is what makes the poll loop in
+  [api_design.md](api_design.md#tear-free-animation) work.
+- **Write-direction DMA and the class-0 dispatcher** are both proven end to
+  end on a real C64 (see
+  [progress_tracker.md](progress_tracker.md#hardware-bring-up-four-rounds-four-bugs)).

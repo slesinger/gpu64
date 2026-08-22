@@ -60,6 +60,8 @@ extern void strupr( char *d, char *s );
 // i.e. m_Screen's own text console -- unusable here for the same IRQ reason)
 // which fans every logger->Write() out to both m_Serial and m_HDMIConsole.
 // See tee_device.h.
+#include "gpu64_vsync.h"
+
 #define STANDARD_SETUP_TIMER_INTERRUPT_CYCLECOUNTER_GPIO										\
 	boolean bOK = TRUE;																			\
 	if ( bOK ) bOK = m_Serial.Initialize( 115200 );												\
@@ -74,7 +76,15 @@ extern void strupr( char *d, char *s );
 	logger->Write( "gpu64", LogNotice, "boot: serial+screen+interrupt+timer up, entering gpioInit()" ); \
 	/* initialize GPIOs */ 																		\
 	gpioInit(); 																				\
-	logger->Write( "gpu64", LogNotice, "boot: gpioInit() returned" );
+	logger->Write( "gpu64", LogNotice, "boot: gpioInit() returned" );							\
+	/* gpu64: measure the HDMI frame period for the frame clock (gpu64_vsync.h). */				\
+	/* Blocking -- ~half a second at 60Hz -- which is why it happens here, at boot, */			\
+	/* and never once the C64 is being watched. A failure is not fatal: it just */				\
+	/* leaves every vblank feature returning UNSUPPORTED. */										\
+	if ( gpu64_vsyncCalibrate() )																\
+		logger->Write( "gpu64", LogNotice, "vsync: %u us/frame", gpu64Vsync.periodUs );			\
+	else																						\
+		logger->Write( "gpu64", LogWarning, "vsync: not calibrated, vblank unavailable" );
 
 #define min(a,b) (((a)<(b))?(a):(b))
 #define max(a,b) (((a)>(b))?(a):(b))

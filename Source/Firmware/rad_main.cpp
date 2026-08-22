@@ -30,6 +30,7 @@
 #define FORCE_RESET_VECTORS
 
 #include "rad_main.h"
+#include "gpu64_font8x8.h"
 #include "build_id.h"
 #include "dirscan.h"
 #include "c64screen.h"
@@ -54,6 +55,7 @@ u64 armCycleCounter;
 // GeoRAM
 #include "rad_georam.h"
 #include "gpu64_api.h"
+#include "gpu64_vsync.h"
 
 // VSF
 u8 vsf[ 17 * 1024 * 1024 ] = {0};
@@ -89,11 +91,23 @@ void warmCache()
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobWrite, 1024 * 2 );
 	FORCE_READ_LINEARa( (void*)gpu64_blobWrite, 1024 * 2, 65536 );
 
+	// gpu64: the deferred page flip's commit is in the same position again
+	// -- called from the polling loop, outside its preload window. The
+	// PAGE_FLIP dispatch re-warms it every time it queues a flip (see
+	// gpu64_vsyncWarmCommit in rad_reu.cpp), since a dispatch will have
+	// evicted whatever this preloaded; this covers the first one.
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_vsyncCommitFlip, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_vsyncCommitFlip, 1024 * 2, 65536 );
+
 	// gpu64: the API register file is touched inline from the polling loop
 	// on every ARG write and every STATUS/ERRCODE read (see GPU64REGS in
 	// gpu64_api.h), so it wants the same treatment REUSTATE gets above.
 	CACHE_PRELOAD_DATA_CACHE( &gpu64Regs, sizeof( GPU64REGS ), CACHE_PRELOADL1KEEP )
 	FORCE_READ_LINEAR32a( &gpu64Regs, sizeof( GPU64REGS ), sizeof( GPU64REGS ) * 8 );
+
+	// gpu64: and the frame-clock state it reads every single pass.
+	CACHE_PRELOAD_DATA_CACHE( &gpu64Vsync, sizeof( GPU64VSYNC ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64Vsync, sizeof( GPU64VSYNC ), sizeof( GPU64VSYNC ) * 8 );
 }
 
 void warmCacheGeoRAM()
@@ -239,20 +253,76 @@ u32 temperature;
 	} while ( !done );
 
 
-// gpu64: checkerboard test pattern, now drawn straight into gpu64's own
-// 320x200x8 framebuffer as palette indices (it used to compute COLOR16
-// values into CScreenDevice's framebuffer -- see gpu64_fb.h for why that
-// arrangement is gone).
+// gpu64: the default-state splash -- the "Hondani" wordmark in greys, centred
+// on gpu64's own 320x200x8 framebuffer.
+//
+// This replaces the milestone 1 checkerboard, which existed only to prove the
+// Pi could drive HDMI at all. That question has been answered on hardware for
+// three milestones now, so the boot screen may as well say whose machine this
+// is. Everything here is palette indices, and it deliberately uses only the
+// greys already in the reset C64 palette (see gpu64_fb.cpp) -- black, dark
+// grey, grey, light grey, white -- so it needs no palette of its own and
+// cannot disturb a program's.
+//
+// The glyphs are gpu64_font8x8.h scaled up by GPU64_LOGO_SCALE, outlined by
+// smearing the same mask one scaled pixel in all eight directions first. That
+// is a lot cheaper than carrying a second, larger font, and at 4x the 8x8 VGA
+// face reads as deliberately blocky rather than as a stretched terminal font.
+#define GPU64_LOGO_TEXT		"HONDANI"
+#define GPU64_LOGO_SCALE	4
+
+static void gpu64DrawLogoGlyph( u8 *p, unsigned nPitch, int x0, int y0, char c, u8 nInk, boolean bGradient )
+{
+	const u8 *pGlyph = gpu64Font8x8[ (u8)c ];
+
+	for ( unsigned gy = 0; gy < GPU64_FONT8X8_HEIGHT; gy++ )
+	{
+		u8 bits = pGlyph[ gy ];
+		if ( bits == 0 )
+			continue;
+
+		// Top of the letter catches the light, the bottom falls away --
+		// three flat bands rather than a real ramp, because the reset
+		// palette only has three greys plus white to work with.
+		u8 ink = nInk;
+		if ( bGradient )
+			ink = ( gy < 3 ) ? 1 : ( gy < 6 ? 15 : 12 );
+
+		for ( unsigned gx = 0; gx < 8; gx++ )
+		{
+			if ( !( bits & ( 0x80 >> gx ) ) )
+				continue;
+
+			int px = x0 + (int)gx * GPU64_LOGO_SCALE;
+			int py = y0 + (int)gy * GPU64_LOGO_SCALE;
+
+			for ( int sy = 0; sy < GPU64_LOGO_SCALE; sy++ )
+			{
+				int y = py + sy;
+				if ( y < 0 || y >= (int)GPU64_FB_HEIGHT )
+					continue;
+				for ( int sx = 0; sx < GPU64_LOGO_SCALE; sx++ )
+				{
+					int x = px + sx;
+					if ( x < 0 || x >= (int)GPU64_FB_WIDTH )
+						continue;
+					p[ (size_t)y * nPitch + x ] = ink;
+				}
+			}
+		}
+	}
+}
+
 void CRAD::showTestPattern( void )
 {
-	// gpu64: this is called both once at boot and again on every C64-side
-	// trigger, so alternating the pattern is what makes a real trigger
+	// gpu64: called both once at boot and again on every C64-side trigger,
+	// so the face colour alternates -- that is what makes a real trigger
 	// visibly distinguishable from the leftover boot-time draw.
 	static unsigned callCount = 0;
 	callCount++;
-	boolean bInvert = ( callCount & 1 ) == 0;
+	boolean bGradient = ( callCount & 1 ) != 0;
 
-	logger->Write( "gpu64", LogNotice, "showTestPattern: call #%u%s", callCount, bInvert ? " (inverted)" : "" );
+	logger->Write( "gpu64", LogNotice, "showTestPattern: call #%u%s", callCount, bGradient ? " (lit)" : " (flat)" );
 
 	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
 	if ( p == 0 )
@@ -260,17 +330,44 @@ void CRAD::showTestPattern( void )
 	unsigned nPitch = m_Gpu64FB.GetPitch();
 
 	for ( unsigned y = 0; y < GPU64_FB_HEIGHT; y++ )
-	{
-		for ( unsigned x = 0; x < GPU64_FB_WIDTH; x++ )
+		memset( p + (size_t)y * nPitch, 0, GPU64_FB_WIDTH );
+
+	const char *pText = GPU64_LOGO_TEXT;
+	unsigned nChars = strlen( pText );
+	int nGlyphW = 8 * GPU64_LOGO_SCALE;
+	int x0 = ( (int)GPU64_FB_WIDTH  - (int)nChars * nGlyphW ) / 2;
+	int y0 = ( (int)GPU64_FB_HEIGHT - GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE ) / 2;
+
+	// Outline first, face second: eight offset copies in dark grey, then the
+	// glyph itself on top of them.
+	static const int dx[ 8 ] = { -1, 0, 1, -1, 1, -1, 0, 1 };
+	static const int dy[ 8 ] = { -1, -1, -1, 0, 0, 1, 1, 1 };
+
+	for ( unsigned pass = 0; pass < 2; pass++ )
+		for ( unsigned i = 0; i < nChars; i++ )
 		{
-			boolean bLit = ( ( x / 20 ) + ( y / 20 ) ) & 1;
-			if ( bInvert )
-				bLit = !bLit;
-			// Cycle through the 16 C64 colours the reset palette holds --
-			// nothing here needs the other 240 entries.
-			p[ (size_t)y * nPitch + x ] = bLit ? (u8)( 1 + ( ( x / 20 + y / 20 ) % 15 ) ) : 0;
+			int cx = x0 + (int)i * nGlyphW;
+
+			if ( pass == 0 )
+			{
+				for ( unsigned d = 0; d < 8; d++ )
+					gpu64DrawLogoGlyph( p, nPitch,
+						cx + dx[ d ] * GPU64_LOGO_SCALE,
+						y0 + dy[ d ] * GPU64_LOGO_SCALE,
+						pText[ i ], 11, FALSE );
+			} else
+				gpu64DrawLogoGlyph( p, nPitch, cx, y0, pText[ i ], 15, bGradient );
 		}
-	}
+
+	// A grey rule under the wordmark, the width of the wordmark itself.
+	int ruleY = y0 + GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE + GPU64_LOGO_SCALE * 2;
+	if ( ruleY >= 0 && ruleY + 1 < (int)GPU64_FB_HEIGHT )
+		for ( int x = x0; x < x0 + (int)nChars * nGlyphW; x++ )
+			if ( x >= 0 && x < (int)GPU64_FB_WIDTH )
+			{
+				p[ (size_t)ruleY * nPitch + x ] = 12;
+				p[ (size_t)( ruleY + 1 ) * nPitch + x ] = 11;
+			}
 
 	m_Gpu64FB.CleanPage( m_Gpu64FB.GetDrawPage() );
 }

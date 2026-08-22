@@ -41,10 +41,16 @@
 #define GPU64_ERR_OUT_OF_RANGE		0x03
 #define GPU64_ERR_BAD_ARGS		0x04
 #define GPU64_ERR_SINGULAR		0x05
-// gpu64: defined by the spec, not implemented by this build -- currently
-// everything vblank-related, since there is no vblank event source in the
-// bus-watch loop yet. Better than pretending a deferred flip happened.
+// gpu64: defined by the spec, not implemented by this build. As of the
+// frame clock (gpu64_vsync.h) the vblank features are implemented, so this
+// now only covers the case where the clock could not be calibrated at boot
+// -- a display that never reports a vertical sync. Better than firing
+// vblank events at a made-up rate.
 #define GPU64_ERR_UNSUPPORTED		0x06
+// gpu64: a deferred PAGE_FLIP is still waiting for its frame boundary. The
+// spec's rule that a failed dispatch does nothing applies -- the queued flip
+// is untouched. Poll STATUS bit0 before asking for another.
+#define GPU64_ERR_BUSY			0x07
 
 // --- blob descriptor spaces --------------------------------------------
 #define GPU64_SPACE_C64			0

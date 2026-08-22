@@ -3,10 +3,10 @@
 The C64→gpu64 command protocol over IO2: everything a C64 programmer needs
 to drive gpu64's framebuffer.
 
-Implemented as of milestone 4, with one exception: **vblank is not
-available yet**. `VBLANK_ARM` with `ARG0 = 1` and `PAGE_FLIP` with
-`ARG0 = 1` both return `UNSUPPORTED`; `STATUS`'s vblank bits never set.
-Everything else on this page runs. See
+Everything on this page is implemented. Vblank included — it shipped after
+milestone 4, and the one thing that can still take it away is a display
+gpu64 could not measure a frame period from at boot; read the frame period
+out of `GET_INFO` to find out (see [vblank](#vblank)). See
 [progress_tracker.md](progress_tracker.md) for hardware test status.
 
 Why the protocol looks the way it does is in
@@ -60,7 +60,7 @@ framebuffer contents at reset are undefined — `CLEAR` first.
 gpu64 draws its own diagnostic log over your framebuffer in **palette index
 255**, one colour, glyph pixels only — the space around each glyph is left
 untouched, so whatever you drew shows through. The log is **on at reset**;
-turn it off with `LOG_ENABLE` ($07) once you don't want it.
+hidden automatically the moment your first command succeeds; turn it back on with `LOG_ENABLE` ($07) when you want it.
 
 Nothing stops you using index 255 as an ordinary drawing colour, or
 repointing it with `PAL_SET` — the log just draws in whatever colour that
@@ -113,6 +113,11 @@ that also means you must stage every byte an opcode reads, every time.
 Class 0 commands complete before the `CMD_LO` write returns, except a
 vblank-deferred `PAGE_FLIP`. Poll `STATUS` bit0 (busy) if you used one.
 
+Two commands are slower than their work suggests, because they wait for the
+display rather than for gpu64: `VBLANK_SYNC`, and `VBLANK_ARM` when arming.
+Both can halt the C64 for up to one frame. They are setup and housekeeping
+commands — do not put either in a per-frame loop.
+
 ### Blob descriptor
 
 Bulk data never crosses the register window byte-by-byte. A command that
@@ -161,13 +166,14 @@ Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
 |---|---|---|---|---|
 | $00 | `NOP` | 0 | — | Nothing. Liveness probe: sets `ERRCODE = OK`. |
 | $01 | `RESET_STATE` | 0 | — | `ERRCODE = OK`, vblank IRQ disarmed, vblank-pending cleared, draw page = visible page = 0. Leaves framebuffer contents and palette alone. |
-| $02 | `VBLANK_ARM` | 1 | `ARG0`: 0 = disarm, 1 = arm | Arms the auto-rearming vblank IRQ. Reflected in `STATUS` bit3. **Arming returns `UNSUPPORTED` in this build.** |
+| $02 | `VBLANK_ARM` | 1 | `ARG0`: 0 = disarm, 1 = arm | Arms the auto-rearming vblank IRQ. Reflected in `STATUS` bit3. Arming also re-syncs the frame clock, so it costs up to one frame of halt — see [vblank](#vblank). |
 | $03 | `VBLANK_ACK` | 0 | — | Clears `STATUS` bit2 (vblank-pending). Poll-loop programs write this after seeing the bit; IRQ handlers write it on entry. |
 | $04 | `SET_DRAW_PAGE` | 1 | `ARG0`: 0 or 1 | Selects the page subsequent draw ops write to. |
-| $05 | `PAGE_FLIP` | 1 | `ARG0`: 0 = now, 1 = at next vblank | Makes the draw page visible and the old visible page the draw page. With `ARG0 = 1` the swap happens at the next vblank and `STATUS` bit0 (busy) stays set until it lands — **`ARG0 = 1` returns `UNSUPPORTED` in this build**; the immediate flip works. |
+| $05 | `PAGE_FLIP` | 1 | `ARG0`: 0 = now, 1 = at next vblank | Makes the draw page visible and the old visible page the draw page. With `ARG0 = 1` the swap happens at the next vblank and `STATUS` bit0 (busy) stays set until it lands; asking for a second deferred flip while one is still pending returns `BUSY` and changes nothing. |
 | $06 | `GET_INFO` | 6 | `ARG0-5` destination descriptor | Writes the 16-byte info block (see below) to your memory. `len` must be ≥ 16. |
-| $07 | `LOG_ENABLE` | 1 | `ARG0`: 0 = off, 1 = on | Shows or hides gpu64's on-screen log overlay. On at reset. |
+| $07 | `LOG_ENABLE` | 1 | `ARG0`: 0 = off, 1 = on | Shows or hides gpu64's on-screen log overlay. On at reset, but **the first successful command of a session hides it automatically** so firmware text does not land on your output; `LOG_ENABLE` itself is exempt, so call it whenever you actually want the log. |
 | $08 | `SET_BORDER` | 1 | `ARG0`: palette index | Paints the border around the drawing surface. Black at reset. See [Border](#border). |
+| $09 | `VBLANK_SYNC` | 0 | — | Re-syncs the frame clock against a real vertical sync. Costs up to one frame of halt; occasional housekeeping for a long-running program, not a per-frame call. See [vblank](#vblank). |
 
 ### Whole surface — $10–$1F
 
@@ -215,7 +221,7 @@ Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
 | 11 | 1 | bitmap of implemented classes: bit0 = class 0, bit1 = class 1 (3D) |
 | 12 | 1 | border width, each side (32) |
 | 13 | 1 | border height, each side (36) |
-| 14 | 2 | reserved, written as zero |
+| 14 | 2 | measured frame period, microseconds — **0 means the frame clock never calibrated**, and every vblank feature will answer `UNSUPPORTED` |
 
 ## Matrix and vector ops — $80–$9F
 
@@ -266,8 +272,6 @@ sets `ERRCODE = BAD_OPCODE` and does nothing else.
 
 ## vblank
 
-**Not implemented in this build** — see the note at the top. The design is:
-
 Two ways to sync to the display, both driven by the same signal:
 
 - **Polling**: read `STATUS` bit2. Set at each vblank, cleared by
@@ -276,6 +280,48 @@ Two ways to sync to the display, both driven by the same signal:
   once per vblank. It stays armed and re-arms itself, like a raster IRQ —
   acknowledge with `VBLANK_ACK` on handler entry. `VBLANK_ARM` with
   `ARG0 = 0` returns to polling.
+
+`VBLANK_ACK` is also what releases the IRQ line, so a handler that forgets
+it gets exactly one interrupt.
+
+### What the vblank signal actually is
+
+gpu64 does not ask the display where the raster is — doing that means a
+mailbox call to the VideoCore, which blocks for up to a frame and would
+stall the bus-watch loop. Instead the frame period is **measured once at
+boot** and extrapolated from a free-running microsecond timer. Both clocks
+come off the same crystal, so the extrapolation holds, but it is not exact:
+
+- Every vblank lands a small **constant offset** after the display's true
+  one, because the boot measurement carries the mailbox's own latency. It is
+  consistent frame to frame, which is what tear-free flipping needs.
+- It **drifts** over long runs — on the order of a millisecond per several
+  minutes. A program that animates for a long time should call
+  `VBLANK_SYNC` occasionally (once a minute is plenty) to re-pin it.
+  `VBLANK_ARM` does this for you when you arm, so a program that arms at
+  start-up begins accurate.
+
+If the boot measurement failed, there is no signal at all: `GET_INFO`
+reports a frame period of 0, `STATUS` bit2 never sets, and `VBLANK_ARM(1)`,
+`PAGE_FLIP(1)` and `VBLANK_SYNC` all return `UNSUPPORTED`. Immediate
+`PAGE_FLIP` still works, so a program can fall back to flipping untimed.
+
+### Tear-free animation
+
+The intended shape, and what
+[`gpu64_vblank_demo.a`](../Source/TestPRG/gpu64_vblank_demo.a) does:
+
+1. `SET_DRAW_PAGE` 1 once, at the start. Every `PAGE_FLIP` after that swaps
+   the pages for you, so the draw page is always the one that is not
+   visible.
+2. Wait for `STATUS` bit2, then `VBLANK_ACK`.
+3. Draw the frame.
+4. `PAGE_FLIP` with `ARG0 = 1`.
+5. Wait for `STATUS` bit0 to clear — the flip has landed.
+
+Step 5 is the only place gpu64 makes the C64 wait on something other than
+its own work, and it is a spin on a register read, not a halt: the C64 is
+free to do anything else instead.
 
 ## Error codes
 
@@ -291,7 +337,8 @@ simply `ERRCODE != OK`.
 | $03 | `OUT_OF_RANGE` | A blob descriptor's `addr + len` runs past the end of its space, or `space` isn't 0 or 1. |
 | $04 | `BAD_ARGS` | Arguments inconsistent for an otherwise valid opcode: `len` not matching `w * h` or `count * 3`, a page or flag byte outside its defined values, a palette range past 256, a matrix dimension of 0, a `READ_RECT` rectangle outside the page. |
 | $05 | `SINGULAR` | `MAT_INVERSE` on a matrix with no inverse. Nothing was written to the destination. |
-| $06 | `UNSUPPORTED` | Defined here but not implemented by this firmware build — currently everything vblank-related. |
+| $06 | `UNSUPPORTED` | The feature is not available on this hardware right now. In practice this means the frame clock did not calibrate at boot, which takes every vblank feature with it. |
+| $07 | `BUSY` | A vblank-deferred `PAGE_FLIP` is still waiting for its frame boundary. The pending flip is untouched; poll `STATUS` bit0 and retry. |
 
 A failed dispatch does nothing: no drawing, no data fetch, no state change.
 
@@ -354,6 +401,10 @@ vblank:
         sta ARG0
         lda #$05        ; PAGE_FLIP at next vblank
         sta CMD_LO
+
+wait    lda STATUS      ; bit0 clears when the flip lands
+        and #$01
+        bne wait
 ```
 
 Multiply a 4x4 matrix at $2000 by a 4x1 vector at $2040, both 8.8 fixed

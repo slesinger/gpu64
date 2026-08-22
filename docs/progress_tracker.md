@@ -389,7 +389,193 @@ The DMA-polarity empirical check (the BASIC `POKE`/mirror test above) is
 still outstanding — not yet run, since hardware time so far went to the
 multicore spike instead.
 
+## 4b. vblank: the frame clock
+
+**Status: done, verified on hardware 2026-08-22.** The demo PRG counted 256
+polled frames and 256 vblank interrupts with `ERRCODE` 0 at a measured frame
+period of `$411A` = 16666 µs, and the bar sweeps smoothly with no tearing.
+
+Milestone 4 shipped every vblank feature as `UNSUPPORTED` — no event source
+existed in the bus-watch loop, so `VBLANK_ARM(1)`, a deferred `PAGE_FLIP`
+and `STATUS`'s vblank bits were all specified but dead. That left the API
+able to draw but not to animate: `PAGE_FLIP` worked, but nothing could time
+it, so anything moving tore.
+
+Chosen as the next step over milestone 5 (extend VIC-II sniffing), which is
+deliberately parked: mirroring only gets meaningfully better with real
+sniffing, which this hardware cannot do (see
+[bus_access_design.md](bus_access_design.md)).
+
+### The idea
+
+The blocking-mailbox premise the milestone 4 draft rejected the feature on
+was too narrow. `WaitForVerticalSync()` does block, and calling it from the
+loop would stall for up to a frame — but **it only has to be called once**.
+Measure the frame period at boot against the free-running 1MHz ARM system
+timer, and from then on the loop finds the next frame boundary with a single
+MMIO read and a compare, which is what it already pays twice per pass to
+sample GPIO. Both clocks come off the same 19.2MHz crystal on a Pi 3, so the
+extrapolation holds instead of wandering the way two independent oscillators
+would.
+
+What it is not is exact. The boot measurement carries the mailbox's own
+latency, so every vblank lands a small *constant* offset after the display's
+real one — harmless for tear-free flipping, which needs consistency, not
+absolute accuracy. And residual period error accumulates: roughly a
+millisecond per several minutes. Hence `VBLANK_SYNC` ($09), one blocking
+vsync wait that re-pins the extrapolation, which `VBLANK_ARM` also does
+implicitly when arming.
+
+### What shipped
+
+- **[gpu64_vsync.h/.cpp](../Source/Firmware/gpu64_vsync.cpp)** — the frame
+  clock: calibration, re-anchor, and the inlined per-pass due-check.
+  Calibration runs at boot from
+  `STANDARD_SETUP_TIMER_INTERRUPT_CYCLECOUNTER_GPIO` (helpers.h) and logs
+  the measured period. Failure is not fatal; it just leaves every vblank
+  feature answering `UNSUPPORTED`, which `GET_INFO` now advertises in
+  advance as a frame period of 0 (bytes 14-15, previously reserved).
+- **The frame boundary is handled in two pieces, split on purpose.** The
+  boundary runs in the bus-watch loop *before* the loop has sampled the bus
+  for that cycle, so anything slow there is a C64 access gone unseen —
+  milestone 4's bug #2. So `gpu64_vsyncAdvance()` (inline, gpu64_vsync.h)
+  does the common case — re-arm the extrapolation, set `STATUS` bit2,
+  request the IRQ — touching nothing but its own struct and costing no
+  cross-TU call at all. Only a pending flip calls out, to
+  `gpu64_vsyncCommitFlip()` in
+  [rad_reu.cpp](../Source/Firmware/rad_reu.cpp), which takes a DMA hold like
+  the dispatch and the mirror snapshot do.
+- **That call is warmed by the dispatch that queues the flip**, not at the
+  point of use. Milestone 4's rule says anything cycle-critical has to warm
+  itself where it is used, but here warming *is* the unprotected delay it
+  would be preventing — a 2KB preload plus force-read in the loop, before
+  the bus is held. Doing it in the `PAGE_FLIP` dispatch instead costs
+  nothing: the bus is already held there, and the flip it queues is exactly
+  the thing about to need it.
+- **Deferred `PAGE_FLIP` split in two.** `CGpu64FrameBuffer::PrepareFlip()`
+  does the log overlay and the cache clean during the dispatch, where the
+  C64 is halted anyway; `CommitFlip()` is left with just the
+  `SetVirtualOffset` the boundary is waiting for. A second deferred flip
+  while one is pending returns the new `BUSY` ($07) error and changes
+  nothing, per the spec's "a failed dispatch does nothing" rule.
+- **The vblank IRQ**, shaped exactly like REU's own on the same physical
+  `bIRQ_OUT` line: the API sets a request, and the loop — the only code
+  allowed to touch a GPIO — asserts it. The release is explicit on
+  `VBLANK_ACK` rather than read-to-clear, and is guarded so it never lets go
+  of a line REU is also holding.
+- **[Source/TestPRG/gpu64_vblank_demo.a](../Source/TestPRG/gpu64_vblank_demo.a)**
+  — a two-phase C64 demo. Phase 1 sweeps a bar with polled vblank and
+  deferred flips (tear-free if the clock is right); phase 2 silences CIA1's
+  timer so gpu64's cartridge IRQ is the only source left, arms it, and
+  counts 256 interrupts under a timeout. Results go on the C64's own screen,
+  so the bench does not need the HDMI log.
+
+### Why this design and not the obvious one
+
+Blocking on `WaitForVerticalSync()` inside the dispatch would have been far
+simpler and drift-free. It was rejected on cost, not on principle: a
+deferred flip would then halt the C64 for a uniformly-distributed 0 to one
+frame, averaging half a frame *per frame* at 60Hz — roughly halving the
+machine's speed for any program that animates. The frame clock never halts
+the C64 for the wait at all.
+
+### Hardware bring-up, and the one rule it re-taught
+
+Two rounds. The first failed completely: every command came back `BAD_CLASS`
+($02) from the very first one, which means `cmdHi` was nonzero before the
+program had run anything — even though the demo writes `#0` to `CMD_HI`
+first, exactly as the working milestone 4 demo does. The loop had
+mis-sampled an IO2 write.
+
+The cause was the two vblank IRQ blocks in the loop's *tail*, which ran
+unconditionally on every pass from power-on. They were the only new work
+live before the API was ever engaged, and therefore the only new work that
+could break the very first command — two struct loads per pass, on a loop
+that runs a million times a second while nothing is happening. Gating them
+on `gpu64ApiActive` (which the mirror already reads every pass) fixed it,
+and round 2 passed clean. This is rule 6 of
+[the polling-loop rules](#hardware-bring-up-four-rounds-four-bugs) restated:
+judge loop additions by *which mode they run in*, not just by their cost.
+
+That round also mis-taught its own lesson once: the visible symptom was "a
+nice blue C64 screen on HDMI", which reads like `CLEAR` worked. It was the
+milestone 3 mirror — `gpu64ApiActive` is set only by a *successful*
+dispatch, so with everything failing the mirror never switched off. Decode
+`ERRCODE` before believing anything visual.
+
+### Measured
+
+- **`SetVirtualOffset` costs 71 µs at best, ~900 µs typically**, measured
+  over 256 flips inside the DMA hold. That answers milestone 4's open
+  question about the mailbox: it is expensive and erratic, so a program
+  flipping every frame hands ~5% of the C64's cycles to the commit and can
+  make the VIC-II flash a line where the hold spans a raster. It is not a
+  correctness problem — the hold is what makes it safe — and it did not
+  stop the demo animating smoothly. Making the flip cheaper than a mailbox
+  round trip is a real optimisation, listed under Known issues.
+- **Tearing: none.** The commit lands late enough in principle to tear, but
+  does not in practice. The wobble seen in round 2 was the log overlay
+  repainting itself over the animation every flip, not the page swap; it
+  went away with the auto-hide below.
+
+## 4c. The HDMI log and the boot splash
+
+**Status: done, verified on hardware 2026-08-22.**
+
+Presentation work, all of it prompted by actually looking at the display
+during 4b's bring-up:
+
+- **The log font is 8x8, not 8x16.** Circle's `CCharGenerator` carries
+  exactly one face, lat1-16, which at 320x200 gives 40 columns by 12 rows —
+  too few lines to follow a boot sequence, and anything of length wrapped.
+  [gpu64_font8x8.h](../Source/Firmware/gpu64_font8x8.h) is the same Linux
+  console font family at half the height (lat9 VGA 8x8, the same GPLv2+
+  provenance as Circle's own `lib/font.h`), giving 25 rows. Columns stay at
+  40: the surface is 320 pixels wide and the glyphs are 8 wide.
+- **The log scrolls instead of wrapping.** It was a ring buffer that put the
+  newest line at the top with older text below it, marked only by a blank
+  seam line, which on a real display reads as a log that stopped partway
+  through the boot. It is a terminal scroll now — one `memmove` of a
+  1000-byte array per line, on a path that already repaints the whole
+  overlay.
+- **Rows that hold text are painted opaque.** Drawing glyph pixels alone
+  leaves no way to erase: nothing knows what was underneath a pixel it lit,
+  so scrolled text ghosted and the log came out doubled. Each row with text
+  now clears its 8-pixel band first. Rows with no text are still left alone,
+  so a partly-filled overlay still lets the mirror show through, and the
+  background is palette index 0 — nothing new is reserved.
+- **The overlay hides itself once a program engages the API.** It was being
+  repainted onto every page on every flip, so firmware text landed on a
+  running program's output and `PrepareFlip()` walked the whole glyph grid
+  every frame. It now switches off on the first successful dispatch, on the
+  same transition that stops the mirror. `LOG_ENABLE` ($07) is exempt, so a
+  program that wants the log still gets it.
+- **The boot screen is a wordmark, not a checkerboard.** The checkerboard
+  existed to prove the Pi could drive HDMI at all, which has been settled
+  since milestone 1. `showTestPattern()` draws "HONDANI" centred in the
+  greys already in the reset C64 palette, so it reserves nothing and cannot
+  disturb a program's. The glyphs are the same 8x8 font at 4x with an
+  outline smeared one scaled pixel in eight directions — cheaper than
+  carrying a second, larger font. The call still alternates lit/flat so a
+  C64-side trigger stays distinguishable from the boot-time draw.
+
 ## 5. Extend VIC-II sniffing
+
+**Status: parked (2026-08-22), by decision rather than by blocker.** The
+mirror cannot get meaningfully better without real bus sniffing, which this
+hardware does not support (see
+[bus_access_design.md](bus_access_design.md)) -- so widening it to more
+VIC-II modes buys less than pushing the API. Two scoping decisions were made
+while parking it, and hold whenever it restarts:
+
+- **Bank/screen detection ($D011/$D016/$D018 + CIA2 $DD00) comes first**
+  whenever this resumes. Every mode below is built on knowing where the
+  screen actually is, and milestone 3's fixed $0400/$D800 assumption has to
+  go before any of them.
+- **Raster IRQ timing, split screens and border tricks move to milestone 7.**
+  They need per-raster-line state, which the bounded-burst snapshot model
+  cannot provide at any poll rate that leaves the C64 in charge. Ruling them
+  out here rather than discovering it mid-implementation.
 
 Broaden bus sniffing beyond milestone 3's default text mode: bitmap mode, multicolor mode, sprites (position, shape, color, priority/collision registers), raster IRQ timing, smooth scrolling (fine-scroll X/Y registers), and VIC bank switching via CIA2. Goal: gpu64 can mirror what real C64 demos/games already do on VIC-II without any code changes on the C64 side, by watching $D000–$D02E and the relevant RAM.
 
@@ -431,19 +617,22 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
   loop never reaches `reuUsingPolling()`, which is where all of gpu64's own
   code runs, so a gpu64 cause is unlikely but unproven.
 
+- **The deferred page flip costs a VideoCore mailbox round trip**, measured
+  at 71 µs best and ~900 µs typically over 256 flips. It runs inside a DMA
+  hold, so it is safe, but a program flipping every frame gives up roughly
+  5% of the C64's cycles to it and can make the VIC-II flash a line where
+  the hold spans a raster. Writing the display offset without the mailbox
+  would remove nearly all of that.
+
 - **Mirror freeze when the on-screen log filled the column, root cause not
-  conclusively identified.** During bring-up the mirror stopped updating
-  after ~14 snapshots, at the moment the log column filled, and the RAD menu
-  button stopped responding too -- meaning `reuUsingPolling()`'s loop itself
-  was stuck, not just the display. Two changes were made afterwards and the
-  mirror was then reported working: the per-snapshot logging (two lines at
-  4/sec, each doing glyph rendering plus a cache clean *inside* the polling
-  loop) was cut to a single line on the first snapshot, and `CHDMIConsole`'s
-  ring wrap was given a visible blank gap. Whether the freeze was caused by
-  the logging cost, by something in the console's wrap path, or by something
-  else that simply correlated with iteration count, was never proven. If it
-  returns, note that the stage-indicator approach (a repainting square whose
-  colour names the last completed step of the snapshot) was what was being
-  built to localise it -- see git history around 028fd01.
+  conclusively identified.** During milestone 3 bring-up the mirror stopped
+  updating after ~14 snapshots, at the moment the log column filled, and the
+  RAD menu button stopped responding too -- so `reuUsingPolling()`'s loop
+  itself was stuck, not just the display. It went away after the
+  per-snapshot logging (two lines at 4/sec, each rendering glyphs and
+  cleaning the cache *inside* the polling loop) was cut to one line on the
+  first snapshot. Whether the logging cost was the cause or merely
+  correlated with iteration count was never proven. It has not recurred,
+  including across milestone 4b's rewrite of the log overlay.
 
 ## To be continued...
