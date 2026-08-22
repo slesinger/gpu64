@@ -238,13 +238,27 @@ void CRAD::showTestPattern( void )
 	DELAY( 1 << 24 );
 	bootLED.Blink( min( wFull, hFull ) / 100, 120, 200 );
 
-	logger->Write( "gpu64", LogNotice, "showTestPattern: drawing %ux%u (screen %ux%u)", w, h, wFull, hFull );
+	// gpu64: this is called both once at boot and again on every C64-side
+	// trigger ($DF0B write, see rad_reu.cpp) -- with an identical pattern
+	// each time, a real hardware tester has no way to tell a fresh trigger
+	// from the leftover boot-time draw just by looking at the screen (this
+	// came up during hw testing: the log line "showTestPattern: drawing..."
+	// was the only real proof a trigger fired). callCount inverts which
+	// squares are lit vs. black on alternating calls, and gets logged, so
+	// each invocation is visibly distinct on screen as well as in the log.
+	static unsigned callCount = 0;
+	callCount++;
+	boolean bInvert = ( callCount & 1 ) == 0;
+
+	logger->Write( "gpu64", LogNotice, "showTestPattern: drawing %ux%u (screen %ux%u), call #%u%s", w, h, wFull, hFull, callCount, bInvert ? " (inverted)" : "" );
 
 	for ( unsigned y = 0; y < h; y++ )
 	{
 		for ( unsigned x = 0; x < w; x++ )
 		{
 			boolean bLit = ( ( x / 20 ) + ( y / 20 ) ) & 1;
+			if ( bInvert )
+				bLit = !bLit;
 			if ( !bLit )
 			{
 				m_Screen.SetPixel( x, y, BLACK_COLOR );

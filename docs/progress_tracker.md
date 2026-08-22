@@ -47,7 +47,8 @@ small for RAD's real `.bss` (total silent hang, zero diagnostic output) and
 a missing `armstub=rad-prefetch.bin` in `config.txt` (unstable/garbled
 picture, looked exactly like a hardware timing fault but wasn't).
 
-The C64→gpu64 trigger path is now implemented (not yet hardware-verified):
+**C64→gpu64 trigger path confirmed working end-to-end on real hardware**
+(RAD cartridge + RPi 3A+, live C64, REU emulation active):
 [`Source/TestPRG/gpu64_trigger_pattern.a`](../Source/TestPRG/gpu64_trigger_pattern.a)
 is a minimal PRG that does a single `STA $DF0B`. On the firmware side,
 `rad_reu.cpp`'s IO2 write handler (inside `reuUsingPolling()`, the same loop
@@ -58,8 +59,36 @@ indirection (`gpu64_showTestPattern()` in `rad_main.cpp`) so `rad_reu.cpp`
 doesn't need to pull in the full Circle/screen include stack. Since the C64
 is DMA-halted for the entire REU polling session, drawing synchronously
 inside the write handler only delays the already-frozen CPU rather than
-risking any bus-timing corruption -- next step is confirming that on real
-hardware.
+risking any bus-timing corruption -- confirmed harmless on real hardware.
+`showTestPattern()` now inverts the checkerboard on alternating calls
+(`callCount` in `rad_main.cpp`) so a real trigger is visibly distinguishable
+from the identical boot-time draw -- confirmed on hardware: running the PRG
+flipped the on-screen pattern from what boot had already drawn.
+
+First real-hardware test attempt hit and resolved two separate bugs before
+this success, both worth remembering for future PRG deploys:
+- **Missing PRG load-address header:** the `.prg` copied to the SD card had
+  been assembled with `64tass --nostart`, which strips the 2-byte
+  load-address header a PRG file needs. Without it, the loader read the
+  PRG's first two *data* bytes (`0b 08`, meant to be the BASIC program's
+  next-line pointer) as the load address instead -- `$080B` little-endian --
+  which is exactly the address RAD printed on load, and explained why
+  everything after that loaded 8 bytes too high (`LIST` showing nothing,
+  SYS landing on garbage, confirmed byte-for-byte via a real ML monitor
+  dump: $080B/$080C/$080D held `0A 00 9E`, bytes meant for $0803-$0805). The
+  source file's own header comment already documents the correct command
+  (plain `64tass ... -o gpu64_trigger_pattern.prg`, no `--nostart`) -- the
+  bug was in a one-off manual deploy, not in the repo.
+- **Trigger handler is REU-emulation-scoped, not global:** the $DF0B write
+  handler only runs inside `reuUsingPolling()`, which RAD only enters when
+  REU/GeoRAM emulation is actively selected from its menu. Launching a PRG
+  via RAD's "no memory expansion" path releases DMA and lets the C64
+  free-run with no bus-watching code active at all afterward, so even a
+  correct trigger write goes unobserved there. Confirmed working by
+  selecting REU emulation before launching the PRG; **still open** for the
+  "no memory expansion" launch path -- see the note under milestone 3 below,
+  since fixing this properly means a standalone gpu64-only watch loop, which
+  overlaps with milestone 3's polling design.
 
 - IO decoding: gpu64 uses the unused remainder of IO2, $DF0B–$DFFF, leaving REU's 11 registers ($DF00–$DF0A) and all of IO1 alone — coexists with REU in all three target setups (RAD-as-REU, C64 Ultimate with RAD's REU switched off, original C64 + expansion port multiplier with a real hardware REU). See [project_description.md](project_description.md#io-address-space-allocation), including the open item to verify the Ultimate's REU doesn't mirror across the full IO2 page.
 - Trigger PRG just needs a single STA to a $DF0B+ offset to kick off the pattern; no data payload yet.
@@ -91,6 +120,7 @@ the gpu64 command API, snapshot polling stops entirely.
 
 - Scope: standard text mode only (40x25, one character set, border/background/multicolor text-mode nuances deferred to milestone 5).
 - Needs VIC bank detection (CIA2 $DD00) and screen/charset pointers (VIC $D018) as part of each snapshot, not just the power-on default addresses -- see bus_access_design.md's open questions for polling rate and DMA-burst sizing.
+- **Also needs to subsume milestone 2's trigger handler out of `reuUsingPolling()`:** confirmed on real hardware that the $DF0B trigger only works today when REU emulation happens to be separately active, because that's the only loop currently watching IO2 while DMA is held. A standalone gpu64 watch loop (cheap IO2-only decode + passthrough, no REU-specific register/prefetch logic) needs to exist independent of REU emulation for milestone 4's command API to work when no REU is selected -- this is naturally the same loop milestone 3's periodic snapshot polling needs, so implement them together.
 
 ## 4. Basic 2D GPU API
 
