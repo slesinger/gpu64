@@ -273,3 +273,32 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
   of [docs/hw_testing.md](hw_testing.md) for the full writeup and next step.
 
 ## To be continued...
+
+### Stale-firmware detour (2026-08-22)
+
+Three consecutive hardware test rounds reported "the newly added diagnostics
+produce no output at all": the `gpu64ApiActive` sticky-flag fix, the two flow
+diagnostic log lines around `hijackC64()`, and all eight HDMI checkpoint
+markers. None of them were ever on the machine.
+
+The RAD SD card's `config.txt` sets `kernel=kernel_rad.img`, but
+`tools/build.sh` deployed to `kernel8.img` -- the name Circle's build produces.
+Every deploy wrote a file the Pi's bootloader never reads, so the hardware kept
+booting whatever `kernel_rad.img` last held (hand-copied at 09:50 that day).
+Test PRGs on the card *did* update normally, since RAD reads those at launch
+time, which is what made the symptom look like a firmware bug rather than a
+deployment one.
+
+The decisive tell: the log showed `Run: bc8 initHijack done` and
+`detectSID: ...` but not the `Run: bc8b mark strip ...` line written *between*
+them. No single build can produce that ordering, so the running image had to be
+older than the source.
+
+Fixes: `tools/build.sh` now parses `config.txt`'s `kernel=` line, deploys under
+that name, and `cmp`-verifies the copy; the stale `kernel8.img` was deleted from
+the card; and every boot now logs `Run: bc0 build <git-describe> src:<digest>`
+as its first line, with build.sh printing the same id after a deploy, so a
+mismatch is visible immediately.
+
+None of the milestone-3 mirror work has been validated on hardware yet -- every
+result so far was measured against firmware that predates it.
