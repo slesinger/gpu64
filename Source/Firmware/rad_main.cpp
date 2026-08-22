@@ -304,6 +304,17 @@ void CRAD::showTestPattern( void )
 // declaration in rad_reu.cpp.
 CRAD *g_pRAD = nullptr;
 
+// gpu64: diagnostic-only counter + log helper, called from
+// gpu64_mirrorSnapshot() (rad_reu.cpp) right before it grabs the DMA burst
+// -- see the comment there. Counts calls so the log line makes it obvious
+// this is actually firing repeatedly, not just once.
+static unsigned gpu64_mirrorSnapshotStartCount = 0;
+void gpu64_logMirrorSnapshotStart( void )
+{
+	gpu64_mirrorSnapshotStartCount++;
+	logger->Write( "gpu64", LogNotice, "gpu64_mirrorSnapshot: starting burst #%u", gpu64_mirrorSnapshotStartCount );
+}
+
 void gpu64_showTestPattern( CRAD *pRAD )
 {
 	if ( pRAD )

@@ -267,11 +267,13 @@ static u8 gpu64MirrorColor[ 1000 ];
 static u8 gpu64MirrorBorder = 0, gpu64MirrorBackground = 0;
 
 // gpu64: how often (in reuUsingPolling() main-loop passes, roughly one C64
-// CPU cycle each) to grab a mirror snapshot. Placeholder -- needs empirical
-// tuning on real hardware, same as this file's other WAIT_CYCLE_*/TIMING_*
-// constants; picked to be roughly once a second assuming ~1 pass/cycle at
-// ~1MHz, unverified.
-#define GPU64_MIRROR_POLL_INTERVAL 1000000
+// CPU cycle each) to grab a mirror snapshot. 1000000 was the original guess
+// and measured ~1fps on real hardware (RAD cartridge + RPi 3A+) -- too slow,
+// per hw feedback. Scaled down from that real calibration point for ~4fps;
+// the fps-per-count ratio itself is still only measured at the one data
+// point above, so this is an extrapolation, not a second hardware
+// measurement -- worth re-checking on hardware rather than assumed exact.
+#define GPU64_MIRROR_POLL_INTERVAL 250000
 
 // gpu64: milestone 3 screen mirror. Grabs a brief DMA burst -- the same
 // CLR_GPIO(bDMA_OUT)/DMA_READBYTE_P1..P3 cycle-stealing technique REU's own
@@ -301,6 +303,14 @@ void gpu64_mirrorSnapshot()
 	register u32 g2;
 	register u16 c_a;
 	register u8 x;
+
+	// gpu64: diagnostic only, added to isolate a hw-reported symptom (the
+	// "drew 40x25 snapshot" log at the end of this function was never once
+	// seen) -- logs *before* the DMA burst starts, so it's distinguishable
+	// from the burst itself hanging/dying partway through. See
+	// gpu64_logMirrorSnapshotStart() in rad_main.cpp.
+	extern void gpu64_logMirrorSnapshotStart( void );
+	gpu64_logMirrorSnapshotStart();
 
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
