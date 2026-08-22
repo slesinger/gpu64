@@ -469,10 +469,50 @@ void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 backgrou
 		}
 	}
 
+	// gpu64: two heartbeats, deliberately on channels that fail independently.
+	// The mirror was observed freezing after 14 snapshots -- both the mirror
+	// image and the on-screen log stopped at once, which could equally mean
+	// "the polling loop died" or "HDMI writes stopped landing in DRAM". These
+	// tell those apart in a single run: the square is an HDMI write that does
+	// not go through CHDMIConsole, the ACT LED is not HDMI at all.
+	static u8 heartbeat = 0;
+	heartbeat ^= 1;
+
+	unsigned hbX = 500, hbY = GPU64_MARK_Y0;
+	if ( hbX + GPU64_MARK_SIZE <= wFull && hbY + GPU64_MARK_SIZE <= hFull )
+	{
+		TScreenColor hbCol = heartbeat ? COLOR16( 31, 31, 31 ) : COLOR16( 0, 0, 15 );
+		for ( unsigned y = hbY; y < hbY + GPU64_MARK_SIZE; y++ )
+			for ( unsigned x = hbX; x < hbX + GPU64_MARK_SIZE; x++ )
+				m_Screen.SetPixel( x, y, hbCol );
+	}
+
+	// On()/Off() are plain GPIO writes -- unlike CActLED::Blink(), which
+	// sleeps, and must never be called from here (this runs with the C64
+	// free-running and the polling loop not servicing the bus). Own instance
+	// rather than CActLED::Get(): the only other CActLED in this file is
+	// showTestPattern()'s local, which is long destructed by now.
+	static CActLED mirrorLED;
+	if ( heartbeat )
+		mirrorLED.On();
+	else
+		mirrorLED.Off();
+
 	// same cache-clean requirement as showTestPattern() -- SetPixel() writes
 	// only land in cache until explicitly cleaned to DRAM.
+	//
+	// gpu64: only the rows actually drawn, not the whole framebuffer. At
+	// 1824x984x2 a full clean is ~3.6MB per snapshot, four times a second,
+	// all of it spent outside reuUsingPolling()'s loop with the C64
+	// free-running -- a needlessly long window in which no bus access is
+	// being serviced. The mirror occupies rows 0..h and the heartbeat square
+	// its own strip, so clean exactly those two.
 	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
-	CleanDataCacheRange( (u64)(uintptr)pFB->GetBuffer(), pFB->GetSize() );
+	u32 nPitch = pFB->GetPitch();
+	u64 nBuffer = (u64)(uintptr)pFB->GetBuffer();
+	CleanDataCacheRange( nBuffer, h * nPitch );
+	if ( hbY + GPU64_MARK_SIZE <= hFull )
+		CleanDataCacheRange( nBuffer + hbY * nPitch, GPU64_MARK_SIZE * nPitch );
 
 	logger->Write( "gpu64", LogNotice, "showMirror: drew 40x25 snapshot (border=%u bg=%u)", border, background );
 }
