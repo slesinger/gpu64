@@ -128,6 +128,11 @@ public:
 	// code never ran" from "this code ran but logging is broken here".
 	void mark( unsigned idx );
 
+	// gpu64: repainting counterpart to mark() -- one square whose colour says
+	// which stage gpu64_mirrorSnapshot() last completed, so a hard hang leaves
+	// the guilty stage on screen. See the implementation for the colour key.
+	void stage( unsigned s );
+
 private:
 	static void FIQHandler( void *pParam );
 

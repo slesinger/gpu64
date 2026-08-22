@@ -363,6 +363,61 @@ void gpu64_mark( unsigned idx )
 		g_pRAD->mark( idx );
 }
 
+// gpu64: stage indicator for gpu64_mirrorSnapshot(). Unlike mark(), which
+// latches (each square stays lit forever), this repaints ONE square whose
+// colour says which stage the snapshot last completed -- so when the loop
+// freezes, the colour left on screen names the statement it froze in.
+//
+// Needed because the freeze is a hard hang: the RAD menu button stopped
+// responding, and that check lives in reuUsingPolling()'s loop, so the loop
+// itself is stuck rather than merely failing to draw. The prime suspects are
+// the unbounded BA-wait spins inside DMA_READBYTE_P1/P2 (they loop until the
+// VIC releases the bus, forever if it never does), and those sit between
+// stages 1 and 4.
+//
+// Deliberately small (16x16) and logger-free: stages 2 and 3 are painted
+// while DMA is held. The C64's CPU is stopped then, so the delay is harmless
+// to it, but there is no reason to make it bigger than it needs to be.
+#define GPU64_STAGE_X		600
+#define GPU64_STAGE_SIZE	16
+
+void CRAD::stage( unsigned s )
+{
+	static const TScreenColor stageColor[ 8 ] =
+	{
+		COLOR16(  8,  8,  8 ),	// 0 grey   - idle/never entered
+		COLOR16( 31,  0,  0 ),	// 1 red    - about to grab DMA
+		COLOR16( 31, 16,  0 ),	// 2 orange - screen RAM read done
+		COLOR16( 31, 31,  0 ),	// 3 yellow - colour RAM read done
+		COLOR16(  0, 31,  0 ),	// 4 green  - DMA released
+		COLOR16(  0, 31, 31 ),	// 5 cyan   - showMirror() returned
+		COLOR16(  0,  0, 31 ),	// 6 blue   - unused
+		COLOR16( 31,  0, 31 )	// 7 magenta- unused
+	};
+
+	unsigned wFull = m_Screen.GetWidth();
+	unsigned hFull = m_Screen.GetHeight();
+
+	unsigned x0 = GPU64_STAGE_X, y0 = GPU64_MARK_Y0;
+	if ( x0 + GPU64_STAGE_SIZE > wFull || y0 + GPU64_STAGE_SIZE > hFull )
+		return;
+
+	TScreenColor col = stageColor[ s & 7 ];
+	for ( unsigned y = y0; y < y0 + GPU64_STAGE_SIZE; y++ )
+		for ( unsigned x = x0; x < x0 + GPU64_STAGE_SIZE; x++ )
+			m_Screen.SetPixel( x, y, col );
+
+	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
+	u32 nPitch = pFB->GetPitch();
+	CleanDataCacheRange( (u64)(uintptr)( pFB->GetBuffer() + y0 * nPitch ), GPU64_STAGE_SIZE * nPitch );
+}
+
+void gpu64_stage( unsigned s )
+{
+	if ( g_pRAD )
+		g_pRAD->stage( s );
+}
+
 // gpu64: only one CRAD is ever constructed (see main() below); g_pRAD is set
 // from its constructor (rad_main.h). This wrapper lets rad_reu.cpp's bus-hijack
 // loop trigger the pattern from the C64 side (IO2 $DF0B write) without pulling
