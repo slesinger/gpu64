@@ -327,8 +327,20 @@ void CRAD::mark( unsigned idx )
 	unsigned x0 = 10 + ( idx & 7 ) * GPU64_MARK_PITCH;
 	unsigned y0 = GPU64_MARK_Y0;
 
-	if ( x0 + GPU64_MARK_SIZE > wFull || y0 + GPU64_MARK_SIZE > hFull )
+	// Clamp rather than bail out. The first hardware run of these markers
+	// reported "no squares at all" on a path that other evidence says did
+	// execute, and an earlier revision returned silently whenever the strip
+	// did not fit -- which would produce exactly that symptom on any display
+	// mode shorter than GPU64_MARK_Y0 + GPU64_MARK_SIZE. A clamped square is
+	// still unambiguous; a silently skipped one is indistinguishable from
+	// code that never ran, which is the whole thing these markers exist to
+	// tell apart.
+	if ( wFull < GPU64_MARK_SIZE || hFull < GPU64_MARK_SIZE )
 		return;
+	if ( x0 + GPU64_MARK_SIZE > wFull )
+		x0 = wFull - GPU64_MARK_SIZE;
+	if ( y0 + GPU64_MARK_SIZE > hFull )
+		y0 = hFull - GPU64_MARK_SIZE;
 
 	TScreenColor col = markColor[ idx & 7 ];
 
@@ -511,6 +523,16 @@ void CRAD::Run( void )
 
 	initHijack();
 	logger->Write( "gpu64", LogNotice, "Run: bc8 initHijack done" );
+
+	// gpu64: reference marker 7 (orange), drawn here where logging is known
+	// to still work -- gives the tester a "this is what a lit square looks
+	// like, and this is where to look for the others" reference, so a later
+	// blank strip can be read as "that code never ran" rather than "maybe I
+	// was looking at the wrong part of the screen". The log line alongside it
+	// records the actual framebuffer geometry the strip was placed against.
+	mark( 7 );
+	logger->Write( "gpu64", LogNotice, "Run: bc8b mark strip y0=%u size=%u screen=%ux%u",
+		(unsigned)GPU64_MARK_Y0, (unsigned)GPU64_MARK_SIZE, m_Screen.GetWidth(), m_Screen.GetHeight() );
 
 #ifdef REU_PROTOCOL
 	nReuProtocol = 0;
