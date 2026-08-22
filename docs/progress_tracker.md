@@ -66,10 +66,31 @@ hardware.
 
 ## 3. Display sniffed current C64 screen buffer
 
-Passively sniff the VIC-II bus during standard text mode (the default screen the C64 boots into) and reconstruct it on the HDMI output: read screen RAM + color RAM + character ROM/charset contents as the C64 writes them, translate PETSCII cells to the 320x200x256-color framebuffer. No C64-side code changes and no new API yet — this proves bus-sniffing itself works before any API is layered on top, and gives a always-available fallback view (e.g. showing the C64's actual screen instead of a static test pattern).
+**Design decided, not yet implemented -- see
+[docs/bus_access_design.md](bus_access_design.md) for the full reasoning.**
+Continuous cycle-by-cycle bus sniffing (the originally imagined approach)
+turned out not to fit this hardware: RAD's board only exposes the full
+16-bit address to the RPi through a multiplexed latch that's cheap to read
+only while the CPU is already DMA-halted, so catching every write to
+arbitrary RAM while the C64 free-runs isn't feasible in software without
+either a permanent bus takeover or a PCB change. Both were rejected --
+**gpu64 must not intercept the C64 bus completely; the C64 stays in charge
+at all times**, and no hardware redesign is being pursued right now.
+
+Revised scope, explicitly *not* aiming for cycle-perfect VIC-II replication
+here (that remains milestones 5/7's job, only once the API-driven mode
+exists): periodic, brief DMA-held snapshot polling (same technique already
+used for menu injection and REU/GeoRAM emulation) reads the current VIC-II
+register block, screen RAM, color RAM, and character set, then releases the
+bus back to the C64 -- a poll, not a permanent takeover. Good enough for
+basic legibility (e.g. a directory listing visible on the HDMI screen),
+not for running arbitrary demos. This polling only runs when gpu64's own
+320x200 API (milestone 4) is *not* currently in use by a C64 program --
+the two modes are mutually exclusive at any moment: once a program engages
+the gpu64 command API, snapshot polling stops entirely.
 
 - Scope: standard text mode only (40x25, one character set, border/background/multicolor text-mode nuances deferred to milestone 5).
-- Needs read-only bus sniffing of VIC-II-relevant writes (RAM at $0400/$D800 by default, changeable via CIA2 bank register and VIC memory pointers — start with default addresses, handle bank switching later if needed).
+- Needs VIC bank detection (CIA2 $DD00) and screen/charset pointers (VIC $D018) as part of each snapshot, not just the power-on default addresses -- see bus_access_design.md's open questions for polling rate and DMA-burst sizing.
 
 ## 4. Basic 2D GPU API
 
