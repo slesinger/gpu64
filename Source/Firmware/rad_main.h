@@ -119,6 +119,15 @@ public:
 	// are each 1000 bytes (40*25), row-major.
 	void showMirror( const u8 *screen, const u8 *color, u8 border, u8 background );
 
+	// gpu64: logger-independent checkpoint marker. Paints one solid square in
+	// a strip just below GPU_OUTPUT_BOX (so it collides with neither the
+	// mirror/test-pattern box above nor the log column to the right). Exists
+	// because the hardware symptom being chased is "logger->Write() calls on a
+	// code path that demonstrably executes produce no on-screen line at all" --
+	// a marker drawn *before* the corresponding log call distinguishes "this
+	// code never ran" from "this code ran but logging is broken here".
+	void mark( unsigned idx );
+
 private:
 	static void FIQHandler( void *pParam );
 

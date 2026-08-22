@@ -323,6 +323,8 @@ void gpu64_mirrorSnapshot()
 	// from the burst itself hanging/dying partway through. See
 	// gpu64_logMirrorSnapshotStart() in rad_main.cpp.
 	extern void gpu64_logMirrorSnapshotStart( void );
+	extern void gpu64_mark( unsigned idx );
+	gpu64_mark( 6 );	// cyan -- the poll counter actually reached its interval
 	gpu64_logMirrorSnapshotStart();
 
 	WAIT_FOR_VIC_HALFCYCLE
@@ -397,6 +399,15 @@ reuEmulationMainLoop:
 	CLR_GPIO( bMPLEX_SEL );
 	WAIT_FOR_CPU_HALFCYCLE
 	BEGIN_CYCLE_COUNTER
+
+	// gpu64: marker 5 (magenta) -- proves the polling loop was actually
+	// entered. Drawn once, here, before the loop, rather than inside it: the
+	// loop is cycle-critical and the C64 is free-running by now, so a repeated
+	// several-thousand-pixel blit in there would be a timing hazard.
+	{
+		extern void gpu64_mark( unsigned idx );
+		gpu64_mark( 5 );
+	}
 
 	while ( 1 )
 	{

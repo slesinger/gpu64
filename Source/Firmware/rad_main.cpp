@@ -297,6 +297,59 @@ void CRAD::showTestPattern( void )
 	logger->Write( "gpu64", LogNotice, "showTestPattern: done" );
 }
 
+// gpu64: checkpoint marker strip -- see CRAD::mark()'s declaration in
+// rad_main.h. Squares sit in the band between GPU_OUTPUT_BOX's bottom edge and
+// the screen bottom, left of the log column (HDMI_LOG_X0), so nothing else
+// draws over them. Each index gets its own fixed colour and x position, and a
+// lit square is permanent for the rest of the session -- the tester just reads
+// off how far execution got, even if no log line ever appears.
+#define GPU64_MARK_Y0		( GPU_OUTPUT_BOX_H + 10 )
+#define GPU64_MARK_SIZE		40
+#define GPU64_MARK_PITCH	60
+
+void CRAD::mark( unsigned idx )
+{
+	static const TScreenColor markColor[ 8 ] =
+	{
+		COLOR16( 31, 31, 31 ),	// 0 white
+		COLOR16( 31,  0,  0 ),	// 1 red
+		COLOR16(  0, 31,  0 ),	// 2 green
+		COLOR16(  0,  0, 31 ),	// 3 blue
+		COLOR16( 31, 31,  0 ),	// 4 yellow
+		COLOR16( 31,  0, 31 ),	// 5 magenta
+		COLOR16(  0, 31, 31 ),	// 6 cyan
+		COLOR16( 31, 16,  0 )	// 7 orange
+	};
+
+	unsigned wFull = m_Screen.GetWidth();
+	unsigned hFull = m_Screen.GetHeight();
+
+	unsigned x0 = 10 + ( idx & 7 ) * GPU64_MARK_PITCH;
+	unsigned y0 = GPU64_MARK_Y0;
+
+	if ( x0 + GPU64_MARK_SIZE > wFull || y0 + GPU64_MARK_SIZE > hFull )
+		return;
+
+	TScreenColor col = markColor[ idx & 7 ];
+
+	for ( unsigned y = y0; y < y0 + GPU64_MARK_SIZE; y++ )
+		for ( unsigned x = x0; x < x0 + GPU64_MARK_SIZE; x++ )
+			m_Screen.SetPixel( x, y, col );
+
+	// only clean the rows actually touched -- one of the call sites is inside
+	// reuUsingPolling()'s cycle-critical loop, where a full-framebuffer clean
+	// would blow the timing budget (same reasoning as CHDMIConsole::Write()).
+	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
+	u32 nPitch = pFB->GetPitch();
+	CleanDataCacheRange( (u64)(uintptr)( pFB->GetBuffer() + y0 * nPitch ), GPU64_MARK_SIZE * nPitch );
+}
+
+void gpu64_mark( unsigned idx )
+{
+	if ( g_pRAD )
+		g_pRAD->mark( idx );
+}
+
 // gpu64: only one CRAD is ever constructed (see main() below); g_pRAD is set
 // from its constructor (rad_main.h). This wrapper lets rad_reu.cpp's bus-hijack
 // loop trigger the pattern from the C64 side (IO2 $DF0B write) without pulling
@@ -545,6 +598,12 @@ void CRAD::Run( void )
 
 		res = hijackC64( false );			// after hijackC64 the CPU is still halted by DMA
 
+		// gpu64: marker 0 (white) -- deliberately BEFORE the log call below,
+		// so a lit square with no matching log line means logging (not the
+		// code path) is what's broken here. See CRAD::mark() for the strip
+		// layout and the full ladder of markers on this path (0..6).
+		mark( 0 );
+
 		// gpu64: diagnostic -- the stretch between here and reuUsingPolling()
 		// starting up had no logging at all, which made a real hardware hang
 		// (found to be gpu64ApiActive getting stuck at 1, see resetREU() in
@@ -627,6 +686,7 @@ void CRAD::Run( void )
 		if ( res == RUN_MEMEXP + 1 )
 		{
 		startREUEmulation:
+			mark( 1 );	// gpu64: red -- REU emulation branch taken
 			REU_SIZE_KB = 128 << meSize0;
 			initREU(mempool);
 			resetREU();
@@ -651,11 +711,13 @@ void CRAD::Run( void )
 
 			reu.isModified = 0;
 
+			mark( 2 );	// gpu64: green -- REU image loaded/initialized, about to wait for "READY."
+
 			if ( radLaunchPRG )
 			{
 				// wait for "READY." to appear on screen
 				WAIT_FOR_READY_PROMPT
-				injectAndStartPRG( prgLaunch, prgSize, true ); 
+				injectAndStartPRG( prgLaunch, prgSize, true );
 			} else
 			if ( radSilentMode != 0xffffffff )
 			{
@@ -663,6 +725,8 @@ void CRAD::Run( void )
 				WAIT_FOR_READY_PROMPT
 				injectMessage( false );
 			}
+
+			mark( 3 );	// gpu64: blue -- PRG injected/started, about to warm caches
 
 			SyncDataAndInstructionCache();
 			warmCache();
@@ -684,6 +748,7 @@ void CRAD::Run( void )
 			// ever prints 1 again right after a fresh resetREU(), that fix
 			// regressed.
 			extern u8 gpu64ApiActive;
+			mark( 4 );	// gpu64: yellow -- last checkpoint before reuUsingPolling() takes over
 			logger->Write( "gpu64", LogNotice, "Run: entering reuUsingPolling, gpu64ApiActive=%d", (int)gpu64ApiActive );
 
 			reuUsingPolling();
