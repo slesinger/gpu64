@@ -203,13 +203,135 @@ Design and implement the first version of the C64→gpu64 command protocol over 
 
 Design questions to settle here: single-byte command + argument bytes vs. a small opcode+length packet; how bulk pixel data crosses the port efficiently (this is the main bottleneck — expansion port bandwidth, not RPi compute); synchronous (C64 polls status) vs. use of the existing NMI/IRQ line for completion signaling.
 
-**Status: register/dispatch protocol design in progress**, see
-[api_design.md](api_design.md) (living document, API reference only). Design
-so far: commands-by-reference over IO2 (payload never crosses the register
-window byte-by-byte, only a space/addr/len reference gpu64 DMA-pulls),
-sticky `CMD_HI` class selector + `CMD_LO` opcode/trigger, a generic 16-byte
-`ARG` block. vblank IRQ confirmed available and reuses REU's own existing
-`bIRQ_OUT` mechanism.
+**Status: done — verified on real hardware 2026-08-22.** The
+developer-facing spec is [api_design.md](api_design.md) (reference only —
+register map, framebuffer, opcode table, error codes, examples); the
+reasoning behind it is
+[milestone4_2d_api_design.md](milestone4_2d_api_design.md).
+
+### What shipped (2026-08-22)
+
+- **[gpu64_fb.h/.cpp](../Source/Firmware/gpu64_fb.cpp) — the 320x200x8
+  framebuffer, which now owns the HDMI display** (architecture A). One
+  `CBcmFrameBuffer`, depth 8, virtual height 400: hardware 256-entry 24-bit
+  palette, hardware page flip via `SetVirtualOffset()`, VideoCore upscaling.
+  `CScreenDevice` is out of the display path entirely — it used to own it at
+  COLOR16 and full HDMI resolution.
+- **The on-screen log is now an overlay inside that surface**, 40x12
+  characters drawn in reserved palette entry 255, glyph pixels only, and
+  re-applied to whichever page a flip is about to show.
+  [tee_device.h](../Source/Firmware/tee_device.h)'s `CHDMIConsole` is a thin
+  adapter onto it, so every existing `logger->Write()` call site is
+  unchanged.
+- **[gpu64_api.h/.cpp](../Source/Firmware/gpu64_api.cpp) — register file,
+  dispatcher and the whole class-0 opcode set**: system/paging/log
+  ($00-$07), `CLEAR`, pixel/line/rect/rect-fill, palette set/load, blit,
+  keyed blit, `READ_RECT`, `GET_INFO`, and the math ops in both formats
+  ($80-$86 fixed 8.8, $90-$96 float32).
+- **[rad_reu.cpp](../Source/Firmware/rad_reu.cpp): full 8-bit IO2 decode**
+  on both the write and read paths, replacing REU's `& 0x1f` mask — which
+  also fixes the read-path landmine (a read in gpu64's range used to index
+  `((u8*)&reu.status)[addr]` off the end of `REUSTATE`). Plus
+  `gpu64_blobRead()`/`gpu64_blobWrite()`, the parameterized version of
+  milestone 3's DMA burst, with write direction added.
+- **The milestone 3 mirror renders into the 8bpp surface**, and got simpler
+  doing it: 40x25 at 8x8 glyphs is exactly 320x200, so the 2x upscale is
+  gone and colour RAM's 4-bit values index the palette directly.
+- **[Source/TestPRG/gpu64_api_demo.a](../Source/TestPRG/gpu64_api_demo.a)** —
+  a C64-side demo that draws with CLEAR/RECT_FILL/LINE/BLIT, then calls
+  `GET_INFO` and puts the "G64" magic gpu64 wrote into C64 RAM onto the
+  C64's own screen, so write-direction DMA can be verified without reading
+  the HDMI log.
+
+### Deliberately not implemented
+
+**vblank.** There is no vblank event source in the bus-watch loop, and
+blocking on `WaitForVerticalSync()` inside the write handler would stall it
+for up to a frame — the cycle-predictability rule forbids exactly that. So
+`VBLANK_ARM(1)` and a vblank-deferred `PAGE_FLIP` return a new
+`UNSUPPORTED` ($06) error instead of quietly behaving like their immediate
+equivalents, and api_design.md says so at the top. Immediate page flip
+works.
+
+### Border
+
+The framebuffer is 384x272 physical with the 320x200 drawing surface centred
+in it, and `SET_BORDER` ($08) paints the frame — the C64's `$D020`, which the
+API had no equivalent for. `PageBuffer()` returns the top-left of the
+*surface*, so every draw op still indexes `p[y * pitch + x]` in 320x200
+coordinates and no drawing code changed. The mirror paints the real `$D020`
+it was already capturing and previously had to discard.
+
+### Hardware bring-up: four rounds, four bugs
+
+Everything structural worked on the first try — boot, display takeover, the
+1:1 mirror, the dispatcher, and **write-direction DMA**, which is what the
+demo's `@ G64 @` on the C64's own screen proves. What took four rounds was
+timing and cache behaviour in the polling loop, and all four findings
+generalise past this milestone.
+
+1. **Palette channels were swapped.** `SetPalette32()` takes `0xAABBGGRR` —
+   red in the *low* byte. Blue came out red; white was unaffected, which is
+   why the log looked right and this first read as a palette-*index* bug.
+
+2. **Register writes issued while gpu64 was drawing were lost.** The C64
+   free-runs through the polling loop, so during a command (a `CLEAR` is
+   ~64000 byte writes plus a cache clean) the CPU gets through dozens of
+   instructions whose IO2 writes are never seen. Symptom: `RECT_FILL`
+   vanished, then `LINE` drew from half-stale arguments. Fixed by holding
+   the bus for the whole dispatch, as an REU transfer does. Neither
+   alternative works: making commands faster cannot help, since even
+   `SET_PIXEL` outlasts the ~1µs between two 6502 stores, and polling
+   `STATUS` cannot either, since a read during a busy handler is not
+   serviced any more than a write. This is now part of the API contract —
+   **a command halts the C64 for its duration** (api_design.md, "What a
+   command costs the C64").
+
+3. **Two loop-timing defects, both showing as intermittent damage.** The
+   dispatch released `bDMA_OUT` wherever the command finished, restarting
+   the 6502 at an undefined phase — every other release in RAD syncs to the
+   start of a VIC half-cycle first. And `gpu64_apiWriteReg()` /
+   `gpu64_apiReadReg()` were uncached cross-TU calls inside the
+   cycle-critical window: on the read path that misses the
+   `WAIT_CYCLE_READ2` deadline and the C64 latches whatever was on the bus
+   (an `ERRCODE` that is not a defined error code), on the write path the
+   loop is still busy when the next `STA` arrives (a command running on a
+   half-written argument block). The register file is now a plain global
+   reached by `static inline` accessors, with only `gpu64_apiDispatch()`
+   left as a real call.
+
+4. **The first byte or two of a DMA burst came back wrong**, never a later
+   one — because `DMA_READBYTE_P2` re-syncs the burst, so the damage could
+   not propagate. Two causes, found in that order. First, the blob helpers
+   synced with a bare `WAIT_FOR_VIC_HALFCYCLE`, which returns immediately if
+   the caller is *already* inside a VIC half-cycle instead of waiting for
+   the transition into one; `handle_transfer.h` gets away with it because it
+   enters at a known phase, these don't. Second, and only visible once the
+   first was fixed: a cold instruction cache. The tell was that launching
+   from the RAD menu lost exactly two bytes every time while every
+   subsequent `RUN` was perfect. `warmCache()` runs once at REU start, but
+   the dispatch standing between it and the first blob transfer evicts the
+   preload — so the helpers now warm their own code at the point of use.
+
+**The general rule this milestone establishes:** for gpu64, "preloaded at
+start-up" is not a durable property of anything the API can reach, because
+the API's own commands are the biggest cache consumers in the system.
+Anything cycle-critical a command can reach has to warm itself where it is
+used.
+
+One self-inflicted bug worth recording, since RAD's macros invite it: their
+arguments are unparenthesised, so passing a clamp inline —
+`FORCE_READ_LINEARa( p, len, len < 1024 ? len : 1024 )` — expanded its loop
+condition to `i < len < 1024 ? len : 1024`, always true. The infinite loop
+sat *inside* the DMA hold, so the C64 stayed halted forever and the symptom
+was a frozen C64 with a perfectly rendered HDMI screen. Never pass an
+expression containing `?:`, `+` or `%` to these macros.
+
+Cosmetic, not a bug: the mirror's blue reads as violet, which is correct —
+the C64's blue is (53,40,121).
+
+Remaining design-level open questions are in
+[milestone4_2d_api_design.md](milestone4_2d_api_design.md#open-questions).
 
 An Opus 5 design review (2026-08-22) of an earlier draft caught a real bug
 in the reasoning, worth recording since it also lived in a source comment
@@ -227,20 +349,11 @@ mirror, gpu64 API, and C64-VIC-II-only — the last being RAD's existing
 around the single invariant that the C64 is never DMA-halted for more than
 one bounded burst in any of them.
 
-**Pending — the empirical sanity check the corrected understanding still
-needs** (cheap, needs no new firmware): with milestone 3's already-built
-firmware, enter REU/mirror mode as usual, then on the C64 run
-
-```
-10 POKE 1024,(PEEK(1024)+1)AND255:GOTO10
-```
-
-and watch the HDMI mirror's top-left character. If it visibly cycles
-through values across successive mirror snapshots rather than sitting
-frozen at whatever it was on entry, that's direct proof the C64 keeps
-executing its own instructions (i.e. free-runs) while gpu64's polling loop
-is active — confirming the corrected model on real hardware, not just by
-code reading.
+**Confirmed on hardware by milestone 4** (2026-08-22), which needed no
+separate experiment in the end: the whole class of bugs that milestone's
+bring-up chased — register writes lost while a command was executing —
+only exists *because* the C64 free-runs through `reuUsingPolling()`. The
+corrected model is the one the working firmware is built on.
 
 The review also flagged the two-core/continuous-render-loop architecture as
 neither required nor properly scoped for milestone 4 — moved out to
@@ -253,19 +366,24 @@ L2 — core 0's timing is a hand-tuned preload schedule that a render loop on
 another core would contend with for cache capacity, not just correctness).
 Rebuilt so cores 1-3 stream writes through a multi-megabyte buffer each.
 
-**Spiked on real hardware (2026-08-22): negative result.** Starting the
-stress cores — even just having them alive, before `reuUsingPolling()` is
-ever reached — produced garbage on the C64's own native VIC-II output
-while navigating RAD's menu. Disabling the spike
-(`GPU64_MULTICORE_SPIKE_ENABLED` left undefined in `rad_main.h`) restored
-clean menu rendering, confirming the multicore startup itself as the
-cause, not `reuUsingPolling()` specifically. Two unconfirmed candidate
-explanations (shared-L2 contention, or a possible cache-coherency
-misconfiguration in the custom armstub's `SMPEN` handling) recorded in
-[milestone6_3d_design.md](milestone6_3d_design.md#architecture-a-second-core-for-the-render-loop)
-along with next steps. Not pursued further now — milestone 4 doesn't need
-multicore, so this doesn't block it; parked as milestone 6's starting
-point.
+**Spiked on real hardware (2026-08-22): negative result, then narrowed
+down.** Starting the stress cores — even just having them alive, before
+`reuUsingPolling()` is ever reached — produced garbage on the C64's own
+native VIC-II output while navigating RAD's menu. A second Opus 5 review
+(this time of the diagnostic plan itself, before spending more hardware
+time) found a confound in that first test and mostly retired the SMPEN
+theory at the desk (see milestone6_3d_design.md for detail); a follow-up
+build isolated multicore *bring-up* (spinlocks, interrupt routing, each
+core's MMU/IRQ enable) from the *stress workload* itself.
+**Bring-up alone: clean menu. Bring-up + stress workload: corrupts.** So
+the cause is workload-driven memory contention, not a fundamental
+bring-up/coherency incompatibility — meaning multicore stays viable for
+milestone 6 in principle, contingent on keeping the eventual render loop's
+memory traffic within a budget that hasn't been found yet. Full writeup and
+next steps in
+[milestone6_3d_design.md](milestone6_3d_design.md#architecture-a-second-core-for-the-render-loop).
+Not pursued further now — milestone 4 doesn't need multicore, so this
+doesn't block it; parked as milestone 6's starting point.
 
 The DMA-polarity empirical check (the BASIC `POKE`/mirror test above) is
 still outstanding — not yet run, since hardware time so far went to the

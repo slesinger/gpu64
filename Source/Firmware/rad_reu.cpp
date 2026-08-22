@@ -28,6 +28,7 @@
 */
 #include "rad_reu.h"
 #include "linux/kernel.h"
+#include "gpu64_api.h"
 
 // gpu64: forward-declared rather than pulling in rad_main.h (which drags in
 // the whole Circle screen/HDMI-console stack) -- see rad_main.h for the
@@ -74,6 +75,9 @@ void resetREU()
 	// gpu64: see the comment on gpu64ApiActive's declaration above -- this
 	// is what actually clears it now.
 	gpu64ApiActive = 0;
+	// gpu64: the API register file resets with it -- a fresh REU session must
+	// not inherit a previous program's staged ARGs, sticky CMD_HI or error.
+	gpu64_apiReset();
 
 	reu.irqRelease = 0;
 
@@ -317,14 +321,6 @@ void gpu64_mirrorSnapshot()
 	register u16 c_a;
 	register u8 x;
 
-	// gpu64: diagnostic only, added to isolate a hw-reported symptom (the
-	// "drew 40x25 snapshot" log at the end of this function was never once
-	// seen) -- logs *before* the DMA burst starts, so it's distinguishable
-	// from the burst itself hanging/dying partway through. See
-	// gpu64_logMirrorSnapshotStart() in rad_main.cpp.
-	extern void gpu64_logMirrorSnapshotStart( void );
-	gpu64_logMirrorSnapshotStart();
-
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
@@ -361,6 +357,155 @@ void gpu64_mirrorSnapshot()
 	gpu64MirrorBackground = x & 0x0F;
 
 	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground );
+}
+
+// gpu64: milestone 4 blob transfers -- the "commands by reference" half of
+// the API (docs/api_design.md). A C64-space transfer is the same brief,
+// bounded DMA burst gpu64_mirrorSnapshot() above already proves on hardware,
+// just parameterized instead of hardcoded to screen RAM; an REU-space
+// transfer never touches the bus at all, since REU memory is ours.
+//
+// Same __attribute__s and the same cache-preload requirement as
+// gpu64_mirrorSnapshot() -- see warmCache() in rad_main.cpp.
+__attribute__( ( optimize( "align-functions=256" ) ) )
+__attribute__( ( section( "section_polling" ) ) )
+u8 gpu64_blobRead( u8 space, u32 addr, u32 len, u8 *pDst )
+{
+	if ( len == 0 )
+		return GPU64_ERR_OK;
+
+	if ( space == GPU64_SPACE_REU )
+	{
+		if ( addr + len > reu.reuSize )
+			return GPU64_ERR_OUT_OF_RANGE;
+		memcpy( pDst, &reuMemory[ addr ], len );
+		return GPU64_ERR_OK;
+	}
+
+	if ( space != GPU64_SPACE_C64 )
+		return GPU64_ERR_OUT_OF_RANGE;
+
+	if ( addr + len > 65536 )
+		return GPU64_ERR_OUT_OF_RANGE;
+
+	// The bus is already held: this is only ever reached from a CMD_LO
+	// dispatch, which asserts DMA around the whole command (see the write
+	// handler in reuUsingPolling()). Sync to a cycle boundary and go.
+	register u32 g2;
+	register u16 c_a;
+	register u8 x;
+
+	// gpu64: warm this function's own instruction cache immediately before
+	// the burst, not just once in warmCache(). The dispatch that got us here
+	// runs a lot of code first -- a CLEAR alone walks 64000 framebuffer
+	// bytes and cleans them -- which is more than enough to evict what
+	// warmCache() preloaded at REU start. The observed symptom was exact:
+	// the first launch of a program lost the first two bytes of its first
+	// blob read, every subsequent RUN was clean. This is the same
+	// preload-then-force-read pair warmCache() uses, just at the point where
+	// it is actually needed. Free in bus terms: the C64 is DMA-halted here,
+	// so nothing is racing us.
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobRead, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_blobRead, 1024 * 2, 1024 * 2 );
+	// ...and the first stretch of the destination, so the very first store
+	// of the burst isn't a cache miss either.
+	// nWarm in a local, not inline: these are unparenthesised macro
+	// arguments, so a ternary here gets torn apart by operator precedence.
+	// Passed as `acc` to FORCE_READ_LINEARa below it produced `i < len <
+	// 1024 ? len : 1024` -- a loop condition that is always true, which hung
+	// the firmware inside a DMA hold and left the C64 halted forever.
+	const u32 nWarm = len < 1024 ? len : 1024;
+	CACHE_PRELOAD_DATA_CACHE( pDst, nWarm, CACHE_PRELOADL1KEEP )
+
+	// gpu64: WAIT_FOR_CPU_HALFCYCLE first, so this catches the *transition*
+	// into the VIC half-cycle. WAIT_FOR_VIC_HALFCYCLE alone returns
+	// immediately if we are already in one -- and we get here at whatever
+	// phase the dispatcher's argument decoding happened to finish, unlike
+	// handle_transfer.h, which enters straight off the loop's own sync. The
+	// symptom of getting this wrong is subtle: DMA_READBYTE_P2's
+	// WAIT_FOR_CPU_HALFCYCLE re-syncs the burst, so only the first byte or
+	// two of a transfer come back wrong, at random.
+	WAIT_FOR_CPU_HALFCYCLE
+	WAIT_FOR_VIC_HALFCYCLE
+	RESTART_CYCLE_COUNTER
+	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
+
+	for ( u32 i = 0; i < len; i++ )
+	{
+		c_a = (u16)( addr + i );
+		DMA_READBYTE_P1( c_a );
+		DMA_READBYTE_P2();
+		DMA_READBYTE_P3( x, false );			// never releases: dispatch owns the hold
+		pDst[ i ] = x;
+	}
+
+	return GPU64_ERR_OK;
+}
+
+__attribute__( ( optimize( "align-functions=256" ) ) )
+__attribute__( ( section( "section_polling" ) ) )
+u8 gpu64_blobWrite( u8 space, u32 addr, u32 len, const u8 *pSrc )
+{
+	if ( len == 0 )
+		return GPU64_ERR_OK;
+
+	if ( space == GPU64_SPACE_REU )
+	{
+		if ( addr + len > reu.reuSize )
+			return GPU64_ERR_OUT_OF_RANGE;
+		memcpy( &reuMemory[ addr ], pSrc, len );
+		return GPU64_ERR_OK;
+	}
+
+	if ( space != GPU64_SPACE_C64 )
+		return GPU64_ERR_OUT_OF_RANGE;
+
+	if ( addr + len > 65536 )
+		return GPU64_ERR_OUT_OF_RANGE;
+
+	// Write direction: same cycle-stealing burst as the read above, using the
+	// macros REU's own Stash transfer uses (handle_transfer.h). This is the
+	// first time gpu64 pushes data *back* to the C64 rather than reading it.
+	// Bus already held by the dispatch wrapper, same as gpu64_blobRead().
+	register u32 g2;
+	register u16 c_a;
+
+	// gpu64: warm this function's own instruction cache immediately before
+	// the burst, not just once in warmCache(). The dispatch that got us here
+	// runs a lot of code first -- a CLEAR alone walks 64000 framebuffer
+	// bytes and cleans them -- which is more than enough to evict what
+	// warmCache() preloaded at REU start. The observed symptom was exact:
+	// the first launch of a program lost the first two bytes of its first
+	// blob read, every subsequent RUN was clean. This is the same
+	// preload-then-force-read pair warmCache() uses, just at the point where
+	// it is actually needed. Free in bus terms: the C64 is DMA-halted here,
+	// so nothing is racing us.
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobWrite, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_blobWrite, 1024 * 2, 1024 * 2 );
+	const u32 nWarm = len < 1024 ? len : 1024;		// see gpu64_blobRead()
+	FORCE_READ_LINEARa( pSrc, len, nWarm );
+
+	// gpu64: WAIT_FOR_CPU_HALFCYCLE first, so this catches the *transition*
+	// into the VIC half-cycle. WAIT_FOR_VIC_HALFCYCLE alone returns
+	// immediately if we are already in one -- and we get here at whatever
+	// phase the dispatcher's argument decoding happened to finish, unlike
+	// handle_transfer.h, which enters straight off the loop's own sync. The
+	// symptom of getting this wrong is subtle: DMA_READBYTE_P2's
+	// WAIT_FOR_CPU_HALFCYCLE re-syncs the burst, so only the first byte or
+	// two of a transfer come back wrong, at random.
+	WAIT_FOR_CPU_HALFCYCLE
+	WAIT_FOR_VIC_HALFCYCLE
+	RESTART_CYCLE_COUNTER
+	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
+
+	for ( u32 i = 0; i < len; i++ )
+	{
+		c_a = (u16)( addr + i );
+		DMA_WRITEBYTE_P1( c_a, pSrc[ i ] );
+		DMA_WRITEBYTE_P2( false );			// never releases: dispatch owns the hold
+	}
+
+	return GPU64_ERR_OK;
 }
 
 #if 1
@@ -462,7 +607,10 @@ reuEmulationMainLoop:
 				SET_BANK2_OUTPUT
 			}
 
-			register u8 addr = IO_ADDRESS & 0x1f;
+			// gpu64: full 8-bit decode, not REU's own "& 0x1f" -- $DF0B-$DFFF
+			// is gpu64's register window (docs/api_design.md), and the 5-bit
+			// mask would alias it back onto REU's 11 registers.
+			register u8 addr = IO_ADDRESS;
 
 			if ( ( IO2_ACCESS && addr == 0x01 && BITS_ALL_SET( D, REU_COMMAND_EXECUTE | REU_COMMAND_FF00_DISABLED ) )
 					|| writeFF00 )
@@ -473,42 +621,75 @@ reuEmulationMainLoop:
 			} else
 			if ( IO2_ACCESS  )
 			{
-				register u8 addr = IO_ADDRESS & 0x1f;
-				//if ( IO_ADDRESS < 0x0b )
+				register u8 addr = IO_ADDRESS;
+
+				// gpu64: $DF0B-$DFFF is gpu64's own register window -- the
+				// command API's registers (docs/api_design.md). REU keeps
+				// $DF00-$DF0A below. Note this is the full 8-bit address:
+				// REU's own "& 0x1f" decode would alias the whole gpu64
+				// window down onto REU's 11 registers.
+				//
+				// Everything the API does happens synchronously here, in the
+				// same immediate-mode model milestone 2's test pattern and
+				// milestone 3's mirror already use on real hardware. The C64
+				// free-runs through this loop (see the "Operating modes"
+				// section of docs/project_description.md); a command that
+				// moves a payload steals the bus for one bounded burst,
+				// proportional to a length the C64 itself chose.
+				if ( addr >= GPU64_REG_CMD_HI )
+				{
+					if ( addr == GPU64_REG_CMD_LO )
+					{
+						// gpu64: hold the bus for the whole command.
+						//
+						// Found on the first hardware test: staging ARG
+						// bytes and then writing CMD_LO only works if the
+						// C64 cannot issue a write while gpu64 is executing
+						// the previous one. It can -- the C64 free-runs
+						// through this loop -- and a CLEAR is ~64000 byte
+						// writes plus a cache clean, during which the CPU
+						// gets through dozens of instructions whose IO2
+						// writes this loop never sees. The symptom was a
+						// command that vanished entirely and a following one
+						// drawn from half-stale arguments.
+						//
+						// So dispatch runs with the CPU DMA-halted, exactly
+						// like an REU transfer: bounded by the command's own
+						// work, and the C64 resumes at its next instruction
+						// with nothing missed. Blob transfers inside the
+						// command no longer release the bus themselves --
+						// the release below is the only one.
+						WAIT_FOR_VIC_HALFCYCLE
+						RESTART_CYCLE_COUNTER
+						WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
+						CLR_GPIO( bDMA_OUT );
+
+						gpu64_apiDispatch( D );
+
+						// gpu64: give the bus back on a cycle boundary, not
+						// wherever the command happened to finish. Every
+						// other release in RAD (DMA_READBYTE_P3,
+						// DMA_WRITEBYTE_P2 via
+						// DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER) syncs to
+						// the start of a VIC half-cycle first; releasing
+						// mid-cycle restarts the 6502 at an undefined phase,
+						// which is how a program survives the first command
+						// or two and then quietly derails.
+						WAIT_FOR_CPU_HALFCYCLE
+						WAIT_FOR_VIC_HALFCYCLE
+						RESTART_CYCLE_COUNTER
+						SET_GPIO( bDMA_OUT );
+					} else
+						// Inlined (gpu64_api.h): a cross-TU call here has to
+						// finish before the loop's next sample, and an
+						// i-cache miss on it loses the C64's next IO2 access
+						// outright -- which showed up as commands running on
+						// half-written argument blocks.
+						gpu64_apiWriteReg( addr, D );
+				} else
 				{
 					switch ( addr )
 					{
-					default:
-						// gpu64: unused remainder of IO2 ($DF0B-$DFFF,
-						// masked down to 0x0B-0x1F by the "& 0x1f" above --
-						// REU only ever decodes 0x00-0x0A) is gpu64's own
-						// register window. Milestone 2's trigger register:
-						// any write to $DF0B (addr 0x0B) kicks off the
-						// checkerboard test pattern.
-						//
-						// CORRECTED (milestone 4 design review, see
-						// docs/project_description.md's "Operating modes"):
-						// a previous version of this comment claimed the C64
-						// is DMA-halted for the whole REU polling session via
-						// reuUsingPolling()'s SET_GPIO(bDMA_OUT). That's
-						// backwards -- SET_GPIO(bDMA_OUT) *releases* the bus
-						// (see handle_transfer.h's CLR/SET bracketing of each
-						// transfer, and DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER's
-						// releaseDMA param in lowlevel_dma.h). The C64 free-runs
-						// through this whole loop; gpu64 only steals the bus in
-						// brief bursts. Pending a hardware sanity check (see
-						// progress_tracker.md), so drawing synchronously here
-						// -- proven to work on real hardware, see milestone 2
-						// in progress_tracker.md -- should not be assumed safe
-						// *because the CPU is frozen*; that specific reasoning
-						// no longer holds and needs re-deriving once the
-						// free-running model is confirmed.
-						if ( addr == 0x0B )
-						{
-							gpu64ApiActive = 1;
-							gpu64_showTestPattern( g_pRAD );
-						}
-						break;
 					case 0x00:
 						break;
 					case 0x01:
@@ -569,7 +750,15 @@ reuEmulationMainLoop:
 			// CPU READS FROM BUS
 			if ( IO2_ACCESS )
 			{
-				register u8 addr = IO_ADDRESS & 0x1f;
+				// gpu64: full 8-bit decode again. This also fixes a real
+				// landmine on the read path: with the old 5-bit mask, a read
+				// from anywhere in gpu64's window indexed
+				// ((u8*)&reu.status)[addr] with addr up to 0x1f, walking off
+				// the end of REUSTATE and returning whatever happened to be
+				// there. gpu64's registers get their own bounds-checked read
+				// (gpu64_apiReadReg), and REU's indexing now only ever sees
+				// 0x00-0x0A.
+				register u8 addr = IO_ADDRESS;
 
 				register u8 disableIRQ = 0;
 				// this is how this looks like in readable form:
@@ -591,18 +780,27 @@ reuEmulationMainLoop:
 							case 0x0A:	D = reu.addrREUCtrl;						break;
 							default:	D = 0xFF;									break;
 							}*/
-				D = ( (u8 *)&reu.status )[ addr ];
-				if ( addr == 0 )
+				if ( addr >= GPU64_REG_CMD_HI )
 				{
-					reu.status &= ~( REU_STATUS_VERIFY_ERROR | REU_STATUS_END_OF_BLOCK | REU_STATUS_INTERRUPT_PENDING );
-					disableIRQ = 1;
+					// Inlined (gpu64_api.h) -- this runs against a hard
+					// deadline: D has to be on the bus by WAIT_CYCLE_READ2
+					// below, so a call with a cold i-cache means the C64
+					// latches whatever was on the bus instead of the
+					// register. That was the intermittently wrong ERRCODE.
+					D = gpu64_apiReadReg( addr );
 				} else
-					if ( addr == 6 )
+				{
+					D = ( (u8 *)&reu.status )[ addr ];
+					if ( addr == 0 )
 					{
-						D |= reu.regBankUnused;
-					}
-
-				//if ( IO_ADDRESS >= 0x0b ) D = 0xff;
+						reu.status &= ~( REU_STATUS_VERIFY_ERROR | REU_STATUS_END_OF_BLOCK | REU_STATUS_INTERRUPT_PENDING );
+						disableIRQ = 1;
+					} else
+						if ( addr == 6 )
+						{
+							D |= reu.regBankUnused;
+						}
+				}
 
 				register u32 DD = D << D0;
 				write32( ARM_GPIO_GPCLR0, ( D_FLAG & ( ~DD ) ) | bOE_Dx | bDIR_Dx );

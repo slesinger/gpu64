@@ -53,6 +53,7 @@
 #include "gpio_defs.h"
 #include "helpers.h"
 #include "gpu64_multicore.h"
+#include "gpu64_fb.h"
 
 CLogger	*logger;
 
@@ -80,8 +81,7 @@ public:
 	// firmware defaults to for now; revisit once cycle-accurate bus timing
 	// needs to be verified for real.
 	CRAD( void )
-		: m_Screen( m_Options.GetWidth(), m_Options.GetHeight() ),
-		m_HDMIConsole( &m_Screen ),
+		: m_HDMIConsole( &m_Gpu64FB ),
 		m_TeeLog( &m_Serial, &m_HDMIConsole ),
 		m_Timer( &m_Interrupt ),
 		m_Logger( 5/*m_Options.GetLogLevel()*/, &m_Timer ),
@@ -111,14 +111,26 @@ public:
 		// CGpu64MultiCore::Run(); core 0 is untouched and proceeds into
 		// CRAD::Run() -> reuUsingPolling() exactly as before.
 		//
-		// GPU64_MULTICORE_SPIKE_ENABLED: temporarily gated off (2026-08-22)
-		// to isolate a real-hardware regression -- VIC-II garbage appearing
-		// before the RAD menu is even reachable, i.e. before
-		// reuUsingPolling() runs at all. Suspect cores 1-3's stress traffic
-		// is disturbing rad_hijack.cpp's own cycle-sensitive bus work, not
-		// just reuUsingPolling(). Re-enable only once that's confirmed one
-		// way or the other -- see progress_tracker.md.
-		#ifdef GPU64_MULTICORE_SPIKE_ENABLED
+		// GPU64_MULTICORE_ENABLED: gated (2026-08-22) to isolate a
+		// real-hardware regression -- VIC-II garbage appearing before the
+		// RAD menu is even reachable, i.e. before reuUsingPolling() runs at
+		// all, when the multicore stress spike was fully enabled.
+		//
+		// Design review (Opus 5) identified a confound in that first A/B:
+		// CMultiCoreSupport::Initialize() itself -- independent of whatever
+		// Run() does per core -- permanently enables CSpinLock's real
+		// atomic path (previously a no-op, now affecting core 0's own
+		// mailbox/GPIO/framebuffer calls too), rewrites interrupt routing,
+		// and brings each secondary core up through EnableMMU()/EnableIRQs()
+		// before Run() is ever reached. So the original test compared "none
+		// of that happens" against "all of that *plus* the stress workload"
+		// -- it never isolated whether bring-up alone is the cause. This
+		// build calls Initialize() (so all of the above happens) while
+		// CGpu64MultiCore::Run() is a no-op on every secondary core (see
+		// gpu64_multicore.cpp) -- isolates bring-up-alone from
+		// bring-up-plus-workload. See progress_tracker.md for the test
+		// procedure and milestone6_3d_design.md for the full writeup.
+		#ifdef GPU64_MULTICORE_ENABLED
 		bOK = m_MultiCore.Initialize() && bOK;
 		#endif
 		return bOK;
@@ -126,7 +138,7 @@ public:
 
 	void Run( void );
 
-	// gpu64: draws directly into m_Screen's already-initialized framebuffer,
+	// gpu64: draws directly into the gpu64 framebuffer,
 	// independent of the C64 bus hijack -- milestone 2 "display basic
 	// pattern" first cut. Public so the C64-triggered path (gpu64_showTestPattern()
 	// in rad_main.cpp, called from the IO2 $DF0B write handler in
@@ -147,7 +159,12 @@ private:
 	CMemorySystem		m_Memory;
 	CKernelOptions		m_Options;
 	CDeviceNameService	m_DeviceNameService;
-	CScreenDevice		m_Screen;
+	// gpu64: milestone 4 -- gpu64's own 320x200x8 framebuffer owns the HDMI
+	// display now (CScreenDevice used to, at COLOR16 and full HDMI
+	// resolution). Only one framebuffer can own it; see
+	// docs/milestone4_2d_api_design.md#display-architecture for the choice
+	// and what it costs. Declared before m_HDMIConsole, which points at it.
+	CGpu64FrameBuffer	m_Gpu64FB;
 	// gpu64: Tier 1 bring-up -- CRAD previously never instantiated a serial
 	// device at all, so CLogger's default log target ("tty1", i.e. m_Screen)
 	// meant every logger->Write() only ever reached the HDMI screen, never
@@ -173,10 +190,10 @@ private:
 	// constructor's initializer-list comment above).
 	CGpu64MultiCore		m_MultiCore;
 	// (showTestPattern() declared public above; implementation in
-	// rad_main.cpp. A separate CBcmFrameBuffer at a custom 320x200
-	// resolution was tried first and produced nothing visible -- likely
-	// fighting m_Screen's own already-negotiated HDMI mode; reusing the
-	// framebuffer Circle already proved works avoids that entirely.)
+	// rad_main.cpp. An early attempt at a *second* CBcmFrameBuffer at
+	// 320x200 alongside CScreenDevice's produced nothing visible -- one
+	// framebuffer owns the display, which is exactly why m_Gpu64FB replaces
+	// CScreenDevice rather than joining it.)
 };
 
 #endif

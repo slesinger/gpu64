@@ -69,7 +69,8 @@ work to run that isn't core 0's bus-watch loop. The rest of this section is
 - **The core-0→core-1 ring buffer must never block core 0.** If core 1
   falls behind and the buffer is full, core 0 rejects the command
   (`STATUS.error` + `ERRCODE = QUEUE_FULL`) rather than waiting — core 0's
-  cycle-predictability requirement (api_design.md) applies here too.
+  cycle-predictability requirement (milestone4_2d_api_design.md)
+  applies here too.
 
 ### The real risk: shared L2, not core-count
 
@@ -121,12 +122,34 @@ neither confirmed:
    needs it, that would produce real memory-view corruption between cores,
    which fits the symptom better than pure contention does.
 
+**Follow-up (2026-08-22), Opus 5 design review + a second hardware round:**
+review of the first spike found a real confound — `CMultiCoreSupport::Initialize()`
+does substantial work independent of what `Run()` does per core (permanently
+enables `CSpinLock`'s real atomic path, rewrites interrupt routing, brings
+each secondary through `EnableMMU()`/`EnableIRQs()` before `Run()` is ever
+reached), so the original A/B never isolated bring-up from workload. The
+review also mostly retired the SMPEN theory at the desk: the armstub's EL3
+prologue runs identically on all four cores before the primary/secondary
+split, so SMPEN is set the same way in both of the original test's builds —
+it can't be what differed between them.
+
+A follow-up build isolated the two: `GPU64_MULTICORE_ENABLED` on (full
+bring-up — spinlocks live, interrupt routing rewritten, every secondary's
+MMU/IRQs enabled) with `GPU64_MULTICORE_STRESS_ENABLED` off (every
+secondary's `Run()` is a no-op). **Result: RAD menu stayed clean.**
+Bring-up alone is not the cause — only the stress workload's actual memory
+traffic corrupts things. This favors the shared-L2/bandwidth contention
+theory over a fundamental coherency problem, and means multicore itself is
+not off the table for milestone 6 — it means the eventual render loop needs
+to be designed within a real memory-traffic budget, not assumed free, and
+that budget still needs to be found.
+
 Not investigated further for now — milestone 4 doesn't need multicore at
-all (see api_design.md), so this isn't blocking. Starting point for
-whoever picks milestone 6 back up: resolve the SMPEN question first (it
-changes which of the two theories above is even in play), then retry the
-spike incrementally (one stress core at a time, smaller buffers) rather
-than all three at full intensity as the first cut did.
+all (see milestone4_2d_api_design.md), so this isn't blocking. Starting point for
+whoever picks milestone 6 back up: find the actual contention threshold
+(a load ladder — one core, smaller/slower traffic patterns, working up
+rather than starting from a deliberately worst-case synthetic stress) now
+that bring-up itself is confirmed clean.
 
 Also unverified: RAD disables IRQs (see progress_tracker.md's hw_testing
 notes on why `CScreenDevice`/`CSerialDevice` logging stops working). Any

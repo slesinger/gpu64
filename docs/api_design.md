@@ -1,190 +1,401 @@
-# gpu64 command API design
+# gpu64 API reference
 
-API reference for the C64→gpu64 command protocol over IO2. This document
-describes the wire protocol only — status, history, and hardware test
-results live in [progress_tracker.md](progress_tracker.md); the continuous
-render loop, multicore execution, and persistent GPU-side resources
-(textures, meshes) are a separate, later concern, covered in
-[milestone6_3d_design.md](milestone6_3d_design.md). Companion to
-[project_description.md](project_description.md) (IO address space
-allocation, target hardware configs, the three operating modes) and
-[bus_access_design.md](bus_access_design.md) (why cycle-by-cycle sniffing
-doesn't fit this hardware).
+The C64→gpu64 command protocol over IO2: everything a C64 programmer needs
+to drive gpu64's framebuffer.
 
-Scope: milestone 4's 2D command set (clear/fill, pixel, line, rect, blit,
-palette, page flip) plus general-purpose math/matrix ops. Everything here
-executes synchronously, in the existing single core-0 bus-watch loop —
-immediate-mode dispatch, the same model `showTestPattern()` already proves
-on hardware. No independent render loop or second core is required for
-this scope; see milestone6_3d_design.md for where and why that changes.
+Implemented as of milestone 4, with one exception: **vblank is not
+available yet**. `VBLANK_ARM` with `ARG0 = 1` and `PAGE_FLIP` with
+`ARG0 = 1` both return `UNSUPPORTED`; `STATUS`'s vblank bits never set.
+Everything else on this page runs. See
+[progress_tracker.md](progress_tracker.md) for hardware test status.
 
-## Philosophy
+Why the protocol looks the way it does is in
+[milestone4_2d_api_design.md](milestone4_2d_api_design.md); status and
+hardware test results are in [progress_tracker.md](progress_tracker.md).
+Class 1 (3D) is specified in
+[milestone6_3d_design.md](milestone6_3d_design.md).
 
-- **IO2 carries commands only, never bulk payload.** A command that needs
-  data (e.g. a blit's source bytes) passes a *reference* — where the data
-  already lives (C64 RAM or REU) and how long it is — not the data itself
-  byte-by-byte through a register. gpu64 pulls the referenced bytes via a
-  DMA burst, the same technique milestone 3's mirror snapshot already
-  proved on hardware, just parameterized instead of hardcoded to screen RAM.
-- **A payload-carrying command causes one bounded DMA-held burst.** Per
-  [project_description.md](project_description.md#operating-modes), the C64
-  is never DMA-halted for anything but a brief burst, in any gpu64 mode.
-  The burst's duration is proportional to the payload's `len` — a known,
-  C64-computable cost, not an open-ended stall.
+---
 
-## Address space
+## Framebuffer
 
-Settled in [project_description.md](project_description.md#io-address-space-allocation):
-gpu64 owns **$DF0B–$DFFF, 245 bytes** of IO2. IO1 ($DE00–$DEFF) stays
-reserved/untouched (needed for target config #3, a real hardware REU sharing
-the bus). REU keeps $DF00–$DF0A.
+| Property | Value |
+|---|---|
+| Resolution | 320 x 200 |
+| Format | 8 bits per pixel — one byte per pixel, a palette index |
+| Page size | 64000 bytes |
+| Pages | 2 (front / back), hardware-swapped |
+| Palette | 256 entries, 24-bit RGB — any 256 colours out of 16.7M. Index 255 is reserved for the on-screen log. |
+| Origin | top-left, +y down |
+| Border | 32 px left/right, 36 px top/bottom, around the 320x200 surface |
 
-Implementation notes for widening the decode beyond REU's own:
+Draw ops write to the **draw page**; the **visible page** is what the HDMI
+output shows. Both are page 0 at reset, so a program that ignores paging
+draws straight to the visible screen. `SET_DRAW_PAGE` and `PAGE_FLIP` give
+you tear-free double buffering: draw the whole frame into the back page,
+then flip.
 
-- The *current* `reuUsingPolling()` dispatch masks `IO_ADDRESS & 0x1f` —
-  that's REU's own internal decode (11 registers fit in 5 bits), not a
-  hardware limit; the GPIO latch delivers the full 8-bit address. gpu64's
-  own dispatch must decode the full byte, not inherit that mask, or the
-  usable space silently shrinks to ~21 aliased addresses.
-- **Existing landmine on the read path**: `rad_reu.cpp`'s REU register read
-  handler indexes `((u8*)&reu.status)[addr]` with `addr` masked to 5 bits —
-  a read from anywhere in the gpu64 range as currently masked walks off the
-  end of `REUSTATE` and returns whatever's there. Widening the decode must
-  not inherit this; gpu64's own registers need their own bounds-checked read
-  path, not REU's.
-- Widening the write-side `switch(addr)` to a full 8 bits puts a bigger
-  jump table/compare chain inside the cycle-critical write path — keep it
-  branch-cheap.
+### Border
 
-## Memory model (this scope)
+Around the drawing surface is a **border**, exactly as on the C64: a frame
+32 pixels wide at the sides and 36 tall at top and bottom, which no draw op
+can reach and which `SET_BORDER` ($08) paints in one palette index. It is
+black at reset.
 
-Two source spaces for a DMA-referencing command:
+The border is a property of the display, not of a page, so `PAGE_FLIP` never
+changes it — set it once and it stays. That also means `SET_BORDER` is
+comparatively expensive: it repaints the frame on both pages. Set it when it
+changes, not once per frame.
 
-- **C64 RAM** — 64KB.
-- **REU** — up to 16MB, independent C64-side expansion memory. Not
-  RPi-resident; pulling from it costs a real DMA burst, same as C64 RAM.
+Coordinates are **signed 16-bit**. Drawing ops **clip** to the 320x200
+page — geometry partly or wholly offscreen is normal and never sets an
+error. `w`/`h` fields are unsigned 16-bit; a zero `w` or `h` is a no-op.
 
-The destination for this scope is always **the existing framebuffer**
-(the same `GPU_OUTPUT_BOX`-backed buffer `showTestPattern()`/`showMirror()`
-already draw into) — there is no persistent, ID-addressed GPU-side resource
-store yet. That's introduced in milestone6_3d_design.md alongside textures
-and meshes.
+At reset, palette entries 0–15 hold the standard C64 colours (indices match
+the C64's own colour numbering), 16–254 are black, and 255 is white. The
+framebuffer contents at reset are undefined — `CLEAR` first.
 
-**Decided**: a DMA read sees whatever C64 memory banking (`$01`) is in
-effect at the moment gpu64 samples it — same convention
-`gpu64_mirrorSnapshot()` already relies on to reach `$D800` colour RAM.
-There is no separate bank-select field. Revisit only if a concrete use case
-needs to read through a banking configuration other than the CPU's current
-one.
+### Index 255 and the on-screen log
 
-## Register map ($DF0B–$DFFF)
+gpu64 draws its own diagnostic log over your framebuffer in **palette index
+255**, one colour, glyph pixels only — the space around each glyph is left
+untouched, so whatever you drew shows through. The log is **on at reset**;
+turn it off with `LOG_ENABLE` ($07) once you don't want it.
 
-| Offset | Name | Dir | Purpose |
+Nothing stops you using index 255 as an ordinary drawing colour, or
+repointing it with `PAL_SET` — the log just draws in whatever colour that
+entry holds, and becomes invisible if you set it to match your background.
+
+## Register map
+
+gpu64 owns **$DF0B–$DFFF** in IO2. REU keeps $DF00–$DF0A; IO1
+($DE00–$DEFF) is untouched.
+
+| Address | Name | Dir | Purpose |
 |---|---|---|---|
-| $DF0B | `CMD_HI` | W | Class selector. **Sticky** — persists until changed, defaults to 0 (2D + math/system) on reset. Writing it alone triggers nothing. |
-| $DF0C | `CMD_LO` | W | Opcode within the current class; write triggers dispatch using whatever `ID`/`ARG` are currently staged |
-| $DF0D | `STATUS` | R | bit0 busy, bit1 error, bit2 vblank-pending, bit3 vblank-IRQ-armed, rest TBD |
-| $DF0E | `ERRCODE` | R | Set on error (`BAD_OPCODE`, `OUT_OF_RANGE`, ...); cleared on next successful `CMD_LO` |
-| $DF0F–$DF10 | `ID` | W | Resource ID, 16-bit — unused in this scope, reserved for milestone 6 |
-| $DF11–$DF20 | `ARG0`–`ARG15` | W | Generic 16-byte argument block, layout defined per-command (see below) |
-| $DF21–$DFFF | — | — | Reserved for growth |
+| $DF0B | `CMD_HI` | W | Class selector. **Sticky** — persists until changed, 0 at reset. Writing it alone triggers nothing. |
+| $DF0C | `CMD_LO` | W | Opcode within the current class. **Writing it fires the command**, using whatever `ID`/`ARG` are staged. |
+| $DF0D | `STATUS` | R | bit0 busy, bit1 error, bit2 vblank-pending, bit3 vblank-IRQ-armed |
+| $DF0E | `ERRCODE` | R | Result of the last dispatch (see [Error codes](#error-codes)) |
+| $DF0F–$DF10 | `ID` | W | Resource ID, 16-bit — unused in class 0, reserved for class 1 |
+| $DF11–$DF20 | `ARG0`–`ARG15` | W | 16-byte argument block, layout defined per opcode |
+| $DF21–$DFFF | — | — | Reserved |
 
-**Protocol**: write `CMD_HI` only when changing class (it persists — the
-common case, staying in class 0, never touches it again after the first
-write). Stage `ID`/`ARG` in any order, any number of writes, then a single
-`STA` to `CMD_LO` fires dispatch. Matches REU's own existing protocol shape
-in this firmware (stage address/length, then write `COMMAND` with the
-execute bit).
+### What a command costs the C64
 
-**Unknown opcode**: `CMD_LO` value with no defined meaning in the current
-class → `ERRCODE = BAD_OPCODE`, no dispatch, no DMA pull. Never silently
-ignored.
+**The write to `CMD_LO` halts the C64 until the command finishes.** gpu64
+holds the bus for the whole dispatch, exactly the way an REU transfer does,
+and the CPU resumes at the next instruction with nothing missed. You do not
+need to poll, wait, or space your writes out — staging `ARG` bytes and
+firing `CMD_LO` back to back always works.
 
-**`ARG`/`ID` staleness**: these registers are write-only with no implicit
-clear. Each opcode's spec (see Opcode table, TBD) must state exactly how
-many of its bytes it reads; core 0 must not read past that count. A command
-that reads more than its spec says would silently inherit bytes an earlier,
-unrelated command left behind — the same failure shape as the
-`gpu64ApiActive` bug (see progress_tracker.md's milestone 3 section) one
-register layer up. This is a hard requirement on the opcode table, not
-optional polish.
+The halt is bounded by the command's own work: a `SET_PIXEL` is trivial, a
+`CLEAR` writes 64000 bytes, a blit also moves its payload across the bus.
+Nothing is unbounded, and nothing else in the API halts the CPU for longer
+than a normal register access.
 
-### ARG block convention for DMA-referencing commands
+If you have raster-timed code running, treat a gpu64 command the way you
+would treat an REU transfer: it steals the cycles it needs.
 
-Not a fixed register layout — each command defines its own use of the 16
-`ARG` bytes — but a command that references a DMA payload (e.g. blit) uses
-a 6-byte **blob descriptor** shape within it:
+### Issuing a command
+
+1. Write `CMD_HI` **only when changing class**. Staying in class 0 (the
+   normal case) means never writing it after the first time.
+2. Stage `ARG` bytes in any order, any number of writes.
+3. Write `CMD_LO` — this dispatches.
+4. Optionally read `ERRCODE`.
+
+`ARG` registers are write-only and are **not** cleared between commands.
+Every opcode reads exactly the byte count listed in its table row and never
+looks past it, so leftovers from a previous command cannot leak in — but
+that also means you must stage every byte an opcode reads, every time.
+
+Class 0 commands complete before the `CMD_LO` write returns, except a
+vblank-deferred `PAGE_FLIP`. Poll `STATUS` bit0 (busy) if you used one.
+
+### Blob descriptor
+
+Bulk data never crosses the register window byte-by-byte. A command that
+needs data passes a 6-byte **blob descriptor** — where the bytes already
+live — and gpu64 fetches them itself:
 
 | Bytes | Field | Purpose |
 |---|---|---|
-| 1 | space | 0 = C64 RAM, 1 = REU |
-| 3 | addr | 24-bit offset within that space (covers REU's full 16MB; C64 RAM just uses the low 16 bits) |
-| 2 | len | byte count (max 65535 — plenty for this scope: a 320x200 framebuffer is 64000 bytes, an 80x50 PETSCII screen is 4000) |
+| 1 | `space` | 0 = C64 RAM, 1 = REU |
+| 3 | `addr` | 24-bit offset in that space (C64 RAM uses the low 16 bits) |
+| 2 | `len` | byte count, max 65535 |
 
-**Decided**: `len = 0` is a no-op (not an error). `addr + len` exceeding the
-source space's size is `ERRCODE = OUT_OF_RANGE` — no silent clamping or
-wraparound (unlike REU's own legacy wrap behavior, which gpu64 has no
-compatibility reason to replicate).
+Multi-byte fields are little-endian (low byte first), as a 6502 expects.
 
-A single-blob command (e.g. a blit) uses one descriptor (6 bytes), leaving
-10 bytes for command-specific fields (destination x/y, width/height, ...).
-Commands needing more than one blob (mesh upload, etc.) are out of this
-scope — see milestone6_3d_design.md.
+The same descriptor is also used as a **destination**: commands that produce
+data (`GET_INFO`, `READ_RECT`, every math op) don't return it through a
+register window — they write it back into the memory you point them at, and
+the write lands before the `CMD_LO` write returns. So a matrix multiply is
+"here are the two operands, here is where the result goes", and you read the
+result straight out of your own RAM.
 
-## Cycle-predictability
+- `len = 0` is a no-op, not an error.
+- `addr + len` past the end of the space → `OUT_OF_RANGE`. No clamping, no
+  wraparound.
+- The fetch sees whatever memory banking (`$01`) is in effect at that
+  moment. There is no bank-select field.
+- Cost: the transfer's time is proportional to `len` — a 64000-byte blit
+  costs more than a 256-byte one, and a command with both a source and a
+  destination pays for both. See "What a command costs the C64" below.
 
-Core 0's write handler must never do anything with *unbounded* or
-*contention-dependent* latency — no allocation, no blocking locks, no
-unbounded cache work. A DMA pull's cost scales with payload length, which
-is a known, C64-computable cost — not the kind of unpredictability being
-avoided here.
+#### Compact descriptor
 
-The destination framebuffer region a blit writes into needs the same cache
-handling `showMirror()` already does for its rows (explicit clean after
-writing, not relying on eventual eviction) — cache state at the
-*destination*, not just the source pull, affects how long a burst actually
-takes.
+Math opcodes use a 4-byte **compact descriptor** instead — `space` (1) plus
+24-bit `addr` (3), with no `len`, because the byte count is already implied
+by the operand's dimensions and element size. Bounds are checked against
+that computed count exactly as if you had written it out.
 
-## vblank signaling
+## Class 0 opcodes — 2D, system, math
 
-Confirmed available and already proven on this hardware: `IRQ_OUT`/`bIRQ_OUT`
-is a real GPIO line into the CBTD3861 transceiver, and REU's own emulation
-already drives it (`rad_reu.cpp:605,618`) for REU's completion-interrupt
-feature. gpu64 reuses the same mechanism for vblank:
+Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
+`ARG0` ($DF11). "Bytes" is exactly how many `ARG` bytes the opcode reads.
 
-- `STATUS.vblank-pending` bit for simple polling (BASIC-friendly, no IRQ
-  handler needed).
-- An IRQ pulse on vblank, gated by a C64-settable "arm" bit
-  (`STATUS.vblank-IRQ-armed`), for programs that want a real interrupt
-  instead of polling.
+### System — $00–$0F
 
-**Decided: stays armed, auto-rearms.** Like a raster IRQ, the handler
-acknowledges on entry; re-arming automatically for the next frame avoids
-needing an explicit re-arm write every frame. A C64-settable disarm (back to
-polling, or off entirely) stays available.
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $00 | `NOP` | 0 | — | Nothing. Liveness probe: sets `ERRCODE = OK`. |
+| $01 | `RESET_STATE` | 0 | — | `ERRCODE = OK`, vblank IRQ disarmed, vblank-pending cleared, draw page = visible page = 0. Leaves framebuffer contents and palette alone. |
+| $02 | `VBLANK_ARM` | 1 | `ARG0`: 0 = disarm, 1 = arm | Arms the auto-rearming vblank IRQ. Reflected in `STATUS` bit3. **Arming returns `UNSUPPORTED` in this build.** |
+| $03 | `VBLANK_ACK` | 0 | — | Clears `STATUS` bit2 (vblank-pending). Poll-loop programs write this after seeing the bit; IRQ handlers write it on entry. |
+| $04 | `SET_DRAW_PAGE` | 1 | `ARG0`: 0 or 1 | Selects the page subsequent draw ops write to. |
+| $05 | `PAGE_FLIP` | 1 | `ARG0`: 0 = now, 1 = at next vblank | Makes the draw page visible and the old visible page the draw page. With `ARG0 = 1` the swap happens at the next vblank and `STATUS` bit0 (busy) stays set until it lands — **`ARG0 = 1` returns `UNSUPPORTED` in this build**; the immediate flip works. |
+| $06 | `GET_INFO` | 6 | `ARG0-5` destination descriptor | Writes the 16-byte info block (see below) to your memory. `len` must be ≥ 16. |
+| $07 | `LOG_ENABLE` | 1 | `ARG0`: 0 = off, 1 = on | Shows or hides gpu64's on-screen log overlay. On at reset. |
+| $08 | `SET_BORDER` | 1 | `ARG0`: palette index | Paints the border around the drawing surface. Black at reset. See [Border](#border). |
 
-## Opcode space
+### Whole surface — $10–$1F
 
-`CMD_HI` selects the class: 0 = 2D + math/matrix + system (this scope), 1 =
-3D (milestone6_3d_design.md), 2+ reserved for later (e.g. a future WiFi
-API). 256 opcodes per class.
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $10 | `CLEAR` | 1 | `ARG0`: colour index | Fills the entire draw page. |
 
-**Class 0 — 2D + math + system** (minimum viable set, carried over from
-progress_tracker.md): clear/fill, set pixel, line, rect (filled/outline),
-blit-by-reference, palette select, page flip; vector/matrix ops (add,
-multiply, transform, inverse, ...); status/error queries.
+### Primitives — $20–$2F
 
-Math/matrix ops live in class 0 rather than getting their own class — likely
-used every frame (camera/transform updates once milestone 6 exists), so
-they belong alongside 2D on the register C64 code will write to most.
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $20 | `SET_PIXEL` | 5 | `ARG0-1` x, `ARG2-3` y, `ARG4` colour | One pixel. |
+| $21 | `LINE` | 9 | `ARG0-1` x0, `ARG2-3` y0, `ARG4-5` x1, `ARG6-7` y1, `ARG8` colour | Line, both endpoints inclusive. |
+| $22 | `RECT` | 9 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` w, `ARG6-7` h, `ARG8` colour | 1-pixel outline; `x,y` is the top-left corner, `w`/`h` include the outline. |
+| $23 | `RECT_FILL` | 9 | as `$22` | Filled rectangle. |
 
-To fill in next: full opcode table, one row per command, with its exact
-`ARG` byte layout and the byte count core 0 must enforce (see the ARG
-staleness requirement above) — texture-adjacent commands wait for
-milestone 6, but the pure-2D set above should get its table next.
+### Palette — $30–$3F
 
-## Open questions
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $30 | `PAL_SET` | 4 | `ARG0` index, `ARG1` r, `ARG2` g, `ARG3` b | Sets one entry from 24-bit RGB. |
+| $31 | `PAL_LOAD` | 8 | `ARG0-5` blob descriptor, `ARG6` first index, `ARG7` count | Fetches `count` RGB triples into entries `first .. first+count-1`. `count = 0` is a no-op. `len` must equal `count * 3` and `first + count` must be ≤ 256, else `BAD_ARGS`. |
 
-1. Full class-0 opcode table — exact `ARG` layout and enforced byte count
-   per command.
-2. `ERRCODE` enum — needs the opcode table to enumerate against.
+### Blit — $40–$4F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $40 | `BLIT` | 14 | `ARG0-5` blob descriptor, `ARG6-7` dstX, `ARG8-9` dstY, `ARG10-11` w, `ARG12-13` h | Fetches `w * h` bytes of 8bpp palette indices, row-major with stride `w`, into the draw page at `dstX,dstY`. Clipped like any drawing op. `len` must equal `w * h`, else `BAD_ARGS`. |
+| $41 | `BLIT_KEYED` | 15 | as `$40`, plus `ARG14` key index | Same, but source pixels equal to `key` leave the destination untouched — the sprite case. |
+| $42 | `READ_RECT` | 14 | `ARG0-5` destination descriptor, `ARG6-7` srcX, `ARG8-9` srcY, `ARG10-11` w, `ARG12-13` h | The reverse of `BLIT`: copies a `w * h` rectangle of the **draw page** back into your memory, row-major with stride `w`. The rectangle must lie entirely within the page (this one does **not** clip) else `BAD_ARGS`; `len` must equal `w * h`. |
+
+### Info block
+
+`GET_INFO` writes 16 bytes:
+
+| Offset | Size | Contents |
+|---|---|---|
+| 0 | 3 | `"G64"` |
+| 3 | 1 | API version, major |
+| 4 | 1 | API version, minor |
+| 5 | 2 | framebuffer width (320) |
+| 7 | 2 | framebuffer height (200) |
+| 9 | 1 | bits per pixel (8) |
+| 10 | 1 | number of pages (2) |
+| 11 | 1 | bitmap of implemented classes: bit0 = class 0, bit1 = class 1 (3D) |
+| 12 | 1 | border width, each side (32) |
+| 13 | 1 | border height, each side (36) |
+| 14 | 2 | reserved, written as zero |
+
+## Matrix and vector ops — $80–$9F
+
+Two parallel sets of the same operations, differing only in element format:
+
+- **$80–$8F — fixed point.** Elements are signed 16-bit **8.8** fixed point,
+  little-endian: `$0100` = 1.0, `$FF00` = −1.0, `$0080` = 0.5. Range
+  ±127.99, resolution 1/256. **2 bytes per element.** Products accumulate at
+  full width and come back to 8.8 **rounded half away from zero and
+  saturated** — a value past the range clamps to ±127.99 rather than
+  wrapping.
+- **$90–$9F — floating point.** Elements are 32-bit IEEE 754 single
+  precision, little-endian. **4 bytes per element.**
+
+Layouts are identical between the two sets; only the implied byte counts
+differ. The low nibble picks the operation, so `$80`/`$90` are both
+`MAT_MUL`, `$81`/`$91` both `MAT_ADD`, and so on.
+
+Matrices are **row-major**, dimensions are given as bytes 1–255, and
+operands are addressed with the 4-byte [compact descriptor](#compact-descriptor)
+— no `len`, since dimensions and element size imply it. A dimension of 0 is
+`BAD_ARGS`; an operand or result running past the end of its space, or a
+result larger than 65535 bytes, is `OUT_OF_RANGE`.
+
+Results are written back to the memory the destination descriptor points at,
+before the `CMD_LO` write returns. Source and destination may be in
+different spaces (compute from REU, write back to C64 RAM). Overlapping
+source and destination is undefined.
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $80 / $90 | `MAT_MUL` | 15 | `ARG0` m, `ARG1` k, `ARG2` n, `ARG3-6` A, `ARG7-10` B, `ARG11-14` C | C(m x n) = A(m x k) · B(k x n) |
+| $81 / $91 | `MAT_ADD` | 14 | `ARG0` m, `ARG1` n, `ARG2-5` A, `ARG6-9` B, `ARG10-13` C | C = A + B, elementwise, all m x n |
+| $82 / $92 | `MAT_SUB` | 14 | as `$81` | C = A − B |
+| $83 / $93 | `MAT_SCALE` | 12 fixed / 14 float | `ARG0` m, `ARG1` n, `ARG2-5` A, `ARG6-9` C, then the scalar inline: `ARG10-11` (8.8) or `ARG10-13` (float) | C = A · scalar |
+| $84 / $94 | `MAT_TRANSPOSE` | 10 | `ARG0` m, `ARG1` n, `ARG2-5` A, `ARG6-9` C | C(n x m) = A(m x n) transposed |
+| $85 / $95 | `MAT_IDENTITY` | 5 | `ARG0` n, `ARG1-4` C | C(n x n) = identity |
+| $86 / $96 | `MAT_INVERSE` | 9 | `ARG0` n, `ARG1-4` A, `ARG5-8` C | C = A⁻¹ (n x n), **n ≤ 64** (larger is `BAD_ARGS`). A singular matrix sets `SINGULAR` and writes nothing. The elimination runs in double precision whatever the element format is, so an 8.8 operand keeps its precision through the inversion. |
+
+A vector is just a matrix with one row or one column: transforming a
+4-vector by a 4x4 matrix is `MAT_MUL` with m=4, k=4, n=1, and transforming
+a batch of vertices is the same call with n = however many. Every dimension
+is a single byte, so a batch is at most 255 vertices per call — split larger
+sets across calls, advancing the operand and result addresses.
+
+Everything not listed above — including $A0–$FF — is undefined: writing it
+sets `ERRCODE = BAD_OPCODE` and does nothing else.
+
+## vblank
+
+**Not implemented in this build** — see the note at the top. The design is:
+
+Two ways to sync to the display, both driven by the same signal:
+
+- **Polling**: read `STATUS` bit2. Set at each vblank, cleared by
+  `VBLANK_ACK`. No IRQ handler needed — usable from BASIC.
+- **Interrupt**: `VBLANK_ARM` with `ARG0 = 1` raises the cartridge IRQ line
+  once per vblank. It stays armed and re-arms itself, like a raster IRQ —
+  acknowledge with `VBLANK_ACK` on handler entry. `VBLANK_ARM` with
+  `ARG0 = 0` returns to polling.
+
+## Error codes
+
+`ERRCODE` is written by **every** dispatch, including successful ones, so a
+stale value can never be mistaken for a fresh failure. `STATUS` bit1 is
+simply `ERRCODE != OK`.
+
+| Value | Name | Meaning |
+|---|---|---|
+| $00 | `OK` | Success. |
+| $01 | `BAD_OPCODE` | No such opcode in the current class. |
+| $02 | `BAD_CLASS` | `CMD_HI` selects a class this firmware doesn't implement. |
+| $03 | `OUT_OF_RANGE` | A blob descriptor's `addr + len` runs past the end of its space, or `space` isn't 0 or 1. |
+| $04 | `BAD_ARGS` | Arguments inconsistent for an otherwise valid opcode: `len` not matching `w * h` or `count * 3`, a page or flag byte outside its defined values, a palette range past 256, a matrix dimension of 0, a `READ_RECT` rectangle outside the page. |
+| $05 | `SINGULAR` | `MAT_INVERSE` on a matrix with no inverse. Nothing was written to the destination. |
+| $06 | `UNSUPPORTED` | Defined here but not implemented by this firmware build — currently everything vblank-related. |
+
+A failed dispatch does nothing: no drawing, no data fetch, no state change.
+
+## Examples
+
+Clear the screen to blue (index 6), then draw a filled white box:
+
+```asm
+CMD_LO  = $df0c
+ARG0    = $df11
+
+        lda #6
+        sta ARG0
+        lda #$10        ; CLEAR
+        sta CMD_LO
+
+        lda #<100
+        sta ARG0
+        lda #>100
+        sta ARG0+1      ; x = 100
+        lda #<50
+        sta ARG0+2
+        lda #>50
+        sta ARG0+3      ; y = 50
+        lda #<80
+        sta ARG0+4
+        lda #>80
+        sta ARG0+5      ; w = 80
+        lda #<40
+        sta ARG0+6
+        lda #>40
+        sta ARG0+7      ; h = 40
+        lda #1
+        sta ARG0+8      ; colour = white
+        lda #$23        ; RECT_FILL
+        sta CMD_LO
+```
+
+Blit a 32x32 sprite from C64 RAM at $C000 into the back page, then flip on
+vblank:
+
+```asm
+        lda #0
+        sta ARG0        ; space = C64 RAM
+        lda #$00
+        sta ARG0+1
+        lda #$c0
+        sta ARG0+2
+        lda #$00
+        sta ARG0+3      ; addr = $00c000
+        lda #<1024
+        sta ARG0+4
+        lda #>1024
+        sta ARG0+5      ; len = 32*32
+        ; dstX, dstY, w, h in ARG6..ARG13 ...
+        lda #$40        ; BLIT
+        sta CMD_LO
+
+        lda #1
+        sta ARG0
+        lda #$05        ; PAGE_FLIP at next vblank
+        sta CMD_LO
+```
+
+Multiply a 4x4 matrix at $2000 by a 4x1 vector at $2040, both 8.8 fixed
+point, leaving the transformed vector at $2080 — all in C64 RAM:
+
+```asm
+        lda #4
+        sta ARG0        ; m = 4
+        sta ARG0+1      ; k = 4
+        lda #1
+        sta ARG0+2      ; n = 1
+
+        lda #0
+        sta ARG0+3      ; A: space = C64 RAM
+        lda #$00
+        sta ARG0+4
+        lda #$20
+        sta ARG0+5
+        lda #$00
+        sta ARG0+6      ; A: addr = $002000
+
+        lda #0
+        sta ARG0+7      ; B: space = C64 RAM
+        lda #$40
+        sta ARG0+8
+        lda #$20
+        sta ARG0+9
+        lda #$00
+        sta ARG0+10     ; B: addr = $002040
+
+        lda #0
+        sta ARG0+11     ; C: space = C64 RAM
+        lda #$80
+        sta ARG0+12
+        lda #$20
+        sta ARG0+13
+        lda #$00
+        sta ARG0+14     ; C: addr = $002080
+
+        lda #$80        ; MAT_MUL, 8.8 fixed point
+        sta CMD_LO      ; result is in $2080..$2087 when this returns
+```
+
+The float32 version is the same code with `#$90` in the last `lda` — and
+16 bytes of result instead of 8.

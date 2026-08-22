@@ -46,7 +46,7 @@ extern void strupr( char *d, char *s );
 #define ROMH_ACCESS			(!(g2 & bROMH))
 #define CPU_RESET			(!(g2&bRESET_OUT)) 
 
-// gpu64: m_Serial is brought up FIRST, before m_Screen/anything else that can
+// gpu64: m_Serial is brought up FIRST, before the framebuffer/anything else that can
 // fail, so the earliest possible boot log reaches GPIO14/15 -- this is the
 // Tier 1 (bare RPi + UART) debug channel from docs/hw_testing.md. Note that
 // gpioInit() below reprograms GPIO14/15 to their cartridge-latch ALT
@@ -63,7 +63,7 @@ extern void strupr( char *d, char *s );
 #define STANDARD_SETUP_TIMER_INTERRUPT_CYCLECOUNTER_GPIO										\
 	boolean bOK = TRUE;																			\
 	if ( bOK ) bOK = m_Serial.Initialize( 115200 );												\
-	if ( bOK ) bOK = m_Screen.Initialize();														\
+	if ( bOK ) bOK = m_Gpu64FB.Initialize();														\
 	if ( bOK ) { 																				\
 		bOK = m_Logger.Initialize( &m_TeeLog ); 												\
 	}																							\

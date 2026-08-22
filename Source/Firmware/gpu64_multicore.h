@@ -23,6 +23,35 @@
 #include <circle/memory.h>
 #include <circle/types.h>
 
+// gpu64: multicore feasibility test matrix (2026-08-22, see
+// docs/milestone6_3d_design.md and docs/progress_tracker.md). Two
+// independent toggles so each hardware round isolates one variable:
+//
+//   GPU64_MULTICORE_ENABLED         -- calls CMultiCoreSupport::Initialize()
+//                                       at all (rad_main.h). Off = secondary
+//                                       cores stay parked in the armstub's
+//                                       own spin table, Circle's multicore
+//                                       machinery (CSpinLock::Enable(),
+//                                       interrupt-routing rewrite, each
+//                                       secondary's EnableMMU()/EnableIRQs())
+//                                       never runs at all.
+//   GPU64_MULTICORE_STRESS_ENABLED  -- within Run(), whether secondary
+//                                       cores actually stream the stress
+//                                       buffers, vs. returning immediately
+//                                       (-> halt()/WFI, not a busy-spin).
+//                                       Only meaningful if the above is on.
+//
+// Rounds so far: both off (clean menu, baseline) -- both on (VIC-II garbage
+// before the menu is even reachable) -- ENABLED on/STRESS off (clean menu:
+// bring-up alone is not the cause, see milestone6_3d_design.md). Both left
+// off by default below: milestone 4 doesn't need multicore, so the resting
+// state stays the plain, fully-proven single-core build. Toggle by hand for
+// whichever round milestone 6 picks this back up with; not wired into
+// tools/build.sh, deliberately, since these are throwaway diagnostic
+// builds, not a shipping configuration.
+// #define GPU64_MULTICORE_ENABLED
+// #define GPU64_MULTICORE_STRESS_ENABLED
+
 // gpu64: multicore feasibility spike for milestone 6 (see
 // docs/milestone6_3d_design.md's "Architecture: a second core for the
 // render loop" section) -- NOT the real render loop.

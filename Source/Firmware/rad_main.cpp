@@ -53,6 +53,7 @@ u64 armCycleCounter;
 
 // GeoRAM
 #include "rad_georam.h"
+#include "gpu64_api.h"
 
 // VSF
 u8 vsf[ 17 * 1024 * 1024 ] = {0};
@@ -77,6 +78,22 @@ void warmCache()
 	extern void gpu64_mirrorSnapshot( void );
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_mirrorSnapshot, 1024 * 2 );
 	FORCE_READ_LINEARa( (void*)gpu64_mirrorSnapshot, 1024 * 2, 65536 );
+
+	// gpu64: milestone 4's blob transfers are in the same position -- called
+	// from inside the polling loop, not covered by its preload window, and
+	// per-byte cycle-critical once the burst starts.
+	extern u8 gpu64_blobRead( u8, u32, u32, u8 * );
+	extern u8 gpu64_blobWrite( u8, u32, u32, const u8 * );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobRead, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_blobRead, 1024 * 2, 65536 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobWrite, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_blobWrite, 1024 * 2, 65536 );
+
+	// gpu64: the API register file is touched inline from the polling loop
+	// on every ARG write and every STATUS/ERRCODE read (see GPU64REGS in
+	// gpu64_api.h), so it wants the same treatment REUSTATE gets above.
+	CACHE_PRELOAD_DATA_CACHE( &gpu64Regs, sizeof( GPU64REGS ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64Regs, sizeof( GPU64REGS ), sizeof( GPU64REGS ) * 8 );
 }
 
 void warmCacheGeoRAM()
@@ -222,89 +239,48 @@ u32 temperature;
 	} while ( !done );
 
 
-// gpu64: draw a checkerboard test pattern directly into m_Screen's already-
-// initialized framebuffer (proven working by the fact CRAD::Initialize()
-// returned TRUE), scaled to whatever resolution it actually negotiated.
+// gpu64: checkerboard test pattern, now drawn straight into gpu64's own
+// 320x200x8 framebuffer as palette indices (it used to compute COLOR16
+// values into CScreenDevice's framebuffer -- see gpu64_fb.h for why that
+// arrangement is gone).
 void CRAD::showTestPattern( void )
 {
-	unsigned wFull = m_Screen.GetWidth();
-	unsigned hFull = m_Screen.GetHeight();
-
-	// gpu64: confined to the reserved top-left box (see tee_device.h) so the
-	// pattern never collides with the HDMI on-screen log below it.
-	unsigned w = min( wFull, (unsigned)GPU_OUTPUT_BOX_W );
-	unsigned h = min( hFull, (unsigned)GPU_OUTPUT_BOX_H );
-
 	// gpu64: this is called both once at boot and again on every C64-side
-	// trigger ($DF0B write, see rad_reu.cpp) -- with an identical pattern
-	// each time, a real hardware tester has no way to tell a fresh trigger
-	// from the leftover boot-time draw just by looking at the screen (this
-	// came up during hw testing: the log line "showTestPattern: drawing..."
-	// was the only real proof a trigger fired). callCount inverts which
-	// squares are lit vs. black on alternating calls, and gets logged, so
-	// each invocation is visibly distinct on screen as well as in the log.
+	// trigger, so alternating the pattern is what makes a real trigger
+	// visibly distinguishable from the leftover boot-time draw.
 	static unsigned callCount = 0;
 	callCount++;
 	boolean bInvert = ( callCount & 1 ) == 0;
 
-	logger->Write( "gpu64", LogNotice, "showTestPattern: drawing %ux%u (screen %ux%u), call #%u%s", w, h, wFull, hFull, callCount, bInvert ? " (inverted)" : "" );
+	logger->Write( "gpu64", LogNotice, "showTestPattern: call #%u%s", callCount, bInvert ? " (inverted)" : "" );
 
-	for ( unsigned y = 0; y < h; y++ )
+	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
+	if ( p == 0 )
+		return;
+	unsigned nPitch = m_Gpu64FB.GetPitch();
+
+	for ( unsigned y = 0; y < GPU64_FB_HEIGHT; y++ )
 	{
-		for ( unsigned x = 0; x < w; x++ )
+		for ( unsigned x = 0; x < GPU64_FB_WIDTH; x++ )
 		{
 			boolean bLit = ( ( x / 20 ) + ( y / 20 ) ) & 1;
 			if ( bInvert )
 				bLit = !bLit;
-			if ( !bLit )
-			{
-				m_Screen.SetPixel( x, y, BLACK_COLOR );
-				continue;
-			}
-			// rainbow gradient across the lit squares, cycling through the
-			// full 15-bit RGB565-ish COLOR16 range
-			u8 r = (u8)( ( x * 31 ) / w );
-			u8 g = (u8)( ( y * 31 ) / h );
-			u8 b = (u8)( ( ( x + y ) * 31 / ( w + h ) ) );
-			m_Screen.SetPixel( x, y, COLOR16( r, g, b ) );
+			// Cycle through the 16 C64 colours the reset palette holds --
+			// nothing here needs the other 240 entries.
+			p[ (size_t)y * nPitch + x ] = bLit ? (u8)( 1 + ( ( x / 20 + y / 20 ) % 15 ) ) : 0;
 		}
 	}
 
-	// The CPU writes above only land in cache until explicitly cleaned to
-	// DRAM -- the GPU/HVS scans out framebuffer memory directly and isn't
-	// cache-coherent with the ARM core, so without this the display just
-	// keeps showing whatever was there before (black), no matter what
-	// SetPixel() does.
-	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
-	CleanDataCacheRange( (u64)(uintptr)pFB->GetBuffer(), pFB->GetSize() );
-
+	m_Gpu64FB.CleanPage( m_Gpu64FB.GetDrawPage() );
 }
 
 // gpu64: only one CRAD is ever constructed (see main() below); g_pRAD is set
 // from its constructor (rad_main.h). This wrapper lets rad_reu.cpp's bus-hijack
-// loop trigger the pattern from the C64 side (IO2 $DF0B write) without pulling
-// in rad_main.h's full Circle/screen include stack -- see the forward
-// declaration in rad_reu.cpp.
+// loop trigger the pattern from the C64 side without pulling in rad_main.h's
+// full Circle/screen include stack -- see the forward declaration in
+// rad_reu.cpp.
 CRAD *g_pRAD = nullptr;
-
-// gpu64: diagnostic-only counter + log helper, called from
-// gpu64_mirrorSnapshot() (rad_reu.cpp) right before it grabs the DMA burst
-// -- see the comment there. Counts calls so the log line makes it obvious
-// this is actually firing repeatedly, not just once.
-// gpu64: one line the first time the mirror polls, then silence. Logging every
-// snapshot (two lines, four times a second) filled the whole log column in
-// about fifteen seconds, and each line is real work inside the polling loop --
-// glyph rendering via SetPixel plus a cache clean -- for no benefit once the
-// mirror is known to be running.
-void gpu64_logMirrorSnapshotStart( void )
-{
-	static u8 logged = 0;
-	if ( !logged )
-	{
-		logged = 1;
-		logger->Write( "gpu64", LogNotice, "mirror: first snapshot" );
-	}
-}
 
 void gpu64_showTestPattern( CRAD *pRAD )
 {
@@ -312,55 +288,29 @@ void gpu64_showTestPattern( CRAD *pRAD )
 		pRAD->showTestPattern();
 }
 
-// gpu64: standard C64 16-color palette (Pepto's commonly-used values, 8-bit
-// per channel here; showMirror() below shifts down to the 5-bit-per-channel
-// range COLOR16() expects). Not read from hardware -- color RAM only ever
-// stores a 4-bit index (0-15) into this fixed, well-known palette, there's
-// nothing to sniff.
-static const u8 c64Palette[ 16 ][ 3 ] = {
-	{   0,   0,   0 },		// 0 black
-	{ 255, 255, 255 },		// 1 white
-	{ 104,  55,  43 },		// 2 red
-	{ 112, 164, 178 },		// 3 cyan
-	{ 111,  61, 134 },		// 4 purple
-	{  88, 141,  67 },		// 5 green
-	{  53,  40, 121 },		// 6 blue
-	{ 184, 199, 111 },		// 7 yellow
-	{ 111,  79,  37 },		// 8 orange
-	{  67,  57,   0 },		// 9 brown
-	{ 154, 103,  89 },		// 10 light red
-	{  68,  68,  68 },		// 11 dark grey
-	{ 108, 108, 108 },		// 12 grey
-	{ 154, 210, 132 },		// 13 light green
-	{ 108,  94, 181 },		// 14 light blue
-	{ 149, 149, 149 },		// 15 light grey
-};
-
 // gpu64: extern rather than #include "font.h" -- that header is a raw
 // generated .bin-to-array dump with no include guard and no `extern`,
 // designed for exactly one translation unit (rad_hijack.cpp already includes
 // it) to own the storage; including it a second time here would duplicate
 // the 4KB array and fail to link. font_bin only gets mutated as menu-logo
-// scratch space during the earlier hijack/menu phase (see tee_device.h's
-// comment on why CHDMIConsole avoids it for that reason) -- by the time
+// scratch space during the earlier hijack/menu phase -- by the time
 // showMirror() runs (during REU emulation, a later phase), that mutation is
 // long done and font_bin is stable to read from.
 extern unsigned char font_bin[ 4096 ];
 
+// gpu64: milestone 3 screen mirror, rendering into the 8bpp framebuffer.
+//
+// This got simpler with milestone 4's display change rather than harder: the
+// C64's 40x25 text at 8x8 pixels per glyph is exactly 320x200, so the mirror
+// is now a 1:1 fit with no upscaling at all (it used to draw at 2x into a
+// COLOR16 framebuffer), and colour RAM's 4-bit values index palette entries
+// 0-15 directly, since the reset palette *is* the C64 palette.
 void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 background )
 {
-	unsigned wFull = m_Screen.GetWidth();
-	unsigned hFull = m_Screen.GetHeight();
-
-	// 40x25 text cells @ 8x8 pixels = 320x200, doubled to 640x400 to fill
-	// most of the reserved GPU_OUTPUT_BOX (700x460, see tee_device.h) --
-	// same box showTestPattern() draws into, since the two are mutually
-	// exclusive at any given moment.
-	const unsigned scale = 2;
-	unsigned w = min( wFull, (unsigned)( 320 * scale ) );
-	unsigned h = min( hFull, (unsigned)( 200 * scale ) );
-
-	TScreenColor bgCol = COLOR16( c64Palette[ background ][ 0 ] >> 3, c64Palette[ background ][ 1 ] >> 3, c64Palette[ background ][ 2 ] >> 3 );
+	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
+	if ( p == 0 )
+		return;
+	unsigned nPitch = m_Gpu64FB.GetPitch();
 
 	for ( unsigned cy = 0; cy < 25; cy++ )
 	{
@@ -369,43 +319,26 @@ void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 backgrou
 			unsigned cellIdx = cy * 40 + cx;
 			u8 code = screen[ cellIdx ];
 			const u8 *glyph = &font_bin[ (unsigned)code * 8 ];
-			TScreenColor fgCol = COLOR16( c64Palette[ color[ cellIdx ] ][ 0 ] >> 3, c64Palette[ color[ cellIdx ] ][ 1 ] >> 3, c64Palette[ color[ cellIdx ] ][ 2 ] >> 3 );
+			u8 fg = color[ cellIdx ] & 15;
 
 			for ( unsigned gy = 0; gy < 8; gy++ )
 			{
 				u8 rowBits = glyph[ gy ];
-				unsigned py = ( cy * 8 + gy ) * scale;
-				if ( py >= h )
-					continue;
-
+				u8 *pDst = p + (size_t)( cy * 8 + gy ) * nPitch + cx * 8;
 				for ( unsigned gx = 0; gx < 8; gx++ )
-				{
-					boolean bLit = ( rowBits & ( 0x80 >> gx ) ) != 0;
-					TScreenColor col = bLit ? fgCol : bgCol;
-					unsigned px = ( cx * 8 + gx ) * scale;
-					if ( px >= w )
-						continue;
-
-					for ( unsigned sy = 0; sy < scale; sy++ )
-						for ( unsigned sx = 0; sx < scale; sx++ )
-							m_Screen.SetPixel( px + sx, py + sy, col );
-				}
+					pDst[ gx ] = ( rowBits & ( 0x80 >> gx ) ) ? fg : background;
 			}
 		}
 	}
 
-	// same cache-clean requirement as showTestPattern() -- SetPixel() writes
-	// only land in cache until explicitly cleaned to DRAM.
-	//
-	// gpu64: only the rows actually drawn, not the whole framebuffer. At
-	// 1824x984x2 a full clean is ~3.6MB per snapshot, four times a second,
-	// all of it spent outside reuUsingPolling()'s loop with the C64
-	// free-running -- a needlessly long window in which no bus access is
-	// being serviced. The mirror only ever touches rows 0..h.
-	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
-	u32 nPitch = pFB->GetPitch();
-	u64 nBuffer = (u64)(uintptr)pFB->GetBuffer();
-	CleanDataCacheRange( nBuffer, h * nPitch );
+	// $D020 now has somewhere to go: the framebuffer carries a real border
+	// around the 320x200 surface (see GPU64_BORDER_W in gpu64_fb.h). Only
+	// repaint it when it actually changed -- SetBorder() touches both pages
+	// and cleans them, which is far more work than the snapshot itself.
+	if ( border != m_Gpu64FB.GetBorder() )
+		m_Gpu64FB.SetBorder( border );
+
+	m_Gpu64FB.CleanPage( m_Gpu64FB.GetDrawPage() );
 }
 
 // gpu64: same free-function indirection as gpu64_showTestPattern() above --

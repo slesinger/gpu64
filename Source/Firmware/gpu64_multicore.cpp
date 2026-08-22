@@ -31,7 +31,17 @@ void CGpu64MultiCore::Run( unsigned nCore )
 	if ( nCore == 0 )
 		return;	// core 0's real work is CRAD::Run(), called separately
 
+	// gpu64: GPU64_MULTICORE_STRESS_ENABLED toggles only this branch, never
+	// whether the stress buffers are linked/sized (see s_StressBuffer
+	// above, unconditional) -- per design review, changing the linked BSS
+	// layout between test variants would itself be a confound, since RAD's
+	// bus timing is layout-sensitive. This build variant (bring-up-only
+	// control, see rad_main.h's GPU64_MULTICORE_ENABLED comment) leaves
+	// secondary cores parked here -- per Circle's multicore.cpp, returning
+	// from Run() takes the core to halt() (WFI), not a busy-spin.
+	#ifdef GPU64_MULTICORE_STRESS_ENABLED
 	StressLoop( nCore );
+	#endif
 }
 
 void CGpu64MultiCore::StressLoop( unsigned nCore )
