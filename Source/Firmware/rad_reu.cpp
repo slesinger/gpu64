@@ -39,13 +39,22 @@ void gpu64_showTestPattern( CRAD *pRAD );
 void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border, u8 background );
 
 // gpu64: set once a C64 program engages the gpu64 API -- currently that's
-// just milestone 2's test-pattern trigger at $DF0B, see the IO2_ACCESS
-// switch below. Per docs/bus_access_design.md, screen-mirror mode and
+// just milestone 2's test-pattern trigger at $DF0B (and, since IO_ADDRESS is
+// masked to 5 bits same as REU's own partial IO2 decode, really any of
+// $DF0B/$DF2B/$DF4B/$DF6B/$DF8B/$DFAB/$DFCB/$DFEB -- any program that scans
+// or fills across IO2, e.g. an REU-detection utility, can trip this
+// incidentally). Per docs/bus_access_design.md, screen-mirror mode and
 // framebuffer-API mode are mutually exclusive: once true, the periodic
-// mirror snapshot in reuUsingPolling()'s main loop stops firing. Nothing
-// currently clears it back to false -- milestone 4's real command API will
-// need to define an explicit "back to mirror" exit; this is provisional
-// until then.
+// mirror snapshot in reuUsingPolling()'s main loop stops firing.
+//
+// Cleared in resetREU() below (called on every fresh entry into REU
+// emulation) rather than never, per a real-hardware hang this caused: once
+// set, it stayed set for the rest of the RPi's power-on session -- a PRG
+// that genuinely tripped it once (deliberately or, per the aliasing above,
+// by accident) silently disarmed the mirror for every REU session
+// afterwards, with zero on-screen indication why. milestone 4's real
+// command API may want its own, more deliberate "back to mirror" exit
+// eventually; resetting on resetREU() is the simple fix for now.
 u8 gpu64ApiActive = 0;
 
 u32 REU_SIZE_KB = 1024;
@@ -62,6 +71,10 @@ static volatile u8 forceRead;
 
 void resetREU()
 {
+	// gpu64: see the comment on gpu64ApiActive's declaration above -- this
+	// is what actually clears it now.
+	gpu64ApiActive = 0;
+
 	reu.irqRelease = 0;
 
     reu.irqTriggered = 0;

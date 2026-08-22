@@ -545,6 +545,16 @@ void CRAD::Run( void )
 
 		res = hijackC64( false );			// after hijackC64 the CPU is still halted by DMA
 
+		// gpu64: diagnostic -- the stretch between here and reuUsingPolling()
+		// starting up had no logging at all, which made a real hardware hang
+		// (found to be gpu64ApiActive getting stuck at 1, see resetREU() in
+		// rad_reu.cpp) indistinguishable from several other silent-forever
+		// possibilities (WAIT_FOR_READY_PROMPT never seeing "READY.",
+		// startForcedResetVectors()'s unbounded loop, dirscan.cpp's
+		// already-marked-file re-launch trap). This one line at least proves
+		// hijackC64() returned and shows what it decided.
+		logger->Write( "gpu64", LogNotice, "Run: hijackC64 returned res=%d radLaunchPRG=%d radLaunchVSF=%d", res, (int)radLaunchPRG, (int)radLaunchVSF );
+
 		WAIT_FOR_CPU_HALFCYCLE
 		WAIT_FOR_VIC_HALFCYCLE
 		RESTART_CYCLE_COUNTER
@@ -664,6 +674,18 @@ void CRAD::Run( void )
 			FORCE_READ_LINEARa( (void*)reuUsingPolling, 1024 * 7, 65536 );
 
 			resetREU();
+
+			// gpu64: diagnostic, see the "hijackC64 returned" log above --
+			// this is the last thing logged before reuUsingPolling() takes
+			// over for good (it only logs again once the mirror poll or the
+			// $DF0B trigger fires). gpu64ApiActive is logged specifically
+			// because it used to get stuck at 1 from a previous session (see
+			// resetREU() in rad_reu.cpp, now cleared there too) -- if this
+			// ever prints 1 again right after a fresh resetREU(), that fix
+			// regressed.
+			extern u8 gpu64ApiActive;
+			logger->Write( "gpu64", LogNotice, "Run: entering reuUsingPolling, gpu64ApiActive=%d", (int)gpu64ApiActive );
+
 			reuUsingPolling();
 		} else
 		///////////////////////////////////////////////////////////////////////
