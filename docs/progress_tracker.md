@@ -161,9 +161,10 @@ than peeking the C64's real char ROM -- which the CPU can't see when it's
 banked out anyway -- plus a hardcoded standard C64 16-color palette (Pepto's
 commonly-used values), since color RAM only ever stores a 4-bit palette
 index, nothing to sniff there. `gpu64ApiActive` (set by the existing $DF0B
-trigger) gates the poll off once a program engages the gpu64 API; nothing
-currently clears it back, since milestone 4's real command API doesn't exist
-yet to define that exit.
+trigger) gates the poll off once a program engages the gpu64 API.
+**Now cleared in `resetREU()`** (see the hardware-test writeup below) rather
+than never -- milestone 4's real command API may eventually want a more
+deliberate exit, but "clear on every fresh REU session" is the fix for now.
 
 Real risk flagged, not yet resolved: `gpu64_mirrorSnapshot()` is a
 substantial new function called from inside `reuUsingPolling()`'s
@@ -193,6 +194,36 @@ selected throughout this session, regardless of the 1MB size configured or
 an image being mounted. Not yet re-tested with `meType` confirmed on REU --
 this is genuinely still the first real test of whether the mirror fires on
 hardware at all.
+
+**Follow-up test with `meType` confirmed REU still showed zero log lines,
+for over a minute.** This ruled out the `meType` theory and the poll-interval
+being merely slow, and turned out to be a real bug, root-caused with an
+Opus advisor pass after two wrong guesses: `gpu64ApiActive` (see above) was
+sticky forever, never cleared, and an earlier `launcher.prg` run in the same
+power-on session had almost certainly already latched it -- silently
+disarming the mirror for every REU session afterward, including the
+`gpu64_mirror_probe.prg` test, with no on-screen indication why. Worth
+noting: `IO_ADDRESS`'s 5-bit mask (`& 0x1f`, same partial decode REU's own
+real registers use) means gpu64's trigger isn't only `$DF0B` -- $DF2B,
+$DF4B, $DF6B, $DF8B, $DFAB, $DFCB, and $DFEB all alias onto it too, so an
+REU-detection utility scanning IO2 could trip it by accident, not just a
+deliberate trigger PRG. Fixed by clearing `gpu64ApiActive` in `resetREU()`.
+Two log lines were also added closing the previously-totally-dark stretch
+between `hijackC64()` returning and `reuUsingPolling()` starting (that gap
+had zero logging at all, which is what made this indistinguishable from
+several other silent-forever possibilities without static tracing --
+`WAIT_FOR_READY_PROMPT` never seeing "READY.", `startForcedResetVectors()`'s
+unbounded loop, dirscan.cpp's already-marked-file re-launch trap). Not yet
+re-verified on hardware after this fix -- next hardware session should
+confirm the mirror actually fires now.
+
+**Separate, unexplained finding from the same session, not yet
+investigated:** the C64's own native video (not HDMI) showed garbage after
+sitting idle in RAD's menu for a few minutes. Unlikely to be caused by any
+of gpu64's changes -- the menu-idle loop never reaches `reuUsingPolling()`,
+which is the only place this session's code runs -- but not confirmed
+either way, and not previously known to be pre-existing RAD behavior.
+Logged here so it isn't lost; needs its own investigation.
 
 ## 4. Basic 2D GPU API
 
