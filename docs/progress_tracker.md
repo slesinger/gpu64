@@ -176,6 +176,24 @@ below might make everything less stable"). A separate, smaller preload for
 `gpu64_mirrorSnapshot` was added alongside it, sized by guesswork
 (1024*2 bytes) -- unverified.
 
+**Hardware test session (2026-08-22) found a real hardware-testing gap, not
+a code bug:** neither `gpu64_mirrorSnapshot: starting burst` nor
+`showMirror: drew ...` appeared at all, even at a fresh boot with nothing
+else running, and independently a memory-test utility failed to detect an
+REU at all -- both symptoms traced to RAD's main menu having a `meType`
+state (0=REU, 1=GeoRAM, 2=None), toggled by the **`T`** key, that's
+completely separate from the REU *size* setting (`+`/`-`, `meSize0`) and
+from whether a `.reu` image is mounted. Whichever `meType` is selected
+decides which of `RUN_MEMEXP+1/+2/+3` a launch takes (see `CRAD::Run()` in
+rad_main.cpp) -- only `meType==0` (REU) ever reaches `reuUsingPolling()` at
+all; `meType==2` (None) is RAD's "no memory expansion" path (releases DMA,
+C64 free-runs, no bus-watching code active whatsoever, matches the
+already-known milestone 2 gap) and was apparently the state actually
+selected throughout this session, regardless of the 1MB size configured or
+an image being mounted. Not yet re-tested with `meType` confirmed on REU --
+this is genuinely still the first real test of whether the mirror fires on
+hardware at all.
+
 ## 4. Basic 2D GPU API
 
 Design and implement the first version of the C64→gpu64 command protocol over the IO1 register window from milestone 2. Minimum viable set:
