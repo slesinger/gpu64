@@ -429,11 +429,25 @@ CRAD *g_pRAD = nullptr;
 // gpu64_mirrorSnapshot() (rad_reu.cpp) right before it grabs the DMA burst
 // -- see the comment there. Counts calls so the log line makes it obvious
 // this is actually firing repeatedly, not just once.
+// Throttled: at 4 snapshots/sec, logging every one filled the whole log column
+// in about fifteen seconds and buried everything else, and each line is real
+// work inside the polling loop (glyph rendering via SetPixel plus a cache
+// clean). One line every GPU64_MIRROR_LOG_EVERY snapshots is enough to show
+// the poll is alive; the heartbeat square and the ACT LED cover the
+// per-snapshot case without touching the log at all.
+#define GPU64_MIRROR_LOG_EVERY	40
+
 static unsigned gpu64_mirrorSnapshotStartCount = 0;
 void gpu64_logMirrorSnapshotStart( void )
 {
 	gpu64_mirrorSnapshotStartCount++;
-	logger->Write( "gpu64", LogNotice, "gpu64_mirrorSnapshot: starting burst #%u", gpu64_mirrorSnapshotStartCount );
+	if ( ( gpu64_mirrorSnapshotStartCount % GPU64_MIRROR_LOG_EVERY ) == 1 )
+		logger->Write( "gpu64", LogNotice, "gpu64_mirrorSnapshot: starting burst #%u", gpu64_mirrorSnapshotStartCount );
+}
+
+unsigned gpu64_mirrorSnapshotCount( void )
+{
+	return gpu64_mirrorSnapshotStartCount;
 }
 
 void gpu64_showTestPattern( CRAD *pRAD )
@@ -569,7 +583,12 @@ void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 backgrou
 	if ( hbY + GPU64_MARK_SIZE <= hFull )
 		CleanDataCacheRange( nBuffer + hbY * nPitch, GPU64_MARK_SIZE * nPitch );
 
-	logger->Write( "gpu64", LogNotice, "showMirror: drew 40x25 snapshot (border=%u bg=%u)", border, background );
+	// throttled for the same reason as the "starting burst" line -- see
+	// GPU64_MIRROR_LOG_EVERY above. Kept in step with that counter so the two
+	// lines still appear as a pair for whichever snapshot does get logged.
+	extern unsigned gpu64_mirrorSnapshotCount( void );
+	if ( ( gpu64_mirrorSnapshotCount() % GPU64_MIRROR_LOG_EVERY ) == 1 )
+		logger->Write( "gpu64", LogNotice, "showMirror: drew 40x25 snapshot (border=%u bg=%u)", border, background );
 }
 
 // gpu64: same free-function indirection as gpu64_showTestPattern() above --

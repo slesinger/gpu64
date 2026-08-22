@@ -122,6 +122,17 @@ private:
 		for ( unsigned y = y0; y < y0 + m_nCharH && y < hFull; y++ )
 			for ( unsigned x = HDMI_LOG_X0; x < wFull; x++ )
 				m_pScreen->SetPixel( x, y, BLACK_COLOR );
+
+		// Clean here rather than relying on Write()'s range: the gap row
+		// NewLine() clears sits outside the rowStart..rowEnd span Write()
+		// knows about, so it would otherwise stay dirty in cache and never
+		// reach the scanned-out DRAM.
+		CBcmFrameBuffer *pFB = m_pScreen->GetFrameBuffer();
+		u32 nPitch = pFB->GetPitch();
+		unsigned yLines = m_nCharH;
+		if ( y0 + yLines > hFull )
+			yLines = hFull - y0;
+		CleanDataCacheRange( (u64)(uintptr)( pFB->GetBuffer() + y0 * nPitch ), yLines * nPitch );
 	}
 
 	void NewLine( void )
@@ -131,6 +142,21 @@ private:
 		if ( m_nRows && m_CurRow >= m_nRows )
 			m_CurRow = 0;
 		ClearRow( m_CurRow );
+
+		// Clear one row *ahead* of the write head as well. The column is a
+		// ring, not a scrolling console, so once it has filled once the
+		// newest line sits immediately above the oldest one with nothing to
+		// separate them -- which reads exactly like a frozen log, and was in
+		// fact reported as one on hardware ("it does not roll over again from
+		// the top"). The blank gap makes the wrap point visible, so a live
+		// log is obviously live.
+		if ( m_nRows )
+		{
+			unsigned gap = m_CurRow + 1;
+			if ( gap >= m_nRows )
+				gap = 0;
+			ClearRow( gap );
+		}
 	}
 
 	void WriteChar( char c )
