@@ -1,2 +1,5 @@
 # Circle SDK checkout + build output, fetched/rebuilt by tools/build.sh
 /external/
+
+# generated per-build by tools/build.sh (stamped into the boot log)
+/Source/Firmware/build_id.h
