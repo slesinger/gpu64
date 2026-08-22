@@ -120,7 +120,61 @@ the gpu64 command API, snapshot polling stops entirely.
 
 - Scope: standard text mode only (40x25, one character set, border/background/multicolor text-mode nuances deferred to milestone 5).
 - Needs VIC bank detection (CIA2 $DD00) and screen/charset pointers (VIC $D018) as part of each snapshot, not just the power-on default addresses -- see bus_access_design.md's open questions for polling rate and DMA-burst sizing.
-- **Also needs to subsume milestone 2's trigger handler out of `reuUsingPolling()`:** confirmed on real hardware that the $DF0B trigger only works today when REU emulation happens to be separately active, because that's the only loop currently watching IO2 while DMA is held. A standalone gpu64 watch loop (cheap IO2-only decode + passthrough, no REU-specific register/prefetch logic) needs to exist independent of REU emulation for milestone 4's command API to work when no REU is selected -- this is naturally the same loop milestone 3's periodic snapshot polling needs, so implement them together.
+- **Also needs to subsume milestone 2's trigger handler out of `reuUsingPolling()`:** confirmed on real hardware that the $DF0B trigger only works today when REU emulation happens to be separately active, because that's the only loop currently watching IO2 while DMA is held. A standalone gpu64 watch loop (cheap IO2-only decode + passthrough, no REU-specific register/prefetch logic) needs to exist independent of REU emulation for milestone 4's command API to work when no REU is selected -- this is naturally the same loop milestone 3's periodic snapshot polling needs, so implement them together. **Explicitly deferred again for this first cut** (see below) -- REU-active is being kept as a hard precondition for now, by the user's own choice, rather than doing that refactor yet.
+
+**First implementation done, not yet hardware-verified.** Deployment target
+for this cut, per discussion: (1) C64 Ultimate with its own built-in REU --
+RAD's own REU emulation switched off, gpu64 alone answers $DF0B-$DFFF
+alongside the Ultimate's software REU at $DF00-$DF0A (config #2 in
+project_description.md); (2) a plain C64 with RAD supplying both REU and
+gpu64 (config #1). Config #3 (expansion-port multiplier + a separate real
+REU cartridge) is intentionally not a target right now. The Ultimate side of
+this is unverified on real hardware -- deliberately deferred until both
+modes work in some fundamental way on the bench, since the user doesn't want
+to repeatedly unbox/reseat the Ultimate for incremental testing.
+
+Scope decisions made for this cut (both deliberate simplifications, not
+oversights):
+- **Fixed default addresses only** -- $0400 screen RAM, $D800 color RAM,
+  $D020/$D021 border/background. No CIA2 $DD00 / VIC $D018 detection yet, so
+  a program that relocates its screen before ever touching gpu64 will render
+  wrong. Can be added later without changing the rendering path.
+- **Fixed-iteration-count poll timer**, not the adaptive
+  "only-poll-when-nothing-else-is-contending" idea floated during design
+  discussion (parked for a later stage) -- a counter inside
+  `reuUsingPolling()`'s existing per-cycle loop
+  (`gpu64MirrorPollCounter`/`GPU64_MIRROR_POLL_INTERVAL` in rad_reu.cpp)
+  triggers a snapshot burst every N passes. N is a placeholder (~1M, guessed
+  at ~1 poll/second) that needs empirical tuning on real hardware, same as
+  this file's other WAIT_CYCLE_*/TIMING_* constants.
+
+Implementation: [`gpu64_mirrorSnapshot()`](../Source/Firmware/rad_reu.cpp)
+grabs a brief DMA burst -- the same `CLR_GPIO(bDMA_OUT)` +
+`DMA_READBYTE_P1..P3` cycle-stealing technique REU's own Store/Fetch
+transfers already use in handle_transfer.h, not a new kind of bus takeover --
+to read 1000 bytes screen RAM + 1000 bytes color RAM + border/background,
+then hands them to [`CRAD::showMirror()`](../Source/Firmware/rad_main.cpp)
+for rendering into the same `GPU_OUTPUT_BOX` milestone 2's test pattern uses
+(the two are mutually exclusive at any moment, see `gpu64ApiActive`).
+Rendering uses gpu64's own bundled character ROM copy (`font_bin`) rather
+than peeking the C64's real char ROM -- which the CPU can't see when it's
+banked out anyway -- plus a hardcoded standard C64 16-color palette (Pepto's
+commonly-used values), since color RAM only ever stores a 4-bit palette
+index, nothing to sniff there. `gpu64ApiActive` (set by the existing $DF0B
+trigger) gates the poll off once a program engages the gpu64 API; nothing
+currently clears it back, since milestone 4's real command API doesn't exist
+yet to define that exit.
+
+Real risk flagged, not yet resolved: `gpu64_mirrorSnapshot()` is a
+substantial new function called from inside `reuUsingPolling()`'s
+cycle-critical loop but isn't covered by that function's own 7KB
+instruction-cache preload window in `warmCache()` -- an icache miss
+mid-burst could blow the per-byte DMA timing the same way an uncached
+`reuUsingPolling()` itself would (this file's own comment: "cache preloading
+is the most crucial part of emulating a REU on a RPi -- changing anything
+below might make everything less stable"). A separate, smaller preload for
+`gpu64_mirrorSnapshot` was added alongside it, sized by guesswork
+(1024*2 bytes) -- unverified.
 
 ## 4. Basic 2D GPU API
 

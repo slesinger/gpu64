@@ -36,6 +36,17 @@
 class CRAD;
 extern CRAD *g_pRAD;
 void gpu64_showTestPattern( CRAD *pRAD );
+void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border, u8 background );
+
+// gpu64: set once a C64 program engages the gpu64 API -- currently that's
+// just milestone 2's test-pattern trigger at $DF0B, see the IO2_ACCESS
+// switch below. Per docs/bus_access_design.md, screen-mirror mode and
+// framebuffer-API mode are mutually exclusive: once true, the periodic
+// mirror snapshot in reuUsingPolling()'s main loop stops firing. Nothing
+// currently clears it back to false -- milestone 4's real command API will
+// need to define an explicit "back to mirror" exit; this is provisional
+// until then.
+u8 gpu64ApiActive = 0;
 
 u32 REU_SIZE_KB = 1024;
 
@@ -248,6 +259,87 @@ __attribute__( ( always_inline ) ) inline void reuPrefetchW( u32 reu_addr )
 }
 
 
+// gpu64: milestone 3 default-state screen mirror -- global rather than
+// stack-local since reuUsingPolling() below is a cycle-critical,
+// register-heavy function and these are too big to want living on its stack.
+static u8 gpu64MirrorScreen[ 1000 ];
+static u8 gpu64MirrorColor[ 1000 ];
+static u8 gpu64MirrorBorder = 0, gpu64MirrorBackground = 0;
+
+// gpu64: how often (in reuUsingPolling() main-loop passes, roughly one C64
+// CPU cycle each) to grab a mirror snapshot. Placeholder -- needs empirical
+// tuning on real hardware, same as this file's other WAIT_CYCLE_*/TIMING_*
+// constants; picked to be roughly once a second assuming ~1 pass/cycle at
+// ~1MHz, unverified.
+#define GPU64_MIRROR_POLL_INTERVAL 1000000
+
+// gpu64: milestone 3 screen mirror. Grabs a brief DMA burst -- the same
+// CLR_GPIO(bDMA_OUT)/DMA_READBYTE_P1..P3 cycle-stealing technique REU's own
+// Store/Fetch transfers already use in handle_transfer.h, not a new kind of
+// bus takeover -- to read the default screen RAM ($0400-$07E7) and color RAM
+// ($D800-$DBE7), plus the current border/background color ($D020/$D021),
+// then hands them to CRAD::showMirror() (rad_main.cpp) for rendering.
+// Scoped per docs/bus_access_design.md: fixed default addresses only (no VIC
+// bank / $D018 detection yet -- a program that relocates its screen will
+// render wrong until that's added), standard text mode only, and gpu64's own
+// bundled character ROM copy (font_bin, see rad_main.cpp) rather than
+// peeking the C64's real char ROM -- which the CPU can't see when it's
+// banked out anyway, and font_bin is only ever mutated by the menu's logo
+// code during the earlier hijack/menu phase, not while this runs.
+//
+// __attribute__ set to match reuUsingPolling() below (same file, same
+// reasoning: this file's cache-preloading/alignment choices are load-bearing
+// for cycle-precise timing, see the comment above reuLoad32() usage in
+// reuUsingPolling()'s tail). Needs its own instruction-cache preload before
+// first use -- see warmCache() in rad_main.cpp -- since it's called from
+// inside reuUsingPolling() but isn't covered by that function's own preload
+// window.
+__attribute__( ( optimize( "align-functions=256" ) ) )
+__attribute__( ( section( "section_polling" ) ) )
+void gpu64_mirrorSnapshot()
+{
+	register u32 g2;
+	register u16 c_a;
+	register u8 x;
+
+	WAIT_FOR_VIC_HALFCYCLE
+	RESTART_CYCLE_COUNTER
+	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
+	CLR_GPIO( bDMA_OUT );
+
+	for ( u16 i = 0; i < 1000; i++ )
+	{
+		c_a = 0x0400 + i;
+		DMA_READBYTE_P1( c_a );
+		DMA_READBYTE_P2();
+		DMA_READBYTE_P3( x, false );
+		gpu64MirrorScreen[ i ] = x;
+	}
+
+	for ( u16 i = 0; i < 1000; i++ )
+	{
+		c_a = 0xD800 + i;
+		DMA_READBYTE_P1( c_a );
+		DMA_READBYTE_P2();
+		DMA_READBYTE_P3( x, false );
+		gpu64MirrorColor[ i ] = x & 0x0F;
+	}
+
+	c_a = 0xD020;
+	DMA_READBYTE_P1( c_a );
+	DMA_READBYTE_P2();
+	DMA_READBYTE_P3( x, false );
+	gpu64MirrorBorder = x & 0x0F;
+
+	c_a = 0xD021;
+	DMA_READBYTE_P1( c_a );
+	DMA_READBYTE_P2();
+	DMA_READBYTE_P3( x, true );		// last byte: release DMA back to the C64
+	gpu64MirrorBackground = x & 0x0F;
+
+	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground );
+}
+
 #if 1
 __attribute__( ( optimize( "align-functions=256" ) ) )
 __attribute__( ( section( "section_polling" ) ) )
@@ -255,6 +347,9 @@ u8 reuUsingPolling( int step )
 {
 	register u32 g2 = bBUTTON, g3;
 	register u16 resetCount = 0;
+	// gpu64: counts main-loop passes toward the next mirror snapshot -- see
+	// gpu64_mirrorSnapshot() and GPU64_MIRROR_POLL_INTERVAL above.
+	register u32 gpu64MirrorPollCounter = 0;
 
 	u16 ipl = 0;
 
@@ -298,6 +393,16 @@ reuEmulationMainLoop:
 
 		if ( BUTTON_PRESSED )
 			return 2;
+
+		// gpu64: default-state screen mirror (milestone 3) -- time-based, not
+		// IO2-access-based, so this fires independent of whatever the C64
+		// program is doing this cycle. Stops entirely once a program engages
+		// the gpu64 API (see gpu64ApiActive above).
+		if ( !gpu64ApiActive && ++gpu64MirrorPollCounter >= GPU64_MIRROR_POLL_INTERVAL )
+		{
+			gpu64MirrorPollCounter = 0;
+			gpu64_mirrorSnapshot();
+		}
 
 		SET_GPIO( bDIR_Dx );
 		WAIT_FOR_CPU_HALFCYCLE
@@ -366,7 +471,10 @@ reuEmulationMainLoop:
 						// timing. See docs/project_description.md's IO
 						// address space allocation section.
 						if ( addr == 0x0B )
+						{
+							gpu64ApiActive = 1;
 							gpu64_showTestPattern( g_pRAD );
+						}
 						break;
 					case 0x00:
 						break;

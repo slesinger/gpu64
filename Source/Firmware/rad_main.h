@@ -111,6 +111,14 @@ public:
 	// rad_reu.cpp) can reach it via g_pRAD, not just CRAD::Run() itself.
 	void showTestPattern( void );
 
+	// gpu64: milestone 3 default-state screen mirror -- renders a 40x25 text
+	// snapshot (screen codes + 4-bit color nibbles + border/background) taken
+	// by gpu64_mirrorSnapshot() (rad_reu.cpp) into the same reserved
+	// GPU_OUTPUT_BOX showTestPattern() uses; the two are mutually exclusive
+	// at any given moment (see gpu64ApiActive in rad_reu.cpp). screen/color
+	// are each 1000 bytes (40*25), row-major.
+	void showMirror( const u8 *screen, const u8 *color, u8 border, u8 background );
+
 private:
 	static void FIQHandler( void *pParam );
 

@@ -66,6 +66,16 @@ void warmCache()
 
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, 1024 * 7 );
 	FORCE_READ_LINEARa( (void*)reuUsingPolling, 1024 * 7, 65536 );
+
+	// gpu64: gpu64_mirrorSnapshot() is called from inside reuUsingPolling()'s
+	// cycle-critical loop but is a separate function, so it isn't covered by
+	// the preload above -- an instruction-cache miss mid-burst could blow the
+	// per-byte DMA_READBYTE timing the same way an uncached reuUsingPolling()
+	// itself would. Size is a guess (matches geoRAMUsingPolling's below);
+	// unverified on real hardware.
+	extern void gpu64_mirrorSnapshot( void );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_mirrorSnapshot, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_mirrorSnapshot, 1024 * 2, 65536 );
 }
 
 void warmCacheGeoRAM()
@@ -298,6 +308,105 @@ void gpu64_showTestPattern( CRAD *pRAD )
 {
 	if ( pRAD )
 		pRAD->showTestPattern();
+}
+
+// gpu64: standard C64 16-color palette (Pepto's commonly-used values, 8-bit
+// per channel here; showMirror() below shifts down to the 5-bit-per-channel
+// range COLOR16() expects). Not read from hardware -- color RAM only ever
+// stores a 4-bit index (0-15) into this fixed, well-known palette, there's
+// nothing to sniff.
+static const u8 c64Palette[ 16 ][ 3 ] = {
+	{   0,   0,   0 },		// 0 black
+	{ 255, 255, 255 },		// 1 white
+	{ 104,  55,  43 },		// 2 red
+	{ 112, 164, 178 },		// 3 cyan
+	{ 111,  61, 134 },		// 4 purple
+	{  88, 141,  67 },		// 5 green
+	{  53,  40, 121 },		// 6 blue
+	{ 184, 199, 111 },		// 7 yellow
+	{ 111,  79,  37 },		// 8 orange
+	{  67,  57,   0 },		// 9 brown
+	{ 154, 103,  89 },		// 10 light red
+	{  68,  68,  68 },		// 11 dark grey
+	{ 108, 108, 108 },		// 12 grey
+	{ 154, 210, 132 },		// 13 light green
+	{ 108,  94, 181 },		// 14 light blue
+	{ 149, 149, 149 },		// 15 light grey
+};
+
+// gpu64: extern rather than #include "font.h" -- that header is a raw
+// generated .bin-to-array dump with no include guard and no `extern`,
+// designed for exactly one translation unit (rad_hijack.cpp already includes
+// it) to own the storage; including it a second time here would duplicate
+// the 4KB array and fail to link. font_bin only gets mutated as menu-logo
+// scratch space during the earlier hijack/menu phase (see tee_device.h's
+// comment on why CHDMIConsole avoids it for that reason) -- by the time
+// showMirror() runs (during REU emulation, a later phase), that mutation is
+// long done and font_bin is stable to read from.
+extern unsigned char font_bin[ 4096 ];
+
+void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 background )
+{
+	unsigned wFull = m_Screen.GetWidth();
+	unsigned hFull = m_Screen.GetHeight();
+
+	// 40x25 text cells @ 8x8 pixels = 320x200, doubled to 640x400 to fill
+	// most of the reserved GPU_OUTPUT_BOX (700x460, see tee_device.h) --
+	// same box showTestPattern() draws into, since the two are mutually
+	// exclusive at any given moment.
+	const unsigned scale = 2;
+	unsigned w = min( wFull, (unsigned)( 320 * scale ) );
+	unsigned h = min( hFull, (unsigned)( 200 * scale ) );
+
+	TScreenColor bgCol = COLOR16( c64Palette[ background ][ 0 ] >> 3, c64Palette[ background ][ 1 ] >> 3, c64Palette[ background ][ 2 ] >> 3 );
+
+	for ( unsigned cy = 0; cy < 25; cy++ )
+	{
+		for ( unsigned cx = 0; cx < 40; cx++ )
+		{
+			unsigned cellIdx = cy * 40 + cx;
+			u8 code = screen[ cellIdx ];
+			const u8 *glyph = &font_bin[ (unsigned)code * 8 ];
+			TScreenColor fgCol = COLOR16( c64Palette[ color[ cellIdx ] ][ 0 ] >> 3, c64Palette[ color[ cellIdx ] ][ 1 ] >> 3, c64Palette[ color[ cellIdx ] ][ 2 ] >> 3 );
+
+			for ( unsigned gy = 0; gy < 8; gy++ )
+			{
+				u8 rowBits = glyph[ gy ];
+				unsigned py = ( cy * 8 + gy ) * scale;
+				if ( py >= h )
+					continue;
+
+				for ( unsigned gx = 0; gx < 8; gx++ )
+				{
+					boolean bLit = ( rowBits & ( 0x80 >> gx ) ) != 0;
+					TScreenColor col = bLit ? fgCol : bgCol;
+					unsigned px = ( cx * 8 + gx ) * scale;
+					if ( px >= w )
+						continue;
+
+					for ( unsigned sy = 0; sy < scale; sy++ )
+						for ( unsigned sx = 0; sx < scale; sx++ )
+							m_Screen.SetPixel( px + sx, py + sy, col );
+				}
+			}
+		}
+	}
+
+	// same cache-clean requirement as showTestPattern() -- SetPixel() writes
+	// only land in cache until explicitly cleaned to DRAM.
+	CBcmFrameBuffer *pFB = m_Screen.GetFrameBuffer();
+	CleanDataCacheRange( (u64)(uintptr)pFB->GetBuffer(), pFB->GetSize() );
+
+	logger->Write( "gpu64", LogNotice, "showMirror: drew 40x25 snapshot (border=%u bg=%u)", border, background );
+}
+
+// gpu64: same free-function indirection as gpu64_showTestPattern() above --
+// lets rad_reu.cpp's gpu64_mirrorSnapshot() reach CRAD::showMirror() without
+// pulling in the full Circle/screen include stack.
+void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border, u8 background )
+{
+	if ( pRAD )
+		pRAD->showMirror( screen, color, border, background );
 }
 
 void CRAD::Run( void )
