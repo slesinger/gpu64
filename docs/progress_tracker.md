@@ -559,6 +559,29 @@ during 4b's bring-up:
   carrying a second, larger font. The call still alternates lit/flat so a
   C64-side trigger stays distinguishable from the boot-time draw.
 
+### The bring-up logs are gone (2026-08-23)
+
+Verified on hardware in the same round that re-confirmed 4d, build
+`e5aef200`. Every breadcrumb that earlier milestones' bring-up left behind
+was removed: helpers.h's two `boot:` lines (milestone 2's silent-hang hunt),
+`initHijack:`'s two, `showTestPattern`'s call counter, and
+`Run: entering reuUsingPolling, gpu64ApiActive=%d` -- whose sticky-flag bug
+is long fixed and recorded. What stays is what a bench round actually reads:
+the **build id** (the stale-firmware tripwire that cost three test rounds in
+milestone 3), the vsync period, and the `LOG_ENABLE` flip stats.
+
+One removal was not cosmetic. The multicore spike's liveness check ran
+*unguarded* in `CRAD::Run()` while the spike itself was compiled out, so it
+could only ever print zeroes -- and it sat between the
+`CACHE_PRELOAD_INSTRUCTION_CACHE( reuUsingPolling )` above it and the
+`reuUsingPolling()` call below, where its `DELAY( 1 << 24 )` plus the
+logger's own framebuffer work evicted exactly the lines that preload exists
+to fill. It is now under `#ifdef GPU64_MULTICORE_STRESS_ENABLED` rather than
+deleted, so milestone 6 keeps it. Because that changes what executes inside a
+cycle-critical setup window -- the one where every milestone 4 bring-up bug
+lived -- it was benched rather than assumed: C64 rows 2 and 3 both `0100`,
+`ERRCODE` 0.
+
 ## 4d. The page flip without the mailbox round trip
 
 **Status: done, verified on hardware 2026-08-23.** The deferred flip's hold
@@ -580,6 +603,11 @@ case, paid by the *next command* outside the frame boundary, which is exactly
 what the split was for. `fast` (not `SLOW`) with `s=0` means the async path
 stayed armed for all 256 flips; the drain never came close to its 50 ms
 timeout. First try, no bring-up bugs.
+
+**Reproduced 2026-08-23** on build `e5aef200` (the log-cleanup build, above):
+`h=0/0/1 us` again, `wait n=256 0/28/906 us s=0`. Two independent runs
+agreeing to the microsecond on the number that matters is what makes this
+result trustworthy rather than a lucky round.
 
 ### The problem 4b left behind
 
@@ -698,6 +726,823 @@ while parking it, and hold whenever it restarts:
 Broaden bus sniffing beyond milestone 3's default text mode: bitmap mode, multicolor mode, sprites (position, shape, color, priority/collision registers), raster IRQ timing, smooth scrolling (fine-scroll X/Y registers), and VIC bank switching via CIA2. Goal: gpu64 can mirror what real C64 demos/games already do on VIC-II without any code changes on the C64 side, by watching $D000–$D02E and the relevant RAM.
 
 - Reference implementation: port/adapt VIC-II rendering logic from VICE (see [project_description.md](project_description.md)) rather than re-deriving it from the datasheet.
+
+## 6a. The multicore load ladder
+
+**Status: eight rounds run on hardware 2026-08-23; round 9 staged. Round 8
+found the bug that has been corrupting this experiment since round 1 --
+false sharing between core 1's mailbox and core 0's hottest cache line.**
+Rounds 1-3 made the instrument trustworthy in the obvious ways. Round 4 found
+that 4 MB/s from core 1 costs core 0 bus cycles. Round 5 appeared to settle
+the mechanism -- 450 MB/s into a cache-resident set free, 3 MB/s into a
+streaming one fatal. Round 6 ruled out non-temporal stores. Rounds 7 and 8
+then contradicted round 5, including on the idle rung where core 1 is asleep,
+and that contradiction turned out to be the real finding: **core 1's rung
+mailbox shared a cache line with the threshold core 0 reads on every pass, so
+core 1 invalidated core 0's hot line a thousand times a second in every rung.
+Rounds 4-6 were clean by link-layout luck.** Every quantitative result before
+round 9 has to be re-taken.
+
+### Round 1: the instrument was the fault
+
+Symptom: the bar swept to about mid-screen, with many frames drawing it at
+the *wrong vertical position*; the C64's own screen showed `G64` briefly,
+then a rectangle of noise, then the machine dropped back to the RAD menu. A
+repeat run failed the same way but sooner -- the bar barely left the left
+edge.
+
+**The result is void, and one number says so: it failed inside rung 0.** The
+bar advances one pixel per frame, so mid-screen is ~160 frames, ~3.2
+seconds, and rung 0 runs for four. Core 1 writes **zero bytes** in rung 0.
+Whatever broke, it was not the DRAM contention this milestone exists to
+measure.
+
+What it actually was, and it is entirely my own: **core 1's throttle polled
+`read32( ARM_SYSTIMER_CLO )` in a tight spin.** The BCM system timer is MMIO
+on the VideoCore peripheral bus -- the same bus core 0 reads
+`ARM_GPIO_GPLEV0` from, in a tight spin, as its entire notion of where the
+C64's clock is (`WAIT_FOR_VIC_HALFCYCLE`). So the "idle" rung put a second
+maximum-rate reader on the one bus core 0 cannot afford latency on. Core 0
+missed PHI edges, missed the IO2 writes that follow them, and `RECT_FILL`
+ran on half-written argument blocks -- which is exactly what "the box at the
+wrong vertical position" *is*: `ARG2/ARG3`, the y coordinate, lost between
+the C64 writing them and the loop sampling them. See
+[[gpu64-polling-loop-timing-rules]] rule 6 and the milestone 4 bring-up
+bugs; this is the same failure with a new cause.
+
+Two details corroborate it over the alternative theory (that the per-pass
+measurement itself is too expensive):
+
+- **The RAD menu and the `LOAD` were clean.** Before the first gpu64 command
+  core 1 spun on a *cached flag*, not on MMIO. The MMIO polling begins the
+  instant the ladder is armed, which is the first gpu64 command -- and that
+  is exactly where the corruption begins.
+- **It got worse on the second run, not identical.** A contention race, not
+  a fixed cost that would fail the same way every time.
+
+### What changed for round 2
+
+- **Core 1 keeps time with `CNTVCT_EL0`, the ARM generic timer read as a
+  system register** -- core-local silicon, no bus cycle, no contention, no
+  way for the instrument to disturb what it measures. `CNTFRQ_EL0` is
+  programmed to 19.2MHz by the armstub's EL3 prologue on every core, with a
+  fallback constant rather than a divide-by-zero on a core nothing can log
+  from. This also makes rung 0 a *valid control* for the first time: it is
+  now genuinely idle.
+- **The pre-start wait and the throttle wait both `yield`**, so a core with
+  nothing to do stops competing for fetch/issue slots.
+- **`GPU64_LADDER_WORKER_ENABLED`**, a second toggle. Commented out, the
+  build keeps everything that touches core 0 -- the per-pass measurement,
+  the widened preload window, multicore bring-up -- but core 1 never runs
+  the worker and parks in `halt()`/WFI, which is the configuration that
+  tested clean on 2026-08-22. That is the A/B to reach for if round 2 still
+  misbehaves: clean in that state exonerates the instrument and puts the
+  fault back on core 1; still broken indicts the measurement itself.
+- **Core 0's per-pass state moved from four loop locals into one struct in
+  memory.** As locals they added register pressure to a loop already at the
+  limit. This turned out to buy only 24 bytes of code, so it was not the
+  round 1 fault, but one hot cache line is still the better trade than
+  spilling the loop's own values.
+
+**Standing lesson for anything added to this loop, on any core:** the
+peripheral bus is as much a shared resource as the L2, and core 0's timing
+depends on it more directly. The milestone 6 design's contention analysis
+([milestone6_3d_design.md](milestone6_3d_design.md)) is entirely about
+shared-L2 capacity and never mentions the peripheral bus. It should -- a
+render loop that polls any MMIO register in a spin will do this again.
+
+### Round 2: better, still void, and now the question is narrow
+
+The `CNTVCT_EL0` fix clearly worked, which retroactively confirms round 1's
+diagnosis: the sweep was **much smoother** and the machine survived
+noticeably longer. It still failed.
+
+What the C64's screen showed:
+
+```
+G64@        magic + ERRCODE 0 -- GET_INFO succeeded
+411A        frame period = $411A = 16666us, the correct PAL figure
+```
+
+and nothing after that -- rows 2-5 never printed, so the PRG never reached
+its 2048th frame. The bar reached the right-hand side and stopped there:
+`xpos` is one byte incremented per frame and the bar is drawn at `x=xpos`,
+so that is **~256 frames, ~5.1 seconds** after the ladder armed. No HDMI log
+appeared, because the PRG died before its closing `LOG_ENABLE(1)` -- the
+whole point of the crash-path dump added below.
+
+Two readings, and the second is the important one:
+
+- **5.1s lands just inside rung 1 (4 MB/s)**, which is superficially a
+  ladder result. It is not trustworthy as one. Rule 2's signature is damage
+  that *accumulates* -- "a program that survives its first commands and
+  derails later" -- so a death at five seconds is equally well explained by
+  four seconds of rung-0 corruption finally catching up with the 6502.
+- **Occasional wrong-y frames were still there during rung 0**, where core 1
+  writes zero bytes and now does not touch the peripheral bus either. That
+  is a real remaining fault and it is not contention with core 1's
+  *workload*. Two candidates are left: the per-pass measurement itself, or
+  core 1's mere presence (bring-up plus a yielding spin).
+
+### Round 3: the isolation A/B, and what it found
+
+Round 3 was run with `GPU64_LADDER_WORKER_ENABLED` **commented out**: the
+build kept every part that touches core 0 -- the per-pass measurement, the
+widened preload window, multicore bring-up -- while core 1 never ran the
+worker and parked in `halt()`/WFI, the configuration that tested clean on
+2026-08-22. The rung index therefore never advanced and all 41 seconds of
+samples landed in rung 0, which is exactly the wanted reading: **core 0
+alone, fully instrumented.**
+
+**A flawless run.** The bar swept left to right repeatedly with no glitch of
+any kind, and the C64 screen read:
+
+```
+G64@   magic, ERRCODE 0
+411A   frame period 16666us
+0800   2048 frames completed
+0800   2048 REU round trips
+0000   REU verify errors
+@      final ERRCODE 0
+```
+
+The HDMI log printed for the first time:
+
+```
+FLIP fast n=2048 h=0/0/1us
+FLIP wait n=2048 0/22/969us s=0
+LADDER c64=865 thr=1297
+idle p=32140k L=31973007 x=1716 a=0
+4MB/s ... max ... done       (all p=0, the worker was parked)
+```
+
+Two conclusions, and they point opposite ways.
+
+**The instrument is exonerated.** Core 0, fully instrumented, with the
+widened preload window and multicore bring-up both active and cores 1-3 in
+WFI, ran 41 seconds without a single missed byte or dropped frame. The
+`FLIP` lines are unchanged from milestone 4d (`h=0/0/1us`, `s=0`), so the
+measurement costs the frame boundary nothing either. **That leaves core 1's
+*activity* as the sole remaining cause of round 2's corruption** -- and
+round 2's core 1 was writing zero bytes and touching no MMIO during the
+window where the corruption started. A `yield` spin was enough. `yield` on a
+Cortex-A53 is a hint that does nothing, so that was a full-speed spinning
+core, and it was enough to break core 0.
+
+**And `L=31973007` out of 32,140,000 passes is my bug, not a finding.** The
+threshold was 1.5x the *minimum* pass, and the minimum is not "one C64
+cycle" -- it is the fastest pass. The loop is PHI-locked but the lock has
+slop both ways: when the previous pass overruns into the next VIC
+half-cycle, this pass's `WAIT_FOR_VIC_HALFCYCLE` returns immediately and the
+delta comes out short. The real figures:
+
+| | ARM cycles | at 1400MHz |
+|---|---|---|
+| nominal PAL cycle (1.0150us) | 1421 | -- |
+| measured min (`c64=`) | 865 | 0.62us |
+| threshold used (`thr=`) | 1297 | 0.93us |
+| measured max (`x=`) | 1716 | 1.23us |
+
+`thr=1297` sat *below* the typical healthy pass, so 99.5% of passes tripped
+it. Meanwhile the number that was trustworthy says the run was perfect:
+across 32.14M passes the worst single pass was 1716 cycles, **1.2 C64 cycles
+-- never even close to missing one.** (The clock is pinned: config.txt sets
+`arm_freq=1400` with `force_turbo=1`, so DVFS is not in play and 1421 is a
+hard nominal.)
+
+### What changed for round 4
+
+- **The threshold comes off the calibration window's mean, not its
+  minimum.** The mean is the estimator that actually means "one C64 cycle",
+  and it is sound as long as misses are rare in the window it is taken over
+  -- which is what putting the calibration window at rung 0 is for.
+- **Each rung now reports its own mean (`m=`)** alongside `L=` and `x=`. A
+  rung whose mean has drifted off the calibrated `c64=` figure is one where
+  core 0 is *systematically* late, which is a different and worse condition
+  than a few long passes, and the round 3 table had no way to show it.
+- **Achieved rates moved to their own `RATE` line**, since the per-rung
+  lines are now at the log's 40 columns.
+- **Core 1 sleeps instead of spinning.** `WFE`, woken by the generic timer's
+  event stream (`CNTKCTL_EL1.EVNTEN`, `EVNTI=14` -> an event every 853us at
+  19.2MHz), with no interrupt involved at any point -- which matters because
+  RAD runs with IRQs disabled and a secondary core taking an unexpected
+  exception has nowhere to report it. This is not a tidy-up: leaving the
+  spin in would make it a constant confound in *every* rung, so each rung
+  would measure its write traffic plus a spin, when the ladder exists to
+  vary exactly one thing. If the event stream does not work the failure is
+  visible and harmless -- core 1 sleeps forever, every rung past idle reads
+  `p=0`, and `RATE` reads all zeros.
+- **The worker is back ON.**
+
+### The crash-path dump
+
+Both rounds so far ended with the C64 derailed and back in the RAD menu,
+which means the test PRG never reached `LOG_ENABLE(1)` and **the entire
+table was lost** -- a run that costs a reflash and yields nothing
+quantitative. The run that fails is the run whose numbers matter most, so
+`reuUsingPolling()` now dumps the table on its way out, from both exit paths
+(`resetREU()` after a sustained CPU reset, and the RAD button return). It
+forces the log back on first, since the auto-hide disabled it at the
+session's first command, and it is one-shot so the second exit path cannot
+scroll the first dump away. The repaint is expensive and that is fine:
+nothing is being timed any more.
+
+Also removed this round, at the user's request: the two `music.wav`
+diagnostic log lines in `rad_hijack.cpp` left over from the SID
+investigation.
+
+### Round 4: the number, and it is much lower than anyone wanted
+
+The first round where every part of the rig worked. Core 1 asleep on `WFE`
+between slots, threshold taken off the calibration mean, per-rung mean added.
+
+```
+LADDER c64=1420 thr=2130
+idle    p=3766k L=0    m=1420 x=1710
+4MB/s   p=339k  L=94   m=1421 x=4456
+(rungs 2-8: no data -- see below)
+RATE 0/3/0/0/0/0/0/0/0
+```
+
+Three things came out of that.
+
+**The instrument is finally clean.** `c64=1420` against a nominal 1421 (a
+1.0150us PAL cycle at the `arm_freq=1400` / `force_turbo=1` pins) says the
+calibration is now measuring what its name claims. And `idle` -- 3.77M
+passes, **`L=0`**, mean exactly on the nominal -- says that core 0
+instrumented, with the widened preload window, with multicore brought up,
+and with core 1 alive but genuinely asleep, misses nothing at all. Every
+confound from rounds 1-3 is closed.
+
+**Putting core 1 to sleep was necessary and sufficient for the idle rung.**
+Round 2's disturbance really was the bare spin: `WFE` parked against the
+generic timer's event stream costs core 0 exactly zero.
+
+**Then core 1 wrote 4 MB/s and core 0 started losing bus cycles.** 94 of
+them in ~1.2 seconds, worst pass 4456 ARM cycles = 3.1 C64 cycles, and the
+machine derailed into the RAD menu before rung 1 was over. The per-rung mean
+stayed at 1421, so this is not systematic lateness -- it is rare, discrete,
+severe stalls.
+
+**4 MB/s is not a bandwidth problem, and this is the important part.** The
+DRAM on this part does hundreds of times that rate. Whatever core 0 is
+losing, it is not losing to memory-bus saturation, and a ladder whose only
+axis is bandwidth cannot find it -- rungs 2 through 9 would have measured the
+same mechanism at rates that make no difference to it.
+
+### What changed for round 5: footprint, not rate
+
+The suspect is **working-set footprint**. Each 4 MB/s slot is a burst of 500
+stores -- 62 fresh cache lines streamed through the shared L2. The
+Cortex-A53's L2 is inclusive of the L1 data caches, so an L2 eviction
+back-invalidates core 0's L1 line, and core 0 then takes a DRAM miss inside
+a loop pass that has about a microsecond to spare. That mechanism is driven
+by how much distinct memory core 1 touches, not by how fast, which is
+exactly the shape round 4 saw: rare, severe, and already present at a
+trivial rate.
+
+So the ladder is now two axes crossed in one run -- three working sets by
+three rates, plus a mitigation and the known-bad top end:
+
+| arm | working set | resident in | rungs |
+|---|---|---|---|
+| `L1 *` | 16 KB | core 1's own L1 D | 4 / 64 / 512 MB/s |
+| `L2 *` | 256 KB | the shared 512 KB L2 | 4 / 64 / 512 MB/s |
+| `DR *` | 2 MB | nothing; streams to DRAM | 4 / 64 / 512 MB/s |
+| `NT 64M` | 2 MB, non-temporal stores | nothing, and allocates nothing | 64 MB/s |
+| `max` | 2 MB, unthrottled | -- | the 2026-08-22 spike's workload |
+
+`DR 4M` is round 4's failing rung repeated, so the two runs are comparable.
+The `L1` arm generates almost no L2 or DRAM traffic at any rate, because
+write-back caching keeps a 16 KB set in core 1's own L1: **if `L1 512M` is
+clean while `DR 4M` is not, footprint is the variable and rate is not**, and
+the ladder's original premise was wrong in an interesting way.
+
+`NT 64M` is the candidate fix, and it is worth a rung rather than a later
+round because it tests the diagnosis rather than merely adding a data point.
+AArch64's `STNP` is a non-temporal store pair: it writes without allocating
+in L1 or L2, so the stream evicts nothing. If `DR 64M` breaks and `NT 64M`
+does not, milestone 6's render loop has a cheap fix and the shared L2 stops
+being a hard ceiling on the whole design.
+
+Twelve rungs at 3 seconds is 36 seconds of ladder.
+
+### The workload was destroying the experiment
+
+Round 4 produced numbers for two rungs out of nine because the C64 derailed
+1.2 seconds into rung 1. That is not incidental: the test PRG drew through
+the gpu64 command API every frame, one mis-sampled IO2 write turns a command
+into a command with a garbage argument, and that is precisely what a bad
+rung *causes*. The workload was arranged so that the first real finding
+would end the run that found it.
+
+The per-frame gpu64 command stream is therefore gone. What is left is one
+verified 256-byte REU round trip per frame, paced off the VIC's own raster
+register, with no gpu64 register touched inside the loop at all. A corrupted
+REU transfer produces a wrong byte, which the PRG counts and keeps going --
+tolerant where a wild command is fatal. Only two gpu64 commands remain, both
+outside the measured window: `GET_INFO` to arm the ladder and `LOG_ENABLE(1)`
+at the end.
+
+Nothing is lost by dropping the drawing. `L=` counts missed bus samples, and
+a missed bus sample is the *mechanism* by which a command would have been
+corrupted -- the number leads the visible symptom rather than depending on
+it. Rows 2-4 of the C64 screen are also now updated every 16 frames, so a
+run that dies partway still shows how far it got.
+
+Belt and braces: core 0 dumps the table itself the moment the published rung
+index reaches the `done` bucket, so the result no longer depends on the C64
+surviving to its own `LOG_ENABLE`.
+
+
+### Round 5: footprint, conclusively
+
+```
+LADDER c64=1420 thr=2130
+idle        p=2883k L=0  m=1420 x=1701
+L1 4MB/s    p=2879k L=0  m=1420 x=1699
+L1 64MB/s   p=2875k L=0  m=1420 x=1697
+L1 512MB/s  p=2879k L=0  m=1420 x=1703
+L2 4MB/s    p=2879k L=0  m=1420 x=1703
+L2 64MB/s   p=2879k L=0  m=1420 x=1696
+L2 512MB/s  p=2879k L=0  m=1420 x=1705
+DR 4MB/s    p=164k  L=21 m=1421 x=4501
+(rungs 8-12: no data -- the machine derailed)
+RATE 0/3/56/450/3/56/449/3/0/0/0/0/0
+```
+
+Seven rungs, **`L=0` on every one**, ~2.9M passes each, mean pass pinned to
+1420 and worst case never above 1705 -- indistinguishable from the idle
+floor. That includes 16 KB written at an achieved **450 MB/s** and 256 KB at
+**449 MB/s**. Then the first rung with a 2 MB working set lost 21 bus cycles
+in 0.17 seconds at an achieved **3 MB/s**, with a worst pass of 4501 cycles
+(3.2 C64 cycles), and the C64 dropped into the RAD menu.
+
+Two orders of magnitude of rate, no effect. One step in footprint, immediate
+failure. **The contention budget is a cache-footprint budget, and the rate
+axis the ladder was originally built around does not exist.**
+
+The mechanism narrows accordingly. It is not "core 1 uses the L2" -- the 256
+KB arm occupies half the shared L2 and rewrites it at 449 MB/s at no cost at
+all, because once resident it hits and evicts nothing. It is specifically
+*churn*: a working set larger than the L2 misses on every store, so every
+store allocates a line, evicts a line, and queues a DRAM writeback. Core 0's
+own rare misses then queue behind that traffic, inside a loop pass with about
+a microsecond of slack. 21 losses across ~164 one-millisecond bursts is
+roughly one burst in eight catching core 0 out, which is the right order for
+that story.
+
+The frame counter reached `0420` (1056 frames, 21.1 s) before the derail --
+exactly the 21 s mark where the seven clean rungs end and `DR 4MB/s` begins.
+Row 4 also recorded a single REU verify error. Both point the same way.
+
+### What changed for round 6
+
+Two questions are left, and the rung table asks them in priority order.
+
+**Can core 1 stream without the churn?** `STNP`, the AArch64 non-temporal
+store pair, writes without allocating in L1 or L2 -- the stream evicts
+nothing because it never occupies anything. Three `NT` rungs at 4 / 64 / 512
+MB/s over the full 2 MB set go **first**, because this is the one result that
+could rescue the architecture as designed. If `NT 512M` is clean, core 1 can
+stream a framebuffer after all and everything else here is a curiosity.
+
+**Where is the cliff?** Five rungs at 384 K / 512 K / 768 K / 1 M / 1.5 M,
+all held at 64 MB/s since rate has been shown not to matter. The shared L2 is
+512 KB, so the informative comparison is 384 K against 768 K. Then the
+streaming arm at three rates, with `2M 4M` repeating rounds 4 and 5's failing
+rung unchanged as the anchor, and `max` unthrottled at the top.
+
+**And the workload gets out of the way again.** Round 5 died 0.17 s into its
+eighth rung and lost the five that mattered most, for the same structural
+reason round 4 died in its second: the C64-side program was talking to the
+cartridge, and a bad rung corrupts exactly that. A verified REU round trip is
+tolerant of a wrong *byte*, but a mis-sampled REU **command register** write
+can launch a transfer of any length to any address.
+
+So the REU round trips now run only for the first 200 frames -- inside the
+`idle` rung, core 1 asleep, nothing able to corrupt them. That keeps a
+positive control (row 3 reaches `0064`, row 4 must be `0000`: the REU path
+works in this build) at zero exposure thereafter. For the remaining ~46
+seconds the program counts raster frames and touches no cartridge register at
+all, so there is nothing left for a missed bus cycle to derail.
+
+Nothing is given up. `L=` is core 0's own count of missed bus samples, and a
+missed sample is the mechanism by which any of that traffic would have been
+corrupted -- the number leads the symptom rather than depending on it, and
+rounds 4 and 5 have already established that a streaming rung corrupts real
+traffic. What is wanted now is the shape of the curve, and that needs the run
+to survive to the top of the ladder.
+
+
+### Round 6: three bugs of mine, and a reframing
+
+Two attempts. The first died a few seconds in:
+
+```
+LADDER c64=1420 thr=2130
+idle       p=1920k L=0 m=1420 x=1703
+NT 4MB/s   p=138k  L=0 m=1420 x=2101
+```
+
+The second derailed at frame `0060` (1.9 s), recovered, and ran to
+completion -- final screen `09C4` frames, `00C8` REU round trips, **`0000`
+verify errors**, `ERRCODE 0` -- but its table was nonsense: every rung zero
+except `idle p=1920k` and `done p=49016k`.
+
+Three defects, all mine.
+
+**The rung length was silently wrong.** `nRungTicks = nFreq * (
+GPU64_LADDER_RUNG_US / 1000000 )` -- integer division, so `2500000 / 1000000`
+is 2 and every rung ran for 2 seconds, not 2.5. Visible only as `idle
+p=1920k` where ~2400k was expected. Fixed by multiplying before dividing.
+
+**Core 1's timeline could not be re-armed.** The worker latched its start
+time exactly once. But a C64 reset makes `resetREU()` clear `gpu64ApiActive`,
+so the next `GET_INFO` re-arms the ladder -- core 0 clears the table and
+resets the rung index, while core 1 carries on against the *original* clock.
+That is the second attempt exactly: after the 1.9 s derail the ladder
+re-armed, core 1's clock was already past the last rung, and it published
+`done` for the remaining 51 seconds. Fixed with a generation counter core 1
+watches; seeing it move restarts its timeline from rung 0.
+
+**The threshold sat exactly on the first failure step.** Loop passes quantise
+to VIC *half*-cycles: 1420 healthy, ~2130 for one missed half-cycle, ~2840
+for a whole cycle. `thr = 1.5 x baseline` is 2130 -- precisely the step it is
+supposed to catch, which `d > thr` then does not exceed. `NT 4MB/s x=2101
+L=0` is a missed half-cycle scored as clean. Now 4/3, i.e. 1893: clear of the
+highest healthy pass ever measured (1710, over five rounds) and clear below
+the step. Rounds 4 and 5 are unaffected -- their clean rungs topped out at
+1705 and their failing rungs at 4400+.
+
+**And non-temporal stores do not help.** Both attempts derailed within
+0.2 seconds of the first `NT` rung beginning, the same way the ordinary 2 MB
+rung did in round 5. That is consistent with the Cortex-A53 treating the
+`STNP` hint as a no-op, which would make the NT rungs simply the DRAM rungs
+under another name. One NT rung stays at the end of the table to confirm it
+under the corrected threshold, but it is no longer a candidate fix.
+
+### The reframing, which is the actual result of this round
+
+The ladder has been failing on a 2 MB working set since round 4. **A gpu64
+framebuffer page is 64 KB.** Two pages is 128 KB; a 320x200 16bpp z-buffer is
+another 128 KB. A double-buffered 3D renderer at this resolution has a
+working set on the order of **256 KB** -- which round 5 measured at 449 MB/s
+with `L=0` across 2.9M passes.
+
+The 2 MB buffer was chosen in round 4, when the question was still bandwidth
+and the point was to guarantee real DRAM traffic. It was never representative
+of the thing being designed. So the picture is much better than rounds 4-6
+have made it look: the constraint is real and sharp, but the renderer may
+well already fit inside it.
+
+### What changed for round 7
+
+One sweep: **footprint, ascending, at a fixed 64 MB/s** -- 256 K, 320 K,
+384 K, 448 K, 512 K, 640 K, 768 K, 1 M, 1.5 M, 2 M. Rate is held constant
+because round 5 showed it is not a variable. 256 K repeats round 5's largest
+clean rung as the anchor; 512 K is the shared L2's size, so the cliff is
+expected near it.
+
+Ascending order is the point. A rung that breaks tends to end the run, so
+climbing means the run dies *at* the cliff with every rung below it already
+recorded -- the failure and the measurement become the same event, instead of
+the failure destroying the measurement as it did in rounds 4, 5 and 6.
+
+`NT 2M` and `max` go last, both expected to fail.
+
+The REU positive control is also pulled back from 200 frames to 100, so it
+sits exactly inside the now-2-second `idle` rung and no cartridge traffic
+overlaps a loaded rung.
+
+
+### Round 7: a contradiction, and the sweep goes on hold
+
+```
+LADDER c64=1420 thr=1893
+idle p=1920k L=30  m=1420 x=3670
+256K p=49k   L=694 m=1434 x=3767
+(everything above: no data -- the machine derailed and did not return)
+```
+
+Two numbers here disagree with everything before them.
+
+**256 K contradicts round 5.** Round 5 ran 256 KB at an achieved 449 MB/s for
+2.9M passes with `L=0`. Round 7 ran the same 256 KB out of the same buffer at
+a *lower* rate, 64 MB/s, and scored 694 missed cycles in 49k passes. Same
+footprint, less load, opposite outcome.
+
+**And `idle` is dirty.** Core 1 asleep, writing nothing -- the configuration
+that read `L=0 x=1703` in rounds 4, 5 and 6 -- came back `L=30 x=3670`. The
+`x=` figure is threshold-independent, so this is not an artefact of round 7's
+threshold change: those passes really happened.
+
+A contradiction that includes the idle rung is not a finding about core 1.
+Something about the *measurement* changed, and until that is understood no
+number from round 7 means anything, including its 256 K figure. The footprint
+sweep is on hold.
+
+### What was ruled out, and what round 8 does
+
+**Link layout was the first suspect and is not the cause.** This round also
+moved the boot logo to the bottom of the frame, and RAD's timing is famously
+layout-sensitive. Building with and without that change and diffing the
+symbol table: **not one symbol moved**, `reuUsingPolling()` included. Cheap to
+check, and it eliminates a whole class of explanation.
+
+**One real defect was found by inspection.** `Gpu64LadderStats` was 24 bytes
+and the array was unaligned, so entries 2, 5, 7 ... straddled a cache line
+while their neighbours did not -- those rungs paid an extra line touch on
+every pass. A per-rung cost that varies by rung index makes rungs
+incomparable, which is the one job this table has. Now padded to 32 and the
+array aligned to 64.
+
+**The leading hypothesis for the dirty idle rung is the REU positive
+control.** It is the only thing that happened in the machine during that
+rung. An REU transfer is a DMA hold -- the longest uninterruptible thing core
+0 ever does -- and the ladder discards exactly *one* pass afterwards. If
+re-entry takes longer than a single pass to settle, the instrument has been
+charging DMA re-entry to whichever rung it landed in all along, and round
+7 differs from round 6 only in how those holds happened to fall.
+
+So round 8 removes it. **The test PRG now touches no cartridge register
+inside the loop at all** -- it counts raster frames and nothing else -- which
+makes `idle` a measurement of core 0 entirely alone. If it is still dirty
+under those conditions, the instrument is at fault and there is nowhere left
+for it to hide. The REU path itself is not in doubt: round 6 ran 200 verified
+round trips with zero errors.
+
+**The sweep restarts from the most-proven-clean load rather than from 256 K:**
+16 K, 64 K, 128 K, 192 K, 256 K, 320 K, 384 K, 448 K, 512 K, 768 K, 1 M, 2 M,
+all at 64 MB/s. 16 K is what round 5 measured clean at 450 MB/s. If 16 K is
+dirty now, the instrument regressed and that is the whole result. If 16 K is
+clean and the dirt starts below 256 K, then round 5's 256 K figure was
+order-dependent -- it followed three 16 KB rungs, so core 1's set was already
+warm -- and the real cliff is lower than round 5 implied.
+
+**`L=` is now a pair,** `L=lost/lost2`: passes past 4/3 of a C64 cycle, and
+passes past two of them. That separates "core 0 arrived a phase late" from
+"core 0 missed a bus cycle outright", and it keeps this round comparable with
+rounds 4-6 whatever the first multiplier is set to.
+
+`NT` and `max` are gone -- non-temporal stores were ruled out in round 6, and
+the 2 M rung is the known-bad top end on its own.
+
+
+### Round 8: the instrument was wrong all along
+
+With the REU control removed -- **no cartridge access at all** -- and the
+sweep restarted from 16 KB:
+
+```
+LADDER c64=1420 thr=1893
+idle p=1974k L=15/1  m=1420 x=2872
+16K  p=20k   L=128/11 m=1427 x=3782
+(everything above: no data -- the machine derailed)
+```
+
+`idle` is dirty with nothing whatsoever in the machine, and 16 KB -- which
+round 5 measured at 450 MB/s with `L=0` over 2.9M passes -- scored 128 missed
+cycles in 20k passes. That was the stated stopping condition: stop reading
+rungs, find the instrument bug.
+
+The symbol table found it in one look:
+
+```
+gpu64LadderThreshold   0x690c364   read by core 0 on EVERY pass
+gpu64LadderRung        0x690c370   written by core 1 EVERY millisecond
+```
+
+Both in the cache line at `0x690c340`. **Core 1 invalidated core 0's hottest
+line a thousand times a second** -- in every rung, including `idle`, where
+core 1 writes no data at all. `s_ElapsedTicks`' upper entries were in that
+line too.
+
+A coherence miss is only ~100 cycles, which sounds survivable. It is not,
+because the loop is PHI-locked: it must finish before the next VIC half-cycle,
+and when it misses it waits out a whole one. **A 100-cycle hiccup quantises
+into a 710-cycle miss** -- precisely the ~2130-cycle passes this table has
+been reporting all along.
+
+This explains the entire shape of the last three rounds, and it is worse than
+a bad round:
+
+- a dirty `idle` rung with core 1 asleep -- core 1 still writes the mailbox
+  every slot in idle;
+- 16 KB clean in round 5 and dirty in round 8 at a seventh of the load;
+- numbers moving when unrelated code changed;
+- round 8's `L=30` improving to `L=15` when the stats array was padded, which
+  shifted these addresses by accident;
+- and **rounds 4, 5 and 6 were clean by link-layout luck, not by design.**
+
+The link-layout suspicion from round 7 was right in spirit and wrong in
+mechanism: nothing had to *move* for this to bite, it was mis-placed from the
+start.
+
+**Every quantitative result in rounds 4-8 has to be re-taken.** The footprint
+finding may well survive -- the mechanism is plausible and the 2 MB rungs
+failed far harder than the cache-resident ones -- but "may well survive" is
+not a measurement.
+
+### The fix, and what round 9 is
+
+All cross-core state is now in structures that are **64 bytes in size and
+64-byte aligned**, so each owns whole cache lines by construction and the
+linker cannot interleave anything into them:
+
+- `Gpu64LadderPass` gathers everything core 0 touches on the hot path -- the
+  previous timestamp, the skip flag, the rung copy, both thresholds, the
+  baseline, the dump flag -- into one line that no other core ever writes.
+- `Gpu64LadderFromWorker` holds core 1's published rung index, alone.
+- `Gpu64LadderToWorker` holds the generation and start flags core 0 publishes,
+  alone.
+- `s_Written` and `s_ElapsedTicks` are aligned, and core 1 now accumulates
+  them in registers and flushes every 64 slots or on a rung change rather than
+  writing them every millisecond.
+
+Core 0 now touches a line another core writes in exactly one place -- the rung
+refresh -- so that interval *is* the exposure. It moves from every 4096 passes
+to every 16384, about 17 ms, against rung boundaries 2 seconds apart.
+
+Round 9 re-runs round 8's ladder unchanged otherwise: same sweep from 16 KB,
+same PRG with no cartridge traffic. `idle` and `16K` are the validation; the
+rest is the measurement, taken for the first time on an instrument that is not
+disturbing itself.
+
+**This is also a milestone 6 design finding, not just an instrument bug.** Any
+variable the render core writes that shares a cache line with anything core 0
+reads per pass will do exactly this, and it will present as a mysterious,
+build-dependent timing fault that moves when unrelated code changes.
+
+
+Milestone 6's whole architecture rests on core 1 being able to run a render
+loop without disturbing core 0's bus-watch timing, and the only measurement
+that exists is [milestone 6's own spike](milestone6_3d_design.md): three
+cores streaming 2MB buffers flat out corrupt the C64's native VIC-II output,
+while multicore *bring-up* alone does not. That brackets the answer between
+"free" and "fatal" and locates it nowhere. This milestone finds the number.
+
+### What changed about the method
+
+The previous rounds' pass/fail signal was a look at the RAD menu -- garbage
+or not garbage. That cannot rank one workload against another, so it can
+only ever confirm the extremes it already found. Three things make this
+round different:
+
+- **A quantitative core-0 metric.** The bus-watch loop is PHI-locked: every
+  pass syncs to the same edge, so the ARM cycles between two consecutive
+  passes are one C64 cycle unless a cycle was *missed*, in which case the
+  delta jumps to a multiple of it. One `MRS PMCCNTR_EL0` and a subtract at
+  the top of the loop therefore counts **missed bus samples** directly --
+  the thing rule 1 says is lost outright with no retry and no error -- not
+  some proxy for jitter. Per rung: passes, missed, worst-case delta.
+- **A ladder, not a worst case.** One worker core (the design says start
+  with core 0 plus one worker), stepping through eight 4-second rungs of
+  *throttled* bandwidth, from idle up to unthrottled. The rung that matters
+  is rung 1: a 320x200x8bpp page rewritten every frame is 64000 * 50 =
+  3.2 MB/s, so the ladder deliberately starts just above what milestone 6
+  actually needs and works up from there.
+- **Its own control.** The instrumentation costs core 0 something, and the
+  widened preload window changes the loop's cache footprint. Both are
+  present in *every* rung including the idle one, so the ladder's answer --
+  the difference between rungs -- is unaffected by them. That is why rung 0
+  is a rung and not a separate build.
+
+### What shipped
+
+- **[gpu64_ladder.h/.cpp](../Source/Firmware/gpu64_ladder.cpp)** -- the rung
+  table, core 1's throttled worker, core 0's per-pass measurement macros, and
+  the report formatter. Throttle is per-millisecond against the system timer,
+  so a rung's rate is set by wall clock rather than by how fast the core
+  happens to be; the report prints the *achieved* rate alongside the target
+  so a rung that could not keep up says so instead of lying about its label.
+- **Core 1 only.** Cores 2 and 3 return from `Run()` to `halt()`/WFI. The
+  2026-08-22 spike used three, which is a worse test of the actual proposal.
+- **The clock starts at the first successful gpu64 command**, not at
+  REU-session start. Rung boundaries are wall-clock, and the time the user
+  spends in the RAD menu and at the BASIC `LOAD` prompt is neither short nor
+  repeatable -- anchoring to the test PRG's first command puts the same rung
+  under the same C64 workload on every run.
+- **Hold sites are excluded from the count.** An REU transfer, a gpu64
+  command, a mirror snapshot and a deferred flip commit all deliberately
+  stop the loop sampling the bus; each raises a skip flag so the pass it
+  lands in is not counted as a missed cycle.
+- **The instruction-cache preload window is widened to `0x1e00`** in the
+  ladder build (`GPU64_POLL_IPL_WINDOW`), and the callers' whole-function
+  preload to 8KB. The measurement adds ~500 bytes of hot loop code, which at
+  the stock `0x1a00` fell *outside* the window -- verified in the
+  disassembly, including the per-pass L2 prefetch tail. Left unfixed, the
+  instrument would have manufactured exactly the timing jitter it was built
+  to detect, and every rung would have failed for the wrong reason.
+- **The report rides `LOG_ENABLE(1)`**, next to the FLIP lines -- still the
+  one command a bench program has for asking the firmware to say something
+  back (milestone 4c).
+- **The toggle is left ON.** Unlike `gpu64_multicore.h`'s, because the image
+  this round needs is the one `tools/build.sh` builds by default. Comment
+  `GPU64_LADDER_ENABLED` back out once the result is recorded here. With it
+  off, the ladder compiles away completely -- `reuUsingPolling()` builds to
+  the same address and the same `0x1b54` bytes as before this milestone,
+  checked in the symbol table.
+
+### Bench procedure
+
+New PRG:
+[Source/TestPRG/gpu64_ladder_test.a](../Source/TestPRG/gpu64_ladder_test.a)
+(assembled `.prg` alongside it). It is the C64-side *workload*, not a
+measurement: 2500 raster-paced frames -- about 50 seconds, comfortably longer
+than the ladder's 26. It touches no cartridge register inside the loop; after that it touches no cartridge
+register at all (see round 6 above for why).
+
+1. Build and deploy as usual (`SDCARD=<mountpoint> tools/build.sh`), and
+   check the boot log's build id matches.
+2. RAD menu, **T key -> REU** -- without it `reuUsingPolling()` never runs
+   and nothing here executes at all.
+3. `LOAD` and `RUN` the PRG. Let it run to the end without touching the
+   machine; it takes about 50 seconds. The HDMI table appears on its own at
+   the 26-second mark and is reprinted at the end.
+
+### Reading the result
+
+The C64's own screen carries the correctness half. Rows 2-4 update live
+every 16 frames, so they are readable even if the run dies:
+
+| row | contents | pass |
+|---|---|---|
+| 0 | `G64` + `ERRCODE` | `G64` then 0 |
+| 1 | frame period, us, hex | non-zero |
+| 2 | frames completed | `09C4` |
+| 3 | REU round trips | `0000` -- REU is not used |
+| 4 | REU verify errors | `0000` -- nothing to verify |
+| 5 | final `ERRCODE` | 0 |
+
+Rows 3 and 4 read zero by design this round -- the REU workload was removed
+to make `idle` a clean measurement of core 0 alone (see round 8 above). They
+are the first thing to put back once the idle rung is trusted again.
+
+The HDMI log carries the timing half, after the two `FLIP` lines (which read
+`n=0` now that nothing flips a page -- expected; 4b/4d have those numbers):
+
+```
+LADDER c64=NNNN thr=NNNN
+idle    p=NNNNk L=N m=NNNN x=NNNN
+L1 4M   p=NNNNk L=N m=NNNN x=NNNN
+...
+done    p=NNNNk L=N m=NNNN x=NNNN
+RATE a0/a1/.../a12
+```
+
+- **`c64=`** is ARM cycles in one C64 cycle, measured. It should read close
+  to **1421** (a 1.0150us PAL cycle at the 1400 MHz `config.txt` pins); round
+  4 read 1420. A wild value means the calibration caught a disturbed window
+  and the whole table is suspect.
+- **`thr=`** is 4/3 of that -- the line above which a pass overran. It is
+  derived from the calibration window's **mean**, not its minimum (round 3),
+  and the multiplier is 4/3 rather than 3/2 because passes quantise to VIC
+  half-cycles and 3/2 lands exactly on the first failure step (round 6).
+- **`L=a/b` is the pass/fail number, per rung.** `a` counts passes past 4/3
+  of a C64 cycle -- core 0 arrived a phase late; `b` counts passes past two
+  cycles -- it missed a bus sample outright. `idle` is the floor and read
+  `L=0` in rounds 4-6, so any non-zero figure on a later rung is
+  attributable to that rung's traffic. **A non-zero `idle` invalidates the
+  run**, as it did in round 7.
+- **`m=`** is that rung's mean pass. Drift away from `c64=` means core 0 is
+  *systematically* late, which is a worse and different thing from a few long
+  passes; round 4's failing rung held `m=1421`, so its damage was discrete.
+- **`x=`** is the worst single pass in that rung. Large `x=` with small `L=`
+  is rare severe stalling rather than steady pressure.
+- **`RATE`** is the achieved rate in MB/s, one field per rung in ladder
+  order. If a field falls short of its rung's label, the throttle could not
+  keep up and that rung's real load is this number, not its name.
+- **`done`** is core 1 idle again after the last rung. It should look like
+  `idle`; if it does not, something is not resetting.
+
+**The expected shape is a ladder that fails at the top**, since `max`
+reproduces the workload already known to corrupt VIC-II output. A run where
+*nothing* fails is not a pass -- it means the workload never reached the
+machine, and the first thing to check is the `RATE` line's top rungs.
+
+Round 9 is a validation round first and a measurement second:
+
+| if | then |
+|---|---|
+| `idle` and `16K` both `L=0/0` | the false sharing was the whole problem, the instrument is trustworthy for the first time, and the sweep above them is the real curve |
+| `idle` clean but `16K` dirty | there is a second disturbance that depends on core 1 doing *any* work; suspect the WFE/event-stream wake path next |
+| `idle` still dirty | something else in the machine disturbs core 0 with nothing running; bisect the ladder's own per-pass code before reading another rung |
+
+The footprint result from round 5 (450 MB/s into 256 KB free, 3 MB/s into
+2 MB fatal) is **provisional** until this run reproduces it. The mechanism is
+plausible and the 2 MB rungs failed far harder than the cache-resident ones,
+but every number in rounds 4-8 was taken on an instrument that was disturbing
+itself.
+
+### Housekeeping still owed
+
+`GPU64_LADDER_ENABLED` in
+[Source/Firmware/gpu64_ladder.h](../Source/Firmware/gpu64_ladder.h) is
+deliberately left **on** so `tools/build.sh` produces the ladder image by
+default. It forces multicore bring-up on, widens `reuUsingPolling()`'s
+i-cache preload window, and puts measurement code inside that loop. **Comment
+it back out and rebuild once the contention number is recorded here.**
 
 ## 6. 3D API layer
 

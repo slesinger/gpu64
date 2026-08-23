@@ -56,6 +56,7 @@ u64 armCycleCounter;
 #include "rad_georam.h"
 #include "gpu64_api.h"
 #include "gpu64_vsync.h"
+#include "gpu64_ladder.h"
 
 // VSF
 u8 vsf[ 17 * 1024 * 1024 ] = {0};
@@ -68,8 +69,8 @@ void warmCache()
 	CACHE_PRELOAD_DATA_CACHE( &reu, sizeof( REUSTATE ), CACHE_PRELOADL1KEEP )
 	FORCE_READ_LINEAR32a( &reu, sizeof( REUSTATE ), sizeof( REUSTATE ) * 8 );
 
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, 1024 * 7 );
-	FORCE_READ_LINEARa( (void*)reuUsingPolling, 1024 * 7, 65536 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, GPU64_POLL_PRELOAD_SIZE );
+	FORCE_READ_LINEARa( (void*)reuUsingPolling, GPU64_POLL_PRELOAD_SIZE, 65536 );
 
 	// gpu64: gpu64_mirrorSnapshot() is called from inside reuUsingPolling()'s
 	// cycle-critical loop but is a separate function, so it isn't covered by
@@ -271,6 +272,12 @@ u32 temperature;
 #define GPU64_LOGO_TEXT		"HONDANI"
 #define GPU64_LOGO_SCALE	4
 
+// Sat at the vertical centre until 2026-08-23; now anchored to the bottom of
+// the frame, this far above it. The wordmark plus its rule is treated as one
+// block, so the gap below the rule is what this measures -- moving the
+// baseline does not need the glyph maths re-derived.
+#define GPU64_LOGO_BOTTOM	16
+
 static void gpu64DrawLogoGlyph( u8 *p, unsigned nPitch, int x0, int y0, char c, u8 nInk, boolean bGradient )
 {
 	const u8 *pGlyph = gpu64Font8x8[ (u8)c ];
@@ -334,7 +341,12 @@ void CRAD::showTestPattern( void )
 	unsigned nChars = strlen( pText );
 	int nGlyphW = 8 * GPU64_LOGO_SCALE;
 	int x0 = ( (int)GPU64_FB_WIDTH  - (int)nChars * nGlyphW ) / 2;
-	int y0 = ( (int)GPU64_FB_HEIGHT - GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE ) / 2;
+
+	// Block height is the glyphs, the gap to the rule, and the rule's two
+	// lines -- the same terms the rule's own y is built from below, so the
+	// two stay in step.
+	int nBlockH = GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE + GPU64_LOGO_SCALE * 2 + 2;
+	int y0 = (int)GPU64_FB_HEIGHT - nBlockH - GPU64_LOGO_BOTTOM;
 
 	// Outline first, face second: eight offset copies in dark grey, then the
 	// glyph itself on top of them.
@@ -688,8 +700,8 @@ void CRAD::Run( void )
 			for ( u32 i = 0; i < 1000; i++ )
 				emuWAIT_FOR_VIC_HALFCYCLE
 
-			CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, 1024 * 7 );
-			FORCE_READ_LINEARa( (void*)reuUsingPolling, 1024 * 7, 65536 );
+			CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, GPU64_POLL_PRELOAD_SIZE );
+			FORCE_READ_LINEARa( (void*)reuUsingPolling, GPU64_POLL_PRELOAD_SIZE, 65536 );
 
 			resetREU();
 

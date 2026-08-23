@@ -6,6 +6,7 @@
 #include "gpu64_fb.h"
 #include "gpu64_vsync.h"
 #include "gpu64_flip.h"
+#include "gpu64_ladder.h"
 #include <circle/util.h>
 
 // gpu64: set once a program actually drives the API, which stops the
@@ -179,6 +180,53 @@ static void logFlipStats( CGpu64FrameBuffer *pFB )
 	pFB->LogWrite( line, (unsigned)( p - line ) );
 }
 
+// gpu64: milestone 6's load-ladder table rides the same reporting hook as
+// the flip stats -- LOG_ENABLE(1) is still the one command a bench program
+// has for asking the firmware to say something back. Compiles away in a
+// normal build (gpu64_ladder.h).
+static void logLadderStats( CGpu64FrameBuffer *pFB )
+{
+#ifdef GPU64_LADDER_ENABLED
+	if ( pFB == 0 )
+		return;
+
+	// One header line plus one line per rung, each well inside the log's 40
+	// columns; sized generously because gpu64_ladderReport() writes without
+	// bounds checking, exactly like logFlipStats() above. Static, per the
+	// note on the blob buffers at the top of this file: this runs on
+	// reuUsingPolling()'s stack.
+	static char line[ 64 * ( GPU64_LADDER_RUNGS + 2 ) ];
+	char *p = gpu64_ladderReport( line );
+
+	pFB->LogWrite( line, (unsigned)( p - line ) );
+#else
+	(void)pFB;
+#endif
+}
+
+// gpu64: the crash-path escape hatch, added after round 2 (2026-08-23).
+//
+// Both ladder rounds so far ended with the C64 derailed and back in the RAD
+// menu, which means the test PRG never reached its closing LOG_ENABLE(1)
+// and the whole table was lost -- the run cost a reflash and told us
+// nothing quantitative. A run that fails is exactly the run whose numbers
+// matter most, so the loop now dumps the table on its way out instead.
+//
+// Forces the log back on first: the auto-hide turned it off at the first
+// command of the session, and DrawLogOverlay() is a no-op while it is off.
+void gpu64_ladderDumpNow( void )
+{
+#ifdef GPU64_LADDER_ENABLED
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 )
+		return;
+
+	pFB->LogEnable( TRUE );
+	logFlipStats( pFB );
+	logLadderStats( pFB );
+#endif
+}
+
 static u8 doSystem( u8 op )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
@@ -304,7 +352,7 @@ static u8 doSystem( u8 op )
 		if ( pFB ) pFB->LogEnable( sArg[ 0 ] ? TRUE : FALSE );
 		// Turning the log *on* is a request to be told something, so this is
 		// where the flip cost gets reported (logFlipStats() above).
-		if ( sArg[ 0 ] ) logFlipStats( pFB );
+		if ( sArg[ 0 ] ) { logFlipStats( pFB ); logLadderStats( pFB ); }
 		return GPU64_ERR_OK;
 
 	case 0x09:					// VBLANK_SYNC
@@ -765,6 +813,18 @@ void gpu64_apiDispatch( u8 op )
 		// API" -- deliberately not any write into the window, so an REU
 		// detection routine scanning IO2 can't disarm the mirror by
 		// accident the way the milestone 2 trigger could.
+		// gpu64: the milestone 6 load ladder starts here rather than at
+		// REU-session start (gpu64_ladder.h). The ladder's rungs are 4s
+		// wall-clock windows, and the user spends an unknown -- and
+		// unrepeatable -- amount of time in the RAD menu and at the BASIC
+		// LOAD prompt before the test PRG runs. Anchoring the clock to the
+		// first successful command puts the same rung under the same C64
+		// workload on every run.
+#ifdef GPU64_LADDER_ENABLED
+		if ( !gpu64ApiActive )
+			gpu64_ladderArm();
+#endif
+
 		gpu64ApiActive = 1;
 	} else
 		sStatus |= GPU64_STATUS_ERROR;

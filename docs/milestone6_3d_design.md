@@ -74,6 +74,83 @@ work to run that isn't core 0's bus-watch loop. The rest of this section is
 
 ### The real risk: shared L2, not core-count
 
+**Amended 2026-08-23, the hard way:** the L2 is not the only shared resource
+that matters, and the section below is incomplete without this. Core 0's
+timing rests on tight MMIO polling of `ARM_GPIO_GPLEV0`, so the **VideoCore
+peripheral bus** is a contended resource too -- and a more direct one than
+the L2, because core 0 depends on the *latency* of every one of those reads
+rather than on aggregate bandwidth. The load ladder's own first round proved
+it by accident: core 1 spinning on the BCM system timer, an MMIO register on
+that same bus, corrupted gpu64 command arguments while writing zero bytes of
+DRAM traffic (progress_tracker.md milestone 6a, round 1). **The render loop
+must not poll any MMIO register in a spin.** Use `CNTVCT_EL0` for time, and
+budget peripheral-bus access separately from memory bandwidth.
+
+**Amended again 2026-08-23, with a measurement, and this one changes the
+design:** the load ladder's fifth round crossed core 1's working-set size
+against its write rate. Every rung whose set fit in cache was **free** --
+16 KB at an achieved 450 MB/s and 256 KB at 449 MB/s both cost core 0 exactly
+zero missed bus cycles over ~2.9M loop passes each. The first rung with a
+2 MB set cost core 0 bus cycles at **3 MB/s** and derailed the C64 in 0.17
+seconds.
+
+**So the constraint is not a bandwidth budget, and the section below is
+wrong about the shape of the problem even though it is right that the L2 is
+the resource.** Two orders of magnitude of rate make no difference; one step
+across the 512 KB shared L2 is fatal. The cost is not capacity contention in
+the steady state -- a 256 KB set occupies half the L2 permanently and costs
+nothing -- it is *churn*: a set larger than the L2 misses on every store, so
+every store allocates a line, evicts a line, and queues a DRAM writeback,
+and core 0's own rare misses queue behind that traffic inside a loop pass
+with about a microsecond of slack.
+
+What this means for the render design:
+
+- **A render loop that streams a full-size framebuffer through DRAM does not
+  work**, at any frame rate, including one so slow it would be useless.
+- **A render loop working out of a cache-resident tile is essentially free**,
+  and can be *fast* -- 450 MB/s of stores into 256 KB cost nothing measurable.
+  Tile-based rendering is not an optimisation here, it is the only shape that
+  fits.
+- The usable resident budget is 512 KB minus whatever core 0's own preload
+  schedule needs, which has not been measured.
+- `STNP`, the non-temporal store pair, is **not** an escape hatch. Round 6
+  derailed within 0.2 s of the first non-temporal rung, twice, exactly as the
+  ordinary 2 MB rung had -- consistent with the Cortex-A53 treating the
+  non-temporal hint as a no-op.
+
+**And a correction to the alarm above, from round 6:** the ladder has been
+failing on a 2 MB working set, but **a gpu64 page is 64 KB**. Two pages is
+128 KB, and a 320x200 16bpp z-buffer is another 128 KB -- so a
+double-buffered 3D renderer at this resolution has a working set around
+**256 KB**, which round 5 measured at 449 MB/s with zero missed bus cycles.
+The 2 MB buffer was chosen back when the question was bandwidth and was never
+representative of this renderer. The constraint is real and sharp, but the
+design as sketched may already fit inside it. Round 7 sweeps 256 K to 2 M to
+find the actual edge.
+
+**Amended a third time 2026-08-23 -- and this one is a hazard, not a
+measurement.** Round 8 of the ladder found that the instrument had been
+disturbing itself since round 1: core 1's rung mailbox shared a cache line
+with a variable core 0 reads on every pass, so core 1 invalidated core 0's
+hottest line a thousand times a second even in rungs where it wrote no data.
+A coherence miss is ~100 cycles, but the polling loop is PHI-locked -- miss
+the deadline and it waits out a whole VIC half-cycle, so 100 cycles of
+interference becomes a 710-cycle miss.
+
+**This is a standing constraint on the render design.** Any variable core 1
+writes that shares a 64-byte line with anything core 0 reads per pass will
+cause bus-cycle loss, and it will present as a mysterious build-dependent
+timing fault that moves when unrelated code changes. Every core-0/core-1
+mailbox must be 64 bytes in size *and* 64-byte aligned, so the linker cannot
+interleave anything into it; see `Gpu64LadderFromWorker` and
+`Gpu64LadderToWorker` in gpu64_ladder.h for the pattern.
+
+The footprint numbers below are **provisional** -- they were all taken on the
+self-disturbing instrument and are being re-measured.
+
+See progress_tracker.md milestone 6a, rounds 4-9.
+
 A first design pass here assumed the only things to verify were (a) whether
 Circle's multicore startup coexists with core 0's bit-banging at all, and
 (b) cache-coherency/memory-barrier correctness between cores. Both matter,
@@ -150,6 +227,18 @@ whoever picks milestone 6 back up: find the actual contention threshold
 (a load ladder — one core, smaller/slower traffic patterns, working up
 rather than starting from a deliberately worst-case synthetic stress) now
 that bring-up itself is confirmed clean.
+
+**That load ladder is now built** —
+[`gpu64_ladder.h`/`.cpp`](../Source/Firmware/gpu64_ladder.cpp), one worker
+core stepping through eight throttled bandwidth rungs from idle to
+unthrottled, while core 0 counts the bus cycles it actually misses and the
+C64 runs verified REU transfers and a vblank flip loop. It replaces the
+"does the RAD menu look like garbage" signal with a per-rung number, which
+is what makes rungs rankable at all. Design rationale, bench procedure and
+how to read the table: progress_tracker.md milestone 6a. **The number this
+section is waiting for is the highest rung with no missed cycles and no REU
+corruption; the memory-traffic budget below it is what the render loop gets
+to spend.**
 
 Also unverified: RAD disables IRQs (see progress_tracker.md's hw_testing
 notes on why `CScreenDevice`/`CSerialDevice` logging stops working). Any

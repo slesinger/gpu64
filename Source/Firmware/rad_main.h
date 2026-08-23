@@ -53,6 +53,7 @@
 #include "gpio_defs.h"
 #include "helpers.h"
 #include "gpu64_multicore.h"
+#include "gpu64_ladder.h"
 #include "gpu64_fb.h"
 
 CLogger	*logger;
@@ -130,7 +131,7 @@ public:
 		// gpu64_multicore.cpp) -- isolates bring-up-alone from
 		// bring-up-plus-workload. See progress_tracker.md for the test
 		// procedure and milestone6_3d_design.md for the full writeup.
-		#ifdef GPU64_MULTICORE_ENABLED
+		#if defined( GPU64_MULTICORE_ENABLED ) || defined( GPU64_LADDER_ENABLED )
 		bOK = m_MultiCore.Initialize() && bOK;
 		#endif
 		return bOK;

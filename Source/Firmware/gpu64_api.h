@@ -120,4 +120,9 @@ static inline u8 gpu64_apiReadReg( u8 addr )
 u8 gpu64_blobRead( u8 space, u32 addr, u32 len, u8 *pDst );
 u8 gpu64_blobWrite( u8 space, u32 addr, u32 len, const u8 *pSrc );
 
+// gpu64: dumps the milestone 6a ladder table (and the flip stats) to the
+// on-screen log immediately, from wherever the bus-watch loop is giving up.
+// See gpu64_api.cpp. Compiles to an empty call in a normal build.
+void gpu64_ladderDumpNow( void );
+
 #endif

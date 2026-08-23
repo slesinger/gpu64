@@ -72,6 +72,7 @@ static u8 *wavMemory;
 
 #include "mahoney_lut.h"
 #include "font.h"
+#include "gpu64_ladder.h"
 
 static u32 g2, g3;
 
@@ -2240,11 +2241,7 @@ void initHijack()
 	extern CLogger	*logger;
 	u32 size;
 	readFile( logger, (char*)DRIVE, ( char* )"SD:RAD/music.wav", wavMemory, &size );
-	logger->Write( "gpu64", LogNotice, "music.wav: read %u bytes, first samples %02x %02x %02x %02x",
-		size, wavMemory[ 0 ], wavMemory[ 1 ], wavMemory[ 2 ], wavMemory[ 3 ] );
 	convertWAV2RAW_inplace( wavMemory );
-	logger->Write( "gpu64", LogNotice, "music.wav: after WAV->RAW, sample[0..3] = %02x %02x %02x %02x, nWAVSamples=%u",
-		wavMemory[ 0 ], wavMemory[ 1 ], wavMemory[ 2 ], wavMemory[ 3 ], nWAVSamples );
 	wavPosition = 0;
 	#endif
 
@@ -3314,8 +3311,8 @@ void __attribute__ ((noinline)) doInjectionVSF( u8 *vsf, u32 vsfSize )
 		extern void warmCache();
 		warmCache();
 
-		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, 1024 * 7 );
-		FORCE_READ_LINEARa( (void*)reuUsingPolling, 1024 * 7, 65536 );
+		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)reuUsingPolling, GPU64_POLL_PRELOAD_SIZE );
+		FORCE_READ_LINEARa( (void*)reuUsingPolling, GPU64_POLL_PRELOAD_SIZE, 65536 );
 
 		reuUsingPolling( 1 );
 	}

@@ -30,6 +30,7 @@
 #include "linux/kernel.h"
 #include "gpu64_api.h"
 #include "gpu64_vsync.h"
+#include "gpu64_ladder.h"
 
 // gpu64: reaching CGpu64FrameBuffer::CommitFlip() from the bus-watch loop
 // without including gpu64_fb.h, which pulls in Circle's framebuffer and
@@ -587,12 +588,16 @@ u8 reuUsingPolling( int step )
 	// gpu64_mirrorSnapshot() and GPU64_MIRROR_POLL_INTERVAL above.
 	register u32 gpu64MirrorPollCounter = 0;
 
+	// gpu64: milestone 6's load-ladder instrumentation (gpu64_ladder.h).
+	// Expands to nothing unless GPU64_LADDER_ENABLED is defined.
+	GPU64_LADDER_LOCALS
+
 	u16 ipl = 0;
 
 	if ( step <= 1 )
 	{
 		void *p = ( && reuEmulationMainLoop );
-		CACHE_PRELOAD_INSTRUCTION_CACHE( p, 0x1a00 );
+		CACHE_PRELOAD_INSTRUCTION_CACHE( p, GPU64_POLL_IPL_WINDOW );
 
 		if ( step == 1 ) return 0;
 
@@ -615,20 +620,34 @@ reuEmulationMainLoop:
 	{
 		WAIT_FOR_VIC_HALFCYCLE
 
+		GPU64_LADDER_SAMPLE
+
 		void *p = (u8*)( && reuEmulationMainLoop ) + ipl;
 		CACHE_PRELOADIKEEP( p );
-		ipl += 64; if ( ipl >= 0x1a00 ) ipl = 0;
+		ipl += 64; if ( ipl >= GPU64_POLL_IPL_WINDOW ) ipl = 0;
 
 		if ( CPU_RESET )
 		{
 			resetCount ++;
 			if ( resetCount > 1000 )
+			{
+				// gpu64: the C64 has derailed and taken the REU with it.
+				// That is the run whose ladder numbers matter most, and
+				// until now it was also the run that lost them -- the test
+				// PRG never gets to its closing LOG_ENABLE(1). Dump on the
+				// way out. Costs a full log repaint, which is free here:
+				// nothing is being timed any more.
+				GPU64_LADDER_DUMP
 				resetREU();
+			}
 		} else
 			resetCount = 0;
 
 		if ( BUTTON_PRESSED )
+		{
+			GPU64_LADDER_DUMP
 			return 2;
+		}
 
 		// gpu64: default-state screen mirror (milestone 3) -- time-based, not
 		// IO2-access-based, so this fires independent of whatever the C64
@@ -638,6 +657,7 @@ reuEmulationMainLoop:
 		{
 			gpu64MirrorPollCounter = 0;
 			gpu64_mirrorSnapshot();
+			GPU64_LADDER_SKIP
 		}
 
 		// gpu64: the frame clock (gpu64_vsync.h). Only meaningful once a
@@ -652,7 +672,7 @@ reuEmulationMainLoop:
 				gpu64_vsyncAdvance( gpu64Now );
 				gpu64Regs.status |= GPU64_STATUS_VBLANK_PENDING;
 				if ( gpu64Vsync.flipPending )
-					gpu64_vsyncCommitFlip();
+					{ gpu64_vsyncCommitFlip(); GPU64_LADDER_SKIP }
 			}
 		}
 
@@ -702,6 +722,7 @@ reuEmulationMainLoop:
 				if ( !writeFF00 ) reu.command = D;
 				#include "handle_transfer.h"
 				reu.reuWaitForFF00 = 0;
+				GPU64_LADDER_SKIP
 			} else
 			if ( IO2_ACCESS  )
 			{
@@ -763,6 +784,7 @@ reuEmulationMainLoop:
 						WAIT_FOR_VIC_HALFCYCLE
 						RESTART_CYCLE_COUNTER
 						SET_GPIO( bDMA_OUT );
+						GPU64_LADDER_SKIP
 					} else
 						// Inlined (gpu64_api.h): a cross-TU call here has to
 						// finish before the loop's next sample, and an
