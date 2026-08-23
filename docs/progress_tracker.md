@@ -561,9 +561,25 @@ during 4b's bring-up:
 
 ## 4d. The page flip without the mailbox round trip
 
-**Status: implemented, awaiting hardware verification.** Everything below is
-built and builds clean; none of it has been on the bench yet. The bench
-procedure is at the end of this section.
+**Status: done, verified on hardware 2026-08-23.** The deferred flip's hold
+on the C64 went from 4b's **71/-/900 us** to **0/0/1 us** over 256 flips,
+with no fallbacks (`s=0`), both C64-side rows still `0100`, and no tearing.
+The measured lines were:
+
+```
+16666us/frame
+FLIP fast n=256 h=0/0/1 us
+FLIP wait n=256 h=0/25/820 us s=0
+```
+
+`h=` is the number the milestone existed to move: the frame boundary now
+halts the C64 for a microsecond at most, so the ~5% of the machine's cycles a
+flipping program used to give up is gone, and a hold can no longer span a
+raster. `wait=` shows where the cost went -- 25 us on average, 820 us worst
+case, paid by the *next command* outside the frame boundary, which is exactly
+what the split was for. `fast` (not `SLOW`) with `s=0` means the async path
+stayed armed for all 256 flips; the drain never came close to its 50 ms
+timeout. First try, no bring-up bugs.
 
 ### The problem 4b left behind
 
@@ -719,13 +735,12 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
   loop never reaches `reuUsingPolling()`, which is where all of gpu64's own
   code runs, so a gpu64 cause is unlikely but unproven.
 
-- **The deferred page flip costs a VideoCore mailbox round trip** — 71 µs
-  best, ~900 µs typically over 256 flips, all of it with the C64 halted.
-  **Addressed in milestone 4d (above) by posting the mailbox request without
-  waiting for the reply; not yet verified on hardware**, so this stays listed
-  until a bench round says otherwise. The deeper fix, writing the HVS display
-  list from the ARM and skipping the VideoCore entirely, is still open and is
-  the next thing to try if tearing appears.
+- ~~**The deferred page flip costs a VideoCore mailbox round trip**~~ —
+  **fixed in milestone 4d, verified on hardware 2026-08-23**: 71/-/900 µs
+  became 0/0/1 µs by posting the mailbox request without waiting for the
+  reply. The deeper fix — writing the HVS display list from the ARM and
+  skipping the VideoCore entirely — remains unneeded: it would cut *latency*,
+  which nothing has complained about, and no tearing appeared.
 
 - **Mirror freeze when the on-screen log filled the column, root cause not
   conclusively identified.** During milestone 3 bring-up the mirror stopped

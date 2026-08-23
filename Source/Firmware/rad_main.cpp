@@ -322,8 +322,6 @@ void CRAD::showTestPattern( void )
 	callCount++;
 	boolean bGradient = ( callCount & 1 ) != 0;
 
-	logger->Write( "gpu64", LogNotice, "showTestPattern: call #%u%s", callCount, bGradient ? " (lit)" : " (flat)" );
-
 	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
 	if ( p == 0 )
 		return;
@@ -695,28 +693,16 @@ void CRAD::Run( void )
 
 			resetREU();
 
-			// gpu64: diagnostic, see the "hijackC64 returned" log above --
-			// this is the last thing logged before reuUsingPolling() takes
-			// over for good (it only logs again once the mirror poll or the
-			// $DF0B trigger fires). gpu64ApiActive is logged specifically
-			// because it used to get stuck at 1 from a previous session (see
-			// resetREU() in rad_reu.cpp, now cleared there too) -- if this
-			// ever prints 1 again right after a fresh resetREU(), that fix
-			// regressed.
-			extern u8 gpu64ApiActive;
-			logger->Write( "gpu64", LogNotice, "Run: entering reuUsingPolling, gpu64ApiActive=%d", (int)gpu64ApiActive );
-
-			// gpu64: multicore feasibility spike (docs/milestone6_3d_design.md)
-			// -- one-shot proof, right before core 0 hands control to the
-			// cycle-critical loop, that cores 1-3 are alive and actually
-			// streaming through their stress buffers: sample their pass
-			// counters, wait a known interval, sample again. This runs
-			// during setup, before reuUsingPolling() takes over, so it costs
-			// nothing inside the cycle-critical path itself. This is only a
-			// liveness check, NOT the real test -- see the class comment in
-			// gpu64_multicore.h and progress_tracker.md for what actually
-			// answers the multicore feasibility question (re-running
-			// milestone 3's mirror/trigger checks while this runs).
+			// gpu64: the multicore feasibility spike's liveness check
+			// (docs/milestone6_3d_design.md) -- samples cores 1-3's pass
+			// counters across a known interval to prove they are alive and
+			// streaming. Compiled out with the spike itself: with
+			// GPU64_MULTICORE_STRESS_ENABLED off it can only ever print
+			// zeroes, and its DELAY plus the logger's own framebuffer work
+			// would run between the reuUsingPolling() preload above and the
+			// call below -- evicting exactly the instruction cache that
+			// preload exists to fill.
+#ifdef GPU64_MULTICORE_STRESS_ENABLED
 			u32 before[ 4 ] = {
 				CGpu64MultiCore::s_PassCounter[ 0 ], CGpu64MultiCore::s_PassCounter[ 1 ],
 				CGpu64MultiCore::s_PassCounter[ 2 ], CGpu64MultiCore::s_PassCounter[ 3 ] };
@@ -726,6 +712,7 @@ void CRAD::Run( void )
 				(unsigned)( CGpu64MultiCore::s_PassCounter[ 1 ] - before[ 1 ] ),
 				(unsigned)( CGpu64MultiCore::s_PassCounter[ 2 ] - before[ 2 ] ),
 				(unsigned)( CGpu64MultiCore::s_PassCounter[ 3 ] - before[ 3 ] ) );
+#endif
 
 			reuUsingPolling();
 		} else

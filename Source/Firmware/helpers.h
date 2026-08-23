@@ -73,10 +73,8 @@ extern void strupr( char *d, char *s );
 	if ( bOK ) bOK = m_Timer.Initialize();														\
 	/* initialize ARM cycle counters (for accurate timing) */ 									\
 	initCycleCounter(); 																		\
-	logger->Write( "gpu64", LogNotice, "boot: serial+screen+interrupt+timer up, entering gpioInit()" ); \
 	/* initialize GPIOs */ 																		\
 	gpioInit(); 																				\
-	logger->Write( "gpu64", LogNotice, "boot: gpioInit() returned" );							\
 	/* gpu64: measure the HDMI frame period for the frame clock (gpu64_vsync.h). */				\
 	/* Blocking -- ~half a second at 60Hz -- which is why it happens here, at boot, */			\
 	/* and never once the C64 is being watched. A failure is not fatal: it just */				\

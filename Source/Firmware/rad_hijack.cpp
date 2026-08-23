@@ -2229,10 +2229,7 @@ u32 handleOneRasterLine( int fade1024, u8 fadeText = 1 )
 
 void initHijack()
 {
-	extern CLogger	*logger;
-	logger->Write( "gpu64", LogNotice, "initHijack: bc0 entered" );
 	initMenu();
-	logger->Write( "gpu64", LogNotice, "initHijack: bc0b initMenu done" );
 
 	//readFile( logger, (char*)DRIVE, ( char* )"SD:RAD/font.bin", &font_bin[ 0 ], &size );
 	//memcpy( font_bin + 2048 + 94 * 8, font_bin + 2048 + 233 * 8, 8 );
