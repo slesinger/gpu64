@@ -35,6 +35,8 @@
 // without including gpu64_fb.h, which pulls in Circle's framebuffer and
 // character-generator headers -- the same reasoning as g_pRAD above.
 boolean gpu64_commitFlip( void );
+// gpu64: warms the mailbox post the commit ends in -- see gpu64_flip.h.
+void gpu64_flipWarm( void );
 
 // gpu64: forward-declared rather than pulling in rad_main.h (which drags in
 // the whole Circle screen/HDMI-console stack) -- see rad_main.h for the
@@ -419,6 +421,10 @@ void gpu64_vsyncWarmCommit( void )
 {
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_vsyncCommitFlip, 1024 * 2 );
 	FORCE_READ_LINEARa( (void*)gpu64_vsyncCommitFlip, 1024 * 2, 1024 * 2 );
+
+	// gpu64: and the mailbox post the commit now ends in, which lives in
+	// another translation unit and is not covered by the preload above.
+	gpu64_flipWarm();
 }
 
 // gpu64: milestone 4 blob transfers -- the "commands by reference" half of

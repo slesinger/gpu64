@@ -171,7 +171,7 @@ Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
 | $04 | `SET_DRAW_PAGE` | 1 | `ARG0`: 0 or 1 | Selects the page subsequent draw ops write to. |
 | $05 | `PAGE_FLIP` | 1 | `ARG0`: 0 = now, 1 = at next vblank | Makes the draw page visible and the old visible page the draw page. With `ARG0 = 1` the swap happens at the next vblank and `STATUS` bit0 (busy) stays set until it lands; asking for a second deferred flip while one is still pending returns `BUSY` and changes nothing. |
 | $06 | `GET_INFO` | 6 | `ARG0-5` destination descriptor | Writes the 16-byte info block (see below) to your memory. `len` must be ≥ 16. |
-| $07 | `LOG_ENABLE` | 1 | `ARG0`: 0 = off, 1 = on | Shows or hides gpu64's on-screen log overlay. On at reset, but **the first successful command of a session hides it automatically** so firmware text does not land on your output; `LOG_ENABLE` itself is exempt, so call it whenever you actually want the log. |
+| $07 | `LOG_ENABLE` | 1 | `ARG0`: 0 = off, 1 = on | Shows or hides gpu64's on-screen log overlay. On at reset, but **the first successful command of a session hides it automatically** so firmware text does not land on your output; `LOG_ENABLE` itself is exempt, so call it whenever you actually want the log. Turning it on also prints two `FLIP` lines giving what this session's page flips cost, in microseconds. |
 | $08 | `SET_BORDER` | 1 | `ARG0`: palette index | Paints the border around the drawing surface. Black at reset. See [Border](#border). |
 | $09 | `VBLANK_SYNC` | 0 | — | Re-syncs the frame clock against a real vertical sync. Costs up to one frame of halt; occasional housekeeping for a long-running program, not a per-frame call. See [vblank](#vblank). |
 

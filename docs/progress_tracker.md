@@ -559,6 +559,108 @@ during 4b's bring-up:
   carrying a second, larger font. The call still alternates lit/flat so a
   C64-side trigger stays distinguishable from the boot-time draw.
 
+## 4d. The page flip without the mailbox round trip
+
+**Status: implemented, awaiting hardware verification.** Everything below is
+built and builds clean; none of it has been on the bench yet. The bench
+procedure is at the end of this section.
+
+### The problem 4b left behind
+
+Milestone 4b measured the deferred `PAGE_FLIP` commit at **71 µs at best,
+~900 µs typically** over 256 flips, and listed it under Known issues. That
+whole cost is `CBcmFrameBuffer::SetVirtualOffset()` — a *synchronous*
+property-mailbox call to the VideoCore — and the commit runs inside the DMA
+hold at the frame boundary, so the C64 is halted for all of it. A program
+flipping every frame gives up roughly 5% of its cycles to the commit, and a
+hold that long can span a raster and flash the VIC-II.
+
+Almost none of that is the ARM's own work. Writing the request into
+`MAILBOX1` is a status poll and one 32-bit store; the rest is waiting for the
+VideoCore's mailbox task to be *scheduled*, which is also why the figure
+swings by more than an order of magnitude.
+
+### What shipped
+
+- **[gpu64_flip.h/.cpp](../Source/Firmware/gpu64_flip.cpp)** — the round trip
+  split in half. `gpu64_flipPost()` fills a pre-built `SET_VIRTUAL_OFFSET`
+  property buffer and writes the mailbox *without reading the reply*;
+  `gpu64_flipDrain()` consumes the reply later, outside the hold. The buffer
+  is built once at init in coherent slot 3 (uncached, so no cache
+  maintenance at all on the fast path) — deliberately **not** slot 0, which
+  `CBcmPropertyTags` reuses for every other property call in the system.
+- **The drain is a correctness mechanism, not bookkeeping.** Once posted, the
+  flip is in flight and the page the C64 may now draw into is not provably
+  off-screen yet. But the C64 cannot draw without issuing a command, and
+  `gpu64_apiDispatch()` drains before doing anything else — so by the time
+  any drawing can happen, the VideoCore has processed the flip. The race is
+  closed by construction rather than by timing luck, and the drain costs
+  nothing in the normal case because the reply is long since ready.
+- **Draining also protects Circle's mailbox users.**
+  `CBcmMailBox::WriteRead()` starts with a `Flush()` that discards stale
+  replies at **20 ms each**. An unconsumed reply of ours sitting in
+  `MAILBOX0` when Circle next uses the mailbox would cost exactly that, so
+  `CommitPalette()`, `WaitForVSync()` and `ResetPages()` drain first too.
+- **A drain timeout disarms the fast path rather than hanging.** 50 ms with
+  no reply — two orders of magnitude past the round trip's real cost — turns
+  the fast path off for the session and every flip falls back to Circle's
+  blocking call, which is slow but proven. `slowCount` counts the fallbacks.
+- **The commit path is now warmed.** With the mailbox wait gone, the
+  remaining cost is mostly the cold instruction cache of the call chain
+  itself, which the ~900 µs used to render invisible. `gpu64_flipWarm()` is
+  called from `gpu64_vsyncWarmCommit()`, i.e. from the `PAGE_FLIP` dispatch
+  where the bus is already held — the same rule 4b established.
+- **The measurement is permanent, and taken at the right place.**
+  `gpu64_commitFlip()` times the *whole* chain, not just the post, because
+  what matters is how long the frame boundary holds the C64. Two system-timer
+  reads, on flips only. `LOG_ENABLE(1)` prints the result — it is exempt from
+  the log auto-hide, so it is the one command a bench program can use to read
+  firmware state back.
+
+### Why this and not writing the HVS display list directly
+
+The obvious deeper fix is to bypass the VideoCore entirely and patch the
+frame pointer in the HVS display list from the ARM, the way Linux's `vc4`
+DRM driver does on this very SoC. That would cut the *latency* as well as the
+cost, not just move the wait.
+
+It was not chosen for a first pass because the dlist is firmware-owned and
+its layout would have to be discovered at runtime and re-verified against
+every firmware version — a real bring-up risk — while latency is not what the
+Known issue complains about. ~1 ms of latency inside a 16.6 ms frame is fine;
+1 ms of *halted C64* is not. If tearing shows up after this change, the HVS
+route is the next thing to try.
+
+### Bench procedure
+
+Unchanged demo:
+[Source/TestPRG/gpu64_vblank_demo.a](../Source/TestPRG/gpu64_vblank_demo.a).
+It already ends with `LOG_ENABLE(1)`, so the flip cost prints itself. Run it
+exactly as in 4b (RAD menu, T key → REU), then read the HDMI log:
+
+```
+FLIP fast n=256 h=min/avg/max us
+FLIP wait n=256 min/avg/max us s=0
+```
+
+- **`fast`, not `SLOW`** — `SLOW` means the fast path was disarmed
+  (init failed, or a drain timed out) and every flip took the old blocking
+  call. `s=` on the second line counts those fallbacks; expect 0.
+- **`h=` is the pass/fail number.** 4b measured 71/-/900 µs here. Single-digit
+  microseconds means the change did what it is for. Anything in the hundreds
+  means the post is not actually asynchronous.
+- **`wait=` is where the cost went**, and it is only interesting if it is
+  large: it is time the *next command* spent finishing an in-flight flip,
+  paid outside the frame boundary. It should be small, because the demo
+  computes a whole frame between the flip and its next command.
+- **The C64-side rows still have to read as they did in 4b** — rows 2 and 3
+  both `0100`, `ERRCODE` 0. The flip rework must not change a single one of
+  them; if it does, the drain placement is wrong.
+- **Watch the animation, not just the numbers.** The specific new failure
+  mode this design could have is tearing or a flash from a page being drawn
+  into before the VideoCore stopped scanning it out. 4b's bar sweep is a
+  tearing test.
+
 ## 5. Extend VIC-II sniffing
 
 **Status: parked (2026-08-22), by decision rather than by blocker.** The
@@ -617,12 +719,13 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
   loop never reaches `reuUsingPolling()`, which is where all of gpu64's own
   code runs, so a gpu64 cause is unlikely but unproven.
 
-- **The deferred page flip costs a VideoCore mailbox round trip**, measured
-  at 71 µs best and ~900 µs typically over 256 flips. It runs inside a DMA
-  hold, so it is safe, but a program flipping every frame gives up roughly
-  5% of the C64's cycles to it and can make the VIC-II flash a line where
-  the hold spans a raster. Writing the display offset without the mailbox
-  would remove nearly all of that.
+- **The deferred page flip costs a VideoCore mailbox round trip** — 71 µs
+  best, ~900 µs typically over 256 flips, all of it with the C64 halted.
+  **Addressed in milestone 4d (above) by posting the mailbox request without
+  waiting for the reply; not yet verified on hardware**, so this stays listed
+  until a bench round says otherwise. The deeper fix, writing the HVS display
+  list from the ARM and skipping the VideoCore entirely, is still open and is
+  the next thing to try if tearing appears.
 
 - **Mirror freeze when the on-screen log filled the column, root cause not
   conclusively identified.** During milestone 3 bring-up the mirror stopped

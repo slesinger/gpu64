@@ -36,6 +36,23 @@
 ;                  while the clock itself is fine
 ;        row 4  ERRCODE at the end                        (0 = OK)
 ;
+;      The run ends by turning gpu64's HDMI log back on, and LOG_ENABLE(1)
+;      makes the firmware print what the 256 flips cost -- two lines:
+;
+;        FLIP fast n=NNN h=min/avg/max us   time the C64 was halted at each
+;                                           frame boundary to commit a flip
+;                                           ("SLOW" instead of "fast" means
+;                                           the mailbox fast path was
+;                                           disarmed and every flip fell back
+;                                           to the blocking call)
+;        FLIP wait n=NNN min/avg/max us s=N time the *next* command paid
+;                                           finishing an in-flight flip;
+;                                           s = flips that fell back
+;
+;      Before milestone 4c the first line was 71/~900 us; the point of the
+;      change is that it should now read single-digit microseconds, with the
+;      wait line small too (see docs/progress_tracker.md).
+;
 ;      REU emulation must be selected in RAD's menu (T key -> REU), same as
 ;      every other gpu64 test PRG -- everything gpu64 does lives inside
 ;      reuUsingPolling().

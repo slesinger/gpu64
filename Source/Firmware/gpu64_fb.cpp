@@ -4,6 +4,7 @@
 */
 #include "gpu64_fb.h"
 #include "gpu64_font8x8.h"
+#include "gpu64_flip.h"
 #include <circle/synchronize.h>
 #include <circle/util.h>
 
@@ -111,6 +112,11 @@ boolean CGpu64FrameBuffer::Initialize( void )
 	}
 
 	m_pFB->SetVirtualOffset( 0, 0 );
+
+	// Not fatal if it fails: CommitFlip() just keeps using the blocking
+	// mailbox call the way milestone 4b shipped it.
+	gpu64_flipInit();
+
 	return TRUE;
 }
 
@@ -212,8 +218,20 @@ boolean CGpu64FrameBuffer::CommitFlip( void )
 	if ( !m_bInitialized )
 		return FALSE;
 
-	if ( !m_pFB->SetVirtualOffset( 0, m_nPendingVisible * GPU64_FB_TOTAL_H ) )
-		return FALSE;
+	u32 nOffsetY = m_nPendingVisible * GPU64_FB_TOTAL_H;
+
+	// The fast path posts the request and returns without waiting for the
+	// VideoCore -- see gpu64_flip.h. It is the whole reason this function is
+	// safe to call from inside the DMA hold at a frame boundary. If it is
+	// unavailable (init failed, or a drain timed out and disarmed it) fall
+	// back to Circle's blocking call, which is exactly how milestone 4b
+	// shipped: correct, and slow enough to notice.
+	if ( !gpu64_flipPost( nOffsetY ) )
+	{
+		gpu64FlipStats.slowCount++;
+		if ( !m_pFB->SetVirtualOffset( 0, nOffsetY ) )
+			return FALSE;
+	}
 
 	m_nDrawPage = m_nVisiblePage;
 	m_nVisiblePage = m_nPendingVisible;
@@ -233,6 +251,7 @@ boolean CGpu64FrameBuffer::WaitForVSync( void )
 {
 	if ( !m_bInitialized )
 		return FALSE;
+	gpu64_flipDrain();				// as in ResetPages(): Circle's mailbox, not ours
 	return m_pFB->WaitForVerticalSync();
 }
 
@@ -241,6 +260,9 @@ void CGpu64FrameBuffer::ResetPages( void )
 	if ( !m_bInitialized )
 		return;
 	m_nDrawPage = m_nVisiblePage = m_nPendingVisible = 0;
+	// Circle's mailbox call below would otherwise swallow an in-flight
+	// flip's reply -- and pay 20 ms for the privilege, per CBcmMailBox::Flush().
+	gpu64_flipDrain();
 	m_pFB->SetVirtualOffset( 0, 0 );
 }
 
@@ -396,6 +418,7 @@ boolean CGpu64FrameBuffer::CommitPalette( void )
 {
 	if ( m_pFB == 0 )
 		return FALSE;
+	gpu64_flipDrain();				// as in ResetPages(): Circle's mailbox, not ours
 	return m_pFB->UpdatePalette();
 }
 
@@ -531,5 +554,24 @@ boolean gpu64_commitFlip( void )
 {
 	if ( g_pGpu64FB == 0 )
 		return FALSE;
-	return g_pGpu64FB->CommitFlip();
+
+	// gpu64: this is the measurement point for the flip's cost, not
+	// gpu64_flipPost() -- what matters is the whole chain, cold instruction
+	// cache included, because that is exactly how long the frame boundary
+	// holds the C64 halted. Two system-timer reads, on flips only.
+	//
+	// Only *deferred* flips are counted: an immediate PAGE_FLIP calls
+	// CommitFlip() directly and never comes through here. That is
+	// deliberate -- the cost this module exists to remove is the one paid
+	// inside the bus-watch loop's hold, and only the deferred flip pays it.
+	u32 t0 = read32( ARM_SYSTIMER_CLO );
+	boolean bOK = g_pGpu64FB->CommitFlip();
+	u32 dt = read32( ARM_SYSTIMER_CLO ) - t0;
+
+	gpu64FlipStats.postCount++;
+	gpu64FlipStats.postTotalUs += dt;
+	if ( dt < gpu64FlipStats.postMinUs ) gpu64FlipStats.postMinUs = dt;
+	if ( dt > gpu64FlipStats.postMaxUs ) gpu64FlipStats.postMaxUs = dt;
+
+	return bOK;
 }

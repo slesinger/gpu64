@@ -5,6 +5,7 @@
 #include "gpu64_api.h"
 #include "gpu64_fb.h"
 #include "gpu64_vsync.h"
+#include "gpu64_flip.h"
 #include <circle/util.h>
 
 // gpu64: set once a program actually drives the API, which stops the
@@ -121,6 +122,62 @@ static inline void fltWrite( u8 *p, u32 i, float f )
 }
 
 // --- class 0 dispatch ---------------------------------------------------
+
+// gpu64: LOG_ENABLE(1) is the only command exempt from the log auto-hide, so
+// it is the one place a bench program can ask the firmware to say something
+// back. Milestone 4c's flip rework exists to move a measured cost, so it
+// reports the measurement -- otherwise the only way to know whether the
+// mailbox split actually helped is to believe it did. See gpu64_flip.h.
+static char *logDec( char *p, u32 v )
+{
+	char tmp[ 10 ];
+	unsigned n = 0;
+	do { tmp[ n++ ] = (char)( '0' + v % 10 ); v /= 10; } while ( v != 0 );
+	while ( n-- ) *p++ = tmp[ n ];
+	return p;
+}
+
+static char *logTriple( char *p, u32 nMin, u32 nTotal, u32 nMax, u32 nCount )
+{
+	if ( nCount == 0 )
+		{ *p++ = '-'; return p; }
+	p = logDec( p, nMin );  *p++ = '/';
+	p = logDec( p, nTotal / nCount ); *p++ = '/';
+	p = logDec( p, nMax );  *p++ = 'u'; *p++ = 's';
+	return p;
+}
+
+static void logFlipStats( CGpu64FrameBuffer *pFB )
+{
+	if ( pFB == 0 )
+		return;
+
+	// Two lines, and every field is a u32 -- sized for the absurd case
+	// (ten digits everywhere) rather than the realistic one, because this
+	// writes without bounds checking.
+	char line[ 192 ];
+	char *p = line;
+
+	const char *pTag = gpu64_flipAvailable() ? "FLIP fast n=" : "FLIP SLOW n=";
+	for ( const char *q = pTag; *q; q++ ) *p++ = *q;
+	p = logDec( p, gpu64FlipStats.postCount );
+
+	*p++ = ' '; *p++ = 'h'; *p++ = '=';
+	p = logTriple( p, gpu64FlipStats.postMinUs, gpu64FlipStats.postTotalUs,
+			  gpu64FlipStats.postMaxUs, gpu64FlipStats.postCount );
+	*p++ = '\n';
+
+	for ( const char *q = "FLIP wait n="; *q; q++ ) *p++ = *q;
+	p = logDec( p, gpu64FlipStats.drainCount );
+	*p++ = ' ';
+	p = logTriple( p, gpu64FlipStats.drainMinUs, gpu64FlipStats.drainTotalUs,
+			  gpu64FlipStats.drainMaxUs, gpu64FlipStats.drainCount );
+	*p++ = ' '; *p++ = 's'; *p++ = '=';
+	p = logDec( p, gpu64FlipStats.slowCount );
+	*p++ = '\n';
+
+	pFB->LogWrite( line, (unsigned)( p - line ) );
+}
 
 static u8 doSystem( u8 op )
 {
@@ -245,6 +302,9 @@ static u8 doSystem( u8 op )
 		if ( sArg[ 0 ] > 1 )
 			return GPU64_ERR_BAD_ARGS;
 		if ( pFB ) pFB->LogEnable( sArg[ 0 ] ? TRUE : FALSE );
+		// Turning the log *on* is a request to be told something, so this is
+		// where the flip cost gets reported (logFlipStats() above).
+		if ( sArg[ 0 ] ) logFlipStats( pFB );
 		return GPU64_ERR_OK;
 
 	case 0x09:					// VBLANK_SYNC
@@ -657,6 +717,14 @@ static u8 doMath( u8 op )
 
 void gpu64_apiDispatch( u8 op )
 {
+	// gpu64: finish any page flip still in flight before anything else runs
+	// (gpu64_flip.h). Two reasons, and both are correctness, not tidiness:
+	// this command may draw into a page the VideoCore has not yet stopped
+	// scanning out, and it may itself want Circle's mailbox, whose Flush()
+	// would eat our reply at 20 ms a go. Normally a no-op -- the reply is
+	// long since ready by the time the C64 issues its next command.
+	gpu64_flipDrain();
+
 	if ( sCmdHi != 0 )
 	{
 		sErr = GPU64_ERR_BAD_CLASS;			// class 1 (3D) is milestone 6
