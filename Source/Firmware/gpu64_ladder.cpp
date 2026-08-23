@@ -20,51 +20,56 @@
 
 #ifdef GPU64_LADDER_ENABLED
 
-Gpu64LadderFromWorker gpu64LadderFromWorker;
 Gpu64LadderToWorker   gpu64LadderToWorker;
 
 Gpu64LadderStats gpu64Ladder[ GPU64_LADDER_RUNGS + 1 ] __attribute__(( aligned( 64 ) ));
 Gpu64LadderPass  gpu64LadderPass;
 
-// One rung per row. `setBytes` is the working-set footprint (the prefix of
-// s_Buffer this rung cycles through) and `bytesPerMs` is the throttle: core 1
-// writes that many bytes, then sleeps out the rest of the millisecond against
-// the generic timer, so the rate is set by wall clock rather than by how fast
-// the core happens to be. Bytes-per-millisecond is also megabytes-per-second
-// times 1000, which is why the achieved-rate column below is just bytes/us.
+// One rung per row. `setBytes` is the working-set footprint (16 KB throughout
+// this round -- L1-resident, so the memory hierarchy is not a variable),
+// `burstLines` is how many consecutive 64-byte lines core 1 writes at the top
+// of a slot, and `slotUs` is how long the slot is. Rate is burstLines x 64 /
+// slotUs, so the last two together are what finally make burst and rate
+// independent -- see gpu64_ladder.h for why that matters and what the 2x2 is
+// meant to decide.
 //
-// See gpu64_ladder.h for how the axis got here. In short: rate turned out not
-// to be a variable at all, so this table holds it fixed and sweeps footprint
-// upward until core 0 breaks. Where that happens is milestone 6's budget.
+// Order matters: a derail ends the run and zeros every rung above it. The spin
+// control comes first because it can void half the table, then the known-clean
+// warm rung, then the burst arm at low rate, then the rate arm at low burst,
+// and the rungs already known to be fatal last.
 static const struct
 {
 	const char *pLabel;			// 7 characters, padded
 	u32	setBytes;
-	u32	bytesPerMs;
-	u8	unthrottled;
-	u8	nonTemporal;
+	u32	burstLines;				// consecutive 64-byte lines per slot
+	u32	slotUs;					// slot period, microseconds
+	u8	mode;					// GPU64_LADDER_MODE_*
 }
 s_Rung[ GPU64_LADDER_RUNGS + 1 ] =
 {
-	{ "idle   ",	0,						0,							0, 0 },
+	{ "park   ",	0,						0,						0,							GPU64_LADDER_MODE_PARK },
 
-	// Ascending footprint at a fixed 64 MB/s. 16K is round 5's most-proven-
-	// clean load; tight spacing through 512K (the shared L2's size) because
-	// that is where the answer has to be.
-	{ "16K    ",	GPU64_LADDER_SET_16K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "64K    ",	GPU64_LADDER_SET_64K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "128K   ",	GPU64_LADDER_SET_128K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "192K   ",	GPU64_LADDER_SET_192K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "256K   ",	GPU64_LADDER_SET_256K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "320K   ",	GPU64_LADDER_SET_320K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "384K   ",	GPU64_LADDER_SET_384K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "448K   ",	GPU64_LADDER_SET_448K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "512K   ",	GPU64_LADDER_SET_512K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "768K   ",	GPU64_LADDER_SET_768K,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "1M     ",	GPU64_LADDER_SET_1M,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
-	{ "2M     ",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_SWEEP_RATE,	0, 0 },
+	// Round 17 killed burst 8 on a cold 2 MB set at 1.6 MB/s while burst 8 on
+	// an L1-resident set was clean at 25 MB/s. A cold store must allocate its
+	// line before it retires, so the same burst is a much longer stall. Every
+	// rung below is cold, and the edge is bracketed between 5 (clean, rounds
+	// 11-12) and 8 (fatal).
+	{ "c b4 lo",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_4,	GPU64_LADDER_SLOT_320US,	GPU64_LADDER_MODE_WORK },
+	{ "c b4 hi",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_4,	GPU64_LADDER_SLOT_40US,		GPU64_LADDER_MODE_WORK },
+	{ "c b5 hi",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_5,	GPU64_LADDER_SLOT_40US,		GPU64_LADDER_MODE_WORK },
+	{ "c b6 hi",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_6,	GPU64_LADDER_SLOT_40US,		GPU64_LADDER_MODE_WORK },
+	{ "c b7 hi",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_7,	GPU64_LADDER_SLOT_40US,		GPU64_LADDER_MODE_WORK },
 
-	{ "done   ",	0,						0,							0, 0 }
+	// The mitigation. DC ZVA writes a whole line with no read-for-ownership,
+	// which is exactly the extra cost a cold store pays. Clean here against a
+	// fatal plain b8 means the cold penalty can be engineered away.
+	{ "zva b8 ",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_8,	GPU64_LADDER_SLOT_40US,		GPU64_LADDER_MODE_ZVA },
+	{ "zva b16",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_16,	GPU64_LADDER_SLOT_40US,		GPU64_LADDER_MODE_ZVA },
+
+	// Round 17's killer, reproduced last so a derail costs nothing above it.
+	{ "c b8 lo",	GPU64_LADDER_SET_DRAM,	GPU64_LADDER_BURST_8,	GPU64_LADDER_SLOT_320US,	GPU64_LADDER_MODE_WORK },
+
+	{ "done   ",	0,						0,						0,							GPU64_LADDER_MODE_PARK }
 };
 
 // Core 1's working set, sized for the largest arm. Static rather than
@@ -97,14 +102,14 @@ void gpu64_ladderArm( void )
 
 	gpu64LadderPass.prev       = 0;
 	gpu64LadderPass.skip       = 1;
-	gpu64LadderPass.tick       = 0;
+	gpu64LadderPass.left       = GPU64_LADDER_RUNG_PASSES;
 	gpu64LadderPass.rung       = 0;
 	gpu64LadderPass.threshold  = 0;
 	gpu64LadderPass.threshold2 = 0;
 	gpu64LadderPass.baseline   = 0;
 	gpu64LadderPass.dumped     = 0;
 
-	gpu64LadderFromWorker.rung = 0;
+	gpu64LadderToWorker.rung = 0;
 
 	// Bump last, and after everything else is cleared: this is what core 1
 	// watches, and seeing it move is what makes core 1 restart its own
@@ -135,6 +140,20 @@ static inline u64 ladderTicks( void )
 	u64 v;
 	asm volatile( "MRS %0, CNTVCT_EL0" : "=r" (v) );
 	return v;
+}
+
+// `DC ZVA` zeroes a whole cache line without reading it first, so a cold
+// write becomes one DRAM transaction instead of a read-for-ownership plus a
+// later writeback. DCZID_EL0 says whether it is usable: bit 4 (DZP) set means
+// prohibited, and the low four bits are log2 of the block size in words. A
+// Cortex-A53 reports 4, i.e. 16 words = 64 bytes = one line. Anything else and
+// the ZVA rung falls back to plain stores, which the report makes visible as a
+// rung whose numbers match its plain-store neighbour exactly.
+static inline bool ladderZvaIs64( void )
+{
+	u64 v;
+	asm volatile( "MRS %0, DCZID_EL0" : "=r" (v) );
+	return ( v & ( 1 << 4 ) ) == 0 && ( v & 0xF ) == 4;
 }
 
 static inline u64 ladderFreq( void )
@@ -181,60 +200,44 @@ static inline void ladderEnableEventStream( void )
 	asm volatile( "ISB" );
 }
 
-// Non-temporal store pair. STNP is the AArch64 hint that this data has no
-// reuse: it writes without allocating in L1 or L2, so the stream does not
-// evict anything either core is relying on. That is precisely the mechanism
-// round 4 implicates, which is what makes the NT rung a test of the
-// diagnosis and not just a second data point.
-//
-// Two u64s per instruction, hence the pairwise loop and the even word counts
-// the rung table's byte figures all happen to give.
-static inline void ladderStoreNT( u64 *p, u64 v )
-{
-	asm volatile( "STNP %1, %2, [%0]" :: "r" (p), "r" (v), "r" (v) : "memory" );
-}
-
 void gpu64_ladderWorker( void )
 {
-	// volatile so the ordinary stores are real traffic and not something the
-	// optimiser can prove nobody reads. The non-temporal path goes through
-	// inline asm and does not need it.
+	// volatile so the stores are real traffic and not something the optimiser
+	// can prove nobody reads.
 	volatile u64 *pBuf = s_Buffer;
 
 	u32 idx = 0;
 	u64 v   = 0;
 
+	const bool bZva = ladderZvaIs64();
+
 	ladderEnableEventStream();
 
-	// Also part of the first round's damage: this used to be a bare spin,
-	// and it ran from boot until the first gpu64 command -- through all of
-	// the RAD menu and the BASIC LOAD. Now the core is actually asleep for
-	// all of it.
 	u32 nGen = gpu64LadderToWorker.gen;
 	while ( nGen == 0 )
 		{ asm volatile( "WFE" ); nGen = gpu64LadderToWorker.gen; }
 
-	// The armstub's EL3 prologue programs CNTFRQ_EL0 to OSC_FREQ on every
-	// core (Source/Firmware/ARM STUB/rad-prefetch.S), so this is 19.2MHz in
+	// The armstub's EL3 prologue programs CNTFRQ_EL0 to OSC_FREQ on every core
+	// (Source/Firmware/ARM STUB/rad-prefetch.S), so this is 19.2MHz in
 	// practice -- but a zero here would be a divide-by-zero hang on a core
 	// nothing can log from, so it falls back rather than trusting that.
 	u64 nFreq = ladderFreq();
 	if ( nFreq == 0 )
 		nFreq = 19200000;
 
-	// Multiply before dividing. This read `nFreq * ( GPU64_LADDER_RUNG_US /
-	// 1000000 )` until round 6, where GPU64_LADDER_RUNG_US was 2500000 and
-	// integer division silently made every rung 2 seconds instead of 2.5 --
-	// visible only as an idle rung with 1920k passes where 2400k was
-	// expected. 19.2e6 * 2e6 is 3.8e13, comfortably inside u64.
-	const u64 nRungTicks = nFreq * GPU64_LADDER_RUNG_US / 1000000;
-	const u64 nSlotTicks = nFreq / 1000;
+	// Recomputed whenever a rung changes the slot period. The event stream
+	// fires once per 2^EVNTI ticks, so a slot shorter than that cannot be
+	// waited on with WFE and is paced by spinning on CNTVCT_EL0 instead --
+	// see the wait at the bottom of the loop, and `spin64`, its control rung.
+	const u64 nEvtTicks = (u64)1 << GPU64_LADDER_EVNTI;
 
-	u64 tStart = ladderTicks();
-	u64 tSlot  = tStart;
-	u64 tPrev  = tStart;
+	u32 nLastSlotUs = 0;
+	u64 nSlotTicks  = nFreq / 1000;
+
+	u64 tSlot = ladderTicks();
+	u64 tPrev = tSlot;
+
 	u32 nLastSet = 0;
-
 	u64 nAccBytes = 0;
 	u64 nAccTicks = 0;
 	u32 nAccSlots = 0;
@@ -242,13 +245,26 @@ void gpu64_ladderWorker( void )
 
 	while ( 1 )
 	{
-		u64 now = ladderTicks();
+		// The only shared read on this path, and it is one word from a line
+		// core 0 writes about twice a second.
+		const u32 rung = gpu64LadderToWorker.rung;
+		const u8  mode = s_Rung[ rung ].mode;
 
-		// Re-armed: start the ladder over from rung 0 against a fresh clock.
+		// PARK: wake on the event stream, read that one word, sleep again.
+		// Nothing else at all -- no timer read, no store, no arithmetic. This
+		// is the control rung, and it has to stay this bare to be worth
+		// anything.
+		if ( mode == GPU64_LADDER_MODE_PARK )
+		{
+			asm volatile( "WFE" );
+			continue;
+		}
+
 		if ( gpu64LadderToWorker.gen != nGen )
 		{
 			nGen = gpu64LadderToWorker.gen;
-			tStart = tSlot = tPrev = now;
+			tSlot = tPrev = ladderTicks();
+			nLastSlotUs = 0;
 			nLastSet = 0;
 			idx = 0;
 			nAccBytes = nAccTicks = 0;
@@ -256,82 +272,103 @@ void gpu64_ladderWorker( void )
 			nAccRung  = 0;
 		}
 
-		u64 rung = ( now - tStart ) / nRungTicks;
-		if ( rung > GPU64_LADDER_RUNGS )
-			rung = GPU64_LADDER_RUNGS;
-		gpu64LadderFromWorker.rung = (u32)rung;
-
-		const u32 nBytes = s_Rung[ rung ].bytesPerMs;
-		const u32 nWrite = nBytes / 8;
-		const u32 nWords = s_Rung[ rung ].setBytes / 8;
-
-		// Restart at the top of the buffer whenever the footprint changes, so
-		// a rung never inherits a cursor pointing past its own working set.
-		if ( s_Rung[ rung ].setBytes != nLastSet )
-			{ nLastSet = s_Rung[ rung ].setBytes; idx = 0; }
-
-		if ( nWords )
+		// TICK and above: paced off the generic timer, in slots this rung's
+		// own length. Resynchronise on a change rather than carrying the old
+		// deadline forward, which would make the first slot of a longer rung
+		// fire immediately.
+		if ( s_Rung[ rung ].slotUs != nLastSlotUs )
 		{
-			if ( s_Rung[ rung ].nonTemporal )
+			nLastSlotUs = s_Rung[ rung ].slotUs;
+			nSlotTicks  = nFreq * nLastSlotUs / 1000000;
+			tSlot = ladderTicks();
+		}
+
+		u64 now = ladderTicks();
+
+		if ( mode >= GPU64_LADDER_MODE_WORK )
+		{
+			// 8 u64 per 64-byte line, written in address order, so a burst of
+			// N lines really is N contiguous lines and not N scattered ones --
+			// the whole point of the rung is the length of an *unbroken* run.
+			const u32 nLines = s_Rung[ rung ].burstLines;
+			const u32 nBytes = nLines * 64;
+			const u32 nWords = s_Rung[ rung ].setBytes / 8;
+
+			// Restart at the top of the buffer whenever the footprint
+			// changes, so a rung never inherits a cursor pointing past its
+			// own working set. Not on a rung change alone: the warm rungs
+			// share a set on purpose and must inherit each other's residency.
+			if ( s_Rung[ rung ].setBytes != nLastSet )
+				{ nLastSet = s_Rung[ rung ].setBytes; idx = 0; }
+
+			if ( mode == GPU64_LADDER_MODE_ZVA && bZva )
 			{
-				for ( u32 i = 0; i + 1 < nWrite; i += 2 )
+				// idx stays a multiple of 8 because every step is a whole
+				// line and every set size is a whole number of lines, so the
+				// address handed to DC ZVA is always 64-byte aligned.
+				u8 *pLine = (u8 *)s_Buffer + (size_t)idx * 8;
+
+				for ( u32 i = 0; i < nLines; i++ )
 				{
-					ladderStoreNT( (u64 *)&pBuf[ idx ], v++ );
-					idx += 2;
-					if ( idx + 1 >= nWords ) idx = 0;
+					asm volatile( "DC ZVA, %0" :: "r" (pLine) : "memory" );
+					idx += 8;
+					if ( idx >= nWords ) { idx = 0; pLine = (u8 *)s_Buffer; }
+					else pLine += 64;
 				}
 			} else
 			{
-				for ( u32 i = 0; i < nWrite; i++ )
+				for ( u32 i = 0; i < nLines * 8; i++ )
 				{
 					pBuf[ idx ] = v++;
 					if ( ++idx >= nWords ) idx = 0;
 				}
 			}
+
+			nAccBytes += nBytes;
 		}
 
-		// Wall time is attributed a whole slot at a time, throttle wait
-		// included -- the achieved rate has to be the rung's *average*
-		// rate, which is what the throttle sets, not the rate of the burst
-		// inside each millisecond.
-		//
-		// Accumulated in registers and published rarely rather than written
-		// every slot. These arrays are on their own cache lines now, so a
-		// per-slot write would no longer be able to reach core 0's state --
-		// but 1000 shared-memory writes a second, from the core whose entire
-		// job is to not disturb core 0, is not a thing to leave in on the
-		// grounds that it is probably harmless.
-		nAccBytes += nBytes;
-		nAccTicks += now - tPrev;
+		if ( mode >= GPU64_LADDER_MODE_ACC )
+		{
+			// Wall time is attributed a whole slot at a time, throttle wait
+			// included -- the achieved rate has to be the rung's *average*
+			// rate, which is what the throttle sets, not the rate of the
+			// burst inside each millisecond.
+			//
+			// Accumulated in registers and published rarely. These arrays are
+			// core-1-private and on their own cache lines, but 1000
+			// shared-memory writes a second from the core whose entire job is
+			// to not disturb core 0 is not a thing to leave in on the grounds
+			// that it is probably harmless.
+			nAccTicks += now - tPrev;
+
+			if ( rung != nAccRung || ++nAccSlots >= 64 )
+			{
+				s_Written[ nAccRung ]      += nAccBytes;
+				s_ElapsedTicks[ nAccRung ] += nAccTicks;
+				nAccBytes = nAccTicks = 0;
+				nAccSlots = 0;
+				nAccRung  = rung;
+			}
+		}
+
 		tPrev = now;
 
-		if ( rung != nAccRung || ++nAccSlots >= 64 )
-		{
-			s_Written[ nAccRung ]      += nAccBytes;
-			s_ElapsedTicks[ nAccRung ] += nAccTicks;
-			nAccBytes = nAccTicks = 0;
-			nAccSlots = 0;
-			nAccRung  = (u32)rung;
-		}
-
-		u64 after = ladderTicks();
-
-		if ( s_Rung[ rung ].unthrottled )
-		{
-			tSlot = after;
-			continue;
-		}
-
-		tSlot += nSlotTicks;
-
-		// If the rung's budget did not fit in its millisecond, do not let
-		// the throttle turn into a catch-up burst -- resync and let the
+		// If the rung's budget did not fit in its millisecond, do not let the
+		// throttle turn into a catch-up burst -- resync and let the
 		// achieved-rate column report the shortfall instead.
-		if ( (s64)( after - tSlot ) > 0 )
-			{ tSlot = after; continue; }
+		tSlot += nSlotTicks;
+		if ( (s64)( ladderTicks() - tSlot ) > 0 )
+			{ tSlot = ladderTicks(); continue; }
 
+		// Sleep while there is more than one event-stream period to wait, then
+		// spin out the remainder. For a slot shorter than 853us that is a pure
+		// CNTVCT_EL0 spin -- core-local, no bus cycle, and controlled for by
+		// the `spin64` rung.
 		while ( (s64)( ladderTicks() - tSlot ) < 0 )
-			asm volatile( "WFE" );
+		{
+			if ( (s64)( tSlot - ladderTicks() ) > (s64)nEvtTicks )
+				asm volatile( "WFE" );
+		}
 	}
 }
 
@@ -398,23 +435,26 @@ char *gpu64_ladderReport( char *p )
 		*p++ = '\n';
 	}
 
-	// Achieved rates, MB/s, one field per rung in ladder order. On its own
+	// Achieved rates, KB/s, one field per rung in ladder order. On its own
 	// line because the per-rung lines are already at the log's 40 columns,
 	// and because what these are for is validating the throttle rather than
 	// reading alongside the timing: a rung whose achieved rate falls short
 	// of its label was really running at this number, not at its name.
 	//
-	// Bytes per microsecond is megabytes per second. Generic-timer ticks
+	// Bytes per microsecond is megabytes per second, so bytes x 1000 per
+	// microsecond is kilobytes per second. Generic-timer ticks
 	// are converted here rather than per slot, so the worker never does a
 	// 64-bit division in its inner loop.
-	p = ladStr( p, "RATE" );
+	p = ladStr( p, "RATEK" );
 	for ( unsigned i = 0; i <= GPU64_LADDER_RUNGS; i++ )
 	{
 		u64 nHz = ladderFreq();
 		u64 nUs = nHz ? s_ElapsedTicks[ i ] * 1000000 / nHz : 0;
 
 		*p++ = ( i == 0 ) ? ' ' : '/';
-		p = ladDec( p, nUs ? (u32)( s_Written[ i ] / nUs ) : 0 );
+		// Kilobytes per second, not megabytes: round 11's whole ladder ran
+		// below 1 MB/s and every field came back a rounded-down zero.
+		p = ladDec( p, nUs ? (u32)( s_Written[ i ] * 1000 / nUs ) : 0 );
 	}
 	*p++ = '\n';
 

@@ -72,84 +72,114 @@ work to run that isn't core 0's bus-watch loop. The rest of this section is
   cycle-predictability requirement (milestone4_2d_api_design.md)
   applies here too.
 
-### The real risk: shared L2, not core-count
+### The real risk: store bursts, not core-count and not the L2
 
-**Amended 2026-08-23, the hard way:** the L2 is not the only shared resource
-that matters, and the section below is incomplete without this. Core 0's
-timing rests on tight MMIO polling of `ARM_GPIO_GPLEV0`, so the **VideoCore
-peripheral bus** is a contended resource too -- and a more direct one than
-the L2, because core 0 depends on the *latency* of every one of those reads
-rather than on aggregate bandwidth. The load ladder's own first round proved
-it by accident: core 1 spinning on the BCM system timer, an MMIO register on
-that same bus, corrupted gpu64 command arguments while writing zero bytes of
-DRAM traffic (progress_tracker.md milestone 6a, round 1). **The render loop
-must not poll any MMIO register in a spin.** Use `CNTVCT_EL0` for time, and
-budget peripheral-bus access separately from memory bandwidth.
+**Settled 2026-08-23 after eighteen rounds of the load ladder. This
+supersedes every earlier amendment in this section; the narrative below is
+kept only as the record of how it was found.**
 
-**Amended again 2026-08-23, with a measurement, and this one changes the
-design:** the load ladder's fifth round crossed core 1's working-set size
-against its write rate. Every rung whose set fit in cache was **free** --
-16 KB at an achieved 450 MB/s and 256 KB at 449 MB/s both cost core 0 exactly
-zero missed bus cycles over ~2.9M loop passes each. The first rung with a
-2 MB set cost core 0 bus cycles at **3 MB/s** and derailed the C64 in 0.17
-seconds.
+Three shared resources were suspected in turn. Two of them are real
+constraints, and the third -- the shared L2 -- turned out not to be the
+axis at all.
 
-**So the constraint is not a bandwidth budget, and the section below is
-wrong about the shape of the problem even though it is right that the L2 is
-the resource.** Two orders of magnitude of rate make no difference; one step
-across the 512 KB shared L2 is fatal. The cost is not capacity contention in
-the steady state -- a 256 KB set occupies half the L2 permanently and costs
-nothing -- it is *churn*: a set larger than the L2 misses on every store, so
-every store allocates a line, evicts a line, and queues a DRAM writeback,
-and core 0's own rare misses queue behind that traffic inside a loop pass
-with about a microsecond of slack.
+**1. The peripheral bus is contended, and it is the sharpest constraint.**
+Core 0's timing rests on tight MMIO polling of `ARM_GPIO_GPLEV0`, so it
+depends on the *latency* of every one of those reads. The ladder's first
+round proved this by accident: core 1 spinning on the BCM system timer, an
+MMIO register on the same bus, corrupted gpu64 command arguments while
+writing zero bytes of DRAM traffic. **The render loop must not poll any MMIO
+register in a spin.** Use `CNTVCT_EL0` for time -- it is core-local, costs
+no bus cycle, and spinning on it at a 64us cadence was measured completely
+free (round 14).
+
+**2. Core 0 must not read any line another core writes.** Separating the
+lines is not enough on its own -- the discovery in round 8 was a mailbox
+sharing a line with core-0 state, but the fix that actually took the noise
+floor to zero (round 10) was removing core 0's *read* of the worker's line
+entirely. A coherence miss is ~100 cycles, but the polling loop is
+PHI-locked, so missing a deadline by 100 cycles costs a whole 710-cycle VIC
+half-cycle. Every core-0/core-1 mailbox must be one-way, 64 bytes, and
+64-byte aligned; see `Gpu64LadderToWorker` in gpu64_ladder.h for the pattern.
+
+**3. The real memory constraint is the length of an unbroken run of stores
+-- not bandwidth, not working-set size, not cache residency in the general
+case.** A run of consecutive stores occupies the memory system for roughly
+its own duration, and a PHI-locked loop pass has about **1us of slack**.
+Anything that fits in that slack is free; anything that does not derails the
+C64. The measured numbers, all at 2 million loop passes per rung:
+
+| what core 1 does | verdict |
+|---|---|
+| burst 5 lines (320 B), cache-resident, at **64 MB/s** | clean (round 17) |
+| burst 8 lines (512 B), cache-resident, at **25 MB/s** | clean (round 17) |
+| burst 12 lines (768 B), cache-resident | marginal -- 2 late passes per 2M |
+| burst 16 lines (1 KB), cache-resident | **fatal**, derailed at 471k passes |
+| burst 4 lines (256 B), **DRAM-resident** (cold, every store misses), at 6.4 MB/s | clean (round 18) |
+| burst 7 lines (448 B), **DRAM-resident**, at **11.2 MB/s** | clean (round 18) |
+| burst 8 lines (512 B), **DRAM-resident**, at only 1.6 MB/s | **fatal**, derailed at 1762k passes (round 17) |
+| burst 8 lines via `DC ZVA`, **DRAM-resident** | **fatal in 18k passes** -- an order of magnitude worse than plain stores (round 18) |
+
+**There is no rate ceiling.** Burst 5 at 64 MB/s is indistinguishable from
+burst 5 at 1 MB/s -- same worst-case pass, zero losses. That is twenty times
+what a 320x200 50 fps double-buffered renderer needs, for free. Two full
+orders of magnitude of rate change nothing; one step up in burst length
+kills the machine. Rate and working-set size are both non-axes.
+
+**Cache residency is not an axis in itself; it shortens the burst slightly.**
+A cold store must allocate its line (read-for-ownership from DRAM) before it
+retires, so a cold line occupies the memory system longer than a warm one --
+but the effect on the threshold is small: **8 lines warm, 7 lines cold.** The
+limit sits at roughly half a kilobyte of unbroken stores either way, which is
+about what ~1 us of slack buys. Round 17 briefly suggested a much larger gap;
+round 18 closed it by testing the cold side properly.
+
+**The design rule, as it stands:**
+
+> The render core may write **at most 7 consecutive cache lines (448 bytes)
+> before yielding** -- 8 if the target is cache-resident. Below that,
+> throughput is unconstrained to at least 11 MB/s cold and 64 MB/s warm, and
+> the working set may be any size.
+>
+> **Design to 256-byte spans (4 lines).** That is 57% of the measured edge,
+> was clean at both 800 KB/s and 6.4 MB/s, and maps onto a natural unit: a
+> 320-pixel 8bpp scanline is 320 bytes, so one yield per scanline fits with
+> room to spare.
+
+**There is no way to buy a longer burst.** Both mitigations were tried on
+hardware and both failed: `STNP` (round 6 -- the A53 treats the non-temporal
+hint as a no-op) and `DC ZVA` (round 18 -- it writes a line with no
+read-for-ownership, which should have helped, and instead derailed the machine
+a hundred times faster than plain stores, most likely because eight `DC ZVA`
+instructions pack eight line allocations into a handful of cycles where
+sixty-four ordinary stores spread them out). The render loop has to yield.
 
 What this means for the render design:
 
-- **A render loop that streams a full-size framebuffer through DRAM does not
-  work**, at any frame rate, including one so slow it would be useless.
-- **A render loop working out of a cache-resident tile is essentially free**,
-  and can be *fast* -- 450 MB/s of stores into 256 KB cost nothing measurable.
-  Tile-based rendering is not an optimisation here, it is the only shape that
-  fits.
-- The usable resident budget is 512 KB minus whatever core 0's own preload
-  schedule needs, which has not been measured.
-- `STNP`, the non-temporal store pair, is **not** an escape hatch. Round 6
-  derailed within 0.2 s of the first non-temporal rung, twice, exactly as the
-  ordinary 2 MB rung had -- consistent with the Cortex-A53 treating the
-  non-temporal hint as a no-op.
+- **Tile-based rendering is no longer required.** The earlier conclusion
+  that a full-size DRAM framebuffer "does not work at any frame rate" was
+  wrong; it came from a synthetic rung that wrote thousands of lines without
+  yielding. A DRAM framebuffer is fine provided the rasteriser breaks its
+  writes into short spans.
+- **Span length is now a first-class design parameter**, and 256 bytes is
+  the safe unit: a 320-pixel scanline at 8bpp is 320 bytes, so the natural
+  yield point is per-scanline, or twice per scanline.
+- **The 512 KB L2 budget is not a budget.** A working set larger than L2
+  costs nothing by itself; only the burst length does.
 
-**And a correction to the alarm above, from round 6:** the ladder has been
-failing on a 2 MB working set, but **a gpu64 page is 64 KB**. Two pages is
-128 KB, and a 320x200 16bpp z-buffer is another 128 KB -- so a
-double-buffered 3D renderer at this resolution has a working set around
-**256 KB**, which round 5 measured at 449 MB/s with zero missed bus cycles.
-The 2 MB buffer was chosen back when the question was bandwidth and was never
-representative of this renderer. The constraint is real and sharp, but the
-design as sketched may already fit inside it. Round 7 sweeps 256 K to 2 M to
-find the actual edge.
+**A caveat on all of the above.** The ladder's metric samples the loop
+period at the top of the loop, which is a resynchronisation point, so a
+stall that lands *mid-pass* corrupts the bus transaction while the period
+still reads healthy. Both fatal rungs above scored zero late passes right up
+until the C64 died. **A clean metric is necessary, not sufficient** -- the
+C64's own behaviour is the ground truth, and any future render loop needs a
+real REU round-trip running underneath it as the positive control.
 
-**Amended a third time 2026-08-23 -- and this one is a hazard, not a
-measurement.** Round 8 of the ladder found that the instrument had been
-disturbing itself since round 1: core 1's rung mailbox shared a cache line
-with a variable core 0 reads on every pass, so core 1 invalidated core 0's
-hottest line a thousand times a second even in rungs where it wrote no data.
-A coherence miss is ~100 cycles, but the polling loop is PHI-locked -- miss
-the deadline and it waits out a whole VIC half-cycle, so 100 cycles of
-interference becomes a 710-cycle miss.
+See progress_tracker.md milestone 6a, rounds 1-18, for the full record --
+including three published diagnoses (false sharing, DRAM line fills, write
+rate) that later rounds killed.
 
-**This is a standing constraint on the render design.** Any variable core 1
-writes that shares a 64-byte line with anything core 0 reads per pass will
-cause bus-cycle loss, and it will present as a mysterious build-dependent
-timing fault that moves when unrelated code changes. Every core-0/core-1
-mailbox must be 64 bytes in size *and* 64-byte aligned, so the linker cannot
-interleave anything into it; see `Gpu64LadderFromWorker` and
-`Gpu64LadderToWorker` in gpu64_ladder.h for the pattern.
+#### How it was found (historical; superseded by the above)
 
-The footprint numbers below are **provisional** -- they were all taken on the
-self-disturbing instrument and are being re-measured.
-
-See progress_tracker.md milestone 6a, rounds 4-9.
 
 A first design pass here assumed the only things to verify were (a) whether
 Circle's multicore startup coexists with core 0's bit-banging at all, and
@@ -235,10 +265,8 @@ unthrottled, while core 0 counts the bus cycles it actually misses and the
 C64 runs verified REU transfers and a vblank flip loop. It replaces the
 "does the RAD menu look like garbage" signal with a per-rung number, which
 is what makes rungs rankable at all. Design rationale, bench procedure and
-how to read the table: progress_tracker.md milestone 6a. **The number this
-section is waiting for is the highest rung with no missed cycles and no REU
-corruption; the memory-traffic budget below it is what the render loop gets
-to spend.**
+how to read the table: progress_tracker.md milestone 6a. **That number has been found, and it is a
+burst length rather than a bandwidth: see the top of this section.**
 
 Also unverified: RAD disables IRQs (see progress_tracker.md's hw_testing
 notes on why `CScreenDevice`/`CSerialDevice` logging stops working). Any
@@ -318,11 +346,301 @@ that doesn't exist yet is speculative generality. If a genuine 3+-blob
 command shows up, give it a bespoke `ARG` layout then, or split it into
 multiple upload commands.
 
+## The API, decided (2026-08-23)
+
+Everything from here to the opcode table was settled in a design pass on
+2026-08-23. It is design, not implementation — nothing below exists in
+firmware yet, and none of it belongs in [api_design.md](api_design.md)
+until it does.
+
+### Shape of the thing
+
+- **Textured, affine-mapped triangles**, flat-lit per face. Not wireframe,
+  not Gouraud.
+- **Both a retained scene and an immediate mode.** The retained scene plus
+  the autonomous loop is the target end-state; `DRAW_MESH` exists because
+  bring-up needs something that draws one mesh with no loop, no scene graph
+  and no cross-core state to be wrong.
+- **3D renders into a viewport**, not the whole screen; the C64 keeps
+  drawing class-0 2D into the rest of the page (HUD, score, text).
+- **16-bit z-buffer over that viewport.** See the budget below.
+
+### Hidden-surface removal and the working-set budget
+
+A z-buffer, sized to the viewport rather than to the screen, and the
+rasteriser takes the region to fill as a parameter rather than assuming
+the whole viewport.
+
+Against round 5's finding, the set that matters is what the render loop
+*writes*: `w * h` bytes of colour into the draw page plus `w * h * 2`
+bytes of z. For the reference 256x160 viewport that is 120 KB, inside the
+256 KB that measured free, with room left for texels — which are the read
+traffic textures add on top, and which no HSR scheme avoids.
+
+    GPU64_3D_BUDGET = 196608     /* w * h * 3, provisional */
+
+`SET_VIEWPORT` rejects anything past that with `OUT_OF_RANGE`. The number
+is provisional until ladder round 7 finds the actual edge; it leaves ~64 KB
+of L2 for texels and for core 0's own preload schedule.
+
+Painter's algorithm was considered and rejected: it saves the 80 KB of z
+but breaks on interpenetrating geometry, and it saves the wrong resource —
+with textures the pressure is read traffic, which sorting does not touch.
+Full tile-based binning bounds both sets and is the eventual answer at
+higher resolutions, but it is a binning pass plus a per-tile emit, and it
+is the wrong thing to be debugging alongside a first affine rasteriser.
+Keeping the region argument in the rasteriser's signature is what keeps
+that upgrade a scheduling change instead of a rewrite.
+
+### Lighting: a generated colormap, not a structured palette
+
+The framebuffer stays **8bpp indexed all the way to scanout**. Shading that
+emitted RGB was considered and rejected: the palette lookup is free today
+because it happens in the display hardware at scanout, and RGB output would
+make each page 128 KB, putting the written set near 380 KB before a single
+texel — over budget, and it would break every class-0 op and the overlay,
+which are defined in palette indices.
+
+Carving the palette into ramps (64 colours x 4 shades, or 32 x 8) was also
+rejected. It constrains artwork, and four shade levels band visibly on a
+rotating face.
+
+Instead, Doom's mechanism — the palette stays 256 freely-chosen colours,
+and lighting goes through a generated table:
+
+    COLORMAP[level][index] -> index          16 levels x 256 = 4 KB
+    inner loop:   dst = colormap[light * 256 + texel]
+
+`BUILD_COLORMAP` darkens every palette entry by each of 16 factors and
+finds the nearest entry the palette actually has — 256 x 16 nearest-colour
+searches, a few milliseconds, once. What this buys:
+
+- Textures use all 256 colours with no imposed ramp layout.
+- 16 light levels, smooth enough that rotation reads as shading.
+- The table is 4 KB, so it is L1-resident: lighting costs one indexed byte
+  load per pixel and **zero DRAM traffic**.
+- It degrades gracefully — a palette with no dark blues maps dark blue to
+  the closest thing it has. Quality tracks how well the palette covers the
+  value range, which the artist controls.
+
+A default palette of roughly 32 hues x 8 brightnesses covers that range
+well, but that is advice to artists, not a wire-format constraint. Distance
+fog is the same table with the level chosen from depth.
+
+### Transforms: no matrices cross the bus
+
+The GPU owns every matrix. The C64 never assembles, sends or sees one.
+
+Each scene node — objects and cameras alike — holds a GPU-side position and
+orientation, manipulated two ways:
+
+| Style | Opcodes | Use |
+|---|---|---|
+| Absolute | `SET_POSITION`, `SET_ORIENTATION` | placing, teleporting, snapping a camera |
+| Relative, **object-local** | `MOVE_LOCAL`, `ROTATE_LOCAL` | "forward 1.5, turn left" is one 8-byte command |
+
+`MOVE_LOCAL` with only `dz` set is walking forward, whatever direction the
+node faces — the GPU composes the delta against the stored orientation. A
+camera is a node with a camera component, so the same four opcodes fly it.
+Perspective is set once at instantiation (`SET_PERSPECTIVE`) and adjustable
+later.
+
+Wire formats, chosen for what a 6502 finds cheap:
+
+| Quantity | Format | Why |
+|---|---|---|
+| Angles | 16-bit binary angle, 65536 = 360 deg | add a turn rate and let it wrap: no clamp, no modulo, no degrees/radians conversion. GPU takes sin/cos from a table. |
+| Positions | signed 16.16, 4 bytes/axis | +/-32768 units at 1/65536 — a level, not just one model |
+| Deltas | signed 8.8, 2 bytes/axis | a per-frame movement is small by definition, and this is the command that fires every frame |
+| Scale | unsigned 8.8, uniform | non-uniform scale would need a normal fix-up in the rasteriser |
+
+### Mesh format
+
+The decisive framing: **the C64 never touches mesh bytes.** It points a blob
+descriptor at data loaded from disk or already sitting in the REU; it does
+not build or edit vertices at runtime. So "easy for the C64" is nearly free,
+and the format is optimised for the rasteriser and for an offline exporter.
+
+Two blobs, fitting the existing two-descriptor `ARG` layout:
+
+    blob 0 — vertices, 6 bytes each, at most 256 per mesh
+        x, y, z            signed 8.8, model space (model fits +/-128 units)
+
+    blob 1 — faces, 12 bytes each
+        i0, i1, i2         1 byte each, index into blob 0
+        u0,v0, u1,v1, u2,v2  1 byte each, per-corner texcoords
+        texid              1 byte, low byte of a texture resource ID
+        flags              1 byte: bit0 double-sided, bit1 flat-colour
+                           (texid is a palette index instead), bit2 unlit
+
+Vertex and face counts are implied by each blob's `len` (`len/6`, `len/12`);
+a `len` not divisible by the stride is `BAD_ARGS`.
+
+Three deliberate calls:
+
+- **Triangles only.** Quads save one index byte and one flags byte per pair
+  of triangles — a quad still needs four corner UVs — and cost a second
+  rasteriser path. The exporter triangulates.
+- **UVs per face-corner, not per vertex.** Non-negotiable for texturing
+  boxy geometry: a cube corner needs three different UVs for the three
+  faces meeting there, and per-vertex UVs would force that vertex to be
+  duplicated three times.
+- **Normals computed GPU-side at upload**, from winding order. Nothing to
+  author, smaller uploads, and flat per-face shading with texture detail is
+  the chosen look. Smooth shading, if ever wanted, is an optional third
+  blob behind a flag — not a format change.
+
+**The 256-vertex cap is per mesh, not per scene.** An index byte is read
+relative to that mesh's own vertex blob. The three limits are independent:
+
+| Limit | Value | Set by |
+|---|---|---|
+| Vertices per mesh | 256 | the 1-byte face index |
+| Meshes and textures resident | thousands | the flat 16-bit resource ID space, 512 MB of resource RAM |
+| Object instances in the scene | 256 | the scene table, sized against the `SCENE_COMMIT` copy |
+
+Splitting large geometry across meshes is wanted regardless of the index
+width, because culling is per object: one giant mesh is all-or-nothing
+against the frustum, while the same geometry as twelve meshes lets eleven
+be rejected by a bounding-sphere test before a vertex is transformed. The
+byte index makes that habit mandatory rather than merely advisable.
+
+### Textures
+
+Power-of-two dimensions, 8 to 256 on each side, not necessarily square, 8bpp
+palette indices — the same palette as everything else. Power-of-two is what
+makes the inner loop's wrap a mask rather than a modulo:
+
+    texel = tex[((v & vmask) << wshift) | (u & umask)]
+
+256 is the ceiling the byte UVs already imply. Anything else is `BAD_ARGS`.
+
+### Frame lifecycle, and where the HUD fits
+
+The render loop only ever writes pixels **inside the viewport**. The HUD
+area of a page is the C64's alone, and nothing on core 1 touches it.
+
+`LOOP_START` takes a mode:
+
+- **Mode 0, handshake (default).** The loop renders a frame into the draw
+  page and then stops, setting `STATUS` bit4 (frame-ready) and putting the
+  page number in `RESULT`. The C64 draws its HUD into that page with
+  ordinary class-0 ops, then calls `SCENE_COMMIT`, which does three things
+  atomically: publishes the shadow scene, flips at the next vblank, and
+  releases the loop to render the following frame into the other page. No
+  races, no polling loop, no torn scene.
+- **Mode 1, free-running.** The loop renders and flips on its own schedule
+  and never waits for the C64 — the "play BASIC while the scene keeps
+  rendering" case from the Philosophy section. `SCENE_COMMIT` still
+  publishes scene updates atomically, but the HUD cannot be redrawn per
+  frame, so whatever is outside the viewport is whatever was last drawn
+  there on each page.
+
+**Scene updates are double-buffered.** Every `SET_POSITION`/`MOVE_LOCAL`/
+`SET_VISIBLE`/etc. writes into a shadow copy of the scene; `SCENE_COMMIT`
+publishes it. A frame therefore never shows one object moved and another
+not.
+
+**Immediate mode requires the loop stopped.** `DRAW_MESH` returns `BUSY`
+while the loop runs, keeping a single owner of the framebuffer and z-buffer
+at any instant. The loop is off after `SCENE_RESET`, so bring-up is
+immediate-mode only and the first rasteriser can be debugged without any
+cross-core state at all.
+
+### Register additions
+
+Class 1 needs one readable byte class 0 does not have:
+
+| Address | Name | Dir | Purpose |
+|---|---|---|---|
+| $DF21 | `RESULT` | R | Low byte of the last command's result — the page number from `SCENE_COMMIT`, the allocated ID from a `CREATE_*`. Meaning is per opcode; undefined for opcodes that define none. |
+
+and one more `STATUS` bit:
+
+| Bit | Meaning |
+|---|---|
+| 4 | frame-ready — the loop has finished a frame and is waiting for `SCENE_COMMIT` (handshake mode only) |
+
+New `ERRCODE` values: `OUT_OF_MEMORY` (resource RAM exhausted, per Resource
+lifecycle above), `QUEUE_FULL` (the core-0-to-core-1 ring buffer is full,
+per Architecture above), `BAD_ID` (no such resource or node), `NO_CAMERA`
+(a render was asked for with no active camera).
+
+### Class 1 opcode table (draft)
+
+`CMD_HI = 1`. `ARG` offsets are relative to `ARG0` ($DF11), exactly as in
+class 0, and every opcode reads exactly the byte count in its row.
+
+#### System and loop — $00-$0F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $00 | `SCENE_RESET` | 0 | — | Destroys every node, stops the loop, leaves uploaded resources alone. |
+| $01 | `SET_VIEWPORT` | 8 | x, y, w, h (16-bit each) | Places the 3D viewport in the page. `w*h*3 > GPU64_3D_BUDGET` is `OUT_OF_RANGE`; a viewport not wholly inside 320x200 is `BAD_ARGS`. |
+| $02 | `SET_PERSPECTIVE` | 6 | `ARG0-1` fov (binary angle), `ARG2-3` near, `ARG4-5` far (8.8) | Projection for the active camera. |
+| $03 | `SET_LIGHT` | 7 | `ARG0-5` direction x,y,z (8.8), `ARG6` ambient level 0-15 | The single directional light. Face shade = ambient + N.L, clamped to 0-15, indexing the colormap. |
+| $04 | `BUILD_COLORMAP` | 0 | — | Regenerates the 16-level colormap from the current palette. Needed after `PAL_LOAD`/`PAL_SET`; costs milliseconds, never call it per frame. |
+| $05 | `SET_BACKGROUND` | 1 | `ARG0` palette index | What the viewport is cleared to each frame. |
+| $06 | `LOOP_START` | 1 | `ARG0` 0 = handshake, 1 = free-running | Starts the render loop. `NO_CAMERA` if none is active. |
+| $07 | `LOOP_STOP` | 0 | — | Stops it after the current frame. |
+| $08 | `SCENE_COMMIT` | 0 | — | Publishes the shadow scene; in handshake mode also flips at vblank and releases the next frame. `RESULT` = the page the just-finished frame is in. |
+
+#### Resources — $10-$1F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $10 | `UPLOAD_MESH` | 12 | `ARG0-5` vertex blob, `ARG6-11` face blob | Uploads into resource RAM under the staged `ID`. Re-upload to a live ID replaces it (see Resource lifecycle). |
+| $11 | `UPLOAD_TEXTURE` | 8 | `ARG0-5` blob, `ARG6` w shift, `ARG7` h shift | Dimensions are `1 << shift`, 3..8. `len` must equal `w*h`. |
+| $12 | `FREE_RESOURCE` | 0 | — | Frees the staged `ID`. |
+
+#### Scene nodes — $20-$2F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $20 | `CREATE_OBJECT` | 2 | `ARG0-1` mesh resource ID | Creates a node instancing that mesh, under the staged node `ID`. |
+| $21 | `CREATE_CAMERA` | 0 | — | Creates a camera node under the staged `ID`. |
+| $22 | `DESTROY_NODE` | 0 | — | Destroys the staged `ID`. |
+| $23 | `SET_ACTIVE_CAMERA` | 0 | — | The staged `ID` becomes the camera the loop renders from. |
+| $24 | `SET_VISIBLE` | 1 | `ARG0` 0 or 1 | Skips the node without destroying it. |
+
+#### Transforms — $30-$3F
+
+All act on the staged node `ID`, and all write into the shadow scene.
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $30 | `SET_POSITION` | 12 | x, y, z (16.16) | Absolute, world space. |
+| $31 | `SET_ORIENTATION` | 6 | yaw, pitch, roll (binary angle) | Absolute. |
+| $32 | `MOVE_LOCAL` | 6 | dx, dy, dz (8.8) | Translate along the node's own axes. |
+| $33 | `MOVE_WORLD` | 6 | dx, dy, dz (8.8) | Translate along world axes. |
+| $34 | `ROTATE_LOCAL` | 6 | dyaw, dpitch, droll (binary angle) | Compose onto the current orientation. |
+| $35 | `SET_SCALE` | 2 | s (unsigned 8.8) | Uniform. |
+| $36 | `GET_TRANSFORM` | 6 | `ARG0-5` destination descriptor | Writes 18 bytes — position (12) + orientation (6) — back to C64 RAM or REU, for collision and gameplay logic. |
+
+#### Immediate mode — $40-$4F
+
+Legal only with the loop stopped; otherwise `BUSY`.
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $40 | `CLEAR_VIEWPORT` | 0 | — | Fills the viewport with the background index and clears the z-buffer. |
+| $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Returns when done. |
+| $42 | `DRAW_NODE` | 0 | — | Same, for a scene node already positioned via $30-$35 — no re-staging of a transform. |
+
 ## Open questions
 
-1. Core-split feasibility (see Architecture above) — prototype with the
-   corrected DRAM-stress spike before designing further on top of it.
-2. Mesh upload's exact `ARG` layout (stride, attribute layout, interleaved
-   vs. separate arrays) — bespoke per command, design when the opcode table
-   gets built.
-3. Full class-1 (3D) opcode table.
+1. Core-split feasibility (see Architecture above) — ladder round 7's edge
+   is the number `GPU64_3D_BUDGET` is provisionally guessing at. Nothing in
+   the API above is invalidated by a lower edge; the viewport just gets
+   smaller, and the rasteriser's region argument is what makes tiling
+   available if it gets much lower.
+2. Whether the scene graph ever needs **hierarchy** (a turret parented to a
+   tank). Deliberately not designed — `SET_PARENT` is a one-opcode addition
+   later, and composing parent transforms every frame is work core 1 does
+   not have to do until something asks for it.
+3. **Clipping strategy** for triangles crossing the near plane — full
+   Sutherland-Hodgman against the frustum, or near-plane only plus 2D
+   scissoring against the viewport rect. The second is cheaper and is
+   probably right, but it wants measuring against real geometry.
+4. Whether a **bounding sphere** is computed at `UPLOAD_MESH` (cheap, and
+   per-object frustum culling wants it) or supplied by the exporter.

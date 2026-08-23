@@ -729,19 +729,16 @@ Broaden bus sniffing beyond milestone 3's default text mode: bitmap mode, multic
 
 ## 6a. The multicore load ladder
 
-**Status: eight rounds run on hardware 2026-08-23; round 9 staged. Round 8
-found the bug that has been corrupting this experiment since round 1 --
-false sharing between core 1's mailbox and core 0's hottest cache line.**
-Rounds 1-3 made the instrument trustworthy in the obvious ways. Round 4 found
-that 4 MB/s from core 1 costs core 0 bus cycles. Round 5 appeared to settle
-the mechanism -- 450 MB/s into a cache-resident set free, 3 MB/s into a
-streaming one fatal. Round 6 ruled out non-temporal stores. Rounds 7 and 8
-then contradicted round 5, including on the idle rung where core 1 is asleep,
-and that contradiction turned out to be the real finding: **core 1's rung
-mailbox shared a cache line with the threshold core 0 reads on every pass, so
-core 1 invalidated core 0's hot line a thousand times a second in every rung.
-Rounds 4-6 were clean by link-layout luck.** Every quantitative result before
-round 9 has to be re-taken.
+**Status: nine rounds run on hardware 2026-08-23; round 10 staged. The
+instrument's noise floor has never been isolated, so no footprint number from
+this milestone is trustworthy yet.** Rounds 1-3 fixed the obvious instrument
+faults. Round 4 found that 4 MB/s from core 1 costs core 0 bus cycles. Round 5
+appeared to settle the mechanism as working-set footprint rather than
+bandwidth. Round 6 ruled out non-temporal stores. Rounds 7, 8 and 9 then
+contradicted round 5 -- **including on rungs where core 1 is doing nothing** --
+and round 9's cache-line fix made it worse rather than better. Round 10 stops
+sweeping footprint and instead steps through *what core 1 does*, from nothing
+upward, to find the noise floor before reading anything above it.
 
 ### Round 1: the instrument was the fault
 
@@ -1375,6 +1372,61 @@ reads per pass will do exactly this, and it will present as a mysterious,
 build-dependent timing fault that moves when unrelated code changes.
 
 
+### Round 9: the false-sharing fix made it worse, and round 6 already knew
+
+```
+LADDER c64=1420 thr=1893
+idle p=1982k L=72/10 m=1421 x=3631
+16K  p=26k   L=154/7 m=1426 x=3720
+```
+
+Round 8 was `idle L=15/1`. After splitting every cross-core variable onto its
+own cache line, verified in the symbol table, idle is `L=72/10`. **The fix
+made it worse.**
+
+So false sharing was not the cause, and round 6's table said so all along --
+it just took until now to read it that way. Round 6's `done` rung recorded
+**49,016k passes, `L=0`, worst pass 1701**, and during that entire 51-second
+stretch core 1 was awake in its slot loop writing the rung mailbox, in exactly
+the cache line round 9 was built to split apart. A theory that predicts
+disaster there and cleanliness in round 9 has it backwards.
+
+The honest position: **the disturbance has never been located.** Rounds 4-9
+have been reading footprint numbers off an instrument whose noise floor nobody
+isolated, and that floor moves between builds for reasons still unknown. It
+was `L=0 x=1703` in rounds 4-6 and has been non-zero in every round since,
+with no change to core 0's hot path that explains it. Reading another
+footprint rung is worthless until that stops.
+
+### Round 10: an ablation instead of a sweep
+
+The rungs now step through **what core 1 does**, each a superset of the one
+below, so the first dirty rung names the cost:
+
+| rung | core 1 does |
+|---|---|
+| `park` | wakes on the event stream, reads one word, sleeps. No timer read, no store, no arithmetic. |
+| `tick` | + reads `CNTVCT_EL0` and paces 1 ms slots |
+| `acc` | + its private accumulator bookkeeping |
+| `16K` ... `2M` | + the actual writes, footprint ascending |
+
+`park` is the control this experiment has never had inside a run -- as close
+to round 3's flawless parked-in-WFI configuration as a core that must notice a
+rung change can get. **If `park` is dirty, core 1 is exonerated entirely** and
+the fault is in core 0's own instrumentation or the machine around it, which
+is a different search and the one worth knowing about first.
+
+**Core 0 now owns the ladder's clock**, counting its own passes
+(`GPU64_LADDER_RUNG_PASSES`, 2M ~ 2.1 s) instead of reading a rung index core 1
+publishes. That removes the last place core 0 touched a line another core
+writes -- the mailbox is one-way now, core 0 to core 1 -- so core 0's hot path
+is entirely self-contained and its noise floor is genuinely its own. It also
+means a rung is a fixed amount of *evidence* rather than a fixed amount of
+time, regardless of what core 0 lost while in it.
+
+The non-temporal store path is deleted; round 6 ruled it out.
+
+
 Milestone 6's whole architecture rests on core 1 being able to run a render
 loop without disturbing core 0's bus-watch timing, and the only measurement
 that exists is [milestone 6's own spike](milestone6_3d_design.md): three
@@ -1444,13 +1496,648 @@ round different:
   the same address and the same `0x1b54` bytes as before this milestone,
   checked in the symbol table.
 
+### Round 10: the instrument is finally clean, and the axis was wrong
+
+Bench, 2026-08-23:
+
+```
+park p=1999k L=0/0 m=1420 x=1495
+tick p=2000k L=0/0 m=1420 x=1495
+acc  p=2000k L=0/0 m=1420 x=1493
+16k  p=0k    L=2/0 m=1422 x=2214
+```
+
+then "the C64 entered RAD menu and the menu is restless".
+
+**The noise floor is zero.** Three rungs, six million passes, not one late
+pass, and a worst case of 1495 ARM cycles -- better than the best figure any
+previous round produced (1701, and that was a *maximum* over a run that also
+carried misses). The instrument can be trusted for the first time since round
+4.
+
+What made it clean was round 10 removing the last place core 0 *read* a line
+another core writes. Core 0 now owns the ladder clock and counts its own
+passes; the mailbox runs one way only. Round 9 had split `threshold` and `rung`
+onto separate cache lines and got *worse* -- because core 0 was still polling
+the worker's line every pass. Core 1 wrote it once a millisecond, invalidating
+core 0's copy roughly 2000 times a run, which is the right order of magnitude
+for round 9's `L=72`. **Separating the lines was never the fix; not reading
+them was.** That is the durable lesson, and it is stronger than the false-
+sharing one it replaces: a render core must not write anything the bus loop
+reads per pass, same line or not.
+
+Every footprint number from rounds 4-9 was measured on a broken instrument and
+is discarded, round 5's headline included.
+
+Then the fourth rung:
+
+- It died in **under 1000 passes** -- under a millisecond of core 1's first
+  write burst.
+- **Two** missed half-cycles were enough to put the C64 in the RAD menu. Core
+  0's margin is not thin, it is zero. There is no "a few misses are tolerable"
+  regime to budget against.
+- And it died at a **16 KB** working set, which fits entirely in the 32 KB L1D
+  and generates no bus traffic at all once warm. Footprint cannot be what
+  killed it.
+
+### What changed for round 11: burst length is the variable
+
+`GPU64_LADDER_SWEEP_RATE` was 64 KB per millisecond, and the worker delivered
+all of it as **8000 consecutive stores** at the top of the slot and then slept
+out the remaining ~985us. Tens of microseconds of unbroken store traffic,
+against a core 0 that needs a bus slot every 1.015us. The rate axis was never a
+rate -- it was a duty cycle hiding a brutal peak.
+
+That also retroactively explains why round 5's footprint table was incoherent
+(450 MB/s "free" at 256 KB, 3 MB/s "fatal" at 2 MB): footprint was changing
+what a burst *cost*, not how much of it there was.
+
+So round 11 holds the working set fixed at 512 KB -- the size of the shared L2,
+and close to the ~256 KB a double-buffered 320x200 renderer with a z-buffer
+actually needs -- and sweeps how many consecutive cache lines core 1 writes
+before it yields:
+
+| rung | set | burst | bytes/slot | MB/s |
+|---|---|---|---|---|
+| `park` | -- | -- | -- | -- |
+| `acc` | -- | -- | -- | -- |
+| `warm` | 512 K | 1 line | 64 | 0.064 |
+| `b4` | 512 K | 4 | 256 | 0.26 |
+| `b16` | 512 K | 16 | 1 K | 1 |
+| `b64` | 512 K | 64 | 4 K | 4 |
+| `b256` | 512 K | 256 | 16 K | 16 |
+| `b1k` | 512 K | 1024 | 64 K | 65 |
+| `b4k` | 512 K | 4096 | 256 K | 262 |
+| `2M b64` | 2 M | 64 | 4 K | 4 |
+| `2M b1k` | 2 M | 1024 | 64 K | 65 |
+
+`park` and `acc` are round 10's controls, kept because a clean floor is what
+makes the rest readable (`tick` and `acc` were both clean, so only the superset
+survives, which buys a rung). `warm` is the gentlest store load that exists --
+one line per millisecond, never two in a row. The two DRAM rungs at the end ask
+whether missing L2 entirely changes the *burst* budget or only the bandwidth.
+
+**The first dirty rung is the answer**: the longest uninterrupted write span a
+render core may issue between yields. That is a directly actionable number --
+it becomes the chunk size the rasteriser writes spans in -- in a way that
+neither "MB/s" nor "working set" ever was.
+
+### Round 11: the burst ceiling is between 4 and 16 cache lines
+
+Bench, 2026-08-23 (photographed off the HDMI log):
+
+```
+LADDER c64=1420 thr=1893
+park    p=1999k L=0/0 m=1420 x=1506
+acc     p=2000k L=0/0 m=1420 x=1570
+warm    p=2000k L=0/0 m=1420 x=1516     512K,  1 line/ms
+b4      p=2000k L=0/0 m=1420 x=1536     512K,  4 lines/ms
+b16     p=100k  L=2/0 m=1420 x=1967     512K, 16 lines/ms  -- died at 0.1s
+RATE    0/0/0/0/0/0/0/0/0/0/0/0
+```
+
+Four rungs, eight million passes, not one late pass, worst case 1570 -- a core
+1 writing four cache lines every millisecond is indistinguishable from a parked
+one. Then sixteen lines in a row kills the machine in a tenth of a second.
+
+**Sixteen lines per millisecond is 1 KB/ms: 1 MB/s.** Bandwidth is not the axis,
+and neither is duty cycle -- `warm` and `b4` have the same duty cycle shape.
+What changed is the length of the unbroken run.
+
+`RATE` reading all zeros is not a fault: every rung ran below 1 MB/s and the
+field was integer megabytes. It is kilobytes per second from round 12 on.
+
+**The mechanism is almost certainly DRAM line fills, not stores.** The set was
+512 KB -- the whole shared L2 -- walked by a linear cursor, so every line
+written was a cold miss: L1 miss, L2 miss, read-for-ownership from DRAM, a
+writeback later. Sixteen back to back is ~16 outstanding DRAM transactions, on
+the order of a microsecond of occupied memory system, against the ~1us of slack
+a PHI-locked loop pass has. Four fits; sixteen does not. The same model
+retro-explains round 10 dying at a 16 KB set that fits in L1: the fatal part
+was the 256-line cold fill on rung entry, not the L1-resident stores after it.
+
+If that holds, "four cache lines" is far less harsh than it sounds, because a
+working set that stays inside L2 never pays it -- and ~256 KB is what a
+double-buffered 320x200 renderer with a z-buffer needs.
+
+### What changed for round 12: warm versus cold
+
+Core 0's loop is **byte-identical** to round 11's (`reuUsingPolling` at the same
+address, the same `0x1db8` bytes), so the zero noise floor carries over
+unexamined. Only core 1's rung table changed.
+
+| rung | set | burst | what it asks |
+|---|---|---|---|
+| `park` | -- | -- | the control |
+| `warmall` | 512 K | 5 | burst 4 was clean; 5 lines x 2000 slots walks the whole set once, so this is also the warm-up |
+| `w b16` | 512 K | 16 | **the discriminator.** Round 11's *cold* b16 was fatal. Clean here means the axis is DRAM fills, not stores |
+| `w b64` | 512 K | 64 | |
+| `w b256` | 512 K | 256 | |
+| `w b1k` | 512 K | 1024 | |
+| `w b4k` | 512 K | 4096 | clean to here means an L2-resident renderer is unconstrained |
+| `zva b16` | 2 M | 16 | cold, but written with `DC ZVA` -- zeroes a line without reading it, halving the DRAM transactions. Clean against a fatal cold b16 blames the *fill* rather than the writeback |
+| `c b8` | 2 M | 8 | the cold bisect of round 11's 4-to-16 gap |
+| `c b12` | 2 M | 12 | |
+| `c b16` | 2 M | 16 | reproduces round 11's kill from a set that can never be resident |
+
+Order is deliberate: a derail ends the run and zeros every rung above it, so
+everything expected to survive runs first and the cold bisect is last.
+
+`DC ZVA` is guarded by a `DCZID_EL0` probe (DZP clear, block size 64 bytes);
+if the part disagrees the rung falls back to plain stores, which shows up as
+numbers identical to its neighbour.
+
+### Round 12: warming did not help, and the metric has a blind spot
+
+Bench, 2026-08-23:
+
+```
+LADDER c64=1420 thr=1893
+park    p=1999k L=0/0 m=1420 x=1495
+warmall p=2000k L=0/0 m=1420 x=1534    512K, burst 5
+w b16   p=38k   L=0/0 m=1420 x=1832    512K, burst 16 -- derailed at 38k
+RATEK   0/281/0/0/0/0/0/0/0/0/0/0
+```
+
+`warmall` walked the entire 512 KB set at a proven-safe burst 5 and was
+flawless (achieved 281 KB/s against a nominal 320, so ~12% of slots overran --
+worth noting but not the story). Then burst 16 on that *warm* set died in 38k
+passes, **faster** than round 11's cold burst 16 at 100k.
+
+**So it is not cache misses.** Residency did not help at all, and the
+DRAM-line-fill model from round 11 is dead. The variable is the length of the
+unbroken store sequence, not how many of those stores miss.
+
+**And it died with `L=0/0`.** Core 0 recorded not one late pass -- worst 1832,
+against a 1893 threshold -- while the machine derailed. That is the more
+important finding, because it is about the instrument.
+
+`GPU64_LADDER_SAMPLE` measures the *period* between consecutive tops of the
+loop. The top of the loop is `WAIT_FOR_VIC_HALFCYCLE`, a resynchronisation
+point. A stall in the middle of a pass blows that pass's internal nanosecond
+deadlines -- the signal sample, the data drive -- and corrupts the bus
+transaction, while the next pass still begins on the next half-cycle edge and
+the delta still reads 1420. **Loop period is not intra-pass punctuality**, and
+only the former has ever been measured.
+
+Round 13 tightens `lost` from 4/3 to 9/8 (1597) so elongation is counted rather
+than only outright misses -- clean rungs across rounds 10-12 top out at
+1495-1570, so 1832 becomes a count instead of a lone `x=` anecdote -- and keeps
+`lost2` at 4/3 so every earlier number stays comparable. But the blind spot is
+real and remains: a rung can corrupt the bus and score zero on both counters.
+
+### What changed for round 13: is it memory traffic at all?
+
+Core 0's loop is again byte-identical (`0x1db8`, same address). Only the rung
+table and the threshold constant changed.
+
+| rung | set | burst | asks |
+|---|---|---|---|
+| `park` | -- | -- | the control |
+| `w16` | 16 K | 5 | warms the set; a cold first slot at burst 1024 would be a 1024-line fill and would end the rung for the wrong reason |
+| `16K b16` | 16 K | 16 | **the decisive rung.** 16 KB fits the 32 KB L1D, so after `w16` these bursts are almost pure L1 hits and generate essentially no bus traffic. **If this dies, the cause is not memory traffic** |
+| `16K b64` | 16 K | 64 | |
+| `16K b1k` | 16 K | 1024 | clean here means bus traffic is confirmed as the mechanism and the budget is a residency budget |
+| `w64` | 64 K | 5 | |
+| `64K b16` | 64 K | 16 | past L1, comfortably inside L2, and genuinely resident in a way 512 KB never was |
+| `64K b64` | 64 K | 64 | |
+| `64K b1k` | 64 K | 1024 | the step from the 16 K sweep isolates L1 residency from L2 residency |
+| `512 b8` | 512 K | 8 | what is left of the cold bisect |
+| `512 b12` | 512 K | 12 | |
+
+If `16K b16` dies, the search leaves memory entirely and moves to core 1's
+execution: the store buffer draining, write-allocate behaviour, or traffic on
+the coherency port that a long uninterrupted store sequence generates
+regardless of where the lines live.
+
+### Round 13: L1-resident bursts kill it too -- and the confound surfaces
+
+Bench, 2026-08-23:
+
+```
+LADDER c64=1420 thr=1893
+park    p=1999k L=0/0 m=1420 x=1574
+w16     p=2000k L=0/0 m=1420 x=1539   16K, burst 5    RATEK 281
+16K b16 p=85k   L=0/0 m=1420 x=1841   16K, burst 16   RATEK 893  -- derailed
+```
+
+The 16 KB set was walked 39 times over by `w16`, so it is unambiguously
+L1-resident. Sixteen consecutive stores to lines already in L1 -- roughly 0.1us
+of work, and no bus traffic at all -- and the C64 dies in 85k passes. `L=0/0`
+again: the blind spot again.
+
+The 9/8 threshold intended for this round **did not apply** -- the edit silently
+failed to match and the build ran at 4/3, which is why the header still reads
+`thr=1893`. `x=1841` is under that, so the table is self-consistent and the
+physical result stands; the constant is fixed for round 14.
+
+**And the real problem with rounds 11-13 is a confound of mine.** The slot
+period was fixed at 1ms throughout, so burst length *is* rate:
+
+| round | rung | burst | achieved | result |
+|---|---|---|---|---|
+| 11 | `b4` | 4 | ~256 KB/s | clean, 2M passes |
+| 12 | `warmall` | 5 | 281 KB/s | clean, 2M passes |
+| 13 | `w16` | 5 | 281 KB/s | clean, 2M passes |
+| 11 | `b16` | 16 | ~893 KB/s | dead at 100k |
+| 12 | `w b16` | 16 | ~893 KB/s | dead at 38k |
+| 13 | `16K b16` | 16 | 893 KB/s | dead at 85k |
+
+Every clean rung is <=320 KB/s and every fatal one ~900 KB/s, across three
+different working sets. Round 11 declared "bandwidth is not the axis" on the
+strength of round 5 -- which had already been retracted as measured on a broken
+instrument. **That conclusion was unsupported.** A rate threshold near 0.5 MB/s
+explains the whole table at least as well as a burst threshold at 16 lines, and
+explains round 13 considerably better.
+
+### What changed for round 14: burst and rate, finally independent
+
+The working set is **16 KB for every rung** -- L1-resident, so the memory
+hierarchy is not a variable and nothing here can be about cache misses. The
+slot period becomes per-rung, which is what decouples the two axes:
+
+|  | 320 KB/s | 1000 KB/s |
+|---|---|---|
+| **burst 5** | `w16 b5` (1 ms) | `b5 hi` (320 us) |
+| **burst 16** | `b16 lo` (3.2 ms) | `b16 1ms` (1 ms) |
+
+- `b16 lo` clean and `b5 hi` fatal -> **rate is the axis**, burst irrelevant.
+- `b16 lo` fatal and `b5 hi` clean -> **burst is the axis**, as claimed.
+- both fatal -> both matter, or the cause is neither.
+
+`b64 lo` extends the burst arm to 64 lines at the same 320 KB/s; `b1 hi` shrinks
+the burst arm to a single line at 1000 KB/s; `b5 vhi` pushes rate to 2 MB/s at a
+burst proven harmless.
+
+Sub-millisecond slots cannot be paced by the event stream (EVNTI 14 is one event
+per 853 us), so those rungs spin on `CNTVCT_EL0`. **`spin64` is the control for
+that and runs second**, because round 2 found a merely-spinning secondary core
+was enough to corrupt core 0 -- that spin was on shared memory, and CNTVCT_EL0
+is a core-local system register with no bus cycle, but the assumption is worth a
+rung. A dirty `spin64` voids every sub-millisecond rung above it.
+
+The elongation threshold is now genuinely 9/8 (`thr=1597` expected in the
+header -- if it still reads 1893, the build did not take).
+
+### Round 14: both axes are real, and the spin control is clean
+
+Bench, 2026-08-23. `thr=1597`, so the 9/8 threshold applied this time.
+
+```
+park    p=1999k L=0/0  m=1420 x=1495
+spin64  p=2000k L=0/0  m=1420 x=1595   64us CNTVCT spin, no stores
+w16 b5  p=2000k L=0/0  m=1420 x=1536   burst 5,  320 KB/s
+b16 lo  p=2000k L=10/0 m=1420 x=1628   burst 16, 321 KB/s -- survived
+b64 lo  p=117k  L=7/2  m=1420 x=1937   burst 64, 320 KB/s -- derailed
+```
+
+**`spin64` is clean.** Spinning on `CNTVCT_EL0` at a 64us cadence costs core 0
+nothing across two million passes. Sub-millisecond pacing is a valid
+instrument, and round 2's spinning-core corruption was about shared memory, not
+about spinning.
+
+**Burst 16 survived a full 2M-pass rung at 320 KB/s** -- the identical burst, on
+the same L1-resident 16 KB set, that killed the machine in 38k-100k passes at
+893 KB/s in rounds 11, 12 and 13. Only the rate differed. **Rate matters**, and
+round 11's "bandwidth is not the axis" is now definitively wrong.
+
+**Burst matters too.** With the rate pinned, the tightened threshold shows a
+clean dose-response:
+
+| rung | burst | rate | loss per million passes | worst pass |
+|---|---|---|---|---|
+| `w16 b5` | 5 | 320 KB/s | 0 | 1536 |
+| `b16 lo` | 16 | 321 KB/s | 5 | 1628 |
+| `b64 lo` | 64 | 320 KB/s | **60**, plus 2 missed half-cycles | 1937 |
+
+Twelve times the loss per pass from burst 16 to burst 64 at a flat rate. So
+burst sets how large each disturbance is and rate sets how many chances it has
+to land on a mid-pass deadline; core 0's tolerance being near zero makes the
+number of chances count almost as much as the size.
+
+The best safe configuration measured so far remains **burst 5 at 320 KB/s** --
+clean over 2M passes in three separate rounds.
+
+### What changed for round 15: the rate arm, and a burst bisect
+
+`b64 lo` ended round 14 before the rate arm ran at all, so the order is
+inverted: rate arm first, burst arm last, fatal rung last of all. The set stays
+16 KB and L1-resident throughout.
+
+| rung | burst | slot | rate |
+|---|---|---|---|
+| `park` | -- | -- | -- |
+| `w16 b5` | 5 | 1 ms | 320 KB/s -- known clean, warms the set |
+| `b5 hi` | 5 | 320 us | 1000 KB/s |
+| `b1 hi` | 1 | 64 us | 1000 KB/s |
+| `b5 vhi` | 5 | 160 us | 2000 KB/s |
+| `b1 vhi` | 1 | 32 us | 2000 KB/s |
+| `b16 lo` | 16 | 3.2 ms | 320 KB/s -- reproduces round 14's marginal rung |
+| `b32 lo` | 32 | 6.4 ms | 320 KB/s -- bisects 16 against 64 |
+| `b64 lo` | 64 | 12.8 ms | 320 KB/s -- known fatal |
+
+`b1 hi` is the sharpest question on the table. A single cache line per slot is
+the smallest possible disturbance; if that is dirty at 1 MB/s, then rate alone
+is fatal and no amount of chunking saves a render loop. If it is clean, the
+disturbance is genuinely per-burst and a renderer can buy throughput by
+yielding more often.
+
+### Round 15: rate is harmless, burst is the axis
+
+Bench, 2026-08-23. `thr=1597`.
+
+```
+park    p=1999k L=0/0 m=1420 x=1513
+w16 b5  p=2000k L=1/0 m=1420 x=1697   burst 5,  319 KB/s
+b5 hi   p=2000k L=0/0 m=1420 x=1540   burst 5,  999 KB/s
+b1 hi   p=2000k L=0/0 m=1420 x=1526   burst 1, 1000 KB/s
+b5 vhi  p=2000k L=0/0 m=1420 x=1537   burst 5, 1999 KB/s
+b1 vhi  p=2000k L=0/0 m=1420 x=1524   burst 1, 2001 KB/s
+b16 lo  p=1031k L=3/0 m=1420 x=1615   burst 16, 320 KB/s -- died at 1031k
+```
+
+**Four consecutive rungs at up to 2 MB/s, all L=0/0**, with worst passes of
+1524-1540 -- cleaner than the 320 KB/s burst-5 rung below them. That is six
+times the rate that killed burst 16 in rounds 11-13. **Rate on its own is
+harmless to at least 2 MB/s**, and round 13's rate hypothesis is dead alongside
+round 11's burst-only one.
+
+**Burst is the axis, and the threshold sits between 5 and 16 lines.** Burst 16
+at 320 KB/s survived a full rung in round 14 and died halfway through one here
+-- the signature of a rung on the edge. Rate modulates how *fast* it kills
+(893 KB/s: dead in 38-100k passes; 320 KB/s: 1031k, or survives) without moving
+the threshold. Each burst of >=16 lines carries some probability of landing on a
+mid-pass deadline; more bursts per second draws more tickets. Burst <=5 draws
+none.
+
+**The working model, which now survives all fifteen rounds:** a run of
+consecutive stores stalls core 0 for roughly its own duration, and core 0 has
+about 1us of slack per PHI-locked pass. Five lines fits inside that; sixteen
+does not. Footprint, cache residency and bandwidth are all irrelevant --
+16 KB L1-resident, 512 KB L2-resident and 2 MB DRAM sets all behave the same at
+the same burst.
+
+### What changed for round 16: the rate ceiling, and the burst bisect
+
+Rate has never actually *failed*, so its ceiling is unmeasured -- and 2 MB/s is
+not enough. A 320x200 framebuffer at 50 fps is 3.2 MB/s on its own. **Whether
+milestone 6 is feasible at all turns on this number**, so it goes first.
+
+| rung | burst | slot | rate |
+|---|---|---|---|
+| `park` | -- | -- | -- |
+| `b5 1M` | 5 | 320 us | 1 MB/s -- clean in round 15, warms the set |
+| `b5 4M` | 5 | 80 us | 4 MB/s |
+| `b5 8M` | 5 | 40 us | 8 MB/s |
+| `b5 16M` | 5 | 20 us | 16 MB/s |
+| `b5 32M` | 5 | 10 us | 32 MB/s |
+| `b8 320` | 8 | 320 us | 1.6 MB/s |
+| `b12 320` | 12 | 320 us | 2.4 MB/s |
+| `b16 320` | 16 | 320 us | 3.2 MB/s -- the known-marginal control |
+
+The burst bisect pins the slot at 320 us so bursts-per-second is constant across
+the three rungs and only burst length moves.
+
+Watch `RATEK` on the fast rungs: at a 10 us slot the worker has to finish forty
+stores plus its bookkeeping inside the slot, and if it cannot, the achieved rate
+is the real load, not the label.
+
+### Round 16: the answer -- burst 8, and no rate ceiling
+
+Bench, 2026-08-23. `thr=1597`. All rungs on an L1-resident 16 KB set.
+
+```
+park     p=1999k L=0/0  m=1420 x=1501
+b5 1M    p=2000k L=0/0  m=1420 x=1542   RATEK  1000
+b5 4M    p=2000k L=0/0  m=1420 x=1542   RATEK  4000
+b5 8M    p=2000k L=0/0  m=1420 x=1544   RATEK  8000
+b5 16M   p=2000k L=0/0  m=1420 x=1544   RATEK 16000
+b5 32M   p=2000k L=0/0  m=1420 x=1542   RATEK 32000
+b8 320   p=2000k L=0/0  m=1420 x=1542   RATEK  1600
+b12 320  p=2000k L=2/0  m=1420 x=1610   RATEK  2400
+b16 320  p=471k  L=22/0 m=1420 x=1757   RATEK  3200 -- derailed
+```
+
+**There is no rate ceiling.** Burst 5 at 32 MB/s is indistinguishable from burst
+5 at 1 MB/s -- same worst pass, zero losses over two million passes each -- and
+`RATEK` confirms the throttle really delivered 32000 KB/s. That is ten times
+what a 320x200 50 fps framebuffer needs, for nothing.
+
+**The burst threshold, at a fixed 320us slot so only burst length moves:**
+
+| burst | bytes | L per 2M passes | worst pass |
+|---|---|---|---|
+| 5 | 320 | 0 | 1542 |
+| 8 | 512 | 0 | 1542 |
+| 12 | 768 | 2 | 1610 |
+| 16 | 1024 | 22, dead at 471k | 1757 |
+
+**Burst 8 clean, 12 marginal, 16 fatal.** The RAD menu was restless afterwards,
+which is the `b16` derail and expected.
+
+**Milestone 6's constraint, in one sentence:** *the render core may write up to
+8 consecutive cache lines -- 512 bytes -- before yielding, and at that chunk
+size its throughput is unconstrained to at least 32 MB/s.*
+
+That is a workable design rule. A rasteriser writing 512-byte spans with a
+yield between them has an order of magnitude more bandwidth than a full-frame
+50 fps renderer needs.
+
+### What changed for round 17: the renderer's real shape
+
+Two gaps keep round 16 from being settled, and both are about generalising off
+the exact configuration that was measured.
+
+| rung | set | burst | slot | rate | asks |
+|---|---|---|---|---|---|
+| `park` | -- | -- | -- | -- | control |
+| `b8 12M` | 16 K | 8 | 40 us | 12.8 MB/s | burst 8 has only been tested at 1.6 MB/s; every fast rung was burst 5 |
+| `b8 25M` | 16 K | 8 | 20 us | 25.6 MB/s | |
+| `b5 64M` | 16 K | 5 | 5 us | 64 MB/s | one more octave, so "no rate ceiling" is not just "none below 32" |
+| `b8 2M l` | 2 M | 8 | 320 us | 1.6 MB/s | **the renderer's real shape.** A 2 MB set misses L2 on every line |
+| `b8 2M h` | 2 M | 8 | 40 us | 12.8 MB/s | the same, at speed |
+| `b10 320` | 16 K | 10 | 320 us | 2.0 MB/s | refines 8-to-12 |
+| `b12 320` | 16 K | 12 | 320 us | 2.4 MB/s | known-marginal control |
+| `b16 320` | 16 K | 16 | 320 us | 3.2 MB/s | known-fatal control, last |
+
+Everything since round 13 has run on a 16 KB L1-resident set, which generates no
+bus traffic at all. Rounds 11-13 found footprint irrelevant, but that was *at
+burst 16*, where every set size died anyway. The `b8 2M` pair checks it at a
+burst that works -- and `b8 2M h` is as close to the actual renderer as this
+instrument gets: a DRAM-resident buffer, 512-byte chunks, 12.8 MB/s.
+
+### Round 17: burst 8 is a warm-cache number, and the renderer's shape breaks it
+
+Bench, 2026-08-23. `thr=1597`.
+
+```
+park     p=1999k L=0/0 m=1420 x=1587   RATEK     0
+b8 12M   p=2000k L=0/0 m=1420 x=1545   RATEK 12800
+b8 25M   p=2000k L=0/0 m=1420 x=1566   RATEK 25599
+b5 64M   p=2000k L=0/0 m=1420 x=1544   RATEK 64000
+b8 2M l  p=1762k L=0/0 m=1420 x=1547   RATEK  1600  -- derailed at 1762k
+b8 2M h  p=0k    (never reached)
+b10 320  p=0k
+b12 320  p=0k
+b16 320  p=0k
+```
+
+**The good half.** Burst 8 on a cache-resident set is solid at **25.6 MB/s**,
+and burst 5 at **64 MB/s** -- one more octave past round 16's 32 -- with worst
+passes of 1545-1566 against a 1587 *park* control. The rate axis is now dead
+past any doubt: sixty-four times the traffic of a rung that killed the machine
+in rounds 11-13, and it is quieter than an idle core.
+
+**The bad half, and it is the one that matters.** `b8 2M l` -- the identical
+burst of 8, on a 2 MB DRAM-resident set, at **one fortieth** the rate of the
+clean `b8 25M` above it -- derailed the C64 at 1.76M passes. Round 16's rule
+was measured entirely on a 16 KB L1-resident set, and it does not survive the
+move to memory the renderer will actually use.
+
+**So cache residency does matter, but not as its own axis.** The consistent
+model is still stall duration: a run of consecutive stores occupies the memory
+system for about as long as it takes, and core 0 has ~1 us of slack per pass. A
+cold store must allocate its line -- read-for-ownership from DRAM -- before it
+retires, so eight cold lines take far longer than eight warm ones. Eight warm
+lines fit in the slack; eight cold ones do not. Everything measured across
+seventeen rounds fits this, including rounds 11 and 12, where burst 4 and burst
+5 on a cold 512 KB set were clean and burst 16 was fatal.
+
+**The blind spot fired again**, exactly as round 12 predicted it would: `b8 2M l`
+scored `L=0/0` with a worst pass of 1547, *below* the park control, right up to
+the moment the machine died. The period metric never saw it. Ground truth is
+whether the C64 is still alive.
+
+**Confirming detail from the bench:** the RAD menu kept flashing about every 15
+seconds afterwards. That is the worker still running -- rung advance is driven
+by core 0's pass counter, so when core 0 stopped the worker stayed on `b8 2M l`
+forever, and kept re-derailing the menu's own bus loop. The flashing is the
+culprit rung signing its name.
+
+**Where the answer stands:** the cold burst limit is bracketed between 5
+(clean over 2M passes, twice) and 8 (fatal). Warm, it is 8.
+
+### What changed for round 18: bisect the cold edge, and try `DC ZVA`
+
+One question left, plus one mitigation worth testing while the rig is set up.
+
+| rung | set | burst | slot | rate | asks |
+|---|---|---|---|---|---|
+| `park` | -- | -- | -- | -- | control |
+| `c b4 lo` | 2 M | 4 | 320 us | 0.8 MB/s | cold burst 4, the conservative floor |
+| `c b4 hi` | 2 M | 4 | 40 us | 6.4 MB/s | the same at speed -- does the rate axis stay dead when the stores are cold? |
+| `c b5 hi` | 2 M | 5 | 40 us | 8.0 MB/s | cold burst 5 at speed; rounds 11-12 only had it slow |
+| `c b6 hi` | 2 M | 6 | 40 us | 9.6 MB/s | the bisect |
+| `c b7 hi` | 2 M | 7 | 40 us | 11.2 MB/s | |
+| `zva b8` | 2 M | 8 | 40 us | 12.8 MB/s | **the mitigation.** `DC ZVA` writes a whole line with no read-for-ownership. Clean here, against a fatal plain `b8`, means the cold penalty is the fill and can be engineered away |
+| `zva b16` | 2 M | 16 | 40 us | 25.6 MB/s | how far the mitigation goes, if it works |
+| `c b8 lo` | 2 M | 8 | 320 us | 1.6 MB/s | round 17's killer, reproduced last so a derail costs nothing above it |
+
+Order is by expected survival, as always -- a derail zeroes every rung above it.
+`DC ZVA` is guarded by the `DCZID_EL0` probe added in round 12 (never yet
+exercised); if the part disagrees the rung silently falls back to plain stores,
+which shows up as numbers identical to `c b8 lo`.
+
+The `zva` pair is the one with design consequences. A rasteriser that writes
+full 64-byte lines -- span fills, framebuffer clears, z-buffer resets -- can use
+it directly, and if it lifts the cold limit to the warm one then span length
+stops being a hard architectural constraint and becomes a local optimisation.
+
+### Round 18: the cold edge is 7 lines, and `DC ZVA` is a hazard, not a hatch
+
+Bench, 2026-08-23. `thr=1597`. Every rung on a cold 2 MB DRAM-resident set.
+
+```
+park     p=1999k L=0/0 m=1420 x=1502   RATEK     0
+c b4 lo  p=2000k L=0/0 m=1420 x=1552   RATEK   800
+c b4 hi  p=2000k L=0/0 m=1420 x=1544   RATEK  6400
+c b5 hi  p=2000k L=0/0 m=1420 x=1542   RATEK  8000
+c b6 hi  p=2000k L=0/0 m=1420 x=1548   RATEK  9600
+c b7 hi  p=2000k L=0/0 m=1420 x=1544   RATEK 11200
+zva b8   p=18k   L=0/0 m=1420 x=1567   RATEK 12800  -- derailed at 18k
+zva b16  p=0k    (never reached)
+c b8 lo  p=0k
+```
+
+**The cold limit is 7 lines, not 4-5.** Five consecutive rungs, ten million
+passes, not one late pass, worst cases 1542-1552 against a `park` control of
+1502. Burst 7 -- 448 bytes -- is clean on a set that misses on every single
+store. Round 17's bracket of 5-to-8 closes at **7 clean, 8 fatal**.
+
+**And the rate axis stays dead when the stores are cold.** Burst 4 at 800 KB/s
+and burst 4 at 6.4 MB/s are indistinguishable, and burst 7 is clean at
+11.2 MB/s. Round 17's fatal cold rung ran at 1.6 MB/s, seven times *slower*
+than a clean rung here. Rate is not an axis warm and it is not an axis cold.
+
+**So warm and cold are much closer than round 17 suggested:** 8 lines warm,
+7 lines cold. The read-for-ownership makes each line longer, but not by
+anything like the factor the 25 MB/s-versus-1.6 MB/s contrast implied. The
+threshold lives at roughly half a kilobyte of unbroken stores either way, which
+is a satisfyingly physical-looking number for ~1 us of slack.
+
+**`DC ZVA` made it worse -- much worse.** The rung derailed in **18k passes**,
+against 1762k for plain stores at the same burst in round 17. The part accepted
+the `DCZID_EL0` probe (`RATEK` shows the nominal 12800 delivered, so it really
+ran) and the mitigation failed on its own terms.
+
+A caveat on the size of that effect: the comparison is confounded, because
+`zva b8` ran at 12.8 MB/s and round 17's plain `c b8 lo` at 1.6 MB/s -- eight
+times the bursts per second against a hundred times faster death. So per burst,
+ZVA is worse by roughly an order of magnitude, and the confound cannot make it
+*better*. The likely reason is density: eight `DC ZVA` instructions issue eight
+line allocations back to back in a handful of cycles, where the plain loop
+spreads the same eight allocations across sixty-four stores and lets some
+retire on the way. It is the same total traffic packed into a sharper spike --
+which is exactly the variable this whole ladder has been measuring.
+
+**`DC ZVA` is therefore off the table for the render loop**, and the intuition
+it was based on -- "avoid the read-for-ownership and the cold penalty goes
+away" -- is wrong here. `zva b16` and the `c b8 lo` control never ran.
+
+**Bench note:** the RAD menu flashed intensely afterwards, more so than round
+17's. Same mechanism -- core 0 stopped, so the worker stayed on its rung
+forever -- but the rung it is stuck on this time is the ZVA one at 12.8 MB/s,
+the most destructive pattern measured in eighteen rounds. It clears on a power
+cycle.
+
+### Milestone 6a: the answer
+
+Eighteen rounds, and the constraint is a single number with a single shape.
+
+> **Core 1 may write at most 7 consecutive cache lines -- 448 bytes -- before
+> yielding. Below that, its throughput is unconstrained to at least 11 MB/s
+> cold and 64 MB/s cache-resident, and its working set may be any size.**
+
+The recommended design rule carries margin: **write in 256-byte spans (4 lines)
+and yield.** That was clean at 800 KB/s and at 6.4 MB/s, sits at 57% of the
+measured edge, and maps onto a natural unit -- a 320-pixel 8bpp scanline is
+320 bytes, so one yield per scanline is inside the limit with room to spare.
+
+What is *not* a constraint, each having been proposed and killed by a later
+round: write bandwidth (free to 64 MB/s), working-set size (2 MB behaves as
+16 KB does), L2 capacity, cache residency as its own axis, and duty cycle.
+What *is*, besides burst length: never poll an MMIO register from another core
+(round 1), and never let core 0 read a line another core writes (rounds 8-10).
+
+Two mitigations were tried and both failed: `STNP` (round 6 -- the A53 treats
+the non-temporal hint as a no-op) and `DC ZVA` (round 18 -- actively worse).
+There is no way to buy a longer burst; the render loop has to yield.
+
+**And the standing caveat on the instrument.** The metric samples loop *period*
+at a resynchronisation point, so a mid-pass stall corrupts the bus while the
+period still reads healthy. Every fatal rung in eighteen rounds scored `L=0/0`
+right up to the moment the C64 died. **A clean metric is necessary, not
+sufficient.** Any future render loop needs a real REU round-trip running
+underneath it as the positive control, and the C64 staying alive is the only
+ground truth there is.
+
 ### Bench procedure
 
 New PRG:
 [Source/TestPRG/gpu64_ladder_test.a](../Source/TestPRG/gpu64_ladder_test.a)
 (assembled `.prg` alongside it). It is the C64-side *workload*, not a
 measurement: 2500 raster-paced frames -- about 50 seconds, comfortably longer
-than the ladder's 26. It touches no cartridge register inside the loop; after that it touches no cartridge
+than the ladder's 24. It touches no cartridge register inside the loop; after that it touches no cartridge
 register at all (see round 6 above for why).
 
 1. Build and deploy as usual (`SDCARD=<mountpoint> tools/build.sh`), and
@@ -1459,7 +2146,7 @@ register at all (see round 6 above for why).
    and nothing here executes at all.
 3. `LOAD` and `RUN` the PRG. Let it run to the end without touching the
    machine; it takes about 50 seconds. The HDMI table appears on its own at
-   the 26-second mark and is reprinted at the end.
+   the 24-second mark and is reprinted at the end.
 
 ### Reading the result
 
@@ -1484,27 +2171,35 @@ The HDMI log carries the timing half, after the two `FLIP` lines (which read
 
 ```
 LADDER c64=NNNN thr=NNNN
-idle    p=NNNNk L=N m=NNNN x=NNNN
-L1 4M   p=NNNNk L=N m=NNNN x=NNNN
+park    p=NNNNk L=N/N m=NNNN x=NNNN
+acc     p=NNNNk L=N/N m=NNNN x=NNNN
+warm    p=NNNNk L=N/N m=NNNN x=NNNN
+b4      p=NNNNk L=N/N m=NNNN x=NNNN
 ...
-done    p=NNNNk L=N m=NNNN x=NNNN
-RATE a0/a1/.../a12
+done    p=NNNNk L=N/N m=NNNN x=NNNN
+RATE a0/a1/.../a11
 ```
 
 - **`c64=`** is ARM cycles in one C64 cycle, measured. It should read close
   to **1421** (a 1.0150us PAL cycle at the 1400 MHz `config.txt` pins); round
   4 read 1420. A wild value means the calibration caught a disturbed window
   and the whole table is suspect.
-- **`thr=`** is 4/3 of that -- the line above which a pass overran. It is
-  derived from the calibration window's **mean**, not its minimum (round 3),
-  and the multiplier is 4/3 rather than 3/2 because passes quantise to VIC
-  half-cycles and 3/2 lands exactly on the first failure step (round 6).
-- **`L=a/b` is the pass/fail number, per rung.** `a` counts passes past 4/3
-  of a C64 cycle -- core 0 arrived a phase late; `b` counts passes past two
-  cycles -- it missed a bus sample outright. `idle` is the floor and read
+- **`thr=`** is the elongation line, 9/8 of `c64=` since round 13 -- a pass
+  measurably longer than a healthy one, not necessarily a missed cycle. It is
+  derived from the calibration window's **mean**, not its minimum (round 3).
+  The second counter's line is 4/3, rather than 3/2, because passes quantise
+  to VIC half-cycles and 3/2 lands exactly on the first failure step (round
+  6). Rounds 10-12 scored `L=a` at 4/3, which is round 13's `L=b`.
+- **`L=a/b` is the pass/fail number, per rung.** `a` counts passes past 9/8 of
+  a C64 cycle -- measurably elongated; `b` counts passes past 4/3 -- core 0
+  overran a VIC half-cycle. **Neither sees a stall that happens mid-pass**,
+  after `WAIT_FOR_VIC_HALFCYCLE` has resynchronised the loop: round 12's fatal
+  rung scored `L=0/0` while the C64 went down. A clean `L=` is necessary, not
+  sufficient. `idle` is the floor and read
   `L=0` in rounds 4-6, so any non-zero figure on a later rung is
-  attributable to that rung's traffic. **A non-zero `idle` invalidates the
-  run**, as it did in round 7.
+  attributable to that rung's traffic. Round 10 measured `park`/`tick`/`acc`
+  at exactly zero over six million passes, so **a non-zero `park` or `acc`
+  invalidates the run** -- the floor is known now, and it is zero.
 - **`m=`** is that rung's mean pass. Drift away from `c64=` means core 0 is
   *systematically* late, which is a worse and different thing from a few long
   passes; round 4's failing rung held `m=1421`, so its damage was discrete.
@@ -1521,19 +2216,23 @@ reproduces the workload already known to corrupt VIC-II output. A run where
 *nothing* fails is not a pass -- it means the workload never reached the
 machine, and the first thing to check is the `RATE` line's top rungs.
 
-Round 9 is a validation round first and a measurement second:
+Round 11 reads bottom-up, and the run will most likely stop at the first
+rung that fails -- two missed half-cycles was enough to derail the C64 in
+round 10, so expect the table to be printed by the crash path with zeros
+above the failing rung. That is a result, not a lost run.
 
 | if | then |
 |---|---|
-| `idle` and `16K` both `L=0/0` | the false sharing was the whole problem, the instrument is trustworthy for the first time, and the sweep above them is the real curve |
-| `idle` clean but `16K` dirty | there is a second disturbance that depends on core 1 doing *any* work; suspect the WFE/event-stream wake path next |
-| `idle` still dirty | something else in the machine disturbs core 0 with nothing running; bisect the ladder's own per-pass code before reading another rung |
+| `park` or `acc` dirty | the run is void; round 10's floor did not reproduce and the build or the machine changed |
+| `warm` dirty | **stores disturb core 0 at any burst length.** One line per millisecond is the floor of what a render core can do, and throttling cannot save the design -- the renderer would need its own memory, not a share of this one |
+| first failure at `b4`..`b64` | the safe span is tiny (under 4 KB) and the rasteriser must yield inside a scanline |
+| first failure at `b256`..`b1k` | a safe span of 16-64 KB, i.e. yield every few scanlines -- workable |
+| nothing fails through `b4k` | 256 MB/s in 256 KB bursts is free, and the contention question is effectively closed for a single worker core |
+| 512 K rungs clean, `2M` rungs dirty at the same burst | missing L2 costs on top of the burst, and the renderer's working set has to stay inside 512 KB |
 
-The footprint result from round 5 (450 MB/s into 256 KB free, 3 MB/s into
-2 MB fatal) is **provisional** until this run reproduces it. The mechanism is
-plausible and the 2 MB rungs failed far harder than the cache-resident ones,
-but every number in rounds 4-8 was taken on an instrument that was disturbing
-itself.
+The number the milestone wants out of this is **the largest clean burst**,
+in cache lines. Everything else on the table is there to prove that number
+was measured on a working instrument.
 
 ### Housekeeping still owed
 

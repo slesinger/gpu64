@@ -58,7 +58,11 @@
 // building both ways and diffing the symbol table -- reuUsingPolling() comes
 // out at the same address and the same 0x1b54 bytes as before the ladder
 // existed.
-#define GPU64_LADDER_ENABLED
+// gpu64: milestone 6a is finished (2026-08-23, round 18) -- OFF for shipping.
+// Uncomment only to re-run the ladder on the bench; it forces multicore
+// bring-up on, widens the i-cache preload window to 0x2000, and puts
+// measurement code inside reuUsingPolling().
+//#define GPU64_LADDER_ENABLED
 
 // The isolation control the first bench round turned out to need. With this
 // commented out, the ladder build keeps *everything* that touches core 0 --
@@ -81,116 +85,135 @@
 // finding the current rung table is built around (see below).
 #define GPU64_LADDER_WORKER_ENABLED
 
-// Rungs, in order. Round 8 sweeps footprint upward again, but **starting from
-// the most-proven-clean load in the whole series** rather than from 256 K.
+// Rungs, in order. Round 17 confirms the answer at the **renderer's real
+// shape**, because round 16 answered the milestone's question.
 //
-// Round 7 came back with a result that contradicts round 5 outright. Round 5
-// ran 256 KB at an achieved 449 MB/s for 2.9M passes with `L=0`; round 7 ran
-// 256 KB at 64 MB/s and scored `L=694` in 49k passes before the machine died.
-// Same footprint, same buffer, a *lower* rate, opposite outcome. Worse, round
-// 7's `idle` rung -- core 1 asleep, writing nothing, the configuration that
-// was flawless in rounds 4, 5 and 6 -- came back `L=30 x=3670` where every
-// previous round read `L=0 x=1703`.
+// Round 16, all on an L1-resident 16 KB set:
 //
-// A contradiction that includes the idle rung is not a finding about core 1.
-// Something about the measurement changed, and until that is understood no
-// number from round 7 means anything. So this round is built to isolate it:
+//   b5 1M ... b5 32M   burst 5, 1/4/8/16/32 MB/s   L=0/0  x=1542-1544, 2M passes
+//   b8  320us          burst 8,  1.6 MB/s          L=0/0  x=1542, 2M passes
+//   b12 320us          burst 12, 2.4 MB/s          L=2/0  x=1610, 2M passes
+//   b16 320us          burst 16, 3.2 MB/s          L=22/0 x=1757, dead at 471k
 //
-//   - The sweep starts at 16 KB, which round 5 measured clean at 450 MB/s.
-//     If 16 KB is dirty now, the instrument regressed between rounds 6 and 8
-//     and that is the whole result. If 16 KB is clean and the dirt starts
-//     somewhere below 256 K, then round 5's 256 K figure was order-dependent
-//     -- it followed three 16 KB rungs, so core 1's set was already warm --
-//     and the real cliff is lower than round 5 implied.
-//   - The C64 program no longer touches the cartridge at all (see the test
-//     PRG), so `idle` becomes a measurement of core 0 entirely alone. A dirty
-//     idle rung under those conditions has nowhere left to hide.
-//   - Rung stats are padded and aligned so no rung pays a straddled cache
-//     line its neighbours do not (see Gpu64LadderStats).
-//   - `L=` is now reported as a pair, so this round is comparable with rounds
-//     4-6 regardless of the threshold change made in round 7.
+// **There is no rate ceiling.** 32 MB/s at burst 5 is indistinguishable from
+// 1 MB/s at burst 5 -- same worst pass, zero losses -- and RATEK confirmed the
+// throttle actually delivered 32000 KB/s. Ten times what a 320x200 50 fps
+// framebuffer needs, for free.
 //
-// Spacing is tight from 16 K to 512 K because that is where the answer has to
-// be, and loose above it because above it the answer is already known.
+// **The burst threshold is 8 clean / 12 marginal / 16 fatal**, measured at a
+// fixed 320us slot so bursts-per-second was constant and only burst length
+// moved.
 //
-// `NT` and `max` are gone. Non-temporal stores were ruled out in round 6, and
-// `max` existed to guarantee something failed -- the 2 M rung does that.
-#define GPU64_LADDER_RUNGS			13
+// So milestone 6's rule is: *the render core may write up to 8 consecutive
+// cache lines -- 512 bytes -- before yielding, and at that chunk size its
+// throughput is unconstrained to at least 32 MB/s.*
+//
+// Two gaps keep that from being settled, and this round closes them:
+//
+//   b8 12M / b8 25M -- burst 8 has only been tested at 1.6 MB/s. Everything
+//               fast was burst 5. If burst 8 holds at 12.8 and 25.6 MB/s, the
+//               rule is a rule and not a coincidence of the two axes.
+//   b5 64M   -- one more octave, to establish that "no rate ceiling" is not
+//               just "no ceiling below 32".
+//   b8 2M lo / b8 2M hi -- the renderer's real shape. Everything since round 13
+//               has run on a 16 KB L1-resident set, which generates no bus
+//               traffic at all. A 2 MB set at burst 8 misses L2 on every line,
+//               at 1.6 MB/s and then at 12.8 MB/s. Rounds 11-13 found footprint
+//               irrelevant *at burst 16*, where everything died regardless;
+//               this checks it where it matters, at a burst that works.
+//   b10 / b12 / b16 -- refines 8-to-12 and re-runs the two known rungs as
+//               controls. Fatal one last.
+#define GPU64_LADDER_RUNGS			9
 
-// Working-set sizes. Core 1 always writes into the same static buffer; a rung
-// uses only the first this-many bytes of it, so rungs differ in footprint and
-// in nothing else -- same code, same alignment, same pages. The shared L2 on
-// this part is 512 KB and the L1 D-cache is 32 KB.
+// What core 1 does in a rung. Cumulative up to WORK; ZVA is WORK with the
+// stores swapped for cache-line zeroing (unused since round 12, kept for the
+// cold path). A rung with MODE_ACC and a short slot is the spin control.
+#define GPU64_LADDER_MODE_PARK		0	// wake, read the rung, sleep again
+#define GPU64_LADDER_MODE_TICK		1	// + read CNTVCT_EL0, pace the slot
+#define GPU64_LADDER_MODE_ACC		2	// + private accumulator bookkeeping
+#define GPU64_LADDER_MODE_WORK		3	// + write the working set
+#define GPU64_LADDER_MODE_ZVA		4	// + write it with DC ZVA instead
+
+// Working-set sizes. 16 KB is L1-resident and 2 MB cannot be cached at all;
+// the L1 D is 32 KB and the shared L2 is 512 KB.
 #define GPU64_LADDER_SET_16K		( 16 * 1024 )
 #define GPU64_LADDER_SET_64K		( 64 * 1024 )
-#define GPU64_LADDER_SET_128K		( 128 * 1024 )
-#define GPU64_LADDER_SET_192K		( 192 * 1024 )
-#define GPU64_LADDER_SET_256K		( 256 * 1024 )
-#define GPU64_LADDER_SET_320K		( 320 * 1024 )
-#define GPU64_LADDER_SET_384K		( 384 * 1024 )
-#define GPU64_LADDER_SET_448K		( 448 * 1024 )
 #define GPU64_LADDER_SET_512K		( 512 * 1024 )
-#define GPU64_LADDER_SET_768K		( 768 * 1024 )
-#define GPU64_LADDER_SET_1M			( 1024 * 1024 )
 #define GPU64_LADDER_SET_DRAM		( 2 * 1024 * 1024 )
 
-// The one rate every footprint rung runs at. Round 5 showed rate is not a
-// variable, so holding it fixed keeps footprint the only thing moving.
-#define GPU64_LADDER_SWEEP_RATE		( 64 * 1000 )
+// Consecutive 64-byte cache lines written at the top of each slot. This is the
+// axis: 8 measured clean, 12 marginal, 16 fatal.
+#define GPU64_LADDER_BURST_1		1
+#define GPU64_LADDER_BURST_4		4
+#define GPU64_LADDER_BURST_5		5
+#define GPU64_LADDER_BURST_6		6
+#define GPU64_LADDER_BURST_7		7
+#define GPU64_LADDER_BURST_8		8
+#define GPU64_LADDER_BURST_10		10
+#define GPU64_LADDER_BURST_12		12
+#define GPU64_LADDER_BURST_16		16
+#define GPU64_LADDER_BURST_32		32
+#define GPU64_LADDER_BURST_64		64
 
-// Wall-clock window per rung, microseconds. 2s x 13 rungs = 26s of ladder;
-// the test PRG runs longer than that on purpose (see
-// Source/TestPRG/gpu64_ladder_test.a).
-#define GPU64_LADDER_RUNG_US		2000000
+// Slot periods, microseconds. Rate is burst x 64 bytes / slot. Everything below
+// ~853us is paced by spinning on CNTVCT_EL0 rather than the event stream --
+// validated clean by round 14's `spin64` and every sub-millisecond rung since.
+#define GPU64_LADDER_SLOT_5US		5
+#define GPU64_LADDER_SLOT_10US		10
+#define GPU64_LADDER_SLOT_20US		20
+#define GPU64_LADDER_SLOT_32US		32
+#define GPU64_LADDER_SLOT_40US		40
+#define GPU64_LADDER_SLOT_64US		64
+#define GPU64_LADDER_SLOT_80US		80
+#define GPU64_LADDER_SLOT_160US		160
+#define GPU64_LADDER_SLOT_320US		320
+#define GPU64_LADDER_SLOT_1MS		1000
+#define GPU64_LADDER_SLOT_3200US	3200
+#define GPU64_LADDER_SLOT_6400US	6400
+#define GPU64_LADDER_SLOT_12800US	12800
+
+#define GPU64_LADDER_RUNG_PASSES	2000000
 
 // The buffer core 1 writes into, sized for the largest arm. Rungs take a
 // prefix of it (GPU64_LADDER_SET_*), so the whole ladder shares one
 // allocation and one alignment.
 #define GPU64_LADDER_BUFFER_BYTES	GPU64_LADDER_SET_DRAM
 
-// Core 0 re-reads core 1's published rung index every this many passes,
-// rather than every pass. This is the *only* time core 0 touches a line
-// another core writes, so the interval is exactly the exposure: at 16384
-// passes it is about 17ms, i.e. ~60 opportunities per second against rung
-// boundaries 2 seconds apart. Granularity costs nothing here and exposure is
-// the thing that has been ruining runs.
-#define GPU64_LADDER_RUNG_POLL		16384
 
 // Samples core 0 spends measuring the undisturbed loop before it fixes the
-// missed-cycle threshold. ~100ms at rung 0 (idle), i.e. the first 2.5% of
-// rung 0 is calibration and is not counted in that rung's L=.
+// missed-cycle threshold. ~100ms at rung 0 (park), i.e. the first 5% of rung 0
+// is calibration and is not counted in that rung's L=.
 //
 // The threshold comes off that window's **mean**, not its minimum. Round 3
-// (2026-08-23) was a visibly perfect run that the table scored as
-// 31,973,007 missed cycles out of 32,140,000 passes, because the minimum is
-// not "one C64 cycle" -- it is the *fastest* pass. The loop is PHI-locked
-// but the lock has slop both ways: when the previous pass overran into the
-// next VIC half-cycle, this pass's WAIT_FOR_VIC_HALFCYCLE returns
-// immediately and the delta comes out short. Round 3 measured min 865 /
-// max 1716 against a nominal 1421 (a 1.0150us PAL cycle at the 1400MHz
-// config.txt pins with force_turbo), so 1.5x the minimum sat *below* the
-// typical healthy pass and tripped on nearly all of them. The mean is the
-// estimator that actually means "one C64 cycle", and it is sound as long as
-// misses are rare in the window it is taken over -- which is what putting
-// the calibration window at rung 0 is for.
+// (2026-08-23) was a visibly perfect run that the table scored as 31,973,007
+// missed cycles out of 32,140,000 passes, because the minimum is not "one C64
+// cycle" -- it is the *fastest* pass. The loop is PHI-locked but the lock has
+// slop both ways: when the previous pass overran into the next VIC half-cycle,
+// this pass's WAIT_FOR_VIC_HALFCYCLE returns immediately and the delta comes
+// out short. Round 3 measured min 865 / max 1716 against a nominal 1421, so
+// 1.5x the minimum sat *below* the typical healthy pass and tripped on nearly
+// all of them.
 //
-// The multiplier is 4/3, not 3/2, and that also cost a round. Loop passes
-// quantise to VIC *half*-cycles, so the delta ladder is 1420 (healthy), then
-// ~2130 for one missed half-cycle, then ~2840 for a whole missed cycle. A
-// 3/2 threshold is 2130 -- sitting exactly on the first failure step, which
-// it then fails to exceed. Round 6's first NT rung scored `L=0 x=2101`: a
-// missed half-cycle, recorded as clean. 4/3 gives 1893, comfortably above
-// the highest healthy pass ever measured (1710, across five rounds) and
-// comfortably below that step. Rounds 4 and 5 stay comparable either way,
-// since their clean rungs all topped out at 1705 and their failing rungs at
-// 4400+.
+// **Two thresholds, and round 12 is why the first one moved.** `lost2` stays at
+// 4/3 of baseline -- 1893, the line that says a pass overran a whole VIC
+// half-cycle -- so every number from rounds 10 to 12 stays comparable. `lost`
+// is now 9/8, i.e. 1597: not a missed cycle, just a pass measurably longer than
+// a healthy one. Round 12's fatal rung scored **L=0/0 with a worst pass of
+// 1832** while the C64 went down, because the only counter that existed was the
+// coarse one. Clean rungs across rounds 10-12 top out at 1495-1570, so 1597
+// sits just above the observed healthy ceiling and turns that 1832 into a
+// count instead of a single anecdote in the x= column.
 //
-// Both counts are reported, as `L=lost/lost2`. The second is passes past
-// **2x** the baseline -- a whole missed C64 cycle rather than a half. Having
-// the pair means a round stays comparable with every earlier one whatever the
-// first multiplier is set to, and it separates "core 0 arrived a phase late"
-// from "core 0 missed a bus cycle outright", which are different severities
-// and were previously lumped together.
+// The 4/3 multiplier for `lost2`, rather than 3/2, also cost a round. Passes
+// quantise to VIC half-cycles: 1420 healthy, ~2130 for one missed half-cycle,
+// ~2840 for a whole missed cycle. A 3/2 threshold is 2130 -- exactly the first
+// failure step, which it then fails to exceed. Round 6's first NT rung scored
+// `L=0 x=2101`: a missed half-cycle, recorded as clean.
+//
+// Neither counter sees a stall that happens *mid-pass*, after
+// WAIT_FOR_VIC_HALFCYCLE has resynchronised the loop -- that is round 12's
+// finding and this file's standing caveat. A rung can corrupt the bus and score
+// zero on both.
 #define GPU64_LADDER_CALIB_PASSES	100000
 
 // reuUsingPolling()'s instruction-cache preload window, and the size the
@@ -252,10 +275,10 @@ struct Gpu64LadderPass
 {
 	u64	prev;
 	u32	skip;
-	u32	tick;
+	u32	left;			// passes remaining in this rung
 	u32	rung;			// core 0's own copy, refreshed rarely from core 1's
-	u32	threshold;		// ARM cycles; 0 until calibrated
-	u32	threshold2;		// 2x baseline: a whole missed C64 cycle
+	u32	threshold;		// ARM cycles, 9/8 baseline: measurably elongated
+	u32	threshold2;		// 4/3 baseline: a missed VIC half-cycle
 	u32	baseline;		// ARM cycles in one C64 cycle: the mean
 	u32	dumped;			// so the table prints once, not twice
 	u32	pad[ 7 ];
@@ -264,8 +287,8 @@ struct Gpu64LadderPass
 struct Gpu64LadderStats
 {
 	u32	passes;
-	u32	lost;			// passes past the 4/3 threshold: a missed half-cycle or worse
-	u32	lost2;			// passes past 2x: a whole missed C64 cycle or worse
+	u32	lost;			// passes past 9/8: measurably longer than healthy
+	u32	lost2;			// passes past 4/3: a missed VIC half-cycle or worse
 	u32	minDelta;		// ARM cycles between consecutive loop passes
 	u32	maxDelta;
 	u32	pad;
@@ -274,33 +297,22 @@ struct Gpu64LadderStats
 
 #ifdef GPU64_LADDER_ENABLED
 
-// The two cross-core mailboxes, each alone on its own cache line so that
-// neither can invalidate anything the other core reads on a hot path. See the
-// note on Gpu64LadderPass for what happens when they are not.
-
-// Written by core 1 once per millisecond slot; read by core 0 once every
-// GPU64_LADDER_RUNG_POLL passes.
-struct Gpu64LadderFromWorker
-{
-	volatile u32 rung;
-	u32 pad[ 15 ];
-} __attribute__(( aligned( 64 ) ));
-
-extern Gpu64LadderFromWorker gpu64LadderFromWorker;
-
-// Written by core 0 only when the ladder is armed; read by core 1 once per
-// slot. `gen` is bumped on every arming and is what makes core 1 restart its
-// own rung timeline -- without it core 1 latched its start time exactly once,
-// and a second arming (which any C64 reset causes, since resetREU() clears
-// gpu64ApiActive and the next GET_INFO re-arms) left core 1 running the first
-// run's clock. Round 6 hit that: after a transient derail the ladder
-// re-armed, core 1's clock was already past the last rung, and it published
-// `done` for the remaining 51 seconds.
+// The one cross-core mailbox, alone on its own cache line. Core 0 writes it
+// -- at a rung boundary, so roughly twice a second -- and core 1 reads it.
+// Nothing goes the other way any more: core 0's hot path touches only its own
+// lines, which is the property that makes its noise floor its own.
+//
+// `gen` is bumped on every arming and is what makes core 1 restart. Without it
+// core 1 latched its start state exactly once, and a second arming (which any
+// C64 reset causes, since resetREU() clears gpu64ApiActive and the next
+// GET_INFO re-arms) left core 1 running the first run's timeline -- round 6
+// hit exactly that.
 struct Gpu64LadderToWorker
 {
 	volatile u32 gen;
 	volatile u32 start;
-	u32 pad[ 14 ];
+	volatile u32 rung;
+	u32 pad[ 13 ];
 } __attribute__(( aligned( 64 ) ));
 
 extern Gpu64LadderToWorker gpu64LadderToWorker;
@@ -371,14 +383,17 @@ void gpu64_ladderDumpNow( void );
 		} else \
 		if ( s->passes >= GPU64_LADDER_CALIB_PASSES ) { \
 			gpu64LadderPass.baseline = (u32)( s->totalDelta / s->passes ); \
-			gpu64LadderPass.threshold2 = gpu64LadderPass.baseline * 2; \
-			gpu64LadderPass.threshold = gpu64LadderPass.baseline + gpu64LadderPass.baseline / 3; \
+			gpu64LadderPass.threshold2 = gpu64LadderPass.baseline + gpu64LadderPass.baseline / 3; \
+			gpu64LadderPass.threshold = gpu64LadderPass.baseline + gpu64LadderPass.baseline / 8; \
 		} \
 	} \
-	if ( ++gpu64LadderPass.tick >= GPU64_LADDER_RUNG_POLL ) { \
-		gpu64LadderPass.tick = 0; \
-		gpu64LadderPass.rung = gpu64LadderFromWorker.rung; \
-		if ( gpu64LadderPass.rung >= GPU64_LADDER_RUNGS ) GPU64_LADDER_DUMP \
+	if ( --gpu64LadderPass.left == 0 ) { \
+		gpu64LadderPass.left = GPU64_LADDER_RUNG_PASSES; \
+		if ( gpu64LadderPass.rung < GPU64_LADDER_RUNGS ) { \
+			gpu64LadderPass.rung++; \
+			gpu64LadderToWorker.rung = gpu64LadderPass.rung; \
+			if ( gpu64LadderPass.rung >= GPU64_LADDER_RUNGS ) GPU64_LADDER_DUMP \
+		} \
 	} }
 
 // A DMA hold (REU transfer, gpu64 command, mirror snapshot, deferred flip
