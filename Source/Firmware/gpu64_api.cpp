@@ -7,6 +7,7 @@
 #include "gpu64_vsync.h"
 #include "gpu64_flip.h"
 #include "gpu64_ladder.h"
+#include "gpu64_3d.h"
 #include <circle/util.h>
 
 // gpu64: set once a program actually drives the API, which stops the
@@ -18,12 +19,13 @@ extern u8 gpu64ApiActive;
 // Global, and reached from the polling loop without a call -- see the
 // comment on GPU64REGS in gpu64_api.h for why. The short aliases keep the
 // rest of this file reading the way it did.
-GPU64REGS gpu64Regs = { 0, 0, GPU64_ERR_OK, { 0, 0 }, { 0 } };
+GPU64REGS gpu64Regs = { 0, 0, GPU64_ERR_OK, { 0, 0 }, 0, { 0 } };
 
 #define sCmdHi	gpu64Regs.cmdHi
 #define sStatus	gpu64Regs.status
 #define sErr	gpu64Regs.err
 #define sId		gpu64Regs.id
+#define sResult	gpu64Regs.result
 #define sArg	gpu64Regs.arg
 
 // gpu64: payload staging. Static rather than stack-local -- these are far too
@@ -44,11 +46,20 @@ void gpu64_apiReset( void )
 	sStatus = 0;
 	sErr    = GPU64_ERR_OK;
 	sId[ 0 ] = sId[ 1 ] = 0;
+	sResult = 0;
 	for ( unsigned i = 0; i < GPU64_ARG_COUNT; i++ )
 		sArg[ i ] = 0;
 	// The frame clock's calibration survives -- it describes the display,
 	// not the session -- but nothing else about the vblank state does.
 	gpu64_vsyncResetState();
+
+	// Class 1's session state goes the same way: ring emptied, every
+	// uploaded resource freed. See docs/milestone6_3d_design.md's Resource
+	// lifecycle -- without this a RUN/STOP+RESTORE leaks the whole arena and
+	// the next program starts against stale IDs.
+#ifdef GPU64_3D_ENABLED
+	gpu64_3dReset();
+#endif
 }
 
 // --- argument accessors -------------------------------------------------
@@ -204,6 +215,31 @@ static void logLadderStats( CGpu64FrameBuffer *pFB )
 #endif
 }
 
+// gpu64: milestone 6's class 1 counters ride the same LOG_ENABLE(1) hook as
+// the flip stats and the ladder table. Reading gpu64_3dWorkerStats here means
+// core 0 touches a line core 1 writes -- normally forbidden (milestone 6a
+// rounds 8-10) -- but this runs only from the log path, never from
+// reuUsingPolling()'s PHI-locked hot loop, so the coherence miss has nowhere
+// to make core 0 late. Do not call it from anywhere else.
+static void logGpu64_3dStats( CGpu64FrameBuffer *pFB )
+{
+#ifdef GPU64_3D_ENABLED
+	if ( pFB == 0 )
+		return;
+
+	// One line, well inside the log's 40 columns. Static for the same reason
+	// the blob buffers at the top of this file are: this runs on
+	// reuUsingPolling()'s stack.
+	static char line[ 96 ];
+	char *p = gpu64_3dReport( line );
+	*p++ = '\n';
+
+	pFB->LogWrite( line, (unsigned)( p - line ) );
+#else
+	(void)pFB;
+#endif
+}
+
 // gpu64: the crash-path escape hatch, added after round 2 (2026-08-23).
 //
 // Both ladder rounds so far ended with the C64 derailed and back in the RAD
@@ -224,6 +260,7 @@ void gpu64_ladderDumpNow( void )
 	pFB->LogEnable( TRUE );
 	logFlipStats( pFB );
 	logLadderStats( pFB );
+	logGpu64_3dStats( pFB );
 #endif
 }
 
@@ -352,7 +389,7 @@ static u8 doSystem( u8 op )
 		if ( pFB ) pFB->LogEnable( sArg[ 0 ] ? TRUE : FALSE );
 		// Turning the log *on* is a request to be told something, so this is
 		// where the flip cost gets reported (logFlipStats() above).
-		if ( sArg[ 0 ] ) { logFlipStats( pFB ); logLadderStats( pFB ); }
+		if ( sArg[ 0 ] ) { logFlipStats( pFB ); logLadderStats( pFB ); logGpu64_3dStats( pFB ); }
 		return GPU64_ERR_OK;
 
 	case 0x09:					// VBLANK_SYNC
@@ -773,14 +810,25 @@ void gpu64_apiDispatch( u8 op )
 	// long since ready by the time the C64 issues its next command.
 	gpu64_flipDrain();
 
+	u8 res;
+
+#ifdef GPU64_3D_ENABLED
+	if ( sCmdHi == 1 )
+	{
+		// Class 1 does not execute here -- it stages a command and hands it
+		// to core 1 (docs/milestone6_3d_design.md, Architecture). What comes
+		// back is the *acceptance* result, not the command's outcome: a
+		// class 1 OK means core 1 has the command, and STATUS bit4 or RESULT
+		// is what says it finished. That is the whole point of the split.
+		res = gpu64_3dDispatch( op );
+	} else
+#endif
 	if ( sCmdHi != 0 )
 	{
-		sErr = GPU64_ERR_BAD_CLASS;			// class 1 (3D) is milestone 6
+		sErr = GPU64_ERR_BAD_CLASS;
 		sStatus |= GPU64_STATUS_ERROR;
 		return;
-	}
-
-	u8 res;
+	} else
 	if ( op < 0x10 )
 		res = doSystem( op );
 	else if ( op < 0x80 )

@@ -54,6 +54,7 @@
 #include "helpers.h"
 #include "gpu64_multicore.h"
 #include "gpu64_ladder.h"
+#include "gpu64_3d.h"
 #include "gpu64_fb.h"
 
 CLogger	*logger;
@@ -131,7 +132,16 @@ public:
 		// gpu64_multicore.cpp) -- isolates bring-up-alone from
 		// bring-up-plus-workload. See progress_tracker.md for the test
 		// procedure and milestone6_3d_design.md for the full writeup.
-		#if defined( GPU64_MULTICORE_ENABLED ) || defined( GPU64_LADDER_ENABLED )
+		//
+		// GPU64_3D_ENABLED brings the same machinery up for milestone 6
+		// proper: core 1 runs the class 1 render loop (gpu64_3d.h), cores 2
+		// and 3 park. The ring buffer has to exist before core 1 starts
+		// draining it, hence the Init() ahead of Initialize().
+		#ifdef GPU64_3D_ENABLED
+		gpu64_3dInit();
+		#endif
+		#if defined( GPU64_MULTICORE_ENABLED ) || defined( GPU64_LADDER_ENABLED ) \
+		 || defined( GPU64_3D_ENABLED )
 		bOK = m_MultiCore.Initialize() && bOK;
 		#endif
 		return bOK;

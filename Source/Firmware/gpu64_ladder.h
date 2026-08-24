@@ -64,6 +64,29 @@
 // measurement code inside reuUsingPolling().
 //#define GPU64_LADDER_ENABLED
 
+// Widen the polling loop's rolling i-cache preload window *without* dragging
+// in the rest of the ladder. This exists to test one hypothesis and nothing
+// else: the shipping window is 0x1a00 measured from reuEmulationMainLoop,
+// and the loop runs past it (see the docs), so a tail of real bus-handling
+// code -- the PMCCNTR waits, the GPIO reads, INP_GPIO_RW -- never enters the
+// rolling preload. That is a candidate mechanism for the rare dropped IO2
+// write the phase-0 bench found: an i-cache miss in the tail makes the loop
+// too busy to sample a C64 write, which is lost outright.
+//
+// The ladder builds already ran at 0x2000 without trouble, so the widened
+// window is known not to break anything by itself. Cost is a staler preload
+// -- 128 passes to walk the window instead of 104 -- and about 1.3KB of
+// overshoot past the end of the function, which merely preloads neighbouring
+// code and is harmless.
+//
+// 2026-08-24: tested and OFF. The two-hour run at 0x2000 saw 14 events in
+// 360000 frames -- 1 per 25700, against 1 per 23250 from the narrow-window
+// runs. No effect whatsoever, so the tail falling outside the preload is not
+// the mechanism and the shipping window stays at 0x1a00. The toggle is kept
+// because it is a clean one-line way to take this variable off the table
+// again after any change to the loop's size.
+//#define GPU64_POLL_IPL_WIDE
+
 // The isolation control the first bench round turned out to need. With this
 // commented out, the ladder build keeps *everything* that touches core 0 --
 // the per-pass measurement, the widened preload window, multicore bring-up
@@ -230,7 +253,7 @@
 // 5, which is not a margin:
 //   aarch64-none-elf-nm -S external/Circle/app/Firmware/kernel8.elf \
 //     | grep reuUsingPolling
-#ifdef GPU64_LADDER_ENABLED
+#if defined( GPU64_LADDER_ENABLED ) || defined( GPU64_POLL_IPL_WIDE )
 	#define GPU64_POLL_IPL_WINDOW	0x2000
 	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 8 )
 #else

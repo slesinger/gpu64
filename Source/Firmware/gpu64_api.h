@@ -25,6 +25,10 @@
 #define GPU64_REG_ID_HI		0x10
 #define GPU64_REG_ARG0		0x11
 #define GPU64_REG_ARG15		0x20
+// gpu64: class 1 only. Low byte of the last command's result -- the page
+// number from SCENE_COMMIT, the allocated ID from a CREATE_*. Meaning is per
+// opcode and undefined for opcodes that define none.
+#define GPU64_REG_RESULT	0x21
 
 #define GPU64_ARG_COUNT		16
 
@@ -33,6 +37,9 @@
 #define GPU64_STATUS_ERROR		0x02
 #define GPU64_STATUS_VBLANK_PENDING	0x04
 #define GPU64_STATUS_VBLANK_ARMED	0x08
+// gpu64: class 1. The render loop has finished a frame and is waiting for
+// SCENE_COMMIT (handshake mode only).
+#define GPU64_STATUS_FRAME_READY	0x10
 
 // --- ERRCODE values -----------------------------------------------------
 #define GPU64_ERR_OK			0x00
@@ -51,6 +58,17 @@
 // spec's rule that a failed dispatch does nothing applies -- the queued flip
 // is untouched. Poll STATUS bit0 before asking for another.
 #define GPU64_ERR_BUSY			0x07
+
+// gpu64: class 1 (milestone 6). See docs/milestone6_3d_design.md.
+// Resource RAM exhausted.
+#define GPU64_ERR_OUT_OF_MEMORY		0x08
+// The core-0-to-core-1 ring buffer is full. Core 0 rejects rather than waits
+// -- its cycle-predictability outranks any one command's completion.
+#define GPU64_ERR_QUEUE_FULL		0x09
+// No such resource or scene node.
+#define GPU64_ERR_BAD_ID		0x0A
+// A render was asked for with no active camera.
+#define GPU64_ERR_NO_CAMERA		0x0B
 
 // --- blob descriptor spaces --------------------------------------------
 #define GPU64_SPACE_C64			0
@@ -73,6 +91,7 @@ struct GPU64REGS
 	u8	status;
 	u8	err;
 	u8	id[ 2 ];
+	u8	result;			// class 1, read-only from the C64
 	u8	arg[ GPU64_ARG_COUNT ];
 };
 
@@ -111,6 +130,8 @@ static inline u8 gpu64_apiReadReg( u8 addr )
 		return gpu64Regs.status;
 	if ( addr == GPU64_REG_ERRCODE )
 		return gpu64Regs.err;
+	if ( addr == GPU64_REG_RESULT )
+		return gpu64Regs.result;
 	return 0xFF;
 }
 

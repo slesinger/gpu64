@@ -18,6 +18,7 @@
 */
 #include "gpu64_multicore.h"
 #include "gpu64_ladder.h"
+#include "gpu64_3d.h"
 
 volatile u32 CGpu64MultiCore::s_PassCounter[ 4 ] = { 0, 0, 0, 0 };
 
@@ -31,6 +32,18 @@ void CGpu64MultiCore::Run( unsigned nCore )
 {
 	if ( nCore == 0 )
 		return;	// core 0's real work is CRAD::Run(), called separately
+
+	// gpu64: milestone 6 proper. One worker core, as the design says -- start
+	// with core 0 plus one and expand only once that is measured. Cores 2 and
+	// 3 return, i.e. go to halt()/WFI, so core 1's traffic is the only memory
+	// traffic in the machine besides core 0's own. That matters: milestone 6a
+	// showed a second core spinning on the wrong thing derails core 0 while
+	// writing zero bytes, so every core that is not needed stays asleep.
+	#ifdef GPU64_3D_ENABLED
+	if ( nCore == 1 )
+		gpu64_3dWorker();		// never returns
+	return;
+	#endif
 
 	// gpu64: the milestone 6 load ladder (gpu64_ladder.h) supersedes the
 	// stress spike below, and uses exactly one worker core -- the design
