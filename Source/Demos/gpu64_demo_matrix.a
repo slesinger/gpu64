@@ -7,7 +7,7 @@
 ;            {__       {__       {__            {__
 ;              {_________         {______________		Expansion Unit
 ;
-;      gpu64 demo 6 of 6 -- MATRIX: the math API, and nothing on the HDMI
+;      gpu64 demo 6 of 7 -- MATRIX: the math API, and nothing on the HDMI
 ;      screen at all.
 ;
 ;      Demo 5 used the matrix ops to move a shape. This one is for the

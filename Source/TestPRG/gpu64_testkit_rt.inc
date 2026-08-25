@@ -50,6 +50,16 @@ cmd1
 	lda ERRCODE
 	rts
 
+; Class 2, the raster layer. Same three writes -- CMD_HI is sticky, so a
+; program that stays in one class only pays for it once; this sets it every
+; time so a test can interleave classes without bookkeeping.
+cmd2
+	ldx #2
+	stx CMD_HI
+	sta CMD_LO
+	lda ERRCODE
+	rts
+
 ; A = ERRCODE, Y = the code the test demands. X = 0 on a match. On a
 ; mismatch X is the code that actually came back -- except when that is OK,
 ; which becomes $FE, because a 0 fail code is how this harness spells

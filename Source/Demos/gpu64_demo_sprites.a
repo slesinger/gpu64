@@ -7,7 +7,7 @@
 ;            {__       {__       {__            {__
 ;              {_________         {______________		Expansion Unit
 ;
-;      gpu64 demo 3 of 6 -- SPRITES: BLIT, BLIT_KEYED and READ_RECT.
+;      gpu64 demo 3 of 7 -- SPRITES: BLIT, BLIT_KEYED and READ_RECT.
 ;
 ;      Bulk pixels never cross the register window byte by byte. A command
 ;      that needs data takes a 6-byte BLOB DESCRIPTOR instead -- space,

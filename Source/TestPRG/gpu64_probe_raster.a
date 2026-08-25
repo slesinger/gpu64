@@ -1,0 +1,593 @@
+;
+;      gpu64 -- class 2 frame-loop probe.
+;
+;      WHAT THIS IS FOR
+;
+;      The conformance suite passes on hardware and the raycast demo, which
+;      uses the same opcodes, blinks: mostly an empty scene, occasionally a
+;      frame of walls. The difference between the two is not an opcode. It
+;      is the SHAPE of the work -- a five-kilobyte batch pulled over DMA,
+;      drawn, read back and flipped, sixty times a second, for minutes.
+;
+;      A blinking screen is not a measurement. This program turns it into
+;      one. It runs the demo's frame three ways and counts, per frame, which
+;      of four things went wrong:
+;
+;        ERR   a dispatch did not return OK. The batch carries a checksum,
+;              so a pull that arrived damaged shows up here as BAD ARGS ($04)
+;              rather than as garbage on the screen. This is the line that
+;              separates "the records did not arrive" from everything else.
+;
+;        STAT  the dispatch returned OK but RASTER_STATS did not report the
+;              batch that was sent -- accepted != the record count, or
+;              anything rejected. The records arrived and were parsed, and
+;              the parse disagreed with what was written.
+;
+;        PIX   stats were perfect and the pixels are still not there. A
+;              64-pixel strip across the middle of the drawn columns is read
+;              back every frame with READ_RECT and compared to the colour
+;              the record asked for. This is the line that says the draw
+;              itself, or the page it landed on, is the problem.
+;
+;      Three phases, each 100 frames, differing in one axis only:
+;
+;        BIG   320 records, page flip and vblank wait -- the demo's frame.
+;        NOFL  320 records, NO flip and no vblank wait. If BIG is dirty and
+;              this is clean, the fault is in the flip, not in the raster.
+;        SML   40 records, flip and vblank wait. If BIG is dirty and this is
+;              clean, the fault scales with the size of the pull.
+;
+;      Nothing here is random and nothing here moves: the same batch is
+;      drawn every frame and the expected pixels are a constant. A screen
+;      that is right on frame 1 and wrong on frame 40 has no explanation
+;      other than the frame loop itself.
+;
+;      Every phase reports four hex numbers. All zero is clean. PIX 0064
+;      on BIG with ERR 0000 and STAT 0000 means every single frame drew
+;      nothing while claiming to have drawn everything -- which is exactly
+;      what the demo looks like.
+;
+;      Runs in about six seconds. Requires the RAD menu switched to REU
+;      mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+; ----------------------------------------------------------------------
+; Geometry and buffers.
+;
+; The two batches live in separate memory rather than sharing a prefix: the
+; small one's checksum would otherwise sit on top of the big one's record
+; 40, and a probe whose two phases can corrupt each other proves nothing.
+; ----------------------------------------------------------------------
+
+VIEW_H	= 160
+NBIG	= 320			; one record per screen column
+NSML	= 40
+COLBIG	= $6000			; NBIG*16 + 2 = 5122 bytes
+COLSML	= $7800			; NSML*16 + 2 =  642 bytes
+READBUF	= $7b00
+STATBUF	= $7b40
+
+COL_Y0	= 40
+COL_Y1	= 119
+PROBE_Y	= 80			; a row well inside every column
+NCHK	= 32			; pixels read back per frame -- must not
+				; exceed NSML, or the small phase would be
+				; judged on columns it never draws
+
+FRAMES	= 100
+
+; Zero page. $f7-$fa only: the kit owns SRC ($fb) and DST ($fd).
+bp	= $f7			; record write pointer
+ix	= $f9			; record index, 16-bit
+
+; ----------------------------------------------------------------------
+; One phase: a batch, a record count, and whether the frame ends with a
+; page flip. Three arguments because there are exactly three things this
+; probe is allowed to vary -- anything else differing between phases would
+; make a difference between them unattributable.
+; ----------------------------------------------------------------------
+
+; A 16-bit constant into a 16-bit variable. The kit has #argw for the ARG
+; window, which is write-only; this is the same thing for plain memory.
+setw	.macro	var, val
+	lda #<(\val)
+	sta \var
+	lda #>(\val)
+	sta \var+1
+	.endm
+
+phase	.macro	addr, count, flip
+	lda #<(\addr)
+	sta phAddr
+	lda #>(\addr)
+	sta phAddr+1
+	lda #<(\count)
+	sta phCount
+	lda #>(\count)
+	sta phCount+1
+	lda #\flip
+	sta phFlip
+	jsr runPhase
+	.endm
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 PROBE - RASTER FRAME LOOP"
+
+; ----------------------------------------------------------------------
+; Session setup. If any of this fails there is no point running a frame
+; loop, so it is judged rather than counted.
+; ----------------------------------------------------------------------
+
+	lda #R2_RESET
+	jsr cmd2
+	#wantOk
+	#check "RESET"
+
+	#argw 0, 0
+	#argw 2, 0
+	#argw 4, 320
+	#argw 6, VIEW_H
+	lda #R2_SET_VIEW
+	jsr cmd2
+	#wantOk
+	#check "SET VIEW"
+
+	; Identity lighting: levels = 0 takes no blob, so a colour written
+	; into a record is the colour that reaches the page and the pixel
+	; check needs no colormap of its own.
+	#argblob 0, SPACE_C64, 0, 0
+	#argb 6, 0
+	lda #R2_SET_COLORMAP
+	jsr cmd2
+	#wantOk
+	#check "NO COLORMAP"
+
+	; Both batches, built once. Neither is ever rewritten, so a record
+	; that changes between frame 1 and frame 100 changed in the pull.
+	#setptr bp, COLBIG
+	#setw bcCount, NBIG
+	jsr buildCols
+	#setptr bp, COLSML
+	#setw bcCount, NSML
+	jsr buildCols
+	#check "BUILD BATCHES"
+
+; ----------------------------------------------------------------------
+; The three phases.
+; ----------------------------------------------------------------------
+
+	#phase COLBIG, NBIG, 1
+	#showw phErr,  "BIG ERR"
+	#showw phCode, "BIG CODE"
+	#showw phStat, "BIG STAT"
+	#showw phPix,  "BIG PIX"
+	#showw phFrst, "BIG 1ST"
+
+	#phase COLBIG, NBIG, 0
+	#showw phErr,  "NOFL ERR"
+	#showw phStat, "NOFL STAT"
+	#showw phPix,  "NOFL PIX"
+	#showw phFrst, "NOFL 1ST"
+
+	#phase COLSML, NSML, 1
+	#showw phErr,  "SML ERR"
+	#showw phStat, "SML STAT"
+	#showw phPix,  "SML PIX"
+	#showw phFrst, "SML 1ST"
+
+	; The verdict. A probe still judges itself, so a clean run is one
+	; word and does not have to be read off fifteen hex numbers.
+	lda phTotal
+	ora phTotal+1
+	tax
+	#check "ALL PHASES OK"
+
+	jsr kitFinish
+	rts
+
+; ======================================================================
+; Building a batch
+;
+; Column x draws rows COL_Y0..COL_Y1 in solid colour (x & 7) + 1. Texture
+; id 0 means "solid", the palette index being the low byte of u -- so this
+; batch exercises the record path, the pull and the span writer without
+; involving a texture upload, and the expected pixel for column x is a
+; constant this program can recompute in three instructions.
+;
+; Colours 1..8 are all non-zero, and the view is filled with 0 before every
+; draw, so "nothing was drawn" is never mistaken for "the right thing was
+; drawn". That is the poison rule applied to a framebuffer.
+; ======================================================================
+
+; bp -> the buffer, bcCount = how many records. Leaves the 16-bit checksum
+; in place immediately after the last record. Returns X = 0.
+buildCols
+	lda bp
+	sta bcBase
+	lda bp+1
+	sta bcBase+1
+
+	lda #0
+	sta ix
+	sta ix+1
+
+bcRec
+	ldy #0
+	lda ix				; x, one record per column
+	sta (bp),y
+	iny
+	lda ix+1
+	sta (bp),y
+	iny
+	lda #<COL_Y0
+	sta (bp),y
+	iny
+	lda #>COL_Y0
+	sta (bp),y
+	iny
+	lda #<COL_Y1
+	sta (bp),y
+	iny
+	lda #>COL_Y1
+	sta (bp),y
+	iny
+	lda #R2_SOLID			; texid 0
+	sta (bp),y
+	iny
+	lda #0				; light -- identity, no colormap
+	sta (bp),y
+	iny
+	lda ix				; u lo IS the colour when texid is 0
+	and #7
+	clc
+	adc #1
+	sta (bp),y
+	iny
+	lda #0
+bcPad
+	sta (bp),y			; u hi, v, dv, flags, pad
+	iny
+	cpy #R2_REC
+	bne bcPad
+
+	clc				; next record
+	lda bp
+	adc #R2_REC
+	sta bp
+	lda bp+1
+	adc #0
+	sta bp+1
+
+	inc ix
+	bne +
+	inc ix+1
++
+	lda ix
+	cmp bcCount
+	bne bcRec
+	lda ix+1
+	cmp bcCount+1
+	bne bcRec
+
+	; The checksum, over the records only. bp is already one past the last
+	; record, which is exactly where it goes -- remember that, because
+	; summing walks bp back over the array.
+	lda bp
+	sta bcEnd
+	lda bp+1
+	sta bcEnd+1
+
+	jsr bcLen			; ix = bcCount * 16
+	lda bcBase
+	sta bp
+	lda bcBase+1
+	sta bp+1
+	jsr sumBytes
+
+	lda bcEnd
+	sta bp
+	lda bcEnd+1
+	sta bp+1
+	ldy #0
+	lda sumL
+	sta (bp),y
+	iny
+	lda sumH
+	sta (bp),y
+
+	ldx #0
+	rts
+
+; ix = bcCount * R2_REC.
+bcLen
+	lda bcCount
+	sta ix
+	lda bcCount+1
+	sta ix+1
+	ldx #4
+bclSh
+	asl ix
+	rol ix+1
+	dex
+	bne bclSh
+	rts
+
+; bp -> bytes, ix = count. sumL/sumH = the 16-bit sum of them, which is the
+; same arithmetic gpu64_rasterChecksum() does on the other side.
+sumBytes
+	lda #0
+	sta sumL
+	sta sumH
+	ldy #0
+sbLoop
+	lda ix
+	ora ix+1
+	beq sbDone
+	clc
+	lda (bp),y
+	adc sumL
+	sta sumL
+	bcc +
+	inc sumH
++
+	iny
+	bne +
+	inc bp+1
++
+	lda ix
+	bne +
+	dec ix+1
++
+	dec ix
+	jmp sbLoop
+sbDone
+	rts
+
+; ======================================================================
+; A phase
+; ======================================================================
+
+runPhase
+	lda #0
+	ldx #9
+rpClr
+	sta phErr,x
+	dex
+	bpl rpClr
+	sta fcLo
+	sta fcHi
+
+	; The blob length for this phase's batch: records plus the checksum.
+	lda phCount
+	sta bcCount
+	lda phCount+1
+	sta bcCount+1
+	jsr bcLen
+	clc
+	lda ix
+	adc #2
+	sta phLen
+	lda ix+1
+	adc #0
+	sta phLen+1
+
+rpFrame
+	; 1. Poison the view. Colour 0 is not a colour any record asks for,
+	;    so a frame that draws nothing reads back as 0 and is caught.
+	#argb 0, 0
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	jsr rpErr
+
+	; 2. The batch, checksummed.
+	lda #SPACE_C64
+	sta ARG+0
+	lda phAddr
+	sta ARG+1
+	lda phAddr+1
+	sta ARG+2
+	lda #0
+	sta ARG+3
+	lda phLen
+	sta ARG+4
+	lda phLen+1
+	sta ARG+5
+	lda phCount
+	sta ARG+6
+	lda phCount+1
+	sta ARG+7
+	#argb 8, R2_BATCH_SUM
+	#argb 9, 0
+	lda #R2_DRAW_COLUMNS
+	jsr cmd2
+	jsr rpErr
+
+	; 3. What gpu64 made of it.
+	#argblob 0, SPACE_C64, STATBUF, 16
+	lda #R2_STATS
+	jsr cmd2
+	jsr rpErr
+	jsr rpStats
+
+	; 4. What actually reached the page. READ_RECT reads the draw page,
+	;    which is still the page just drawn -- the flip comes after.
+	#poison READBUF, NCHK
+	#stgRead READBUF, 0, PROBE_Y, NCHK, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	jsr rpErr
+	jsr rpPix
+
+	; 5. The frame boundary, if this phase has one.
+	lda phFlip
+	beq rpNoFlip
+	lda #OP_PAGE_FLIP
+	jsr cmd0
+	jsr rpErr
+	lda #OP_VBLANK_SYNC
+	jsr cmd0
+	; Deliberately not tallied: a display whose frame clock never
+	; calibrated answers UNSUPPORTED here, and that is a property of the
+	; display, not a defect this probe is looking for.
+rpNoFlip
+
+	inc fcLo
+	bne +
+	inc fcHi
++
+	lda fcLo
+	cmp #<FRAMES
+	bne rpMore
+	lda fcHi
+	cmp #>FRAMES
+	beq rpTally
+rpMore
+	jmp rpFrame
+rpTally
+
+	; Roll this phase's failures into the running total the verdict reads.
+	clc
+	lda phTotal
+	adc phErr
+	sta phTotal
+	lda phTotal+1
+	adc phErr+1
+	sta phTotal+1
+	clc
+	lda phTotal
+	adc phStat
+	sta phTotal
+	lda phTotal+1
+	adc phStat+1
+	sta phTotal+1
+	clc
+	lda phTotal
+	adc phPix
+	sta phTotal
+	lda phTotal+1
+	adc phPix+1
+	sta phTotal+1
+	rts
+
+; A = ERRCODE from the dispatch just made.
+rpErr
+	cmp #ERR_OK
+	beq reDone
+	pha
+	lda phErr
+	ora phErr+1
+	bne reBump			; already have a code; keep the first
+	pla
+	pha
+	sta phCode
+reBump
+	pla
+	inc phErr
+	bne +
+	inc phErr+1
++
+	jsr rpFirst
+reDone
+	rts
+
+; The batch gpu64 says it drew must be the batch that was sent.
+rpStats
+	lda STATBUF+2
+	cmp phCount
+	bne rsBad
+	lda STATBUF+3
+	cmp phCount+1
+	bne rsBad
+	lda STATBUF+4
+	ora STATBUF+5
+	beq rsDone
+rsBad
+	inc phStat
+	bne +
+	inc phStat+1
++
+	jsr rpFirst
+rsDone
+	rts
+
+; The strip that came back must be the colours the records asked for.
+rpPix
+	ldy #0
+rpxLoop
+	tya
+	and #7
+	clc
+	adc #1
+	cmp READBUF,y
+	bne rpxBad
+	iny
+	cpy #NCHK
+	bne rpxLoop
+	rts
+rpxBad
+	inc phPix
+	bne +
+	inc phPix+1
++
+	jsr rpFirst
+	rts
+
+; The first frame of this phase on which anything at all went wrong. Frames
+; are numbered from 1, so 0 means "nothing did".
+rpFirst
+	lda phFrst
+	ora phFrst+1
+	bne rfDone
+	clc
+	lda fcLo
+	adc #1
+	sta phFrst
+	lda fcHi
+	adc #0
+	sta phFrst+1
+rfDone
+	rts
+
+; ======================================================================
+; Variables. phErr..phFrst are cleared as a block by runPhase, so they must
+; stay contiguous and in this order; phTotal must NOT be among them.
+; ======================================================================
+
+phErr	.word 0
+phCode	.word 0
+phStat	.word 0
+phPix	.word 0
+phFrst	.word 0
+
+phTotal	.word 0
+phAddr	.word 0
+phCount	.word 0
+phLen	.word 0
+phFlip	.byte 0
+fcLo	.byte 0
+fcHi	.byte 0
+
+bcBase	.word 0
+bcEnd	.word 0
+bcCount	.word 0
+sumL	.byte 0
+sumH	.byte 0
+
+	.include "gpu64_testkit_rt.inc"

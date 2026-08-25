@@ -1,0 +1,307 @@
+;
+;      gpu64 API conformance -- class 2 walls: SET_CAMERA and DRAW_WALLS.
+;
+;      WHAT THIS IS FOR
+;
+;      DRAW_WALLS is the first class 2 opcode that does geometry rather than
+;      pixels: the C64 sends a wall segment in world coordinates and gpu64
+;      projects it. That moves the per-column divide -- the thing a 1 MHz
+;      6502 cannot afford and the reason the raycast demo sends five
+;      kilobytes of column records a frame -- across the bus once, at upload
+;      time, instead of sixty times a second.
+;
+;      The arithmetic itself is not what this program checks. That is
+;      covered far better by tools/rastercheck, which renders random
+;      cameras and random walls through the firmware's own core and through
+;      an independently written model and compares all 64000 pixels. What
+;      this program checks is the part that only exists on hardware: that
+;      the camera the C64 wrote is the camera the core was handed, and that
+;      a wall a programmer would reasonably write lands where the geometry
+;      says it should.
+;
+;      THE GEOMETRY, WORKED OUT BY HAND
+;
+;      Every expected number below comes from this and nothing else, so a
+;      red line here is a firmware defect and not a disagreement about what
+;      was expected:
+;
+;        camera at the origin, looking along +x, eye 0.5 up in a room 2.0
+;        tall, projecting 160 pixels across a 320-wide view
+;        wall from (4, 2) to (4, -2), so its front faces the camera
+;
+;      Both ends are 4.0 away, so the wall is flat on:
+;
+;        half-width on screen  = 2.0 / 4.0 * 160 = 80 pixels
+;        columns               = 160 - 80 .. 160 + 80 - 1  = 80 .. 239
+;        bottom row            = 100 + 0.5 / 4.0 * 160     = 120, so 119
+;        top row               = 100 - 1.5 / 4.0 * 160     = 40
+;
+;      Each edge is asserted from both sides, because an off-by-one in the
+;      projection is exactly the defect this is looking for and a check that
+;      only samples the middle of the wall would never see one.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+BATCH	= $3200				; the record array a batch names
+STATS	= $3300				; RASTER_STATS reads back here
+RB	= $3380				; READ_RECT reads back here
+
+BG	= 0				; the colour the page is cleared to
+WALLC	= 7				; the wall itself
+CEILC	= 3				; ceiling, when CAM_PAINT is on
+FLOORC	= 2				; floor, likewise
+FARC	= 1				; the wall that is behind the camera
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 8 - WALLS"
+
+	; Is class 2 there at all? GET_INFO byte 11 bit 2 says so, and if it
+	; is clear then every line below fails as BAD_CLASS for a reason
+	; that is not a defect. Ask first.
+	#poison RB, 16, $aa
+	#argblob 0, SPACE_C64, RB, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "GET INFO"
+
+	#clracc
+	lda RB+11
+	and #$04
+	bne +
+	jsr kitBad
++
+	#useacc
+	#check "CLASS 2 BIT"
+
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+	#wantOk
+	#check "CLEAR"
+
+	lda #R2_RESET
+	jsr cmd2
+	#wantOk
+	#check "RESET"
+
+	; ---------------------------------------------------------------
+	; SET_CAMERA and DRAW_WALLS.
+	;
+	; The projection is arithmetic, and arithmetic is what the model in
+	; tools/prgsim and the differential harness in tools/rastercheck
+	; already agree about to the pixel. What this section is for is the
+	; part neither of those covers: that the wire layer hands the core
+	; the camera the C64 wrote, and that a wall a C64 programmer would
+	; reasonably write lands where the geometry says it should.
+	;
+	; The geometry, worked out by hand so a failure here is a firmware
+	; defect and not a disagreement about what was expected:
+	;
+	;   camera at the origin, looking along +x, eye 0.5 up in a room
+	;   2.0 tall, projecting 160 pixels across a 320-wide view
+	;   wall from (4, 2) to (4, -2), so it faces the camera
+	;
+	;   both ends are 4.0 away, so the wall is flat on and its columns
+	;   run from x=80 to x=239, top row 40 and bottom row 119.
+	; ---------------------------------------------------------------
+
+	; A full view and no lighting: this section asserts raw colours.
+	#argw 0, 0
+	#argw 2, 0
+	#argw 4, 320
+	#argw 6, 200
+	lda #R2_SET_VIEW
+	jsr cmd2
+	#argblob 0, SPACE_C64, 0, 0
+	#argb 6, 0
+	lda #R2_SET_COLORMAP
+	jsr cmd2
+	#wantOk
+	#check "WALL SETUP"
+
+	; A camera that cannot be projected is refused, once per reason.
+	#r2cam 0, 0, 0, $0080, $0200, 0
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "CAM PROJ 0"
+
+	#r2cam 0, 0, 0, 0, $0200, $a000
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "CAM EYE 0"
+
+	#r2cam 0, 0, 0, $0200, $0200, $a000
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "CAM CEIL LOW"
+
+	#r2cam 0, 0, 0, $0080, $0200, $a000
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#wantOk
+	#check "SET CAMERA"
+
+	; A wall wound the other way is seen from behind, and a one-sided
+	; wall seen from behind is a rejection, not a hole.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2wall BATCH, $0400, $fe00, $0400, $0200, 0, 0, WALLC, WALLC
+	#r2batch BATCH, 1
+	lda #R2_DRAW_WALLS
+	jsr cmd2
+	#raw
+
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 0		; accepted
+	#expectw STATS+4, 1		; rejected
+	#useacc
+	#check "WALL BACKFACE"
+
+	; The same wall, wound to face the camera.
+	#r2wall BATCH, $0400, $0200, $0400, $fe00, 0, 0, WALLC, WALLC
+	#r2batch BATCH, 1
+	lda #R2_DRAW_WALLS
+	jsr cmd2
+	#wantOk
+	#check "DRAW WALLS"
+
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 1
+	#expectw STATS+4, 0
+	#useacc
+	#check "WALL ACCEPTED"
+
+	; Where the hand-worked geometry says the edges are. One pixel each
+	; side of every edge, because an off-by-one in the projection is the
+	; failure this is actually looking for.
+	#stgRead RB, 78, 80, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; x=78, outside
+	#expectb RB+1, BG		; x=79, outside
+	#expectb RB+2, WALLC		; x=80, first column
+	#expectb RB+3, WALLC
+	#useacc
+	#check "WALL LEFT EDGE"
+
+	#stgRead RB, 238, 80, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WALLC		; x=238
+	#expectb RB+1, WALLC		; x=239, last column
+	#expectb RB+2, BG		; x=240, outside
+	#expectb RB+3, BG
+	#useacc
+	#check "WALL RIGHT EDGE"
+
+	#stgRead RB, 160, 38, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; y=38
+	#expectb RB+1, BG		; y=39
+	#expectb RB+2, WALLC		; y=40, top row
+	#expectb RB+3, WALLC
+	#useacc
+	#check "WALL TOP EDGE"
+
+	#stgRead RB, 160, 118, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WALLC		; y=118
+	#expectb RB+1, WALLC		; y=119, bottom row
+	#expectb RB+2, BG		; y=120
+	#expectb RB+3, BG
+	#useacc
+	#check "WALL BOT EDGE"
+
+	; A wall wholly behind the camera costs a rejection and no pixels.
+	#r2wall BATCH, $fc00, $0200, $fc00, $fe00, 0, 0, FARC, FARC
+	#r2batch BATCH, 1
+	lda #R2_DRAW_WALLS
+	jsr cmd2
+	#raw
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 0
+	#expectw STATS+4, 1
+	#useacc
+	#check "WALL BEHIND"
+
+	; CAM_PAINT: the same wall also fills its columns above and below.
+	; The rows outside the wall's own columns are untouched, which is
+	; what makes this different from a full-screen clear.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2cam 0, 0, 0, $0080, $0200, $a000, R2_CAM_PAINT, FLOORC, CEILC
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#r2wall BATCH, $0400, $0200, $0400, $fe00, 0, 0, WALLC, WALLC
+	#r2batch BATCH, 1
+	lda #R2_DRAW_WALLS
+	jsr cmd2
+	#wantOk
+	#check "PAINT WALLS"
+
+	#stgRead RB, 160, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, CEILC		; ceiling, above the wall
+	#useacc
+	#check "PAINT CEILING"
+
+	#stgRead RB, 160, 150, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, FLOORC		; floor, below the wall
+	#useacc
+	#check "PAINT FLOOR"
+
+	#stgRead RB, 10, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; a column no wall covered
+	#useacc
+	#check "PAINT NO WALL"
+
+	jmp kitFinish
+
+	.include "gpu64_testkit_rt.inc"

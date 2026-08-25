@@ -1,0 +1,574 @@
+;
+;      gpu64 API conformance -- class 2 things: DRAW_THINGS.
+;
+;      WHAT THIS IS FOR
+;
+;      DRAW_SPRITE takes a screen rectangle, so the 6502 has to project the
+;      sprite itself, and it has no argument room left for a depth. That is
+;      enough for a weapon held in front of the camera and for nothing else.
+;      DRAW_THINGS takes a WORLD position and depth-tests every pixel against
+;      the buffer DRAW_SECTORS filled, which is what lets a monster stand
+;      behind a wall.
+;
+;      The arithmetic is not what this program checks; tools/rastercheck
+;      does that far better, 64000 pixels at a time against an independently
+;      written model. What this checks is the part that exists only on
+;      hardware: that the records the C64 wrote are the ones the core was
+;      handed, and that the depth buffer really is shared between the two
+;      opcodes.
+;
+;      THE GEOMETRY, WORKED OUT BY HAND
+;
+;      Every expected number below comes from this and nothing else, so a
+;      red line here is a firmware defect and not a disagreement about what
+;      was expected:
+;
+;        camera at the origin, looking along +x, eye at absolute height 0.5,
+;        projecting 160 pixels across a 320-wide view, so the horizon is
+;        row 100 and the view centre is column 160
+;
+;        sector 0  floor 0.0  ceiling 2.0
+;
+;      Every thing here is 1.0 x 1.0 world units standing on the floor at
+;      absolute 0.0, straight ahead on the view axis. At distance z:
+;
+;        width  = 1.0/z * 160 px, centred on column 160
+;        bottom row = 100 + 0.5*160/z, so the last row is one above it
+;        top row    = 100 - 0.5*160/z
+;
+;        A at z = 4.0   40 px wide   columns 140..179   rows  80..119
+;        B at z = 8.0   20 px wide   columns 150..169   rows  90..109
+;        C at z = 2.0   80 px wide   columns 120..199   rows  60..139
+;
+;      B is entirely inside A, and A is entirely inside C, which is what
+;      makes the depth assertions unambiguous.
+;
+;      THE WALL, from the sector test, is at (4, 2)..(4, -2), front sector
+;      0, so z = 4.0: columns 80..239, rows 40..119. C is nearer than it and
+;      B is further, so C covers it and it covers B completely.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+STATS	= $3300				; RASTER_STATS reads back here
+RB	= $3380				; READ_RECT reads back here
+TEX	= $3400			        ; the textures are built here
+
+BG	= 0				; the colour the page is cleared to
+WALLC	= 7				; the wall between A and C
+THA	= 1				; thing A's one texel
+THB	= 2				; thing B's
+THC	= 3				; thing C's
+
+; The quadrant texture: 2x2, one colour per corner, so a thing drawn with it
+; says which way up and which way round it was sampled.
+QTL	= 8
+QBL	= 9
+QTR	= 10
+QBR	= 11
+
+IDA	= 1
+IDB	= 2
+IDC	= 3
+IDQ	= 4
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 10 - THINGS"
+
+	; Is class 2 there at all? GET_INFO byte 11 bit 2 says so, and if it
+	; is clear then every line below fails as BAD_CLASS for a reason
+	; that is not a defect. Ask first.
+	#poison RB, 16, $aa
+	#argblob 0, SPACE_C64, RB, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "GET INFO"
+
+	#clracc
+	lda RB+11
+	and #$04
+	bne +
+	jsr kitBad
++
+	#useacc
+	#check "CLASS 2 BIT"
+
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+
+	; RESET also empties the depth buffer. Without that every assertion
+	; below would depend on which program ran before this one.
+	lda #R2_RESET
+	jsr cmd2
+	#wantOk
+	#check "RESET"
+
+	; A full view and no lighting: this program asserts raw colours.
+	#argw 0, 0
+	#argw 2, 0
+	#argw 4, 320
+	#argw 6, 200
+	lda #R2_SET_VIEW
+	jsr cmd2
+	#argblob 0, SPACE_C64, 0, 0
+	#argb 6, 0
+	lda #R2_SET_COLORMAP
+	jsr cmd2
+	#wantOk
+	#check "THING SETUP"
+
+	#r2sectors secTab, NSEC
+	lda #R2_SET_SECTORS
+	jsr cmd2
+	#wantOk
+	#check "SET SECTORS"
+
+	#r2cam 0, 0, 0, $0080, $0200, $a000
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#wantOk
+	#check "SET CAMERA"
+
+	jsr buildTextures
+	#clracc
+	#uptex IDA, TEX+0, 1, 1
+	#uptex IDB, TEX+1, 1, 1
+	#uptex IDC, TEX+2, 1, 1
+	#uptex IDQ, TEX+4, 2, 2
+	#useacc
+	#check "UPLOAD TEX"
+
+	; ---------------------------------------------------------------
+	; One thing, and where its edges land. An off-by-one in the
+	; projection is what this is looking for; a check that only sampled
+	; the middle would never see one.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingA, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#wantOk
+	#check "DRAW THINGS"
+
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 1		; accepted
+	#expectw STATS+4, 0		; rejected
+	#useacc
+	#check "THING ACCEPTED"
+
+	#stgRead RB, 138, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; x=138
+	#expectb RB+1, BG		; x=139
+	#expectb RB+2, THA		; x=140, first column
+	#expectb RB+3, THA
+	#useacc
+	#check "THING LEFT EDGE"
+
+	#stgRead RB, 178, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA
+	#expectb RB+1, THA		; x=179, last column
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "THING RIGHT EDGE"
+
+	#stgRead RB, 160, 78, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; y=78
+	#expectb RB+1, BG		; y=79
+	#expectb RB+2, THA		; y=80, top of a 1.0-tall thing
+	#expectb RB+3, THA
+	#useacc
+	#check "THING TOP EDGE"
+
+	#stgRead RB, 160, 118, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA
+	#expectb RB+1, THA		; y=119, standing on the floor
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "THING BOT EDGE"
+
+	; ---------------------------------------------------------------
+	; Malformed records. Each is one rejected record and no pixels --
+	; never a failed command, because one bad thing in a batch of forty
+	; must not lose the other thirty-nine.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch badThings, NBAD
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#wantOk
+	#check "DRAW BAD THINGS"
+
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 0		; none accepted
+	#expectw STATS+4, NBAD		; all rejected
+	#expectd STATS+8, 0		; and nothing drawn
+	#useacc
+	#check "BAD THINGS REJECTED"
+
+	; A well-formed thing that clips entirely off the side is ACCEPTED
+	; and draws nothing. That is the difference the counters have to
+	; keep: rejected means the record was wrong, not that it missed.
+	#r2batch offThing, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 1		; accepted
+	#expectw STATS+4, 0		; not rejected
+	#expectd STATS+8, 0		; but no pixels
+	#useacc
+	#check "OFFSCREEN ACCEPTED"
+
+	; ---------------------------------------------------------------
+	; DEPTH against the sector geometry. This is the section that only
+	; passes if the two opcodes really share one buffer.
+	; ---------------------------------------------------------------
+
+	; The wall alone, so the rows and columns below are known good
+	; before anything is drawn against them.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 wallW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#r2batch thingB, 1		; z = 8, behind the wall at z = 4
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#wantOk
+	#check "DRAW BEHIND WALL"
+
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WALLC		; the wall, not the thing
+	#useacc
+	#check "THING BEHIND WALL"
+
+	; The same thing with nothing in front of it, to prove the record
+	; itself draws and that the line above failed for the right reason.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingB, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THB
+	#useacc
+	#check "THING ALONE DRAWS"
+
+	; And in front of the wall: C is at z = 2, the wall at z = 4.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 wallW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#r2batch thingC, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THC
+	#useacc
+	#check "THING IN FRONT"
+
+	; C is 80 columns wide and the wall is 160: outside C the wall is
+	; still there, which is what says C covered exactly its own rect
+	; and not the whole column range of the batch.
+	#stgRead RB, 118, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WALLC		; x=118, still wall
+	#expectb RB+1, WALLC		; x=119
+	#expectb RB+2, THC		; x=120, C's first column
+	#expectb RB+3, THC
+	#useacc
+	#check "THING FRONT EDGE"
+
+	; ---------------------------------------------------------------
+	; Things against each other. A thing writes depth as well as
+	; testing it, so a batch of things is order-independent -- the same
+	; property DRAW_SECTORS has, and the reason the C64 never sorts.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingAB, 2		; A first, then B behind it
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA
+	#useacc
+	#check "THING NEAR WINS"
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingBA, 2		; B first, then A in front of it
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA
+	#useacc
+	#check "THINGS ANY ORDER"
+
+	; B is inside A, so the corners of A must still be A in both.
+	#stgRead RB, 142, 82, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA
+	#useacc
+	#check "THING CORNER"
+
+	; NODEPTH opts out of the buffer entirely, which is how a muzzle
+	; flash gets drawn over the world. B is further away and still wins.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingAN, 2		; A, then B with NODEPTH
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THB
+	#useacc
+	#check "THING NODEPTH"
+
+	; ---------------------------------------------------------------
+	; Sampling: which way up and which way round. A quadrant texture in
+	; A's rectangle splits at column 160 and row 100.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingQ, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 145, 85, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, QTL
+	#useacc
+	#check "THING TOP LEFT"
+
+	#stgRead RB, 175, 85, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, QTR
+	#useacc
+	#check "THING TOP RIGHT"
+
+	#stgRead RB, 145, 115, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, QBL
+	#useacc
+	#check "THING BOT LEFT"
+
+	#stgRead RB, 175, 115, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, QBR
+	#useacc
+	#check "THING BOT RIGHT"
+
+	; FLIPX mirrors u and nothing else, so the two top corners trade
+	; places and the top stays the top.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingQF, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 145, 85, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, QTR
+	#useacc
+	#check "THING FLIPX"
+
+	#stgRead RB, 145, 115, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, QBR		; flipped across, not over
+	#useacc
+	#check "THING FLIPX ROW"
+
+	; MASKED drops the texels equal to the batch key -- and drops their
+	; depth with them, so the key is a hole and not a black square.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingQM, 1, 0, QTL
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 145, 85, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; the keyed quadrant is not drawn
+	#useacc
+	#check "THING MASKED"
+
+	#stgRead RB, 175, 85, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, QTR		; and the others still are
+	#useacc
+	#check "THING MASK KEEPS"
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+; The four textures, built at run time so the file carries no blob.
+; Column-major: texel( u, v ) is at [ u * h + v ], so a 2x2 is stored
+; top-left, bottom-left, top-right, bottom-right.
+; ----------------------------------------------------------------------
+buildTextures
+	lda #THA
+	sta TEX+0
+	lda #THB
+	sta TEX+1
+	lda #THC
+	sta TEX+2
+	lda #QTL
+	sta TEX+4
+	lda #QBL
+	sta TEX+5
+	lda #QTR
+	sta TEX+6
+	lda #QBR
+	sta TEX+7
+	rts
+
+; ----------------------------------------------------------------------
+; Level and thing data. Static, which is the whole argument for class 2:
+; uploaded once, and a frame after that costs the camera alone.
+; ----------------------------------------------------------------------
+
+secTab
+	#r2secd $0000, $0200, 5, 6, 0		; 0: the room, floor 0, ceil 2
+NSEC	= 1
+
+	; x1, y1, x2, y2, u1, u2, front, back, light, flags, texm/u/l, colm/u/l
+wallW
+	#r2walld $0400, $0200, $0400, $fe00, 0, 0, 0, R2_NO_SECTOR, 0, 0, 0, 0, 0, WALLC
+
+; The three things, each written once: the ORDER assertions are only worth
+; anything if the two batches are the same two records, and hand-copied
+; record lines do not stay that way -- gpu64_test_sectors learned that the
+; expensive way.
+	;        x,     y,  base,      w,      h, tex, light, flags
+thingAd	.macro
+	#r2thingd $0400, $0000, $0000, $0100, $0100, IDA, 0
+	.endm
+thingBd	.macro
+	#r2thingd $0800, $0000, $0000, $0100, $0100, IDB, 0
+	.endm
+
+thingA	#thingAd
+thingB	#thingBd
+thingC	#r2thingd $0200, $0000, $0000, $0100, $0100, IDC, 0
+
+thingAB	#thingAd
+	#thingBd
+thingBA	#thingBd
+	#thingAd
+
+; A with B on top of it, B opting out of the depth buffer.
+thingAN	#thingAd
+	#r2thingd $0800, $0000, $0000, $0100, $0100, IDB, 0, R2_THING_NODEPTH
+
+; A's rectangle with the quadrant texture, plain, flipped and masked.
+thingQ	#r2thingd $0400, $0000, $0000, $0100, $0100, IDQ, 0
+thingQF	#r2thingd $0400, $0000, $0000, $0100, $0100, IDQ, 0, R2_THING_FLIPX
+thingQM	#r2thingd $0400, $0000, $0000, $0100, $0100, IDQ, 0, R2_THING_MASKED
+
+; y = 100.0 puts this one thousands of columns off the left edge -- well
+; formed, so accepted, and clipped away, so it draws nothing.
+offThing
+	#r2thingd $0400, $6400, $0000, $0100, $0100, IDA, 0
+
+badThings
+	#r2thingd $0400, $0000, $0000, $0000, $0100, IDA, 0	; zero width
+	#r2thingd $0400, $0000, $0000, $0100, $0000, IDA, 0	; zero height
+	#r2thingd $0400, $0000, $0000, $0100, $0100, 0,   0	; no texture id
+	#r2thingd $0400, $0000, $0000, $0100, $0100, 99,  0	; unknown texture
+	#r2thingd $fc00, $0000, $0000, $0100, $0100, IDA, 0	; behind the camera
+NBAD	= 5
+
+	.include "gpu64_testkit_rt.inc"

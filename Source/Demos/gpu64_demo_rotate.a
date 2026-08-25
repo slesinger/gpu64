@@ -7,7 +7,7 @@
 ;            {__       {__       {__            {__
 ;              {_________         {______________		Expansion Unit
 ;
-;      gpu64 demo 5 of 6 -- ROTATE: the matrix ops doing real work.
+;      gpu64 demo 5 of 7 -- ROTATE: the matrix ops doing real work.
 ;
 ;      gpu64 will do linear algebra for the C64 at ARM speed. This demo
 ;      uses it for the obvious thing: a shape is stored once, and every

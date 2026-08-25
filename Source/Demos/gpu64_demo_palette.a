@@ -7,7 +7,7 @@
 ;            {__       {__       {__            {__
 ;              {_________         {______________		Expansion Unit
 ;
-;      gpu64 demo 2 of 6 -- PALETTE: 256 colours, and animation for free.
+;      gpu64 demo 2 of 7 -- PALETTE: 256 colours, and animation for free.
 ;
 ;      The framebuffer is 8 bits per pixel and every byte is a palette
 ;      index, so the 256 entries are a level of indirection sitting between

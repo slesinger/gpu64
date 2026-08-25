@@ -7,7 +7,7 @@
 ;            {__       {__       {__            {__
 ;              {_________         {______________		Expansion Unit
 ;
-;      gpu64 demo 1 of 6 -- HELLO: the first thing to run.
+;      gpu64 demo 1 of 7 -- HELLO: the first thing to run.
 ;
 ;      Nothing here is animated and nothing is double-buffered. It paints
 ;      one picture on the HDMI screen with the six commands you will use

@@ -96,6 +96,65 @@ OP_FLT_TRANSPOSE = $94
 OP_FLT_IDENTITY	= $95
 OP_FLT_INVERSE	= $96
 
+; --- class 2 opcodes -- the raster layer (CMD_HI = 2) ------------------
+; Columns, spans and scaled sprites: the primitives a Doom-shaped renderer
+; needs. See docs/api_design.md, "Class 2 opcodes".
+R2_RESET	= $00
+R2_SET_VIEW	= $01
+R2_SET_COLORMAP	= $02
+R2_STATS	= $03
+R2_FILL_VIEW	= $04
+R2_SET_CAMERA	= $05
+R2_SET_SECTORS	= $06
+R2_UPLOAD_TEX	= $10
+R2_FREE_TEX	= $11
+R2_DRAW_COLUMNS	= $20
+R2_DRAW_SPANS	= $21
+R2_DRAW_SPRITE	= $22
+R2_DRAW_WALLS	= $23
+R2_DRAW_SECTORS	= $24
+R2_DRAW_THINGS	= $25
+
+; Record stride, both batch kinds -- a power of two so indexing record n is
+; a shift and not a multiply.
+R2_REC		= 16
+
+; DRAW_SECTORS' own stride, and the sector record. Thirty-two bytes because a
+; two-sided wall names two sectors and three textures and none of that fits
+; beside the geometry in sixteen -- and because a level is uploaded once, so
+; the extra bytes are never paid for again.
+R2_WALL2	= 32
+R2_SEC		= 8
+R2_NO_SECTOR	= $ff		; backSec: this wall is solid
+
+; Column record flags (byte 14), sprite flags (ARG14), batch flags (ARG8).
+R2_COL_MASKED	= $01
+R2_SPR_MASKED	= $01
+R2_SPR_FLIPX	= $02
+R2_BATCH_SUM	= $01
+
+; Wall record flags (byte 14) and SET_CAMERA flags (ARG5).
+R2_WALL_MASKED	= $01
+R2_WALL_FLATLIT	= $02
+R2_CAM_PAINT	= $01
+
+; DRAW_SECTORS wall flags (byte 15) and sector flags (byte 7).
+R2_WALL_NOFLATS	= $04		; this wall's columns paint no flats
+R2_SEC_SKY	= $01		; ceiling not painted, no upper band drawn
+
+; DRAW_THINGS record flags (byte 12). A separate set from the DRAW_SPRITE
+; ones because a thing needs four bits and FLIPX and FLATLIT would otherwise
+; both want $02.
+R2_THING_MASKED	 = $01
+R2_THING_FLIPX	 = $02
+R2_THING_NODEPTH = $04		; ignore the depth buffer: neither tested
+				; nor written, so the thing is on top
+R2_THING_FLATLIT = $08
+
+; texid 0 in a record is not an error: it means "solid colour", the palette
+; index being the low byte of the record's u field.
+R2_SOLID	= 0
+
 ; --- error codes -------------------------------------------------------
 ERR_OK		= $00
 ERR_BAD_OPCODE	= $01
@@ -105,6 +164,9 @@ ERR_BAD_ARGS	= $04
 ERR_SINGULAR	= $05
 ERR_UNSUPPORTED	= $06
 ERR_BUSY	= $07
+ERR_OUT_OF_MEMORY = $08		; class 2: the texture arena is full
+ERR_QUEUE_FULL	= $09
+ERR_BAD_ID	= $0a		; class 2: a texture id of 0, past 255, or dead
 
 ; --- geometry and spaces -----------------------------------------------
 FB_W		= 320
@@ -193,8 +255,242 @@ argcd	.macro	off, space, addr
 	sta ARG+\off+3
 	.endm
 
+
+; ----------------------------------------------------------------------
+; Class 2 record staging.
+;
+; These write a 16-byte record into a batch array in your own RAM -- they
+; do NOT touch the ARG window. A batch is built once and then handed to
+; gpu64 as a single command, which is the entire point of the class: 800
+; primitives cost one dispatch, not 800.
+;
+; \rec is the address of the record. Use them for a fixed batch; a real
+; renderer writes the same bytes from a loop.
+; ----------------------------------------------------------------------
+
+; A wall column: screen column \x, rows \y0..\y1 inclusive, sampling
+; texture column \u of texture \tex from v = \v stepping \dv per row.
+r2col	.macro	rec, x, y0, y1, tex, light, u, v, dv, flags=0
+	lda #<(\x)
+	sta \rec+0
+	lda #>(\x)
+	sta \rec+1
+	lda #<(\y0)
+	sta \rec+2
+	lda #>(\y0)
+	sta \rec+3
+	lda #<(\y1)
+	sta \rec+4
+	lda #>(\y1)
+	sta \rec+5
+	lda #\tex
+	sta \rec+6
+	lda #\light
+	sta \rec+7
+	lda #<(\u)
+	sta \rec+8
+	lda #>(\u)
+	sta \rec+9
+	lda #<(\v)
+	sta \rec+10
+	lda #>(\v)
+	sta \rec+11
+	lda #<(\dv)
+	sta \rec+12
+	lda #>(\dv)
+	sta \rec+13
+	lda #\flags
+	sta \rec+14
+	lda #0
+	sta \rec+15
+	.endm
+
+; A floor/ceiling span: screen row \y, columns \x0..\x1 inclusive,
+; sampling from u,v stepping du,dv per column. All four are 8.8.
+r2span	.macro	rec, y, x0, x1, tex, light, u, v, du, dv
+	lda #<(\y)
+	sta \rec+0
+	lda #>(\y)
+	sta \rec+1
+	lda #<(\x0)
+	sta \rec+2
+	lda #>(\x0)
+	sta \rec+3
+	lda #<(\x1)
+	sta \rec+4
+	lda #>(\x1)
+	sta \rec+5
+	lda #\tex
+	sta \rec+6
+	lda #\light
+	sta \rec+7
+	lda #<(\u)
+	sta \rec+8
+	lda #>(\u)
+	sta \rec+9
+	lda #<(\v)
+	sta \rec+10
+	lda #>(\v)
+	sta \rec+11
+	lda #<(\du)
+	sta \rec+12
+	lda #>(\du)
+	sta \rec+13
+	lda #<(\dv)
+	sta \rec+14
+	lda #>(\dv)
+	sta \rec+15
+	.endm
+
+; The batch command itself: where the records are, how many, and whether
+; the last two bytes are a checksum.
+; The camera, for DRAW_WALLS. Angle is binary -- 256 to the circle, 0 looking
+; along +x. Heights and the projection distance are 8.8; the projection
+; distance is in pixels, so 160.0 across a 320-wide view is a 90-degree field
+; of view.
+r2cam	.macro	x, y, ang, eye, ceil, proj, flags=0, floorc=0, ceilc=0, horizon=0
+	#argw 0, \x
+	#argw 2, \y
+	#argb 4, \ang
+	#argb 5, \flags
+	#argw 6, \eye
+	#argw 8, \ceil
+	#argw 10, \proj
+	#argb 12, \floorc
+	#argb 13, \ceilc
+	#argb 14, \horizon
+	.endm
+
+; A wall segment in WORLD space -- it does not change when the player moves,
+; which is the whole point of it. u1 and u2 are the texture coordinate at
+; each endpoint, so no length and no square root is ever needed. Winding
+; decides which side is the front: a wall is only drawn from the side that
+; projects it left to right.
+r2wall	.macro	rec, x1, y1, x2, y2, tex, light, u1, u2, flags=0
+	lda #<(\x1)
+	sta \rec+0
+	lda #>(\x1)
+	sta \rec+1
+	lda #<(\y1)
+	sta \rec+2
+	lda #>(\y1)
+	sta \rec+3
+	lda #<(\x2)
+	sta \rec+4
+	lda #>(\x2)
+	sta \rec+5
+	lda #<(\y2)
+	sta \rec+6
+	lda #>(\y2)
+	sta \rec+7
+	lda #\tex
+	sta \rec+8
+	lda #\light
+	sta \rec+9
+	lda #<(\u1)
+	sta \rec+10
+	lda #>(\u1)
+	sta \rec+11
+	lda #<(\u2)
+	sta \rec+12
+	lda #>(\u2)
+	sta \rec+13
+	lda #\flags
+	sta \rec+14
+	lda #0
+	sta \rec+15
+	.endm
+
+; --- DRAW_SECTORS -----------------------------------------------------
+; A level with steps in it. Heights come from a sector table instead of from
+; the camera, and a wall may be two-sided: it then draws a band above the far
+; ceiling and a band below the far floor and leaves the middle see-through.
+;
+; These two emit DATA, not stores, because a level does not change. Build it
+; once at assembly time, upload it once, and a frame costs the camera alone.
+;
+; For DRAW_SECTORS the camera's eye height is an ABSOLUTE world height, not
+; a height above a floor -- a level with steps has no one floor to measure
+; from. SET_CAMERA still validates eye > 0 and ceil > eye, so send the
+; level's tallest ceiling as ceil; DRAW_SECTORS does not read it.
+r2secd	.macro	floor, ceil, floorc, ceilc, light, flags=0
+	.word	\floor, \ceil
+	.byte	\floorc, \ceilc, \light, \flags
+	.endm
+
+; One wall. front/back are sector ids, back = R2_NO_SECTOR for a solid wall.
+; texm/texu/texl are the middle, upper and lower textures, 0 for "the flat
+; colour in colm/colu/coll instead". Winding decides the front face, exactly
+; as in DRAW_WALLS.
+r2walld	.macro	x1, y1, x2, y2, u1, u2, front, back, light, flags=0, texm=0, texu=0, texl=0, colm=0, colu=0, coll=0
+	.word	\x1, \y1, \x2, \y2, \u1, \u2
+	.byte	\front, \back, \light, \flags
+	.byte	\texm, \texu, \texl
+	.byte	\colm, \colu, \coll
+	.byte	0, 0
+	.fill	8, 0			; reserved -- must be zero
+	.endm
+
+; SET_SECTORS: where the sector table is and how many sectors it holds.
+; count = 0 drops the table.
+r2sectors .macro addr, count
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_SEC
+	#argw 6, \count
+	.endm
+
+; One thing: a billboard at a world position, depth-tested against whatever
+; DRAW_SECTORS left in the depth buffer -- which is what puts a monster
+; behind a wall. Send this batch AFTER the DRAW_SECTORS for the same frame.
+;
+; x,y are world 8.8 and base is the ABSOLUTE height of the sprite's bottom,
+; the same measure the sector table's floor heights use -- so a thing
+; standing on the floor of sector n has base = that sector's floor. w and h
+; are its size in world units, 8.8: the card always faces the camera, so w is
+; measured straight across the view and there is no rotation to send.
+;
+; A thing is always textured; tex = 0 is a rejected record.
+r2thingd .macro	x, y, base, w, h, tex, light, flags=0
+	.word	\x, \y, \base, \h, \w
+	.byte	\tex, \light, \flags
+	.byte	0, 0, 0			; reserved -- must be zero
+	.endm
+
+; DRAW_SECTORS' batch, which is r2batch with the other stride.
+r2batch2 .macro	addr, count, flags=0, key=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_WALL2+((\flags)&1)*2
+	#argw 6, \count
+	#argb 8, \flags
+	#argb 9, \key
+	.endm
+
+r2batch	.macro	addr, count, flags=0, key=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_REC+((\flags)&1)*2
+	#argw 6, \count
+	#argb 8, \flags
+	#argb 9, \key
+	.endm
+
 ; Fire the command. This is the write that halts the C64 and does the work.
 cmd	.macro	op
+	lda #\op
+	sta CMD_LO
+	.endm
+
+; The same, for a class 2 (raster) command. CMD_HI is sticky, so strictly a
+; demo only has to write it when the class changes -- this writes it every
+; time, which costs one store and removes a whole category of bookkeeping
+; bug from a program that interleaves classes.
+cmd2	.macro	op
+	lda #2
+	sta CMD_HI
+	lda #\op
+	sta CMD_LO
+	.endm
+
+; And back to class 0.
+cmd0	.macro	op
+	lda #0
+	sta CMD_HI
 	lda #\op
 	sta CMD_LO
 	.endm

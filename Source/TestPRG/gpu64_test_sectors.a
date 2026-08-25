@@ -1,0 +1,494 @@
+;
+;      gpu64 API conformance -- class 2 sectors: SET_SECTORS and DRAW_SECTORS.
+;
+;      WHAT THIS IS FOR
+;
+;      DRAW_WALLS draws a level whose floor and ceiling are the same
+;      everywhere and whose walls are all solid. DRAW_SECTORS is the same
+;      projection with the two things a real level needs: heights that come
+;      from a sector table, and a two-sided wall with a window in it.
+;
+;      The window is why the depth buffer changed shape. DRAW_WALLS keeps
+;      one depth per column, which is exact only while every wall is opaque
+;      from floor to ceiling; a portal is not, so DRAW_SECTORS keeps one per
+;      PIXEL. The four assertions in the DEPTH section are the ones that
+;      actually check this -- everything else would pass with the old buffer.
+;
+;      The arithmetic is not what this program checks; tools/rastercheck
+;      does that far better, 64000 pixels at a time against an independently
+;      written model. What this checks is the part that exists only on
+;      hardware: that the table and the records the C64 wrote are the ones
+;      the core was handed.
+;
+;      THE GEOMETRY, WORKED OUT BY HAND
+;
+;      Every expected number below comes from this and nothing else, so a
+;      red line here is a firmware defect and not a disagreement about what
+;      was expected:
+;
+;        camera at the origin, looking along +x, eye at absolute height 0.5,
+;        projecting 160 pixels across a 320-wide view, so the horizon is
+;        row 100 and the view centre is column 160
+;
+;        sector 0  floor 0.0  ceiling 2.0
+;        sector 1  floor 0.5  ceiling 1.5   -- the room through the window
+;        sector 2  floor 0.0  ceiling 2.0, SKY
+;
+;      A row for a world height h at distance z is  100 + (0.5 - h)*160/z.
+;
+;      NEAR WALL, from (4, 2) to (4, -2), front sector 0, so z = 4.0:
+;        half-width  = 2.0 / 4.0 * 160 = 80  ->  columns 80 .. 239
+;        floor 0.0   -> 100 + 0.5*160/4  = 120, so the last row is 119
+;        ceiling 2.0 -> 100 - 1.5*160/4  = 40
+;
+;      As a PORTAL into sector 1 the same wall draws two bands:
+;        lower, floor 0.0 up to floor 0.5   -> rows 100 .. 119
+;        upper, ceiling 1.5 up to 2.0       -> rows  40 ..  59
+;        and rows 60 .. 99 are the window and are not drawn at all.
+;
+;      FAR WALL, from (8, 2) to (8, -2), front sector 0, so z = 8.0:
+;        half-width  = 2.0 / 8.0 * 160 = 40  ->  columns 120 .. 199
+;        rows        = 70 .. 109
+;      Seen through the window it is visible in rows 70 .. 99; rows 100 ..
+;      109 are behind the near wall's lower band and must lose to it.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+STATS	= $3300				; RASTER_STATS reads back here
+RB	= $3380				; READ_RECT reads back here
+
+BG	= 0				; the colour the page is cleared to
+MIDC	= 7				; a solid wall's middle band
+UPC	= 4				; a portal's upper band
+LOWC	= 5				; a portal's lower band
+FARC	= 1				; the wall seen through the window
+FLOORC	= 2				; sector 0's floor, when CAM_PAINT is on
+CEILC	= 3				; sector 0's ceiling, likewise
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 9 - SECTORS"
+
+	; Is class 2 there at all? GET_INFO byte 11 bit 2 says so, and if it
+	; is clear then every line below fails as BAD_CLASS for a reason
+	; that is not a defect. Ask first.
+	#poison RB, 16, $aa
+	#argblob 0, SPACE_C64, RB, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "GET INFO"
+
+	#clracc
+	lda RB+11
+	and #$04
+	bne +
+	jsr kitBad
++
+	#useacc
+	#check "CLASS 2 BIT"
+
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+	lda #R2_RESET
+	jsr cmd2
+	#wantOk
+	#check "RESET"
+
+	; A full view and no lighting: this program asserts raw colours.
+	#argw 0, 0
+	#argw 2, 0
+	#argw 4, 320
+	#argw 6, 200
+	lda #R2_SET_VIEW
+	jsr cmd2
+	#argblob 0, SPACE_C64, 0, 0
+	#argb 6, 0
+	lda #R2_SET_COLORMAP
+	jsr cmd2
+	#wantOk
+	#check "SECTOR SETUP"
+
+	; ---------------------------------------------------------------
+	; SET_SECTORS
+	; ---------------------------------------------------------------
+
+	; A ceiling at or below its own floor is not a sector. The whole
+	; upload is refused -- a partly applied table would be a level that
+	; renders wrongly for the rest of the session.
+	#r2sectors badSec, 1
+	lda #R2_SET_SECTORS
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "SEC CEIL LOW"
+
+	; A length that does not match the count is refused before the DMA.
+	#argblob 0, SPACE_C64, secTab, NSEC*R2_SEC-1
+	#argw 6, NSEC
+	lda #R2_SET_SECTORS
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "SEC BAD LEN"
+
+	; DRAW_SECTORS with no table at all is refused rather than drawing
+	; a level whose heights are whatever the last one's were.
+	#r2sectors secTab, 0
+	lda #R2_SET_SECTORS
+	jsr cmd2
+	#wantOk
+	#check "SEC DROP TABLE"
+
+	#r2batch2 solidW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "SEC NO TABLE"
+
+	#r2sectors secTab, NSEC
+	lda #R2_SET_SECTORS
+	jsr cmd2
+	#wantOk
+	#check "SET SECTORS"
+
+	#r2cam 0, 0, 0, $0080, $0200, $a000
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#wantOk
+	#check "SET CAMERA"
+
+	; ---------------------------------------------------------------
+	; A one-sided wall: sector 0's floor to sector 0's ceiling.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 solidW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#wantOk
+	#check "DRAW SECTORS"
+
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 1		; accepted
+	#expectw STATS+4, 0		; rejected
+	#useacc
+	#check "SOLID ACCEPTED"
+
+	; One pixel each side of every edge: an off-by-one in the projection
+	; is the failure this is looking for, and a check that only samples
+	; the middle of a wall would never see one.
+	#stgRead RB, 78, 80, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; x=78
+	#expectb RB+1, BG		; x=79
+	#expectb RB+2, MIDC		; x=80, first column
+	#expectb RB+3, MIDC
+	#useacc
+	#check "SOLID LEFT EDGE"
+
+	#stgRead RB, 238, 80, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, MIDC
+	#expectb RB+1, MIDC		; x=239, last column
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "SOLID RIGHT EDGE"
+
+	#stgRead RB, 160, 38, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; y=38
+	#expectb RB+1, BG		; y=39
+	#expectb RB+2, MIDC		; y=40, ceiling 2.0
+	#expectb RB+3, MIDC
+	#useacc
+	#check "SOLID TOP EDGE"
+
+	#stgRead RB, 160, 118, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, MIDC
+	#expectb RB+1, MIDC		; y=119, floor 0.0
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "SOLID BOT EDGE"
+
+	; A record naming a sector that is not in the table is rejected --
+	; the same verdict a record naming a missing texture gets.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 badIdW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#raw
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 0
+	#expectw STATS+4, 1
+	#useacc
+	#check "SEC BAD ID"
+
+	; ---------------------------------------------------------------
+	; The portal: the same wall, two-sided into sector 1.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 portalW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#wantOk
+	#check "DRAW PORTAL"
+
+	#stgRead RB, 160, 58, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, UPC		; y=58, upper band
+	#expectb RB+1, UPC		; y=59, its last row
+	#expectb RB+2, BG		; y=60, the window opens
+	#expectb RB+3, BG
+	#useacc
+	#check "PORTAL UPPER"
+
+	#stgRead RB, 160, 98, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; y=98, still the window
+	#expectb RB+1, BG		; y=99, its last row
+	#expectb RB+2, LOWC		; y=100, lower band
+	#expectb RB+3, LOWC
+	#useacc
+	#check "PORTAL LOWER"
+
+	#stgRead RB, 160, 118, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, LOWC
+	#expectb RB+1, LOWC		; y=119, floor 0.0
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "PORTAL BOTTOM"
+
+	; ---------------------------------------------------------------
+	; DEPTH. These four are the ones a per-column depth buffer would
+	; fail: the far wall has to appear inside the window, and lose to
+	; the near wall's lower band in the rows they share.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 portalW, 2		; near first, then far
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#wantOk
+	#check "DRAW DEPTH"
+
+	#stgRead RB, 160, 68, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; y=68, above the far wall
+	#expectb RB+1, BG		; y=69
+	#expectb RB+2, FARC		; y=70, its top row, seen through
+	#expectb RB+3, FARC
+	#useacc
+	#check "DEPTH THROUGH"
+
+	#stgRead RB, 160, 98, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, FARC		; y=98, still the far wall
+	#expectb RB+1, FARC		; y=99
+	#expectb RB+2, LOWC		; y=100, the near band wins
+	#expectb RB+3, LOWC
+	#useacc
+	#check "DEPTH NEAR WINS"
+
+	; The far wall is narrower, so its own edges are still where its own
+	; distance puts them: columns 120..199 inside the window.
+	#stgRead RB, 118, 80, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; x=118, past the far wall
+	#expectb RB+1, BG		; x=119
+	#expectb RB+2, FARC		; x=120, its first column
+	#expectb RB+3, FARC
+	#useacc
+	#check "DEPTH FAR EDGE"
+
+	; Order must not matter. The same two walls the other way round have
+	; to produce the same picture -- that is the property that replaces
+	; Doom's BSP tree, so it is asserted and not assumed.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 swapW, 2		; far first, then near
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#stgRead RB, 160, 98, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, FARC
+	#expectb RB+1, FARC
+	#expectb RB+2, LOWC
+	#expectb RB+3, LOWC
+	#useacc
+	#check "DEPTH ANY ORDER"
+
+	; ---------------------------------------------------------------
+	; Flats, and the sky flag.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2cam 0, 0, 0, $0080, $0200, $a000, R2_CAM_PAINT
+	lda #R2_SET_CAMERA
+	jsr cmd2
+	#r2batch2 solidW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#wantOk
+	#check "PAINT FLATS"
+
+	; The colours come from the SECTOR, not from the camera: that is what
+	; lets two rooms in one level have different floors.
+	#stgRead RB, 160, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, CEILC
+	#useacc
+	#check "FLAT CEILING"
+
+	#stgRead RB, 160, 150, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, FLOORC
+	#useacc
+	#check "FLAT FLOOR"
+
+	#stgRead RB, 10, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; a column no wall covered
+	#useacc
+	#check "FLAT NO WALL"
+
+	; A sky ceiling is not a surface. It is not painted, and it takes no
+	; depth either -- which is what lets a wall drawn afterwards still
+	; appear against it.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch2 skyW, 1
+	lda #R2_DRAW_SECTORS
+	jsr cmd2
+	#stgRead RB, 160, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; sky, left alone
+	#useacc
+	#check "SKY CEILING"
+
+	#stgRead RB, 160, 150, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, FLOORC		; but the floor is still painted
+	#useacc
+	#check "SKY FLOOR"
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+; Level data. Static, so it is assembled rather than built at run time --
+; which is the whole argument for DRAW_SECTORS: this is uploaded once and a
+; frame after that costs the camera alone.
+; ----------------------------------------------------------------------
+
+secTab
+	; floor, ceiling, floor colour, ceiling colour, light, flags
+	#r2secd $0000, $0200, FLOORC, CEILC, 0		; 0: the room we stand in
+	#r2secd $0080, $0180, 6, 6, 0			; 1: through the window
+	#r2secd $0000, $0200, FLOORC, CEILC, 0, R2_SEC_SKY
+NSEC	= 3
+
+badSec
+	#r2secd $0200, $0100, 0, 0, 0			; ceiling below its floor
+
+	; x1, y1, x2, y2, u1, u2, front, back, light, flags, texm/u/l, colm/u/l
+solidW
+	#r2walld $0400, $0200, $0400, $fe00, 0, 0, 0, R2_NO_SECTOR, 0, 0, 0, 0, 0, MIDC
+
+badIdW
+	#r2walld $0400, $0200, $0400, $fe00, 0, 0, NSEC, R2_NO_SECTOR, 0, 0, 0, 0, 0, MIDC
+
+; The two walls of the depth section, written once each: the DEPTH ANY
+; ORDER assertion is only worth anything if the second batch is the same
+; two walls as the first, and two hand-copied record lines would not stay
+; that way -- the first draft of this file had them one argument apart.
+nearWall .macro
+	#r2walld $0400, $0200, $0400, $fe00, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, UPC, LOWC
+	.endm
+
+farWall	.macro
+	#r2walld $0800, $0200, $0800, $fe00, 0, 0, 0, R2_NO_SECTOR, 0, 0, 0, 0, 0, FARC
+	.endm
+
+; DRAW DEPTH sends both, near first, which is why these two are adjacent.
+portalW	#nearWall
+farW	#farWall
+
+swapW	#farWall
+	#nearWall
+
+skyW
+	#r2walld $0400, $0200, $0400, $fe00, 0, 0, 2, R2_NO_SECTOR, 0, 0, 0, 0, 0, MIDC
+
+	.include "gpu64_testkit_rt.inc"

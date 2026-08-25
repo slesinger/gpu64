@@ -13,6 +13,7 @@ the on-screen log overlay, cache behaviour, and anything about timing beyond
 "a vblank happens every frame period".
 """
 
+import math
 import struct
 
 FB_W, FB_H, FB_PAGES = 320, 200, 2
@@ -39,6 +40,27 @@ ERR_BAD_ARGS = 0x04
 ERR_SINGULAR = 0x05
 ERR_UNSUPPORTED = 0x06
 ERR_BUSY = 0x07
+ERR_OUT_OF_MEMORY = 0x08
+ERR_QUEUE_FULL = 0x09
+ERR_BAD_ID = 0x0A
+
+# Class 2 -- the raster layer (docs/api_design.md, "Class 2 opcodes").
+RASTER_REC_BYTES = 16
+RASTER_WALL2_BYTES = 32
+RASTER_SEC_BYTES = 8
+RASTER_MAX_SECTORS = 128
+RASTER_MAX_DIM = 1024
+RASTER_MAX_LEVELS = 64
+RASTER_MAX_TEXTURES = 255
+RASTER_ARENA_BYTES = 8 * 1024 * 1024
+COL_MASKED = 0x01
+SPR_MASKED = 0x01
+SPR_FLIPX = 0x02
+THING_MASKED = 0x01
+THING_FLIPX = 0x02
+THING_NODEPTH = 0x04
+THING_FLATLIT = 0x08
+BATCH_CHECKSUM = 0x01
 
 ST_BUSY = 0x01
 ST_ERROR = 0x02
@@ -55,6 +77,35 @@ REG_RESULT = 0x21
 def s16(v):
     v &= 0xFFFF
     return v - 0x10000 if v & 0x8000 else v
+
+
+def s8(v):
+    v &= 0xFF
+    return v - 0x100 if v & 0x80 else v
+
+
+def idiv(n, d):
+    """Integer division truncating toward zero, which is what C's / does.
+
+    Python's // floors, and the two disagree for exactly the negative
+    operands the wall projection is full of. Every division in r_walls()
+    goes through here so the model and gpu64_raster_core.cpp cannot drift
+    apart on a sign.
+    """
+    q = abs(n) // abs(d)
+    return -q if (n < 0) != (d < 0) else q
+
+
+# sin(2*pi*i/256) in 8.8, the same table gpu64_raster_core.cpp holds.
+SINTAB = [int(round(256 * math.sin(2 * math.pi * i / 256))) for i in range(256)]
+
+
+def fsin(a):
+    return SINTAB[a & 0xFF]
+
+
+def fcos(a):
+    return SINTAB[(a + 64) & 0xFF]
 
 
 def fix_read(buf, i):
@@ -140,6 +191,23 @@ class Gpu64Model:
         self.palette[255 * 3:256 * 3] = b'\xff\xff\xff'
         self.log_enabled = True
         self.api_active = False
+
+        # --- class 2 (raster) -----------------------------------------
+        # ids are 1..255; each entry is (w, h, texels) with texels stored
+        # column-major, texel(u, v) at texels[u * h + v].
+        self.rtex = {}
+        self.rarena_used = 0
+        self.rview = (0, 0, FB_W, FB_H)
+        self.rcolormap = None
+        self.rlevels = 0
+        self.rbatch = [0, 0, 0]          # accepted, rejected, pixels
+        self.rcam = dict(x=0, y=0, ang=0, flags=0, eye=0x0080, ceil=0x0200,
+                         proj=0xA000, floorc=0, ceilc=0, horizon=0)
+        self.rsectors = []
+        self.rrequested = 0
+        # Persistent, exactly like the firmware's static s_ZBuf: DRAW_SECTORS
+        # clears it and DRAW_THINGS reads what DRAW_SECTORS left.
+        self.zbuf = [0xFFFF] * (FB_W * FB_H)
 
         self.vb_armed = False
         self.flip_pending = False
@@ -332,12 +400,12 @@ class Gpu64Model:
     # --- dispatch ---------------------------------------------------------
     def dispatch(self, op):
         self.dispatches += 1
-        if self.cmd_hi != 0:
+        if self.cmd_hi not in (0, 2):
             self.err = ERR_BAD_CLASS
             self.status |= ST_ERROR
             return
         try:
-            res = self.execute(op)
+            res = self.execute_r2(op) if self.cmd_hi == 2 else self.execute(op)
         except IndexError:
             res = ERR_OUT_OF_RANGE
         self.err = res
@@ -405,7 +473,7 @@ class Gpu64Model:
             info[8] = FB_H >> 8
             info[9] = 8
             info[10] = FB_PAGES
-            info[11] = 0x01
+            info[11] = 0x01 | 0x04       # class 0 and class 2; class 1 is not modelled
             info[12] = BORDER_W
             info[13] = BORDER_H
             info[14] = self.frame_period_us & 0xFF
@@ -690,3 +758,867 @@ class Gpu64Model:
             return self.blob_write(spC, adC, C)
 
         return ERR_BAD_OPCODE
+
+    # ==================================================================
+    # Class 2 -- the raster layer
+    #
+    # Written from docs/api_design.md's class 2 section, not from
+    # Source/Firmware/gpu64_raster_core.cpp. Where this and the firmware
+    # disagree, one of them is wrong and the disagreement is the finding --
+    # tools/rastercheck exists to surface exactly that, on a PC.
+    # ==================================================================
+
+    def r_lookup(self, texid):
+        return self.rtex.get(texid)
+
+    def r_light_row(self, light):
+        if self.rcolormap is None or self.rlevels == 0:
+            return None
+        lvl = min(light, self.rlevels - 1)
+        return memoryview(self.rcolormap)[lvl * 256:(lvl + 1) * 256]
+
+    def r_put(self, x, y, c):
+        self.page()[y * FB_W + x] = c
+
+    def execute_r2(self, op):
+        a = self.arg
+        if op == 0x00:                                  # RASTER_RESET
+            self.rtex = {}
+            self.rarena_used = 0
+            self.rview = (0, 0, FB_W, FB_H)
+            self.rcolormap = None
+            self.rlevels = 0
+            self.rbatch = [0, 0, 0]
+            self.rrequested = 0
+            self.rcam = dict(x=0, y=0, ang=0, flags=0, eye=0x0080,
+                             ceil=0x0200, proj=0xA000, floorc=0, ceilc=0,
+                             horizon=0)
+            self.rsectors = []
+            # The depth buffer's lifecycle matches the firmware's: RESET
+            # makes it empty again, so a program that sends things but no
+            # sectors does not inherit the previous one's depth.
+            self.zbuf = [0xFFFF] * (FB_W * FB_H)
+            return ERR_OK
+
+        if op == 0x01:                                  # SET_VIEW
+            x, y = self.a_u16(0), self.a_u16(2)
+            w, h = self.a_u16(4), self.a_u16(6)
+            if w == 0 or h == 0:
+                return ERR_BAD_ARGS
+            if x + w > FB_W or y + h > FB_H:
+                return ERR_BAD_ARGS
+            self.rview = (x, y, w, h)
+            return ERR_OK
+
+        if op == 0x02:                                  # SET_COLORMAP
+            space, addr, length = self.a_blob(0)
+            levels = a[6]
+            if levels == 0:
+                self.rcolormap, self.rlevels = None, 0
+                return ERR_OK
+            if levels > RASTER_MAX_LEVELS:
+                return ERR_BAD_ARGS
+            if length != levels * 256:
+                return ERR_BAD_ARGS
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            self.rcolormap, self.rlevels = data, levels
+            return ERR_OK
+
+        if op == 0x03:                                  # RASTER_STATS
+            space, addr, length = self.a_blob(0)
+            if length < 16:
+                return ERR_BAD_ARGS
+            acc, rej, pix = self.rbatch
+            free_kb = (RASTER_ARENA_BYTES - self.rarena_used) >> 10
+            info = bytearray(16)
+            info[0:2] = b'R2'
+            info[2] = acc & 0xFF
+            info[3] = (acc >> 8) & 0xFF
+            info[4] = rej & 0xFF
+            info[5] = (rej >> 8) & 0xFF
+            info[6] = self.rrequested & 0xFF
+            info[7] = (self.rrequested >> 8) & 0xFF
+            for i in range(4):
+                info[8 + i] = (pix >> (8 * i)) & 0xFF
+            live = len(self.rtex)
+            info[12] = live & 0xFF
+            info[13] = (live >> 8) & 0xFF
+            info[14] = free_kb & 0xFF
+            info[15] = (free_kb >> 8) & 0xFF
+            return self.blob_write(space, addr, info)
+
+        if op == 0x04:                                  # FILL_VIEW
+            vx, vy, vw, vh = self.rview
+            self.rect_fill(vx, vy, vw, vh, a[0])
+            # The depth of the pixels this erases goes with them: a pixel
+            # just painted background has nothing in it. Without this a
+            # thing batch would be occluded by geometry no longer drawn.
+            for y in range(vy, vy + vh):
+                for x in range(vx, vx + vw):
+                    self.zbuf[y * FB_W + x] = 0xFFFF
+            return ERR_OK
+
+        if op == 0x10:                                  # UPLOAD_TEXTURE
+            space, addr, length = self.a_blob(0)
+            texid = self.ident[0] | (self.ident[1] << 8)
+            w, h = self.a_u16(6), self.a_u16(8)
+            flags = a[10]
+            if texid == 0 or texid > RASTER_MAX_TEXTURES:
+                return ERR_BAD_ID
+            if w == 0 or h == 0 or w > RASTER_MAX_DIM or h > RASTER_MAX_DIM:
+                return ERR_BAD_ARGS
+            if h & (h - 1):
+                return ERR_BAD_ARGS
+            if length != w * h:
+                return ERR_BAD_ARGS
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            need = (w * h + 63) & ~63
+            if need > RASTER_ARENA_BYTES - self.rarena_used:
+                return ERR_OUT_OF_MEMORY
+            self.rarena_used += need
+            if flags & 0x01:                            # source is row-major
+                col = bytearray(w * h)
+                for u in range(w):
+                    for v in range(h):
+                        col[u * h + v] = data[v * w + u]
+                data = col
+            self.rtex[texid] = (w, h, data)
+            return ERR_OK
+
+        if op == 0x11:                                  # FREE_TEXTURE
+            texid = self.ident[0] | (self.ident[1] << 8)
+            if texid == 0 or texid > RASTER_MAX_TEXTURES:
+                return ERR_BAD_ID
+            if texid not in self.rtex:
+                return ERR_BAD_ID
+            del self.rtex[texid]
+            return ERR_OK
+
+        if op == 0x05:                                  # SET_CAMERA
+            proj = self.a_u16(10)
+            eye, ceil = self.a_s16(6), self.a_s16(8)
+            if proj == 0 or eye <= 0 or ceil <= eye:
+                return ERR_BAD_ARGS
+            self.rcam = dict(x=self.a_s16(0), y=self.a_s16(2), ang=a[4],
+                             flags=a[5], eye=eye, ceil=ceil, proj=proj,
+                             floorc=a[12], ceilc=a[13],
+                             horizon=s8(a[14]))
+            return ERR_OK
+
+        if op in (0x20, 0x21):                          # DRAW_COLUMNS / SPANS
+            res, recs, count = self.r_pull_batch()
+            if res != ERR_OK or count == 0:
+                return res
+            if op == 0x20:
+                self.r_columns(recs, count, a[9])
+            else:
+                self.r_spans(recs, count)
+            return ERR_OK
+
+        if op == 0x22:                                  # DRAW_SPRITE
+            return self.r_sprite()
+
+        if op == 0x23:                                  # DRAW_WALLS
+            res, recs, count = self.r_pull_batch()
+            if res != ERR_OK or count == 0:
+                return res
+            self.r_walls(recs, count, a[9])
+            return ERR_OK
+
+        if op == 0x06:                                  # SET_SECTORS
+            space, addr, length = self.a_blob(0)
+            count = self.a_u16(6)
+            if count == 0:
+                self.rsectors = []
+                return ERR_OK
+            if count > RASTER_MAX_SECTORS:
+                return ERR_BAD_ARGS
+            if length != count * RASTER_SEC_BYTES:
+                return ERR_BAD_ARGS
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            built = []
+            for i in range(count):
+                r = data[i * RASTER_SEC_BYTES:(i + 1) * RASTER_SEC_BYTES]
+                f = s16(r[0] | (r[1] << 8))
+                c = s16(r[2] | (r[3] << 8))
+                if c <= f:
+                    # Rejected whole. The table that was working stays.
+                    return ERR_BAD_ARGS
+                built.append(dict(floor=f, ceil=c, floorc=r[4], ceilc=r[5],
+                                  light=r[6], flags=r[7]))
+            self.rsectors = built
+            return ERR_OK
+
+        if op == 0x24:                                  # DRAW_SECTORS
+            res, recs, count = self.r_pull_batch(RASTER_WALL2_BYTES)
+            if res != ERR_OK or count == 0:
+                return res
+            if not self.rsectors:
+                return ERR_BAD_ARGS
+            self.r_sectors(recs, count, a[9])
+            return ERR_OK
+
+        if op == 0x25:                                  # DRAW_THINGS
+            res, recs, count = self.r_pull_batch()
+            if res != ERR_OK or count == 0:
+                return res
+            self.r_things(recs, count, a[9])
+            return ERR_OK
+
+        return ERR_BAD_OPCODE
+
+    def r_pull_batch(self, stride=None):
+        stride = RASTER_REC_BYTES if stride is None else stride
+        space, addr, length = self.a_blob(0)
+        count = self.a_u16(6)
+        flags = self.arg[8]
+
+        self.rrequested = count
+        self.rbatch = [0, 0, 0]
+        if count == 0:
+            return ERR_OK, None, 0
+
+        want = count * stride + (2 if flags & BATCH_CHECKSUM else 0)
+        if length != want or want > 65536:
+            return ERR_BAD_ARGS, None, 0
+
+        res, data = self.blob_read(space, addr, length)
+        if res != ERR_OK:
+            return res, None, 0
+
+        if flags & BATCH_CHECKSUM:
+            body = count * stride
+            want16 = data[body] | (data[body + 1] << 8)
+            if (sum(data[:body]) & 0xFFFF) != want16:
+                # "A failed dispatch does nothing" -- nothing is drawn.
+                return ERR_BAD_ARGS, None, 0
+
+        return ERR_OK, data, count
+
+    def r_columns(self, recs, count, key):
+        vx, vy, vw, vh = self.rview
+        for i in range(count):
+            r = recs[i * RASTER_REC_BYTES:(i + 1) * RASTER_REC_BYTES]
+            x = r[0] | (r[1] << 8)
+            y0 = s16(r[2] | (r[3] << 8))
+            y1 = s16(r[4] | (r[5] << 8))
+            texid, light = r[6], r[7]
+            u = r[8] | (r[9] << 8)
+            v = s16(r[10] | (r[11] << 8))
+            dv = s16(r[12] | (r[13] << 8))
+            flags = r[14]
+
+            if x < vx or x >= vx + vw or y1 < y0:
+                self.rbatch[1] += 1
+                continue
+            tex = None
+            if texid != 0:
+                tex = self.r_lookup(texid)
+                if tex is None:
+                    self.rbatch[1] += 1
+                    continue
+            self.rbatch[0] += 1
+
+            if y0 < vy:
+                v += dv * (vy - y0)
+                y0 = vy
+            if y1 >= vy + vh:
+                y1 = vy + vh - 1
+            if y0 > y1:
+                continue
+
+            cmap = self.r_light_row(light)
+            if tex is None:
+                c = u & 0xFF
+                if cmap is not None:
+                    c = cmap[c]
+                for y in range(y0, y1 + 1):
+                    self.r_put(x, y, c)
+                self.rbatch[2] += y1 - y0 + 1
+                continue
+
+            tw, th, texels = tex
+            uu = u % tw
+            base = uu * th
+            hmask = th - 1
+            masked = bool(flags & COL_MASKED)
+            for y in range(y0, y1 + 1):
+                t = texels[base + ((v >> 8) & hmask)]
+                v += dv
+                if masked and t == key:
+                    continue
+                self.r_put(x, y, cmap[t] if cmap is not None else t)
+                self.rbatch[2] += 1
+
+    def r_spans(self, recs, count):
+        vx, vy, vw, vh = self.rview
+        for i in range(count):
+            r = recs[i * RASTER_REC_BYTES:(i + 1) * RASTER_REC_BYTES]
+            y = s16(r[0] | (r[1] << 8))
+            x0 = s16(r[2] | (r[3] << 8))
+            x1 = s16(r[4] | (r[5] << 8))
+            texid, light = r[6], r[7]
+            u = s16(r[8] | (r[9] << 8))
+            v = s16(r[10] | (r[11] << 8))
+            du = s16(r[12] | (r[13] << 8))
+            dv = s16(r[14] | (r[15] << 8))
+
+            if y < vy or y >= vy + vh or x1 < x0:
+                self.rbatch[1] += 1
+                continue
+            tex = None
+            if texid != 0:
+                tex = self.r_lookup(texid)
+                # A span wraps u every pixel, so w has to be a mask too.
+                if tex is None or (tex[0] & (tex[0] - 1)):
+                    self.rbatch[1] += 1
+                    continue
+            self.rbatch[0] += 1
+
+            if x0 < vx:
+                n = vx - x0
+                u += du * n
+                v += dv * n
+                x0 = vx
+            if x1 >= vx + vw:
+                x1 = vx + vw - 1
+            if x0 > x1:
+                continue
+
+            cmap = self.r_light_row(light)
+            if tex is None:
+                c = u & 0xFF
+                if cmap is not None:
+                    c = cmap[c]
+                for x in range(x0, x1 + 1):
+                    self.r_put(x, y, c)
+                self.rbatch[2] += x1 - x0 + 1
+                continue
+
+            tw, th, texels = tex
+            wmask, hmask = tw - 1, th - 1
+            for x in range(x0, x1 + 1):
+                t = texels[((u >> 8) & wmask) * th + ((v >> 8) & hmask)]
+                self.r_put(x, y, cmap[t] if cmap is not None else t)
+                u += du
+                v += dv
+            self.rbatch[2] += x1 - x0 + 1
+
+
+    # ------------------------------------------------------------------
+    # DRAW_WALLS.
+    #
+    # A line-for-line mirror of gpu64_rasterWalls() in
+    # Source/Firmware/gpu64_raster_core.cpp. Written from the same
+    # description rather than translated from the C, and then diffed
+    # against it by tools/rastercheck -- which is the only reason either
+    # one can be trusted about a projection this fiddly.
+    # ------------------------------------------------------------------
+
+    NEAR = 0x0040                                       # 0.25 world units
+
+    def r_to_view(self, x, y):
+        c = fcos(self.rcam['ang'])
+        sn = fsin(self.rcam['ang'])
+        dx = x - self.rcam['x']
+        dy = y - self.rcam['y']
+        return ((dx * sn - dy * c) >> 8, (dx * c + dy * sn) >> 8)
+
+    def r_walls(self, recs, count, key):
+        vx, vy, vw, vh = self.rview
+        vx0, vx1 = vx, vx + vw
+        vy0, vy1 = vy, vy + vh
+        cam = self.rcam
+
+        if cam['proj'] == 0 or cam['eye'] <= 0 or cam['ceil'] <= cam['eye']:
+            self.rbatch[1] += count
+            return
+
+        depth = [0] * FB_W
+        proj = cam['proj']
+        centre_x = vx0 + vw // 2
+        horizon = vy0 + vh // 2 + cam['horizon']
+        eye_h = cam['eye']
+        top_h = cam['ceil'] - cam['eye']
+        page = self.page()
+
+        for i in range(count):
+            r = recs[i * RASTER_REC_BYTES:(i + 1) * RASTER_REC_BYTES]
+            avx, avz = self.r_to_view(s16(r[0] | (r[1] << 8)),
+                                      s16(r[2] | (r[3] << 8)))
+            bvx, bvz = self.r_to_view(s16(r[4] | (r[5] << 8)),
+                                      s16(r[6] | (r[7] << 8)))
+            au = s16(r[10] | (r[11] << 8))
+            bu = s16(r[12] | (r[13] << 8))
+            texid, light, flags = r[8], r[9], r[14]
+
+            if avz < self.NEAR and bvz < self.NEAR:
+                self.rbatch[1] += 1
+                continue
+
+            tex = self.rtex.get(texid) if texid != 0 else None
+            if texid != 0 and tex is None:
+                self.rbatch[1] += 1
+                continue
+
+            if avz < self.NEAR:
+                t = idiv((self.NEAR - avz) << 16, bvz - avz)
+                avx += (bvx - avx) * t >> 16
+                au += (bu - au) * t >> 16
+                avz = self.NEAR
+            elif bvz < self.NEAR:
+                t = idiv((self.NEAR - bvz) << 16, avz - bvz)
+                bvx += (avx - bvx) * t >> 16
+                bu += (au - bu) * t >> 16
+                bvz = self.NEAR
+
+            sxa = centre_x + (idiv(avx * proj, avz) >> 8)
+            sxb = centre_x + (idiv(bvx * proj, bvz) >> 8)
+            if sxb <= sxa:
+                self.rbatch[1] += 1
+                continue
+
+            self.rbatch[0] += 1
+
+            iza = idiv(1 << 22, avz)
+            izb = idiv(1 << 22, bvz)
+            uza = (au * iza) >> 8
+            uzb = (bu * izb) >> 8
+
+            x0, x1 = max(sxa, vx0), min(sxb - 1, vx1 - 1)
+            if x0 > x1:
+                continue
+            span = sxb - sxa
+
+            if tex is not None:
+                tw, th, tdata = tex
+                hmask = th - 1
+
+            for x in range(x0, x1 + 1):
+                t = x - sxa
+                iz = iza + idiv((izb - iza) * t, span)
+                if iz <= 0 or iz <= depth[x]:
+                    continue
+                depth[x] = iz
+                z = idiv(1 << 22, iz)
+                if z <= 0:
+                    continue
+
+                yb = horizon + (idiv(eye_h * proj, z) >> 8)
+                yt = horizon - (idiv(top_h * proj, z) >> 8)
+                if yb <= yt:
+                    continue
+
+                lvl = light
+                if not (flags & 0x02):
+                    lvl = min(light + (z >> 9), 255)
+                cmap = self.r_light_row(lvl)
+
+                if cam['flags'] & 0x01:
+                    for y in range(vy0, min(yt - 1, vy1 - 1) + 1):
+                        page[y * FB_W + x] = cam['ceilc']
+                        self.rbatch[2] += 1
+                    for y in range(max(yb, vy0), vy1):
+                        page[y * FB_W + x] = cam['floorc']
+                        self.rbatch[2] += 1
+
+                ya, yz = max(yt, vy0), min(yb - 1, vy1 - 1)
+                if ya > yz:
+                    continue
+
+                if tex is None:
+                    c = (r[10] | (r[11] << 8)) & 0xFF
+                    if cmap is not None:
+                        c = cmap[c]
+                    for y in range(ya, yz + 1):
+                        page[y * FB_W + x] = c
+                    self.rbatch[2] += yz - ya + 1
+                    continue
+
+                uz = uza + idiv((uzb - uza) * t, span)
+                uu = (idiv(uz << 8, iz) >> 8) % tw
+                col = uu * th
+                dv = idiv(th << 8, yb - yt)
+                v = (ya - yt) * dv
+                for y in range(ya, yz + 1):
+                    tx = tdata[col + ((v >> 8) & hmask)]
+                    v += dv
+                    if (flags & 0x01) and tx == key:
+                        continue
+                    page[y * FB_W + x] = cmap[tx] if cmap is not None else tx
+                    self.rbatch[2] += 1
+
+    # ------------------------------------------------------------------
+    # DRAW_SECTORS. Same projection as r_walls, with the two things a
+    # level with steps in it needs: heights that come from a sector table
+    # rather than from the camera, and a two-sided wall that draws a band
+    # above the far ceiling and a band below the far floor and leaves the
+    # middle see-through.
+    #
+    # Depth is per pixel here, as z in 8.8 with 0xFFFF for empty and
+    # nearer meaning smaller -- a portal column has no single depth, so
+    # r_walls's one-1/z-per-column buffer cannot express it.
+    # ------------------------------------------------------------------
+
+    Z_EMPTY = 0xFFFF
+
+    @staticmethod
+    def r_zstore(z):
+        if z < 0:
+            return 0
+        return min(z, Gpu64Model.Z_EMPTY - 1)
+
+    @staticmethod
+    def r_lit(base, z, flatlit):
+        return base if flatlit else min(base + (z >> 9), 255)
+
+    def r_sectors(self, recs, count, key):
+        vx, vy, vw, vh = self.rview
+        vx0, vx1 = vx, vx + vw
+        vy0, vy1 = vy, vy + vh
+        cam = self.rcam
+
+        if cam['proj'] == 0 or not self.rsectors:
+            self.rbatch[1] += count
+            return
+
+        zbuf = self.zbuf
+        for y in range(vy0, vy1):
+            for x in range(vx0, vx1):
+                zbuf[y * FB_W + x] = self.Z_EMPTY
+        proj = cam['proj']
+        centre_x = vx0 + vw // 2
+        horizon = vy0 + vh // 2 + cam['horizon']
+        eye = cam['eye']
+        page = self.page()
+
+        def band(x, z, y_top, y_bot, yt, yb, tex, colour, cmap, flags, uu):
+            yt, yb = max(yt, vy0), min(yb, vy1)
+            if yt >= yb or y_bot <= y_top:
+                return
+            zs = self.r_zstore(z)
+            if tex is None:
+                c = cmap[colour] if cmap is not None else colour
+                for y in range(yt, yb):
+                    if zs >= zbuf[y * FB_W + x]:
+                        continue
+                    zbuf[y * FB_W + x] = zs
+                    page[y * FB_W + x] = c
+                    self.rbatch[2] += 1
+                return
+            tw, th, tdata = tex
+            col = (uu % tw) * th
+            hmask = th - 1
+            dv = idiv(th << 8, y_bot - y_top)
+            v = (yt - y_top) * dv
+            for y in range(yt, yb):
+                if zs >= zbuf[y * FB_W + x]:
+                    v += dv
+                    continue
+                tx = tdata[col + ((v >> 8) & hmask)]
+                v += dv
+                if (flags & 0x01) and tx == key:
+                    continue
+                zbuf[y * FB_W + x] = zs
+                page[y * FB_W + x] = cmap[tx] if cmap is not None else tx
+                self.rbatch[2] += 1
+
+        # The depth a flat writes is never nearer than the wall whose
+        # column painted it: a plane is infinite and a sector's floor is
+        # not, so without the clamp a low ceiling two rooms away wins the
+        # rows above the wall that hides it. Lighting still uses the row's
+        # true distance.
+        def flat(x, z_wall, yt, yb, drop, colour, base, flatlit):
+            yt, yb = max(yt, vy0), min(yb, vy1)
+            for y in range(yt, yb):
+                dy = y - horizon
+                if dy == 0 or (dy > 0) != (drop > 0):
+                    continue
+                z = idiv(drop * proj, dy << 8)
+                if z <= 0:
+                    continue
+                zs = self.r_zstore(max(z, z_wall))
+                if zs >= zbuf[y * FB_W + x]:
+                    continue
+                cmap = self.r_light_row(self.r_lit(base, z, flatlit))
+                zbuf[y * FB_W + x] = zs
+                page[y * FB_W + x] = cmap[colour] if cmap is not None else colour
+                self.rbatch[2] += 1
+
+        nsec = len(self.rsectors)
+        for i in range(count):
+            r = recs[i * RASTER_WALL2_BYTES:(i + 1) * RASTER_WALL2_BYTES]
+            avx, avz = self.r_to_view(s16(r[0] | (r[1] << 8)),
+                                      s16(r[2] | (r[3] << 8)))
+            bvx, bvz = self.r_to_view(s16(r[4] | (r[5] << 8)),
+                                      s16(r[6] | (r[7] << 8)))
+            au = s16(r[8] | (r[9] << 8))
+            bu = s16(r[10] | (r[11] << 8))
+            front, back, light, flags = r[12], r[13], r[14], r[15]
+
+            if avz < self.NEAR and bvz < self.NEAR:
+                self.rbatch[1] += 1
+                continue
+            if front >= nsec:
+                self.rbatch[1] += 1
+                continue
+            two_sided = back != 0xFF
+            if two_sided and back >= nsec:
+                self.rbatch[1] += 1
+                continue
+
+            fs = self.rsectors[front]
+            bs = self.rsectors[back] if two_sided else None
+
+            tex = [None, None, None]
+            bad = False
+            for k in range(3):
+                tid = r[16 + k]
+                if tid:
+                    tex[k] = self.rtex.get(tid)
+                    if tex[k] is None:
+                        bad = True
+            if bad:
+                self.rbatch[1] += 1
+                continue
+            tex_m, tex_u, tex_l = tex
+
+            if avz < self.NEAR:
+                t = idiv((self.NEAR - avz) << 16, bvz - avz)
+                avx += (bvx - avx) * t >> 16
+                au += (bu - au) * t >> 16
+                avz = self.NEAR
+            elif bvz < self.NEAR:
+                t = idiv((self.NEAR - bvz) << 16, avz - bvz)
+                bvx += (avx - bvx) * t >> 16
+                bu += (au - bu) * t >> 16
+                bvz = self.NEAR
+
+            sxa = centre_x + (idiv(avx * proj, avz) >> 8)
+            sxb = centre_x + (idiv(bvx * proj, bvz) >> 8)
+            if sxb <= sxa:
+                self.rbatch[1] += 1
+                continue
+
+            self.rbatch[0] += 1
+
+            iza = idiv(1 << 22, avz)
+            izb = idiv(1 << 22, bvz)
+            uza = (au * iza) >> 8
+            uzb = (bu * izb) >> 8
+
+            x0, x1 = max(sxa, vx0), min(sxb - 1, vx1 - 1)
+            if x0 > x1:
+                continue
+            span = sxb - sxa
+            flatlit = bool(flags & 0x02)
+            flats = bool(cam['flags'] & 0x01) and not (flags & 0x04)
+
+            for x in range(x0, x1 + 1):
+                t = x - sxa
+                iz = iza + idiv((izb - iza) * t, span)
+                if iz <= 0:
+                    continue
+                z = idiv(1 << 22, iz)
+                if z <= 0:
+                    continue
+
+                yf = horizon + (idiv((eye - fs['floor']) * proj, z) >> 8)
+                yc = horizon + (idiv((eye - fs['ceil']) * proj, z) >> 8)
+
+                if flats:
+                    if not (fs['flags'] & 0x01):
+                        flat(x, z, vy0, yc, eye - fs['ceil'], fs['ceilc'],
+                             fs['light'], flatlit)
+                    flat(x, z, yf, vy1, eye - fs['floor'], fs['floorc'],
+                         fs['light'], flatlit)
+
+                cmap = self.r_light_row(self.r_lit(light, z, flatlit))
+
+                uu = 0
+                if tex_m is not None or tex_u is not None or tex_l is not None:
+                    uz = uza + idiv((uzb - uza) * t, span)
+                    uu = idiv(uz << 8, iz) >> 8
+
+                if not two_sided:
+                    band(x, z, yc, yf, yc, yf, tex_m, r[19], cmap, flags, uu)
+                    continue
+
+                ybf = horizon + (idiv((eye - bs['floor']) * proj, z) >> 8)
+                ybc = horizon + (idiv((eye - bs['ceil']) * proj, z) >> 8)
+
+                if bs['floor'] > fs['floor']:
+                    band(x, z, ybf, yf, ybf, yf, tex_l, r[21], cmap, flags, uu)
+                if bs['ceil'] < fs['ceil'] and not (fs['flags'] & 0x01):
+                    band(x, z, yc, ybc, yc, ybc, tex_u, r[20], cmap, flags, uu)
+
+                # The far sector's flats, seen through the window. Nothing
+                # else paints them: flats are painted by the columns of the
+                # walls standing on them, and a corridor's own side walls
+                # seen end-on cover almost no columns.
+                if flats:
+                    w_top, w_bot = max(yc, ybc), min(yf, ybf)
+                    if not (bs['flags'] & 0x01):
+                        flat(x, z, w_top, w_bot, eye - bs['ceil'],
+                             bs['ceilc'], bs['light'], flatlit)
+                    flat(x, z, w_top, w_bot, eye - bs['floor'],
+                         bs['floorc'], bs['light'], flatlit)
+
+    # ------------------------------------------------------------------
+    # DRAW_THINGS: billboards in world space, depth-tested per pixel
+    # against what DRAW_SECTORS left in the buffer. Depth is one value for
+    # the whole card, and it is written as well as tested at drawn pixels,
+    # so a batch is order-independent.
+    # ------------------------------------------------------------------
+
+    def r_things(self, recs, count, key):
+        vx, vy, vw, vh = self.rview
+        vx0, vx1 = vx, vx + vw
+        vy0, vy1 = vy, vy + vh
+        cam = self.rcam
+
+        if cam['proj'] == 0:
+            self.rbatch[1] += count
+            return
+
+        zbuf = self.zbuf
+        page = self.page()
+        proj = cam['proj']
+        centre_x = vx0 + vw // 2
+        horizon = vy0 + vh // 2 + cam['horizon']
+        eye = cam['eye']
+
+        for i in range(count):
+            r = recs[i * RASTER_REC_BYTES:(i + 1) * RASTER_REC_BYTES]
+            wx, wy = s16(r[0] | (r[1] << 8)), s16(r[2] | (r[3] << 8))
+            base = s16(r[4] | (r[5] << 8))
+            world_h = r[6] | (r[7] << 8)
+            world_w = r[8] | (r[9] << 8)
+            texid, light, flags = r[10], r[11], r[12]
+
+            vxx, vzz = self.r_to_view(wx, wy)
+            if vzz < self.NEAR:
+                self.rbatch[1] += 1
+                continue
+            if world_w == 0 or world_h == 0:
+                self.rbatch[1] += 1
+                continue
+            tex = self.r_lookup(texid) if texid else None
+            if tex is None:
+                self.rbatch[1] += 1
+                continue
+
+            self.rbatch[0] += 1
+
+            wpx = idiv(world_w * proj, vzz) >> 8
+            sxc = centre_x + (idiv(vxx * proj, vzz) >> 8)
+            y_bot = horizon + (idiv((eye - base) * proj, vzz) >> 8)
+            y_top = horizon + (idiv((eye - base - world_h) * proj, vzz) >> 8)
+            hpx = y_bot - y_top
+            if wpx <= 0 or hpx <= 0:
+                continue
+
+            x_left = sxc - wpx // 2
+            x0, x1 = max(x_left, vx0), min(x_left + wpx - 1, vx1 - 1)
+            y0, y1 = max(y_top, vy0), min(y_top + hpx - 1, vy1 - 1)
+            if x0 > x1 or y0 > y1:
+                continue
+
+            tw, th, texels = tex
+            ustep = (tw << 16) // wpx
+            vstep = (th << 16) // hpx
+
+            masked = bool(flags & THING_MASKED)
+            flip = bool(flags & THING_FLIPX)
+            nodepth = bool(flags & THING_NODEPTH)
+            cmap = self.r_light_row(self.r_lit(light, vzz,
+                                               bool(flags & THING_FLATLIT)))
+            zs = self.r_zstore(vzz)
+
+            ustart = (x0 - x_left) * ustep
+            vrow = (y0 - y_top) * vstep
+
+            for sy in range(y0, y1 + 1):
+                sv = min(vrow >> 16, th - 1)
+                vrow += vstep
+                ucol = ustart
+                for sx in range(x0, x1 + 1):
+                    su = min(ucol >> 16, tw - 1)
+                    ucol += ustep
+                    if not nodepth and zs >= zbuf[sy * FB_W + sx]:
+                        continue
+                    if flip:
+                        su = tw - 1 - su
+                    t = texels[su * th + sv]
+                    if masked and t == key:
+                        continue
+                    if not nodepth:
+                        zbuf[sy * FB_W + sx] = zs
+                    page[sy * FB_W + sx] = cmap[t] if cmap is not None else t
+                    self.rbatch[2] += 1
+
+    def r_sprite(self):
+        a = self.arg
+        texid = self.ident[0] | (self.ident[1] << 8)
+        if texid == 0 or texid > RASTER_MAX_TEXTURES:
+            return ERR_BAD_ID
+        tex = self.r_lookup(texid)
+        if tex is None:
+            return ERR_BAD_ID
+
+        x, y = self.a_s16(0), self.a_s16(2)
+        w, h = self.a_u16(4), self.a_u16(6)
+        light, key = a[8], a[9]
+        clip_y0, clip_y1 = self.a_s16(10), self.a_s16(12)
+        flags = a[14]
+
+        self.rbatch = [0, 0, 0]
+        self.rrequested = 1
+        if w == 0 or h == 0:
+            self.rbatch[1] = 1
+            return ERR_OK
+        self.rbatch[0] = 1
+
+        tw, th, texels = tex
+        ustep = (tw << 16) // w
+        vstep = (th << 16) // h
+
+        vx, vy, vw, vh = self.rview
+        x0, x1 = x, x + w - 1
+        y0, y1 = y, y + h - 1
+        y0 = max(y0, clip_y0)
+        y1 = min(y1, clip_y1)
+        x0 = max(x0, vx)
+        x1 = min(x1, vx + vw - 1)
+        y0 = max(y0, vy)
+        y1 = min(y1, vy + vh - 1)
+        if x0 > x1 or y0 > y1:
+            return ERR_OK
+
+        cmap = self.r_light_row(light)
+        masked = bool(flags & SPR_MASKED)
+        flip = bool(flags & SPR_FLIPX)
+        ustart = (x0 - x) * ustep
+        vrow = (y0 - y) * vstep
+
+        for sy in range(y0, y1 + 1):
+            sv = min(vrow >> 16, th - 1)
+            ucol = ustart
+            for sx in range(x0, x1 + 1):
+                su = min(ucol >> 16, tw - 1)
+                ucol += ustep
+                if flip:
+                    su = tw - 1 - su
+                t = texels[su * th + sv]
+                if masked and t == key:
+                    continue
+                self.r_put(sx, sy, cmap[t] if cmap is not None else t)
+                self.rbatch[2] += 1
+            vrow += vstep
+        return ERR_OK

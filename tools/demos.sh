@@ -6,7 +6,8 @@
 #   1. assemble it with 64tass into the matching .prg
 #   2. run it under tools/prgsim, twice: once modelling a display with a
 #      frame clock and once modelling one without, because a demo that only
-#      works on the first is broken on hardware nobody can predict
+#      works on the first is broken on hardware nobody can predict. The
+#      first run is 400 frames -- see the comment on --stop-after below
 #   3. render what the HDMI output was showing when it finished, into
 #      Source/Demos/out/<name>.ppm
 #
@@ -67,8 +68,18 @@ for n in "${names[@]}"; do
 	bad=0
 	for mode in "" "--no-vblank"; do
 		ppm=""
-		[ -z "$mode" ] && ppm="--ppm=$OUTDIR/$n.ppm"
-		if simout=$( python3 "$SIM" "$prg" --demo $mode $ppm 2>&1 ); then
+		frames="--stop-after=60"
+		if [ -z "$mode" ]; then
+			ppm="--ppm=$OUTDIR/$n.ppm"
+			# Several hundred frames, not the handful the simulator
+			# used to run: a defect whose onset was frame 98 got
+			# through a 96-frame check once already on this project,
+			# and the raycast demo looked clean here for the same
+			# reason. The no-vblank pass only has to prove the demo
+			# does not hang, so it stays short.
+			frames="--stop-after=400"
+		fi
+		if simout=$( python3 "$SIM" "$prg" --demo $mode $frames $ppm 2>&1 ); then
 			[ $verbose -eq 1 ] && echo "$simout"
 		else
 			echo "SIM FAIL  $n ${mode:-(vblank)}"

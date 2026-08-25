@@ -8,6 +8,7 @@
 #include "gpu64_flip.h"
 #include "gpu64_ladder.h"
 #include "gpu64_3d.h"
+#include "gpu64_raster.h"
 #include <circle/util.h>
 
 // gpu64: set once a program actually drives the API, which stops the
@@ -59,6 +60,12 @@ void gpu64_apiReset( void )
 	// the next program starts against stale IDs.
 #ifdef GPU64_3D_ENABLED
 	gpu64_3dReset();
+#endif
+
+	// Class 2 goes the same way: every texture freed, the view back to the
+	// full surface, lighting back to identity.
+#ifdef GPU64_RASTER_ENABLED
+	gpu64_rasterReset();
 #endif
 }
 
@@ -250,6 +257,28 @@ static void logGpu64_3dStats( CGpu64FrameBuffer *pFB )
 #endif
 }
 
+// gpu64: class 2's counters on the same LOG_ENABLE(1) hook. What a bench
+// round reads here is `rej=` -- a batch that lost bytes on the way across the
+// bus rejects records that should have been accepted, which is the
+// length-readback half of CLAUDE.md's rule 3.
+static void logGpu64_RasterStats( CGpu64FrameBuffer *pFB )
+{
+#ifdef GPU64_RASTER_ENABLED
+	if ( pFB == 0 )
+		return;
+
+	// One line, inside the log's 40 columns. Static for the same reason the
+	// blob buffers at the top of this file are.
+	static char line[ 96 ];
+	char *p = gpu64_rasterReport( line );
+	*p++ = '\n';
+
+	pFB->LogWrite( line, (unsigned)( p - line ) );
+#else
+	(void)pFB;
+#endif
+}
+
 // gpu64: the crash-path escape hatch, added after round 2 (2026-08-23).
 //
 // Both ladder rounds so far ended with the C64 derailed and back in the RAD
@@ -271,6 +300,7 @@ void gpu64_ladderDumpNow( void )
 	logFlipStats( pFB );
 	logLadderStats( pFB );
 	logGpu64_3dStats( pFB );
+	logGpu64_RasterStats( pFB );
 #endif
 }
 
@@ -378,7 +408,18 @@ static u8 doSystem( u8 op )
 		info[ 8 ] = (u8)( GPU64_FB_HEIGHT >> 8 );
 		info[ 9 ] = 8;					// bits per pixel
 		info[ 10 ] = GPU64_FB_PAGES;
-		info[ 11 ] = 0x01;				// class 0 implemented, class 1 not
+		// Bitmap of implemented classes, built from the build's own
+		// toggles rather than written out by hand -- this byte is how a
+		// program discovers class 2 exists, and a hardcoded literal here
+		// had already gone stale once (it still said "class 1 not" with
+		// class 1 shipping).
+		info[ 11 ] = 0x01;				// class 0
+#ifdef GPU64_3D_ENABLED
+		info[ 11 ] |= 0x02;				// class 1, the 3D pipeline
+#endif
+#ifdef GPU64_RASTER_ENABLED
+		info[ 11 ] |= 0x04;				// class 2, the raster layer
+#endif
 		info[ 12 ] = GPU64_BORDER_W;			// border width, each side
 		info[ 13 ] = GPU64_BORDER_H;			// border height, each side
 		// Measured frame period in microseconds, 0 if the frame clock could
@@ -399,7 +440,7 @@ static u8 doSystem( u8 op )
 		if ( pFB ) pFB->LogEnable( sArg[ 0 ] ? TRUE : FALSE );
 		// Turning the log *on* is a request to be told something, so this is
 		// where the flip cost gets reported (logFlipStats() above).
-		if ( sArg[ 0 ] ) { logFlipStats( pFB ); logLadderStats( pFB ); logGpu64_3dStats( pFB ); }
+		if ( sArg[ 0 ] ) { logFlipStats( pFB ); logLadderStats( pFB ); logGpu64_3dStats( pFB ); logGpu64_RasterStats( pFB ); }
 		return GPU64_ERR_OK;
 
 	case 0x09:					// VBLANK_SYNC
@@ -831,6 +872,16 @@ void gpu64_apiDispatch( u8 op )
 		// class 1 OK means core 1 has the command, and STATUS bit4 or RESULT
 		// is what says it finished. That is the whole point of the split.
 		res = gpu64_3dDispatch( op );
+	} else
+#endif
+#ifdef GPU64_RASTER_ENABLED
+	if ( sCmdHi == 2 )
+	{
+		// Class 2 executes here and now, on core 0, exactly like a class 0
+		// draw op -- the C64 is halted for the dispatch, so there is nothing
+		// for another core to overlap with. See
+		// docs/milestone8_raster_design.md.
+		res = gpu64_rasterDispatch( op );
 	} else
 #endif
 	if ( sCmdHi != 0 )

@@ -37,6 +37,18 @@ Options:
                     judges itself and exit status follows its verdict; a
                     demo has nothing to judge, so returning cleanly is the
                     whole of the pass condition.
+    --stop-after=N  report the STOP key pressed on the Nth poll rather than
+                    the 4th. A demo polls STOP once a frame, so this is how
+                    many frames it runs. THE DEFAULT OF 4 IS NOT A CHECK:
+                    a defect whose onset is frame 98 is invisible to it, and
+                    that has already happened once on this project. Any demo
+                    change wants a run of several hundred.
+    --frame-log     print one line per page flip: frame number, the drawn
+                    page's non-zero pixel count, and the two status rows the
+                    demo prints. This is what turns "it blinks" into a frame
+                    number and a delta.
+    --ppm-frame=N:PATH
+                    write the page being flipped away at frame N. Repeatable.
     --trace N       dump the last N instructions if something goes wrong
     --max N         instruction budget (default 200 million)
 """
@@ -73,13 +85,18 @@ def screen_to_ascii(c):
 
 
 class Machine:
-    def __init__(self, calibrated=True):
+    def __init__(self, calibrated=True, stop_after=4, frame_log=False,
+                 ppm_frames=None):
         self.mem = bytearray(65536)
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
         self.stop_polls = 0
+        self.stop_after = stop_after
         self.done = False
         self.final = None
+        self.frame_log = frame_log
+        self.ppm_frames = ppm_frames or {}
+        self.frame = 0
 
     # Straight RAM, used by the model's DMA: a blob fetch sees memory, not
     # the IO2 window, and never re-enters the register file.
@@ -98,9 +115,29 @@ class Machine:
 
     def write(self, addr, val):
         if 0xDF00 <= addr <= 0xDFFF:
+            # A page flip is the frame boundary, and it is the only one a
+            # demo tells us about. Sample on the way in, while the page that
+            # was just drawn is still the draw page.
+            flip = (addr == 0xDF0C and self.gpu.cmd_hi == 0
+                    and (val & 0xFF) == 0x05)
+            if flip:
+                self.on_flip()
             self.gpu.write_reg(addr - IO2, val)
             return
         self.mem[addr] = val & 0xFF
+
+    def on_flip(self):
+        self.frame += 1
+        path = self.ppm_frames.get(self.frame)
+        if path is not None:
+            write_ppm(path, self.gpu, page=self.gpu.draw_page)
+        if not self.frame_log:
+            return
+        page = self.gpu.pages[self.gpu.draw_page]
+        ink = sum(1 for b in page if b)
+        rows = self.screen()
+        status = ' | '.join(r.strip() for r in rows[20:25] if r.strip())
+        print("frame %4d  ink %6d  %s" % (self.frame, ink, status))
 
     def load_prg(self, path):
         data = open(path, 'rb').read()
@@ -116,7 +153,8 @@ class Machine:
             # Report "not pressed" a few times so a caller that expects to
             # wait actually waits, then report pressed so the run finishes.
             self.stop_polls += 1
-            self.cpu.p = (self.cpu.p | 0x02) if self.stop_polls > 3 else (self.cpu.p & ~0x02)
+            pressed = self.stop_polls > self.stop_after
+            self.cpu.p = (self.cpu.p | 0x02) if pressed else (self.cpu.p & ~0x02)
             self.rts()
             return True
         if pc == 0xE544:                    # clear screen
@@ -177,12 +215,12 @@ class Machine:
         return rows
 
 
-def write_ppm(path, gpu):
+def write_ppm(path, gpu, page=None):
     """The visible page as the display would show it, border included."""
     w = gpu64model.FB_W + 2 * gpu64model.BORDER_W
     h = gpu64model.FB_H + 2 * gpu64model.BORDER_H
     pal = gpu.palette
-    page = gpu.pages[gpu.visible_page]
+    page = gpu.pages[gpu.visible_page if page is None else page]
     border = bytes(pal[gpu.border * 3:gpu.border * 3 + 3])
     rows = [border * w] * gpu64model.BORDER_H
     for y in range(gpu64model.FB_H):
@@ -214,8 +252,16 @@ def main(argv):
     trace = 0
     max_insns = 200_000_000
     ppm = None
+    stop_after = 4
+    frame_log = '--frame-log' in opts
+    ppm_frames = {}
     demo = '--demo' in opts
     for o in opts:
+        if o.startswith('--stop-after='):
+            stop_after = int(o.split('=')[1])
+        if o.startswith('--ppm-frame='):
+            n, path = o.split('=', 1)[1].split(':', 1)
+            ppm_frames[int(n)] = path
         if o.startswith('--trace'):
             trace = int(o.split('=')[1]) if '=' in o else 40
         if o.startswith('--max='):
@@ -223,7 +269,8 @@ def main(argv):
         if o.startswith('--ppm='):
             ppm = o.split('=', 1)[1]
 
-    m = Machine(calibrated=calibrated)
+    m = Machine(calibrated=calibrated, stop_after=stop_after,
+                frame_log=frame_log, ppm_frames=ppm_frames)
     addr, size = m.load_prg(args[0])
     # A BASIC stub sits at $0801; the code itself starts at $0810.
     start = 0x0810

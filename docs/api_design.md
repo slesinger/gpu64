@@ -77,7 +77,7 @@ gpu64 owns **$DF0B–$DFFF** in IO2. REU keeps $DF00–$DF0A; IO1
 | $DF0C | `CMD_LO` | W | Opcode within the current class. **Writing it fires the command**, using whatever `ID`/`ARG` are staged. |
 | $DF0D | `STATUS` | R | bit0 busy, bit1 error, bit2 vblank-pending, bit3 vblank-IRQ-armed |
 | $DF0E | `ERRCODE` | R | Result of the last dispatch (see [Error codes](#error-codes)) |
-| $DF0F–$DF10 | `ID` | W | Resource ID, 16-bit — unused in class 0, reserved for class 1 |
+| $DF0F–$DF10 | `ID` | W | Resource ID, 16-bit — unused in class 0; class 2 names a texture with it |
 | $DF11–$DF20 | `ARG0`–`ARG15` | W | 16-byte argument block, layout defined per opcode |
 | $DF21–$DFFF | — | — | Reserved |
 
@@ -218,7 +218,7 @@ Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
 | 7 | 2 | framebuffer height (200) |
 | 9 | 1 | bits per pixel (8) |
 | 10 | 1 | number of pages (2) |
-| 11 | 1 | bitmap of implemented classes: bit0 = class 0, bit1 = class 1 (3D) |
+| 11 | 1 | bitmap of implemented classes: bit0 = class 0, bit1 = class 1 (3D), bit2 = class 2 (raster) |
 | 12 | 1 | border width, each side (32) |
 | 13 | 1 | border height, each side (36) |
 | 14 | 2 | measured frame period, microseconds — **0 means the frame clock never calibrated**, and every vblank feature will answer `UNSUPPORTED` |
@@ -269,6 +269,339 @@ sets across calls, advancing the operand and result addresses.
 
 Everything not listed above — including $A0–$FF — is undefined: writing it
 sets `ERRCODE = BAD_OPCODE` and does nothing else.
+
+## Class 2 opcodes — the raster layer
+
+Set `CMD_HI = 2`. This is the column/span/sprite layer a first-person
+renderer needs: instead of one command per shape, you fill an array of
+**16-byte records** in your own RAM and hand gpu64 the whole array in a
+single dispatch. A frame of several hundred primitives costs one command
+and one bulk fetch, not several thousand register writes. Why it is a class
+of its own, and what it is aimed at, is in
+[milestone8_raster_design.md](milestone8_raster_design.md).
+
+Every class 2 primitive is clipped to the **view rectangle**, which starts
+as the whole surface. Records draw into the current draw page, so class 0's
+`SET_DRAW_PAGE` and `PAGE_FLIP` work exactly as they do for 2D drawing, and
+class 0 and class 2 can draw into the same page in the same frame.
+
+### System — $00–$0F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $00 | `RASTER_RESET` | 0 | — | Frees every texture, view back to the whole surface, colormap back to identity, counters cleared. Also happens on a session reset, so a new program never inherits another one's texture ids. |
+| $01 | `SET_VIEW` | 8 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` w, `ARG6-7` h | The clip rectangle every class 2 primitive obeys. `w` or `h` of 0, or a rectangle running off the surface, is `BAD_ARGS`. |
+| $02 | `SET_COLORMAP` | 7 | `ARG0-5` blob descriptor, `ARG6` levels | Loads a `levels × 256` lighting table: a pixel of palette index `c` at light level `L` is drawn as `map[L * 256 + c]`. `levels = 0` removes it and returns to drawing raw indices. Max 64 levels; `len` must equal `levels * 256`. |
+| $03 | `RASTER_STATS` | 6 | `ARG0-5` destination descriptor | Writes the 16-byte stats block (below) — what became of the **last** batch. `len` must be ≥ 16. |
+| $04 | `FILL_VIEW` | 1 | `ARG0` palette index | Fills the view rectangle with one raw index. No colormap, no clipping beyond the view. **Also empties the class 2 depth buffer over the same rectangle** — a pixel just painted background has nothing in it, so this is the op a frame starts with. |
+| $05 | `SET_CAMERA` | 15 | `ARG0-1` x, `ARG2-3` y, `ARG4` angle, `ARG5` flags, `ARG6-7` eye height, `ARG8-9` ceiling height, `ARG10-11` projection, `ARG12` floor colour, `ARG13` ceiling colour, `ARG14` horizon | The camera `DRAW_WALLS` projects through. Position and heights are signed 8.8 world units; angle is binary, 256 to the circle, 0 looking along +x. Projection is the distance to the projection plane in pixels as 8.8 — 160.0 (`$A000`) across a 320-wide view is a 90° field of view. Horizon is a signed pixel offset from the view's centre row. Flags bit 0 (`CAM_PAINT`) has each wall column also fill its own ceiling above and floor below in the two colours. A projection of 0, an eye height at or below 0, or a ceiling at or below the eye is `BAD_ARGS`. For `DRAW_SECTORS` the eye height is an **absolute** world height rather than a height above the floor, the ceiling height is not read at all (send the level's tallest, so the validation passes), and the two flat colours are not read either — they come from the sector. |
+| $06 | `SET_SECTORS` | 8 | `ARG0-5` blob descriptor, `ARG6-7` count | Loads the sector table `DRAW_SECTORS` reads heights and flat colours from — see the sector record below. `count = 0` drops the table. Max 128 sectors; `len` must equal `count * 8`. A sector whose ceiling is at or below its own floor rejects the **whole** upload with `BAD_ARGS` and leaves the table that was already there untouched. |
+
+### Resources — $10–$1F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $10 | `UPLOAD_TEXTURE` | 11 | `ARG0-5` blob descriptor, `ARG6-7` w, `ARG8-9` h, `ARG10` flags; **`ID`** = texture id | Copies `w * h` bytes into gpu64's texture arena under id `1..255`. **`h` must be a power of two** (it is masked per pixel); `w` need not be, unless the texture is used by `DRAW_SPANS`, which masks both. Either dimension 0 or over 1024 is `BAD_ARGS`, as is a `w * h` over 65536; `len` must equal `w * h`. `ID = 0` is `BAD_ID`, and so is an id past 255. Re-uploading a live id replaces it. Arena exhausted is `OUT_OF_MEMORY`. |
+| $11 | `FREE_TEXTURE` | 0 | **`ID`** = texture id | Releases the id. An id that is not live is `BAD_ID`. |
+
+The texture arena is a bump allocator: freeing an id, or re-uploading over a
+live one, releases the **id** but not the bytes. Load a level's textures
+once rather than swapping them per frame, and use `RASTER_RESET` — or a
+session reset — to get the space back.
+
+Textures are stored **column-major**: `texel(u, v)` is byte `u * h + v`. That
+is the order a wall column reads them in, which is what makes a column one
+sequential walk instead of `h` scattered reads. `ARG10` bit 0 set says your
+source is row-major and asks gpu64 to transpose it on the way in — pay it
+once at upload rather than per pixel.
+
+### Batches — $20–$2F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $20 | `DRAW_COLUMNS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` column records. |
+| $21 | `DRAW_SPANS` | 9 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags | Draws `count` span records. |
+| $23 | `DRAW_WALLS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` wall records — see below. |
+| $24 | `DRAW_SECTORS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` **32-byte** sector-wall records — see below. `BAD_ARGS` if `SET_SECTORS` has not been sent. |
+| $25 | `DRAW_THINGS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte thing records — billboards in world space, depth-tested against the buffer `DRAW_SECTORS` filled. See below. |
+| $22 | `DRAW_SPRITE` | 15 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` w, `ARG6-7` h, `ARG8` light, `ARG9` key, `ARG10-11` clipY0, `ARG12-13` clipY1, `ARG14` flags; **`ID`** = texture id | Scales one texture into the screen rectangle `x,y,w,h`, clipped to the view **and** to the inclusive row range `clipY0..clipY1`. Flags: bit0 mask on `key`, bit1 flip horizontally. `w` or `h` of 0 draws nothing (and counts as one rejected primitive); an unknown id is `BAD_ID`. |
+
+`count = 0` is a no-op, not an error. Otherwise `len` must be exactly
+`count * 16` — `count * 32` for `DRAW_SECTORS` — plus 2 more if the checksum flag is set, and no more than
+65536 bytes in total — anything else is `BAD_ARGS`.
+
+**`ARG8` bit 0 — the batch checksum.** With it set, the two bytes following
+the records are a plain 16-bit little-endian sum of the record bytes. gpu64
+recomputes it and answers `BAD_ARGS`, drawing nothing, if it disagrees. A
+6502 cannot afford to sum thousands of bytes every frame, so use it where it
+is free: on a batch that is built once and re-sent unchanged, the sum is
+computed once too. For a batch rebuilt every frame, the `rejected` counter
+in the stats block is the cheaper watch — see
+[the note on the bus](#what-a-command-costs-the-c64).
+
+#### Wall record — 16 bytes
+
+A wall segment in **world** coordinates. gpu64 does the projection, the
+perspective texture mapping, the distance lighting and the depth sorting, so
+the C64 sends the same unchanged bytes every frame and spends its own time
+on the game. This is the one class 2 opcode that is geometry rather than
+pixels, and it is where the per-column divide a 1 MHz 6502 cannot afford
+went.
+
+| Bytes | Field | Meaning |
+|---|---|---|
+| 0-1 | x1 | first endpoint, signed 8.8 world units |
+| 2-3 | y1 | |
+| 4-5 | x2 | second endpoint |
+| 6-7 | y2 | |
+| 8 | texid | texture id, or 0 for a solid colour taken from the low byte of `u1` |
+| 9 | light | base light level, before distance is added |
+| 10-11 | u1 | texture u at the first endpoint, signed 8.8 texels |
+| 12-13 | u2 | texture u at the second endpoint |
+| 14 | flags | bit0 mask on `key`; bit1 use `light` unchanged, with no darkening by distance |
+| 15 | — | reserved, write 0 |
+
+**Winding decides which side is the front.** A wall is drawn only from the
+side that projects it left to right; seen from the other side it is one
+rejected record and no pixels. Walls are one-sided, exactly as Doom's are,
+and this is what makes a closed room cost nothing to look at from outside.
+
+**u1 and u2 rather than a length and a scale**, because a length needs a
+square root. Give the texture coordinate at each end and the interpolation
+is perspective-correct with no root anywhere. Since `u` is signed 8.8 texels
+it reaches 127.99, so tile a long wall as several segments — which is what a
+cell-based level gives you for free, one record per cell face.
+
+**Depth is sorted for you.** Every column is tested against a 1/z buffer that
+`DRAW_WALLS` clears at the start of each batch, so records may arrive in any
+order. Doom needed a BSP tree to avoid that sort; here it is a comparison.
+
+**What is not here yet:** walls run floor to ceiling at one height for the
+whole level, the height `SET_CAMERA` gives. Varying floor and ceiling
+heights, two-sided walls and windows are `DRAW_SECTORS`, below; this opcode
+is kept as it is because it is simpler to drive and its per-column depth
+buffer is cheaper.
+
+Distance darkening adds `z / 2` light levels to the record's `light`, `z`
+being the column's distance in world units, unless bit 1 says otherwise. The
+result is clamped to the colormap's last level, so a level that runs out of
+levels goes as dark as it can rather than failing.
+
+Rejections a wall record can earn, none of which fail the batch: both
+endpoints behind the near plane (0.25 world units), an unknown `texid`, or a
+back face. A camera that cannot be projected rejects every record in the
+batch.
+
+#### Sector record — 8 bytes
+
+The vertical shape of a level. `DRAW_SECTORS`' wall records name two of
+these by one-byte id instead of carrying four heights each, which is what
+keeps the wall record down to 32 bytes.
+
+| Bytes | Field | Meaning |
+|---|---|---|
+| 0-1 | floorH | floor height, signed 8.8 **absolute** world units |
+| 2-3 | ceilH | ceiling height; must be above the floor |
+| 4 | floorCol | palette index the floor is painted in |
+| 5 | ceilCol | palette index the ceiling is painted in |
+| 6 | light | base light level for this sector's floor and ceiling |
+| 7 | flags | bit0 (`SEC_SKY`) — the ceiling is not a surface |
+
+**`SEC_SKY`** means the ceiling is neither painted nor given depth, and a
+wall whose front sector has it draws no upper band. So a courtyard's wall
+stops at the sky instead of growing a lintel across it, and whatever the
+page already held shows through — put a `FILL_VIEW`, or a sky texture, there.
+
+#### Sector-wall record — 32 bytes
+
+`DRAW_SECTORS`' record. Everything the wall record does, plus the two things
+a level with steps in it needs: floor and ceiling heights that come from the
+sector table, and a **two-sided** wall that draws a band above the far
+ceiling and a band below the far floor and leaves the middle see-through.
+
+Thirty-two bytes rather than sixteen because a two-sided wall names two
+sectors and three textures and none of that fits beside the geometry. It
+costs nothing per frame: a level is uploaded once and its checksum computed
+once.
+
+| Bytes | Field | Meaning |
+|---|---|---|
+| 0-1 | x1 | first endpoint, signed 8.8 world units |
+| 2-3 | y1 | |
+| 4-5 | x2 | second endpoint |
+| 6-7 | y2 | |
+| 8-9 | u1 | texture u at the first endpoint, signed 8.8 texels |
+| 10-11 | u2 | texture u at the second endpoint |
+| 12 | frontSec | sector id on the side this record is seen from |
+| 13 | backSec | sector id on the far side, or `$FF` for a solid wall |
+| 14 | light | base light level for all three bands |
+| 15 | flags | bit0 mask on `key`; bit1 use `light` unchanged; bit2 (`WALL_NOFLATS`) this wall's columns paint no floor and no ceiling whatever the camera says |
+| 16 | texMid | texture for a solid wall, floor to ceiling; 0 for a flat colour |
+| 17 | texUpper | texture for the band from this ceiling down to the far one |
+| 18 | texLower | texture for the band from the far floor down to this one |
+| 19 | colMid | palette index used when `texMid` is 0 |
+| 20 | colUpper | likewise for `texUpper` |
+| 21 | colLower | likewise for `texLower` |
+| 22-31 | — | reserved, write 0 |
+
+Winding, `u1`/`u2`, distance darkening, the near plane and the rejection
+rules are all exactly as for the wall record above; a bad sector id rejects
+a record the same way a bad texture id does. `v` walks each band's texture
+over that band's own full height on screen, so an upper band carries the
+whole texture squeezed into it.
+
+**A two-sided wall is still one-sided per record.** The level carries the
+other side as a second record with the endpoints swapped and the sectors
+exchanged — which is also how the far side's bands get their own textures
+without this record knowing anything about them.
+
+**Depth is per PIXEL here, not per column.** It has to be: a window means a
+column is no longer owned by one wall — the near wall owns the band above
+the window and the band below it, and something further away owns the
+middle. The buffer is cleared at the start of each batch, so records may
+still arrive in any order, and Doom's BSP tree, which exists to produce that
+order, is still not needed.
+
+**Floors and ceilings are drawn per column, by the walls.** With
+`CAM_PAINT` set, each wall column fills from the view's top down to where
+its front sector's ceiling cuts the column, and from where its floor cuts it
+down to the view's bottom, in that sector's colours. Every such row has its
+own distance, so a floor depth-tests correctly against a wall standing on
+it, and a two-sided wall also paints the far sector's flats inside its
+window — nothing else would, because a corridor's own side walls seen
+end-on cover almost no columns.
+
+One correction is applied to that: **the depth a flat writes is never nearer
+than the wall whose column painted it.** A plane is infinite and a sector's
+floor is not, so without the clamp a low ceiling two rooms away wins the
+rows above the wall that hides it. It is the cheap stand-in for Doom's
+visplane clipping, which needs a front-to-back order this design does not
+have. Lighting still uses the row's true distance, so the clamp is
+invisible. One consequence: it only reaches one sector through a portal — a
+sector two portals away can leave a hole.
+
+**What is not here yet:** flat (floor and ceiling) textures, sloped floors,
+and flats seen through two portals in a row. Sprites that depth-test against
+this buffer are `DRAW_THINGS`, below.
+
+#### Thing record — 16 bytes
+
+A billboard at a **world** position, projected by the same camera as
+`DRAW_SECTORS` and depth-tested per pixel against the buffer it filled —
+which is what lets a monster stand behind a wall.
+
+`DRAW_SPRITE` cannot do this. It takes a screen rectangle, so the C64 has to
+do the projection, and it has no argument room left for a depth. Keep
+`DRAW_SPRITE` for what is genuinely at a screen position and must never be
+occluded: the weapon in the player's hands, the status bar, a full-screen
+flash.
+
+| Bytes | Field | Meaning |
+|---|---|---|
+| 0-1 | x | world position, signed 8.8 |
+| 2-3 | y | |
+| 4-5 | base | **absolute** height of the bottom of the sprite, signed 8.8 — the same measure the sector table's floor heights use, so a thing standing on the floor of sector *n* carries that sector's floor height |
+| 6-7 | h | height in world units, unsigned 8.8 |
+| 8-9 | w | width in world units, unsigned 8.8 |
+| 10 | texture id | must name a live texture; 0 is a rejected record |
+| 11 | light | base light level, darkened by distance unless `THING_FLATLIT` |
+| 12 | flags | bit0 mask on the batch `key`; bit1 flip horizontally; bit2 (`THING_NODEPTH`) ignore the depth buffer entirely; bit3 (`THING_FLATLIT`) use `light` unchanged |
+| 13-15 | — | reserved, write 0 |
+
+The card always faces the camera, so `w` is measured straight across the
+view and there is no rotation to send. A thing is `w` wide and `h` tall in
+world units at any distance; the screen rectangle is whatever the projection
+makes of that, centred on the column the world position projects to.
+
+**Depth is written as well as tested**, at drawn pixels only — so a masked
+texel is a hole in the depth too, and a batch of things is order-independent
+exactly as a batch of walls is. `THING_NODEPTH` opts out of both, which is
+how a muzzle flash gets painted over the world; things drawn that way *do*
+depend on the order they arrive in.
+
+**Send this batch after `DRAW_SECTORS` for the same frame.** The depth
+buffer is shared and persists: it is emptied by `FILL_VIEW`, by
+`DRAW_SECTORS` (over the view, at the start of each batch) and by
+`RASTER_RESET`, and by nothing else. Things sent before the level's walls
+would be occluded by whatever the buffer still held.
+
+A record with `w` or `h` of 0, an unknown or zero texture id, or a position
+behind the near plane is **rejected**; one that is well formed and clips
+away entirely, or is too far off to cover a pixel, is **accepted** and draws
+nothing. That distinction is the whole value of the counters: rejected means
+the record was wrong, not that it missed.
+
+#### Column record — 16 bytes
+
+Doom's `R_DrawColumn`: one textured vertical strip.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | x — screen column, unsigned |
+| 2 | 2 | y0 — first row, **signed** |
+| 4 | 2 | y1 — last row, inclusive, **signed** |
+| 6 | 1 | texture id, or 0 for solid colour |
+| 7 | 1 | light level |
+| 8 | 2 | u — texture column (wrapped modulo `w` once per record); with texid 0, the low byte is the palette index |
+| 10 | 2 | v — texture row at `y0`, **8.8 signed** |
+| 12 | 2 | dv — v step per screen row, **8.8 signed** |
+| 14 | 1 | flags: bit0 = skip source texels equal to the batch `key` (the masked/see-through column) |
+| 15 | 1 | reserved, write 0 |
+
+`y0` and `y1` are signed and are *meant* to run off the view: a wall close
+enough is thousands of pixels tall. gpu64 clips them **and advances `v`
+across the rows it discarded**, so a texture does not slide as you walk into
+a wall. A record with `y1 < y0`, an `x` outside the view, or an unknown
+texture id is **rejected** — counted, not fatal, and the rest of the batch
+still draws.
+
+#### Span record — 16 bytes
+
+Doom's `R_DrawSpan`: one horizontal strip, with `u` and `v` both stepping.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | y — screen row, **signed** |
+| 2 | 2 | x0 — first column, **signed** |
+| 4 | 2 | x1 — last column, inclusive, **signed** |
+| 6 | 1 | texture id, or 0 for solid colour |
+| 7 | 1 | light level |
+| 8 | 2 | u — **8.8 signed** |
+| 10 | 2 | v — **8.8 signed** |
+| 12 | 2 | du — u step per screen column, **8.8 signed** |
+| 14 | 2 | dv — v step per screen column, **8.8 signed** |
+
+Both coordinates are masked every pixel, so a **textured** span needs a
+texture whose width *and* height are powers of two; one whose width is not
+rejects the record. Solid-colour spans (texid 0) have no such restriction
+and are the cheap way to lay down a lit floor and ceiling gradient — one
+record per row.
+
+#### Stats block
+
+`RASTER_STATS` writes 16 bytes describing the **last** batch dispatched:
+
+| Offset | Size | Contents |
+|---|---|---|
+| 0 | 2 | `"R2"` |
+| 2 | 2 | accepted — records that were drawn or clipped away |
+| 4 | 2 | rejected — records that were malformed or named an unknown texture |
+| 6 | 2 | requested — the `count` the command asked for |
+| 8 | 4 | pixels written |
+| 12 | 2 | live textures |
+| 14 | 2 | free arena space, KB |
+
+`requested` against `accepted + rejected` is the length readback the bus
+asks for, and `rejected` is the counter that moves if a batch arrives
+damaged. Reading it back costs one dispatch and a 16-byte write, which is
+cheap enough to do every frame.
+
+### Class 2 error codes
+
+Class 2 adds three codes to the table below: `$08 OUT_OF_MEMORY` (the
+texture arena is full), `$0A BAD_ID` (a texture id of 0, past 255, or not
+live), and — from a batch op on a build without the class compiled in —
+`$02 BAD_CLASS`.
 
 ## vblank
 
@@ -339,12 +672,14 @@ simply `ERRCODE != OK`.
 | $05 | `SINGULAR` | `MAT_INVERSE` on a matrix with no inverse. Nothing was written to the destination. |
 | $06 | `UNSUPPORTED` | The feature is not available on this hardware right now. In practice this means the frame clock did not calibrate at boot, which takes every vblank feature with it. |
 | $07 | `BUSY` | A vblank-deferred `PAGE_FLIP` is still waiting for its frame boundary. The pending flip is untouched; poll `STATUS` bit0 and retry. |
+| $08 | `OUT_OF_MEMORY` | A resource upload had nowhere to go — in class 2, the texture arena is full. Free something and retry. |
+| $0A | `BAD_ID` | A resource id that is 0, past the end of its table, or not currently live. |
 
 A failed dispatch does nothing: no drawing, no data fetch, no state change.
 
 ## Examples
 
-Six complete, commented programs are in [`Source/Demos/`](../Source/Demos/) — one per area of the API, buildable and viewable on a PC with `tools/demos.sh`. See [demos.md](demos.md) for what each one shows. The fragments below are the same idioms in isolation.
+Eight complete, commented programs are in [`Source/Demos/`](../Source/Demos/) — one per area of the API, buildable and viewable on a PC with `tools/demos.sh`. See [demos.md](demos.md) for what each one shows. The fragments below are the same idioms in isolation.
 
 Clear the screen to blue (index 6), then draw a filled white box:
 

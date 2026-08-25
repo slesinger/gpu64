@@ -995,15 +995,111 @@ run is most likely that floor and not the renderer. See *IO2 write sampling*
 below.
 
 
+## 8. Class 2 -- the raster layer (2026-08-25; suite green on hardware, demos not)
+
+The step toward running Doom on a stock 1MHz C64. Rationale and as-built
+decisions: [milestone8_raster_design.md](milestone8_raster_design.md); the
+usable surface: [api_design.md](api_design.md#class-2-opcodes--the-raster-layer).
+
+**What it is.** Doom's three drawing primitives -- `R_DrawColumn`,
+`R_DrawSpan` and the masked/scaled sprite -- as batched 16-byte records.
+The C64 fills an array in its own RAM and hands over the whole array in one
+dispatch. Ten opcodes: `RASTER_RESET`, `SET_VIEW`, `SET_COLORMAP`,
+`RASTER_STATS`, `FILL_VIEW`, `UPLOAD_TEXTURE`, `FREE_TEXTURE`,
+`DRAW_COLUMNS`, `DRAW_SPANS`, `DRAW_SPRITE`. Runs synchronously on core 0
+inside the dispatch window, like a class 0 draw op.
+
+**Why batching is the whole design.** The bottleneck was never the Pi. A
+Doom-shaped frame is several hundred primitives; at one command each that is
+some thousands of IO2 register writes, which at 1MHz is most of the frame
+gone before a pixel is drawn -- and it is several hundred separate exposures
+to the ~1/180000 write-drop floor. One command plus one bulk fetch removes
+both.
+
+**What was built.**
+
+| Piece | Where |
+|---|---|
+| The portable pixel core | `Source/Firmware/gpu64_raster_core.{h,cpp}` |
+| The wire layer: arena, texture table, view, colormap, stats | `Source/Firmware/gpu64_raster_class2.cpp` |
+| Class routing, session reset, `GET_INFO` class bit, log line | `Source/Firmware/gpu64_api.cpp` |
+| Reference model, written from the document not the firmware | `tools/prgsim/gpu64model.py` |
+| Differential harness, firmware core vs model | `tools/rastercheck/` |
+| Conformance PRG, 52 assertions | `Source/TestPRG/gpu64_test_raster.a` |
+| Demo | `Source/Demos/gpu64_demo_raycast.a` |
+
+The whole class is behind `GPU64_RASTER_ENABLED` in `gpu64_raster.h`, which
+is the bisect handle if class 0 or class 1 ever regresses.
+
+### Verification, all on a PC
+
+- `tools/testprg.sh raster` -- 52 assertions, PASS in both display cases.
+  Same discipline as the class 0 suite: green here means the suite asserts
+  what the document says, so a red line at the bench would mean the firmware
+  does not.
+- `tools/rastercheck` -- **2500 randomised scenarios agreed pixel for pixel
+  and counter for counter** between the firmware's own
+  `gpu64_raster_core.cpp`, compiled natively, and the Python reference
+  model. The two were written from opposite ends and the scenarios spend
+  their randomness on the edges the PRG can only sample a few of: columns
+  starting above the view (so `v` has to be advanced across the rows that
+  were clipped), negative `dv`, `u` past the texture width, spans naming a
+  non-power-of-two texture, sprites clipped by `clipY0`/`clipY1`, masking
+  and lighting.
+- `tools/demos.sh raycast` -- renders `Source/Demos/out/raycast.ppm`, which
+  is the expected HDMI output.
+
+The one disagreement the differential harness found was real and is fixed:
+`DRAW_SPRITE` was not counting itself in `accepted`/`rejected` at all, so
+`RASTER_STATS` reported nothing about it. A sprite is now counted the way a
+column record is -- a degenerate rectangle is rejected, a well-formed one
+that clips away entirely is accepted and draws nothing.
+
+Fixing the suite also caught a stale assertion in the class 0 tests:
+`BAD CLASS` was asserted on class **2**, which is now a real class. It moved
+to class 3.
+
+### Two things the class does about the bus
+
+CLAUDE.md requires any bulk upload through DMA to carry a checksum or a
+length readback. Class 2 has both, and they are meant for different batches:
+
+- `ARG8` bit 0 turns on a 16-bit sum of the record bytes, verified before
+  anything is drawn. A 6502 cannot afford to sum thousands of bytes per
+  frame, so this is for a batch built once and re-sent unchanged -- the
+  raycast demo checksums its 160 static floor/ceiling spans and not its 320
+  per-frame wall columns.
+- `RASTER_STATS` reports `requested` against `accepted + rejected` for the
+  last batch. That is the length readback, it costs one dispatch, and it is
+  what a per-frame batch watches instead. The demo prints both counters on
+  the C64's screen every frame.
+
+### Not done
+
+- **No per-frame cost figure for a batch pull at Doom sizes.** The class 2
+  conformance suite and the demos have since run on hardware (8b, 8c and 8d
+  below), but nothing has ever measured how long a full-size batch holds the
+  bus. That number is still owed.
+- Textured floors in the demo. The raycast demo's floor and ceiling are
+  solid-colour spans (texid 0) with per-row lighting; a textured floor needs
+  a per-row multiply on the 6502 that the demo does not do. The record
+  format is the same either way.
+- The batches run on core 0, inside the dispatch window, so they halt the
+  C64 for their duration. Moving them to core 1 is a separate question and
+  runs straight into milestone 6a's 7-cache-line burst limit -- see the
+  design doc.
+
+
 ## Demonstration programs (written and HARDWARE-VERIFIED 2026-08-25)
 
-Six developer-facing PRGs in `Source/Demos/`, built and rendered on a PC by
-`tools/demos.sh`, indexed in [demos.md](demos.md): `hello`, `palette`,
-`sprites`, `bounce`, `rotate`, `matrix`. They are what a developer copies
+Eight developer-facing PRGs in `Source/Demos/`, built and rendered on a PC
+by `tools/demos.sh`, indexed in [demos.md](demos.md): `hello`, `palette`,
+`sprites`, `bounce`, `rotate`, `matrix`, and -- added with milestone 8 and
+NOT yet bench-tested -- `raycast`. They are what a developer copies
 from; the conformance suite below is what proves the firmware. Nothing in
 them asserts anything.
 
-All six ran correctly on hardware on 2026-08-25, first bench round, no
+The first six ran correctly on hardware on 2026-08-25, first bench round, no
 defects found and no firmware change needed -- the card was already running
 `src:cf073b3a`. That is the result the PC rendering was for: six programs
 went from written to hardware-verified in one round rather than six.
@@ -1030,7 +1126,7 @@ is worse than tearing.
 
 ## The class 0 conformance suite (written 2026-08-24, HARDWARE-VERIFIED)
 
-Six self-verdicting PRGs (`Source/TestPRG/gpu64_test_*.a`) plus a PC oracle
+Eight self-verdicting PRGs (`Source/TestPRG/gpu64_test_*.a`) plus a PC oracle
 (`tools/prgsim/`), run with `tools/testprg.sh`. Full usage in
 [hw_testing.md](hw_testing.md#the-api-conformance-suite).
 
@@ -1312,3 +1408,276 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
   if it comes back.
 
 ## To be continued...
+
+## 8a. `DRAW_WALLS` -- gpu64 does the projection (written 2026-08-25, host-verified only)
+
+**The bench round that closed section 8** ran the eight-program conformance
+suite on hardware and every line was green, so class 2 does on the real bus
+what the document says. The raycast demo, which uses the same opcodes, does
+not: it blinks, showing mostly an empty scene with occasional corrupted
+walls. That is unresolved and is section 8b.
+
+**What was added.** `SET_CAMERA` ($05) and `DRAW_WALLS` ($23). A wall record
+is a segment in **world** coordinates; gpu64 projects it, maps the texture
+with perspective, lights it by distance, and depth-tests every column
+against a 1/z buffer it clears itself.
+
+Why this is the step toward Doom and not a convenience: `gpu64_demo_raycast`
+spends nearly all of a frame on the per-column divide and then sends 5120
+bytes of column records across the bus to show for it. `gpu64_demo_walls`
+draws a bigger level and the 6502's entire contribution to a frame is two
+16-bit adds, one map lookup and ten bytes of camera. The level is 162 wall
+segments that never change, so its checksum is computed once at start-up and
+all 2592 bytes are verified on every frame for free -- which is what rule 3
+in CLAUDE.md asks for and what a per-frame batch cannot afford.
+
+The depth buffer is worth calling out separately. Records may arrive in any
+order; a nearer column wins. Doom needed a BSP tree to avoid exactly that
+sort, and a C64 has no time for one.
+
+**Verified, all on a PC:**
+
+- `tools/rastercheck` extended to wall scenarios -- random cameras, random
+  segments biased to straddle the near plane, illegal cameras one time in
+  ten. **2500 scenarios across five seeds, 855 of them walls, zero
+  disagreements** between the firmware core and the independently written
+  Python model, pixel for pixel and counter for counter.
+- `gpu64_test_walls` -- a new conformance program, 21 assertions, split out
+  of `gpu64_test_raster` because the two together overran the 42 result
+  slots on a C64 screen and a failure that cannot be read is not a test. Its
+  expected numbers are worked out by hand from the geometry in its own
+  header, so a red line at the bench is a firmware defect and not a
+  disagreement about what was expected. Each of the wall's four edges is
+  asserted from both sides.
+- `tools/demos.sh walls` -- renders `Source/Demos/out/walls.ppm`.
+
+**Not done:** walls run floor to ceiling at one height for the whole level.
+Varying floor and ceiling heights, two-sided walls and windows are not in
+this opcode -- they are section 8c, `DRAW_SECTORS`. (`DRAW_WALLS` itself was
+verified on hardware in the round that closed 8b, below.)
+
+## 8b. The raycast demo blinks on hardware -- CLOSED
+
+**Closed 2026-08-25.** The bench round after the instruments below were
+built came back clean: `gpu64_test_walls`, `gpu64_probe_raster` and the rest
+of the suite all green on hardware. The blink is not reproducing, and since
+`gpu64_demo_raycast` changed between the two rounds -- it now latches
+`ERRCODE` at the point of failure instead of four dispatches later -- there
+is no clean way to say which of the two changes is responsible. What the
+round does establish is that `DRAW_COLUMNS` at demo size and demo rate is
+not broken on the real bus. `gpu64_probe_raster` stays in the suite: if the
+blink comes back, it is a six-second run away from a number.
+
+The original report follows.
+
+Reported 2026-08-25 after the suite passed: mostly an empty scene, the floor
+and ceiling gradient and the status bar perfect, occasionally a frame of
+corrupted-looking walls. So class 0 and `DRAW_SPANS` are fine and it is the
+per-frame 5120-byte `DRAW_COLUMNS` batch that mostly draws nothing.
+
+**Ruled out by reading the firmware:** `gpu64_blobRead` (warms its own
+i-cache and the whole destination; the 16000-byte BLIT round trip already
+passes on hardware), `pullBatch`'s validation, `makeTarget`/`GetDrawPage`
+(re-resolved per dispatch, so a flip cannot leave a batch drawing into the
+wrong page), `cleanView`/`CleanRows`, and the IO2 write-drop floor, which at
+~1/180000 is orders of magnitude too rare to explain "most frames".
+
+**Ruled out by simulation:** the demo itself. `tools/prgsim/runsim.py` grew
+a `--stop-after=N` option because it was reporting the STOP key pressed
+after four polls, so every demo run had been about five frames long -- the
+exact blind spot `vice-validation-run-length` records. **401 frames** now
+run clean: `ACC 0140 REJ 0000 ERR OK` on every one, and the rendered frames
+are correct.
+
+**Instruments built for the next bench round**, both of which turn "it
+blinks" into a number:
+
+- `gpu64_probe_raster` -- 300 frames in about six seconds, three phases
+  differing in one axis each: 320 records with a page flip (the demo's
+  frame), 320 records with no flip, and 40 records with a flip. Per frame it
+  counts four things separately: a dispatch that did not return OK, stats
+  that do not report the batch that was sent, and a 32-pixel strip read back
+  with `READ_RECT` that is not the colour the records asked for. `ERR`
+  non-zero means the records did not arrive (the batch is checksummed);
+  `STAT` clean and `PIX` dirty means they arrived, parsed and were drawn and
+  the pixels still are not there.
+- `gpu64_demo_raycast` now latches `ERRCODE` immediately after
+  `DRAW_COLUMNS` -- four more dispatches follow it before the status bar is
+  drawn, so a failed wall batch was leaving no trace -- and prints sticky
+  `BAD`/`ERRS`/`LAST` counters on row 23. Those only ever go up, so they can
+  be read off a photograph of a screen that is misbehaving. ACC/REJ on row
+  22 are one frame's snapshot and cannot be.
+
+
+
+## 8c. `DRAW_SECTORS` -- floors, ceilings and windows (written 2026-08-25, host-verified only)
+
+**What was added.** `SET_SECTORS` ($06) and `DRAW_SECTORS` ($24). Every open
+cell of a level belongs to a sector with its own floor height, ceiling
+height, two flat colours and a light level; a wall record names a front and
+a back sector, and a wall with a back sector is **two-sided** -- it draws the
+band above the far ceiling and the band below the far floor and leaves the
+middle see-through.
+
+That is the whole of what `DRAW_WALLS` could not express, and it is the
+shape a Doom level actually has: steps, head clearance, windows, and a sky.
+
+### The one design decision worth recording
+
+**Depth had to go from per column to per pixel.** `DRAW_WALLS` keeps one
+1/z per column and lets the nearest wall own the column outright, which is
+exact only while every wall is opaque floor to ceiling. A portal is not: the
+near wall owns the band above the window and the band below it, and
+something further away owns the middle. So `DRAW_SECTORS` keeps a 320x200
+buffer of z in 8.8 -- 128 KB of static store and one `u16` compare per pixel
+written.
+
+What that buys is the property `DRAW_WALLS` bought for columns, kept: records
+may arrive in any order. Doom's BSP tree exists to produce that order, and a
+1 MHz 6502 has no time for one.
+
+`DRAW_WALLS` was left exactly as it is rather than migrated onto the new
+buffer. It had just gone green on hardware, the two are not pixel-identical
+for a closed level with `CAM_PAINT` (a per-column buffer lets the nearest
+wall suppress a farther one's flats outright), and both are documented. A
+regression traded for tidiness is a bad trade with bench time this scarce.
+
+### The bug that came out of the first demo render
+
+Floors and ceilings come out of the same loop: a flat is a horizontal plane,
+so its distance is a function of the screen row alone, which is exactly what
+makes it depth-test correctly against a wall standing on it.
+
+Two things were wrong with that, and both were visible in the first frame of
+`gpu64_demo_sectors` and in neither the conformance program nor 3400
+differential scenarios -- because both need a *level*, not a wall:
+
+1. **Nothing painted the far sector's flats inside a window.** Flats are
+   painted by the columns of the walls standing on them, and a corridor's
+   own side walls seen end-on down that corridor cover almost no columns at
+   all. A two-sided wall now paints the back sector's flats across its own
+   window.
+2. **An infinite plane stole rows in front of the wall that hides it.** The
+   corridor's ceiling at 1.0, extended infinitely, really *is* nearer than
+   the room's ceiling at 2.0 in the rows above the doorway -- so it won them,
+   and the player's own room was painted over with the ceiling of the room
+   beyond. The fix is one clamp: **the depth a flat writes is never nearer
+   than the wall whose column painted it.** The wall is the near boundary of
+   what that column can see of that sector. Lighting still uses the row's
+   true distance.
+
+That clamp is the cheap stand-in for Doom's visplane clipping, which needs a
+front-to-back order this design deliberately does not have. It reaches one
+sector through a portal; two portals deep can still leave a hole.
+
+The general lesson is the one the demos keep teaching: a differential
+harness on random primitives and a conformance program on hand-worked
+geometry both passed this. Rendering an actual level is a different test.
+
+### Verified, all on a PC
+
+- `tools/rastercheck` extended to sector scenarios -- random cameras, random
+  segments biased to straddle the near plane, sector ids out of range one
+  time in six, back sectors `$FF` half the time, an empty sector table one
+  time in ten. **3400 scenarios across ten seeds, 935 of them sectors, zero
+  disagreements** between the firmware core and the independently written
+  Python model, pixel for pixel and counter for counter.
+- `gpu64_test_sectors` -- a new conformance program, 32 assertions, its
+  expected numbers worked out by hand from the geometry in its own header.
+  Four of them are the per-pixel depth buffer specifically, including one
+  that sends the same two walls in the other order and demands the same
+  picture.
+- `gpu64_demo_sectors` -- 401 frames clean in the simulator, `ERR OK` on
+  every one, 106 wall records a frame.
+
+### A tooling fix that came with it
+
+`tools/demos.sh` was running every demo for about five frames. It passed
+`--demo` but not `--stop-after`, so the simulator's default -- STOP pressed
+on the fourth poll -- ended each run almost immediately. It now runs 400
+frames on the vblank pass. This is the third appearance of the same blind
+spot on this project; see `vice-validation-run-length`.
+
+### Not done
+
+- Flat (floor and ceiling) textures. The record format does not change for
+  them; the per-row `u`,`v` walk does.
+- Sloped floors, and a sector's light varying across it.
+
+Verified on hardware 2026-08-25: `gpu64_test_sectors` green, and the demo
+renders the level.
+
+## 8d. `DRAW_THINGS` -- sprites in the world
+
+`DRAW_SPRITE` takes a screen rectangle, so the 6502 does the projection, and
+its fifteen argument bytes are full -- there is no room for a depth. That is
+enough for a weapon and a status bar and nothing else. A Doom level's
+monsters, barrels and pickups are at *world* positions and have to be
+occluded by the walls in front of them.
+
+`DRAW_THINGS` ($25) is a batch of 16-byte records: world x, y, the absolute
+height of the sprite's bottom, its size in world units, a texture, a light
+and flags. gpu64 projects it against the same camera `DRAW_SECTORS` uses and
+depth-tests **every pixel** against the buffer `DRAW_SECTORS` filled.
+
+Two decisions worth recording:
+
+1. **Depth is written as well as tested**, at drawn pixels only. It would
+   have been cheaper to test and not write -- Doom does exactly that and
+   sorts its sprites back to front. Writing keeps the property the rest of
+   class 2 has: a batch is order-independent, and the C64 never sorts
+   anything. A masked texel writes no depth either, so a keyed-out pixel is
+   a hole in the depth as well as in the picture.
+2. **One depth per card**, not per column, as in Doom. A billboard faces the
+   camera; its distance does not vary across it.
+
+### The lifecycle hole this opened, found on the desk
+
+The depth buffer is static and starts as all zeroes -- "nearer than
+anything", which rejects every pixel. `DRAW_SECTORS` never noticed, because
+it clears the view before it draws. `DRAW_THINGS` reads a buffer it does not
+fill, so it can see the raw state, and it can also see what the *previous
+program* left there. Three things closed it:
+
+- a lazy full clear on first use, so "the depth buffer starts empty" is
+  true rather than nearly true;
+- `RASTER_RESET` empties it, so two conformance runs in one session give the
+  same answer;
+- **`FILL_VIEW` empties it over the rectangle it fills.** This is the one
+  that is a design decision and not a patch: a pixel just painted background
+  has nothing in it, so leaving last frame's depth behind would let geometry
+  that is no longer drawn go on occluding things that are. `FILL_VIEW` is
+  the op a frame starts with, and now it means it.
+
+The whole hole showed up as eleven red lines in `gpu64_test_things` on a PC,
+before any of it went near the bench.
+
+### Verified, all on a PC
+
+- `tools/rastercheck` grew a sixth scenario kind: a wall batch and then a
+  thing batch against it, so the things have something to be occluded by --
+  a thing nothing hides tests nothing. **3100 scenarios across eight seeds,
+  641 of them things, zero disagreements** between the firmware core and the
+  independently written Python model, pixel for pixel and counter for
+  counter. Plus 2000 more after the `FILL_VIEW` change.
+- `gpu64_test_things` -- 33 assertions, expected numbers worked out by hand
+  from the geometry in its own header. Four are the shared depth buffer
+  specifically, and one sends the same two things in the other order and
+  demands the same picture.
+- `gpu64_demo_sectors` -- six barrels added to the level, one of them
+  walking, 401 frames clean with `ERR OK` on every one. The corridor barrel
+  is cut off at its base by the step it stands behind, which is the thing
+  that would have been wrong if the two opcodes did not share a buffer.
+
+### On hardware
+
+Verified 2026-08-25, the same round as 8c: `gpu64_test_things` green,
+`gpu64_test_sectors` still green after the `FILL_VIEW` change, and
+`gpu64_demo_sectors` rendering the barrels correctly occluded by the level.
+
+### Not done
+
+- Things are not clipped to the sector they stand in, so a thing taller than
+  a corridor pokes through its ceiling. Doom behaves the same way.
+- Nothing tells the C64 which things are visible, so a level with a thousand
+  of them sends a thousand records a frame.

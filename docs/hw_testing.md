@@ -78,10 +78,48 @@ transposed signs in the Euler matrix, a bug that presents as a perspective
 artefact rather than as a maths error and would have cost a whole session to
 chase on hardware.
 
+## Testing the class 2 raster core without hardware
+
+The same trick, differently aimed. `Source/Firmware/gpu64_raster_core.cpp`
+is the whole of class 2's pixel work and depends on nothing but
+`<circle/types.h>`, so `tools/rastercheck` compiles it natively and renders
+randomised scenarios through it -- and through the independent reference
+model in `tools/prgsim/gpu64model.py`, which was written from
+[api_design.md](api_design.md) rather than from the firmware. Then it
+compares all 64000 pixels and the batch counters.
+
+```
+make -C tools/rastercheck run            # 400 scenarios
+python3 tools/rastercheck/check.py -n 5000 --seed 3
+```
+
+A disagreement is a finding either way round: either the firmware does not
+do what the document says, or the document does not say what the firmware
+does. Both are worth knowing, and both are far cheaper to find here.
+
+The scenarios deliberately concentrate on the edges a PRG can only sample a
+few of -- columns starting above the view (so `v` must be advanced across
+the clipped rows), negative `dv`, `u` past the texture width, spans naming a
+non-power-of-two texture, sprites clipped by `clipY0`/`clipY1`, masking and
+lighting. `DRAW_WALLS` scenarios add a random camera and segments biased to
+straddle the near plane, plus an illegal camera one time in ten. Do this
+before a bench trip: the first run found `DRAW_SPRITE` not counting itself
+in the stats block at all.
+
+Wall scenarios matter here more than anywhere else in class 2, because
+`DRAW_WALLS` is the only opcode whose output is arithmetic rather than a
+copy. Two people writing a perspective projection from the same paragraph
+will disagree about a rounding or a sign, and the disagreement will be one
+wrong pixel on one column at one angle. That is not findable at a bench, and
+it is findable here in a second -- which is why the model's divisions go
+through an `idiv()` that truncates toward zero the way C does, rather than
+Python's flooring `//`.
+
 ## The demonstration programs
 
-`Source/Demos/gpu64_demo_*.a` is six developer-facing programs -- `hello`,
-`palette`, `sprites`, `bounce`, `rotate`, `matrix` -- indexed in
+`Source/Demos/gpu64_demo_*.a` is nine developer-facing programs -- `hello`,
+`palette`, `sprites`, `bounce`, `rotate`, `matrix`, `raycast`, `walls` --
+indexed in
 [demos.md](demos.md). They assert nothing and reach no verdict; they are what
 a developer copies from, and on the bench they are a fast visual smoke test
 of the whole API surface. `hello` is the go/no-go: if it draws, the cartridge
@@ -94,16 +132,35 @@ tools/demos.sh              # assemble, run on the PC in both display cases
 
 Those PPMs are the expected HDMI output. Compare against them before
 concluding that hardware is wrong -- the same argument as `tools/hostsim` and
-the suite below, and it paid the same way: all six passed on hardware in a
-single round.
+the suite below, and it paid the same way: the first six passed on hardware
+in a single round. `raycast` has been on the bench and blinks -- see the
+progress tracker, section 8b. `walls` is newer still and has never run on
+hardware.
+
+**Run a demo long before believing it.** `runsim.py` reports the STOP key
+pressed after four polls, and a demo polls it once a frame, so the default
+run is about five frames. That is not a check:
+
+```
+python3 tools/prgsim/runsim.py Source/Demos/gpu64_demo_walls.prg \
+        --demo --stop-after=400 --frame-log --max=2000000000
+```
+
+`--frame-log` prints one line per page flip -- the frame number, the drawn
+page's non-zero pixel count and whatever the demo has written on the C64's
+status rows -- and `--ppm-frame=N:PATH` writes the page being flipped away at
+frame N. This is what a demo that misbehaves only after a while looks like on
+a PC, and `vice-validation-run-length` is the note about why four frames was
+never going to find one.
 
 Deploy by copying the `.prg` files into `RAD_PRG/` on the card. RAD reads
 those at launch time, so unlike the kernel image they never go stale.
 
 ## The API conformance suite
 
-`Source/TestPRG/gpu64_test_*.a` is a six-program suite that checks class 0
-against [api_design.md](api_design.md) and prints its own verdict. It exists
+`Source/TestPRG/gpu64_test_*.a` is a ten-program suite that checks class 0
+and class 2 against [api_design.md](api_design.md) and prints its own
+verdict. It exists
 so that a bench session starts from a known-good baseline instead of from a
 demo that looks about right.
 
@@ -115,6 +172,10 @@ demo that looks about right.
 | `gpu64_test_math` | `$80`–`$86`, 8.8 fixed point: products, rounding on both signs, saturation, inverse, and `SINGULAR` leaving the destination untouched |
 | `gpu64_test_float` | `$90`–`$96`, IEEE 754: the same shapes, as the control for the fixed-point rounding cases |
 | `gpu64_test_pages` | `SET_DRAW_PAGE`, both forms of `PAGE_FLIP`, `VBLANK_ARM`/`ACK`/`SYNC` — and it adapts to a display with no frame clock |
+| `gpu64_test_raster` | Class 2 end to end: the view rectangle, texture upload rules, both batch kinds read back pixel by pixel, clipping with `v` advanced across the dropped rows, rejected records against `RASTER_STATS`, the batch checksum passing and failing, `DRAW_SPRITE` scaling and clipping, and the colormap |
+| `gpu64_test_walls` | `SET_CAMERA`'s three refusals, and `DRAW_WALLS` against geometry worked out by hand: a flat-on wall at a known distance, each of its four edges asserted from both sides, a back face and a wall behind the camera counted as rejections, and `CAM_PAINT` filling the ceiling and floor of the columns a wall covers and no others |
+| `gpu64_test_sectors` | `SET_SECTORS`' three refusals, and `DRAW_SECTORS` against geometry worked out by hand: a one-sided wall's four edges from both sides, a portal's upper band, window and lower band at their exact rows, and four assertions on the **per-pixel** depth buffer -- a far wall visible through the window, losing to the near wall's lower band in the rows they share, at its own width, and unchanged when the two records are sent in the other order. Those four are the ones a per-column depth buffer would fail |
+| `gpu64_test_things` | `DRAW_THINGS` against the same hand-worked geometry: a billboard's four screen edges at a known distance, the five malformed records that are rejected and the well-formed one that clips away and is not, a thing behind a wall and a thing in front of one, two things in either order, `THING_NODEPTH`, and the four quadrants of a 2x2 texture plus `FLIPX` and the mask key. The wall assertions are the ones that matter: they only pass if `DRAW_SECTORS` and `DRAW_THINGS` really share one depth buffer |
 
 Each prints one line per assertion — a name and either `OK` or `F<hex>` — and
 a verdict line at the bottom. **The fail code is the byte that was wrong**,
@@ -132,7 +193,7 @@ Results stay on screen until RUN/STOP, which also clears it so BASIC's
 ### Desk-check before the bench
 
 ```
-tools/testprg.sh                # assemble all six and desk-check them
+tools/testprg.sh                # assemble all ten and desk-check them
 tools/testprg.sh -v system      # ...and print the screen it produced
 ```
 
@@ -276,6 +337,40 @@ a **64-byte** transfer. 64 bytes is inside any warm window, so the cold-line
 defect cannot reach it; and three in seven is orders of magnitude above the
 ~1/35000 register-write drop rate. `gpu64_probe_reu` was written to measure
 it: see below.
+
+### gpu64_probe_raster -- the class 2 frame loop
+
+`Source/TestPRG/gpu64_probe_raster.a`. Written for the raycast blink and
+useful for any class 2 batch defect that only shows up over frames. 300
+frames in about six seconds, three phases differing in exactly one axis:
+
+| Phase | Records | Flip | Isolates |
+|---|---|---|---|
+| `BIG` | 320 | yes | the demo's own frame shape |
+| `NOFL` | 320 | no | whether the fault is in the page flip |
+| `SML` | 40 | yes | whether the fault scales with the size of the pull |
+
+Nothing in it is random and nothing in it moves: the same checksummed batch
+is drawn every frame and the expected pixels are a constant, so a screen
+that is right on frame 1 and wrong on frame 40 has no explanation other than
+the frame loop. Each phase counts four things separately, and which one
+moves is the answer:
+
+- `ERR` -- a dispatch did not return OK. The batch carries a checksum, so a
+  pull that arrived damaged appears here as `BAD ARGS` ($04) rather than as
+  garbage. This separates "the records did not arrive" from everything else.
+- `STAT` -- OK returned, but `RASTER_STATS` does not report the batch that
+  was sent. The records arrived and the parse disagreed with what was
+  written.
+- `PIX` -- stats perfect and the pixels still are not there. A 32-pixel
+  strip is read back with `READ_RECT` every frame and compared to the colour
+  the records asked for.
+- `1ST` -- the first frame of the phase on which anything went wrong, so a
+  late onset is visible as a number rather than as a feeling.
+
+All zero on all three phases is clean. `PIX 0064` on `BIG` with `ERR 0000`
+and `STAT 0000` means every frame drew nothing while claiming to have drawn
+everything -- which is what the raycast demo looks like.
 
 ### gpu64_probe_reu
 

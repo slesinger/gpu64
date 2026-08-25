@@ -7,4 +7,9 @@
 # gpu64 host sim: build product and rendered output
 tools/hostsim/hostsim
 tools/hostsim/out/
+
+# gpu64 rastercheck: build product and scratch scenario
+tools/rastercheck/rastercheck
+tools/rastercheck/out/
+tools/rastercheck/.scenario.bin
 __pycache__/

@@ -213,8 +213,9 @@ start
 	#check "BAD OP FF"
 
 	; A class this firmware does not implement. CMD_HI is sticky, so this
-	; also proves it can be moved off 0 and back.
-	lda #2
+	; also proves it can be moved off 0 and back. Class 3 rather than 2:
+	; class 2 is the raster layer and answers opcode $00 for real.
+	lda #3
 	sta CMD_HI
 	lda #OP_NOP
 	sta CMD_LO

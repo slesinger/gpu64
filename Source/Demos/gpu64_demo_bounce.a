@@ -7,7 +7,7 @@
 ;            {__       {__       {__            {__
 ;              {_________         {______________		Expansion Unit
 ;
-;      gpu64 demo 4 of 6 -- BOUNCE: the tear-free animation skeleton.
+;      gpu64 demo 4 of 7 -- BOUNCE: the tear-free animation skeleton.
 ;
 ;      This is the loop to copy into your own program. Everything else is
 ;      eight bouncing squares and a sweeping bar, which exist only so that
