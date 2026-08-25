@@ -1,0 +1,440 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 -- API conformance suite 5/6: the floating-point matrix ops.
+;
+;      WHAT THIS TESTS
+;
+;      Opcodes $90-$96: the same seven operations as $80-$86, on 32-bit IEEE
+;      754 singles instead of 8.8 fixed point. Four bytes an element,
+;      little-endian, identical layouts, and the low nibble picks the
+;      operation in both sets -- so $85 and $95 are both MAT_IDENTITY and
+;      the only difference is what an element is.
+;
+;      That symmetry is itself under test here. Every shape in this program
+;      matches one in gpu64_test_math, deliberately, so the two files can be
+;      read side by side and any place where the two sets diverge is
+;      visible. Where the answers differ, it is because the FORMAT differs,
+;      and each of those is called out:
+;
+;        NO SATURATION. 127.0 + 127.0 is 254.0 here. In 8.8 it clamps to
+;        $7FFF, because 254 is outside +-127.99. Nothing clamps in float
+;        until the exponent runs out, which is far outside anything this
+;        API will produce.
+;
+;        NO ROUNDING LOSS ON NEGATIVES. -1.0 times 1.0 is exactly -1.0.
+;        The fixed-point set has to round a wide accumulator back down to
+;        8.8 and can get the sign case wrong; float never does, so this
+;        file is the control against which that one is read. If ROUND NEG
+;        fails in test 4 and MUL MINUS ONE passes here, the fault is in the
+;        fixed-point rounding and nowhere else.
+;
+;        ELEMENT SIZE FEEDS THE BOUNDS. A 128x128 identity is 65536 bytes
+;        in float and only 32768 in 8.8, so the same call that is legal
+;        there is OUT_OF_RANGE here.
+;
+;      Every operand and every expected value is exactly representable in
+;      binary -- halves, quarters and eighths -- so nothing in this file
+;      depends on a tolerance. A float test that needs a tolerance is a
+;      float test that will one day fail for a reason nobody can explain.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+MC	= $3000
+MC2	= $3400
+
+; IEEE 754 single precision, as the 32-bit pattern.
+E0	= $00000000
+E1	= $3f800000
+E2	= $40000000
+E3	= $40400000
+E4	= $40800000
+E5	= $40a00000
+E6	= $40c00000
+E8	= $41000000
+EHALF	= $3f000000
+EQTR	= $3e800000
+EEIGHTH	= $3e000000
+EM1	= $bf800000
+EM2	= $c0000000
+E1_5	= $3fc00000
+E2_25	= $40100000
+E1_125	= $3f900000
+E100	= $42c80000
+E200	= $43480000
+E2_5	= $40200000
+E1_25	= $3fa00000
+EMHALF	= $bf000000
+EMQTR	= $be800000
+E127	= $42fe0000
+EM127	= $c2fe0000
+E254	= $437e0000
+EM254	= $c37e0000
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 5 - FLOAT MATH"
+
+; ----------------------------------------------------------------------
+; MAT_IDENTITY.
+; ----------------------------------------------------------------------
+
+	#poison MC, 36
+	#argb 0, 3
+	#argcd 1, SPACE_C64, MC
+	lda #OP_FLT_IDENTITY
+	jsr cmd0
+	#wantOk
+	#check "IDENTITY"
+
+	#clracc
+	#expectd MC+0, E1			; (0,0)
+	#expectd MC+4, E0
+	#expectd MC+16, E1			; (1,1)
+	#expectd MC+32, E1			; (2,2)
+	#expectd MC+8, E0			; (0,2)
+	#expectd MC+24, E0			; (2,0)
+	#useacc
+	#check "IDENT EXACT"
+
+; ----------------------------------------------------------------------
+; MAT_MUL.
+; ----------------------------------------------------------------------
+
+	#poison MC2, 12
+	#argb 0, 3
+	#argb 1, 3
+	#argb 2, 1
+	#argcd 3, SPACE_C64, MC
+	#argcd 7, SPACE_C64, vec3
+	#argcd 11, SPACE_C64, MC2
+	lda #OP_FLT_MUL
+	jsr cmd0
+	#wantOk
+	#check "MUL VECTOR"
+
+	#setptr P1, vec3
+	#setptr P2, MC2
+	#setlen 12
+	jsr kitCmp
+	#check "MUL IDENTITY"
+
+	; The same 2x2 product test 4 does in 8.8, to the same four answers.
+	#poison MC2, 16
+	#argb 0, 2
+	#argb 1, 2
+	#argb 2, 2
+	#argcd 3, SPACE_C64, mulA
+	#argcd 7, SPACE_C64, mulB
+	#argcd 11, SPACE_C64, MC2
+	lda #OP_FLT_MUL
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, E2_25			; 2*1 + 0.5*0.5
+	#expectd MC2+4, E4			; 2*2 + 0.5*0
+	#expectd MC2+8, E1_125			; 1*1 + 0.25*0.5
+	#expectd MC2+12, E2			; 1*2 + 0.25*0
+	#useacc
+	#check "MUL 2X2"
+
+; ----------------------------------------------------------------------
+; The control for test 4's rounding cases. See the header: these passing
+; while the 8.8 equivalents fail localises the fault precisely.
+; ----------------------------------------------------------------------
+
+	#poison MC2, 8
+	#argb 0, 1
+	#argb 1, 1
+	#argb 2, 2
+	#argcd 3, SPACE_C64, rowNeg
+	#argcd 7, SPACE_C64, rowHalf
+	#argcd 11, SPACE_C64, MC2
+	lda #OP_FLT_MUL
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, EMHALF			; -1.0 * 0.5
+	#expectd MC2+4, EMQTR			; -1.0 * 0.25
+	#useacc
+	#check "ROUND NEG"
+
+	#poison MC2, 4
+	#argb 0, 1
+	#argb 1, 1
+	#argb 2, 1
+	#argcd 3, SPACE_C64, rowNeg
+	#argcd 7, SPACE_C64, rowPos
+	#argcd 11, SPACE_C64, MC2
+	lda #OP_FLT_MUL
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, EM1
+	#useacc
+	#check "MUL MINUS ONE"
+
+; ----------------------------------------------------------------------
+; No saturation. Both of these clamp in 8.8 and neither does here.
+; ----------------------------------------------------------------------
+
+	#poison MC2, 4
+	#argb 0, 1
+	#argb 1, 1
+	#argb 2, 1
+	#argcd 3, SPACE_C64, row100
+	#argcd 7, SPACE_C64, rowTwo
+	#argcd 11, SPACE_C64, MC2
+	lda #OP_FLT_MUL
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, E200			; 200.0, not a clamp
+	#useacc
+	#check "NO SAT MUL"
+
+	#poison MC2, 8
+	#argb 0, 1
+	#argb 1, 2
+	#argcd 2, SPACE_C64, satA
+	#argcd 6, SPACE_C64, satA
+	#argcd 10, SPACE_C64, MC2
+	lda #OP_FLT_ADD
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, E254			; 127.0 + 127.0
+	#expectd MC2+4, EM254
+	#useacc
+	#check "NO SAT ADD"
+
+; ----------------------------------------------------------------------
+; MAT_ADD, MAT_SUB, MAT_SCALE.
+; ----------------------------------------------------------------------
+
+	#poison MC2, 8
+	#argb 0, 1
+	#argb 1, 2
+	#argcd 2, SPACE_C64, addA
+	#argcd 6, SPACE_C64, addB
+	#argcd 10, SPACE_C64, MC2
+	lda #OP_FLT_ADD
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, E1_5			; 1.0 + 0.5
+	#expectd MC2+4, E1			; 2.0 + -1.0
+	#useacc
+	#check "ADD"
+
+	#poison MC2, 8
+	#argb 0, 1
+	#argb 1, 2
+	#argcd 2, SPACE_C64, addA
+	#argcd 6, SPACE_C64, addB
+	#argcd 10, SPACE_C64, MC2
+	lda #OP_FLT_SUB
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, EHALF			; 1.0 - 0.5
+	#expectd MC2+4, E3			; 2.0 - -1.0
+	#useacc
+	#check "SUB"
+
+	; The scalar is inline and four bytes wide here, ARG10-13, where the
+	; 8.8 set uses two. That difference is the only one in the whole
+	; argument block.
+	#poison MC2, 8
+	#argb 0, 1
+	#argb 1, 2
+	#argcd 2, SPACE_C64, scaleA
+	#argcd 6, SPACE_C64, MC2
+	#argb 10, <(E2_5)
+	#argb 11, >(E2_5)
+	#argb 12, `(E2_5)
+	#argb 13, (E2_5) >> 24
+	lda #OP_FLT_SCALE
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, E2_5			; 1.0 * 2.5
+	#expectd MC2+4, E1_25			; 0.5 * 2.5
+	#useacc
+	#check "SCALE"
+
+; ----------------------------------------------------------------------
+; MAT_TRANSPOSE.
+; ----------------------------------------------------------------------
+
+	#poison MC2, 24
+	#argb 0, 2
+	#argb 1, 3
+	#argcd 2, SPACE_C64, trA
+	#argcd 6, SPACE_C64, MC2
+	lda #OP_FLT_TRANSPOSE
+	jsr cmd0
+	#clracc
+	#expectd MC2+0, E1
+	#expectd MC2+4, E4
+	#expectd MC2+8, E2
+	#expectd MC2+12, E5
+	#expectd MC2+16, E3
+	#expectd MC2+20, E6
+	#useacc
+	#check "TRANSPOSE"
+
+; ----------------------------------------------------------------------
+; MAT_INVERSE. A diagonal matrix of powers of two, so the inverse is
+; exactly representable and no tolerance is needed.
+; ----------------------------------------------------------------------
+
+	#poison MC2, 36
+	#argb 0, 3
+	#argcd 1, SPACE_C64, invA
+	#argcd 5, SPACE_C64, MC2
+	lda #OP_FLT_INVERSE
+	jsr cmd0
+	#wantOk
+	#check "INVERSE"
+
+	#clracc
+	#expectd MC2+0, EHALF			; 1/2
+	#expectd MC2+16, EQTR			; 1/4
+	#expectd MC2+32, EEIGHTH		; 1/8
+	#expectd MC2+4, E0
+	#expectd MC2+28, E0
+	#useacc
+	#check "INVERSE EXACT"
+
+	; ...and the round trip: A times its own inverse is the identity.
+	#poison MC, 36
+	#argb 0, 3
+	#argb 1, 3
+	#argb 2, 3
+	#argcd 3, SPACE_C64, invA
+	#argcd 7, SPACE_C64, MC2
+	#argcd 11, SPACE_C64, MC
+	lda #OP_FLT_MUL
+	jsr cmd0
+	#clracc
+	#expectd MC+0, E1
+	#expectd MC+16, E1
+	#expectd MC+32, E1
+	#expectd MC+4, E0
+	#expectd MC+20, E0
+	#useacc
+	#check "INVERSE ROUND"
+
+	#poison MC2, 16
+	#argb 0, 2
+	#argcd 1, SPACE_C64, singA
+	#argcd 5, SPACE_C64, MC2
+	lda #OP_FLT_INVERSE
+	jsr cmd0
+	#wantErr ERR_SINGULAR
+	#check "SINGULAR"
+
+	#setptr P1, MC2
+	#setlen 16
+	lda #$aa
+	sta kitVal
+	jsr kitChkFill
+	#check "SINGULAR KEPT"
+
+; ----------------------------------------------------------------------
+; Argument validation, including the one bound that differs from the 8.8
+; set purely because an element is twice as wide.
+; ----------------------------------------------------------------------
+
+	#argb 0, 0
+	#argcd 1, SPACE_C64, MC2
+	lda #OP_FLT_IDENTITY
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "IDENTITY N0"
+
+	#argb 0, 0
+	#argb 1, 2
+	#argb 2, 2
+	#argcd 3, SPACE_C64, mulA
+	#argcd 7, SPACE_C64, mulB
+	#argcd 11, SPACE_C64, MC2
+	lda #OP_FLT_MUL
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "MUL M0"
+
+	; 128 x 128 x 4 bytes is 65536 -- one past what a blob can carry.
+	#argb 0, 128
+	#argcd 1, SPACE_C64, $4000
+	lda #OP_FLT_IDENTITY
+	jsr cmd0
+	#wantErr ERR_OUT_OF_RANGE
+	#check "128 TOOBIG"
+
+	; The identical call in 8.8 is 32768 bytes and is fine, which is the
+	; whole point: the bound is on bytes, not on dimensions.
+	#argb 0, 128
+	#argcd 1, SPACE_C64, $4000
+	lda #OP_MAT_IDENTITY
+	jsr cmd0
+	#wantOk
+	#check "128 FITS 8.8"
+
+	#argb 0, 3
+	#argcd 1, 9, MC2
+	lda #OP_FLT_IDENTITY
+	jsr cmd0
+	#wantErr ERR_OUT_OF_RANGE
+	#check "BAD SPACE"
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+; Operands. Row-major, little-endian, four bytes an element.
+; ----------------------------------------------------------------------
+
+vec3	.dword E1, E2, E3
+
+mulA	.dword E2, EHALF			; [ 2.0  0.5 ]
+	.dword E1, EQTR				; [ 1.0  0.25]
+mulB	.dword E1, E2				; [ 1.0  2.0 ]
+	.dword EHALF, E0			; [ 0.5  0.0 ]
+
+rowPos	.dword E1
+rowNeg	.dword EM1
+rowTwo	.dword E2
+row100	.dword E100
+rowHalf	.dword EHALF, EQTR
+
+addA	.dword E1, E2
+addB	.dword EHALF, EM1
+satA	.dword E127, EM127
+scaleA	.dword E1, EHALF
+
+trA	.dword E1, E2, E3			; [ 1 2 3 ]
+	.dword E4, E5, E6			; [ 4 5 6 ]
+
+invA	.dword E2, E0, E0			; diag( 2, 4, 8 )
+	.dword E0, E4, E0
+	.dword E0, E0, E8
+singA	.dword E1, E2
+	.dword E2, E4
+
+	.include "gpu64_testkit_rt.inc"

@@ -3,3 +3,8 @@
 
 # generated per-build by tools/build.sh (stamped into the boot log)
 /Source/Firmware/build_id.h
+
+# gpu64 host sim: build product and rendered output
+tools/hostsim/hostsim
+tools/hostsim/out/
+__pycache__/

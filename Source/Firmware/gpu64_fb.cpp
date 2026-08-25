@@ -84,10 +84,10 @@ boolean CGpu64FrameBuffer::Initialize( void )
 		return FALSE;
 
 	for ( unsigned i = 0; i < 16; i++ )
-		m_pFB->SetPalette32( (u8)i, PackRGB( c64Palette[ i ][ 0 ], c64Palette[ i ][ 1 ], c64Palette[ i ][ 2 ] ) );
+		SetPaletteEntry( (u8)i, c64Palette[ i ][ 0 ], c64Palette[ i ][ 1 ], c64Palette[ i ][ 2 ] );
 	for ( unsigned i = 16; i < 255; i++ )
-		m_pFB->SetPalette32( (u8)i, PackRGB( 0, 0, 0 ) );
-	m_pFB->SetPalette32( GPU64_LOG_INK, PackRGB( 255, 255, 255 ) );
+		SetPaletteEntry( (u8)i, 0, 0, 0 );
+	SetPaletteEntry( GPU64_LOG_INK, 255, 255, 255 );
 
 	if ( !m_pFB->Initialize() )
 		return FALSE;
@@ -409,6 +409,12 @@ void CGpu64FrameBuffer::ReadRect( u8 *pDst, unsigned x, unsigned y, unsigned w, 
 
 void CGpu64FrameBuffer::SetPaletteEntry( u8 nIndex, u8 r, u8 g, u8 b )
 {
+	// The shadow is updated even when there is no framebuffer, so
+	// BUILD_COLORMAP sees the same palette a display would have shown.
+	m_Palette[ nIndex * 3 + 0 ] = r;
+	m_Palette[ nIndex * 3 + 1 ] = g;
+	m_Palette[ nIndex * 3 + 2 ] = b;
+
 	if ( m_pFB == 0 )
 		return;
 	m_pFB->SetPalette32( nIndex, PackRGB( r, g, b ) );

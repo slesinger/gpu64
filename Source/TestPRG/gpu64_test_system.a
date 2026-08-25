@@ -1,0 +1,441 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 -- API conformance suite 1/6: system ops, the info block, and
+;      the error codes.
+;
+;      WHAT THIS TESTS
+;
+;      The parts of class 0 that have nothing to do with pixels: liveness,
+;      what gpu64 says about itself, and -- most of the file -- whether the
+;      documented error codes are actually produced.
+;
+;      That last part is the reason this program exists first. An error code
+;      that has never come back off the bus is not an implemented error
+;      code, it is a constant in a header. Every failure mode class 0
+;      defines is provoked here on purpose: a bad opcode, a bad class, a
+;      descriptor that runs off the end of C64 RAM, a descriptor whose space
+;      is neither 0 nor 1, a length that disagrees with the shape it
+;      describes, and a flag byte outside its defined values. A command that
+;      answers OK where one of those was demanded fails as $FE, so a missing
+;      check can never be mistaken for a pass.
+;
+;      It also pins the info block field by field. GET_INFO is how a program
+;      discovers the geometry it is drawing into, so every field being right
+;      is load-bearing for anything written against the API rather than
+;      against this specific build.
+;
+;      HOW TO READ THE RESULT
+;
+;      Rows 2-22, two columns. Each line is a name and either OK or F<hex>,
+;      where the hex is the byte that was wrong -- almost always the ERRCODE
+;      that came back. Row 24 carries the counts and the verdict.
+;
+;      FRAMEPERIOD shows a number, not a verdict: the measured frame period
+;      in microseconds. $4E20 is 20000us, a PAL 50Hz display; around $411B
+;      is NTSC. Zero means the frame clock never calibrated at boot, and
+;      every vblank feature will answer UNSUPPORTED.
+;
+;      It is deliberately NOT judged. Whether a display could be measured at
+;      boot is a property of the display, not a conformance question about
+;      the firmware, and failing the suite for it would train a tester to
+;      ignore a red line. gpu64_test_pages reads the same field and adjusts
+;      what it demands of every vblank feature accordingly, which is the
+;      behaviour a real program has to have as well.
+;
+;      Requires the RAD menu switched to REU mode with T. Class 0 only, so
+;      it does not need a firmware built with GPU64_3D_ENABLED.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+INFO	= $2000				; 16-byte info block lands here
+PALBUF	= $2100				; 16 RGB triples
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 1 - SYSTEM"
+
+; ----------------------------------------------------------------------
+; Liveness.
+; ----------------------------------------------------------------------
+
+	lda #OP_NOP
+	jsr cmd0
+	#wantOk
+	#check "NOP"
+
+; ----------------------------------------------------------------------
+; The info block.
+;
+; GET_INFO does not answer through the register window -- it writes 16
+; bytes into memory the caller nominates, which is the same destination
+; descriptor every producing command uses. So this is also the first test
+; that a blob write reaches C64 RAM at all.
+; ----------------------------------------------------------------------
+
+	; Poison the buffer first. Without this, a GET_INFO that wrote nothing
+	; at all could pass on whatever happened to be there.
+	#setptr P1, INFO
+	#setlen 16
+	lda #$5a
+	sta kitVal
+	jsr kitFill
+
+	#argblob 0, SPACE_C64, INFO, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "GET INFO"
+
+	#clracc
+	#expectb INFO+0, $47			; 'G'
+	#expectb INFO+1, $36			; '6'
+	#expectb INFO+2, $34			; '4'
+	#useacc
+	#check "INFO MAGIC"
+
+	#clracc
+	#expectb INFO+3, 1			; version major
+	#useacc
+	#check "INFO VERSION"
+
+	#clracc
+	#expectw INFO+5, FB_W
+	#expectw INFO+7, FB_H
+	#useacc
+	#check "INFO SIZE"
+
+	#clracc
+	#expectb INFO+9, 8			; bits per pixel
+	#expectb INFO+10, FB_PAGES
+	#useacc
+	#check "INFO FORMAT"
+
+	#clracc
+	#expectb INFO+12, BORDER_W
+	#expectb INFO+13, BORDER_H
+	#useacc
+	#check "INFO BORDER"
+
+	; bit0 = class 0. Only bit0 is demanded: bit1 depends on whether this
+	; firmware was built with GPU64_3D_ENABLED, which is a build option, not
+	; a conformance question.
+	lda INFO+11
+	and #$01
+	jsr kitWantSet
+	#check "INFO CLASSES"
+
+	; Reported, not judged -- see the header.
+	#showw INFO+14, "FRAMEPERIOD"
+
+; ----------------------------------------------------------------------
+; Descriptor validation.
+;
+; The three ways a blob descriptor can be wrong, each provoked on its own so
+; a single over-broad check cannot cover for a missing one.
+; ----------------------------------------------------------------------
+
+	; len below the 16 the info block needs.
+	#argblob 0, SPACE_C64, INFO, 15
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "INFO SHORT"
+
+	; space is neither 0 nor 1.
+	#argblob 0, 2, INFO, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantErr ERR_OUT_OF_RANGE
+	#check "BAD SPACE"
+
+	; addr + len past the end of C64 RAM. No clamping, no wraparound.
+	#argblob 0, SPACE_C64, $fff8, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantErr ERR_OUT_OF_RANGE
+	#check "ADDR OVERRUN"
+
+	; The boundary case on the good side: the last 16 bytes of the space
+	; are addressable. $FFF0 + 16 is exactly 65536, which must be allowed --
+	; an off-by-one in the bounds check shows up here and nowhere else.
+	; The write lands under the KERNAL ROM, in RAM the CPU cannot see with
+	; the default banking, so nothing is read back -- only the code matters.
+	#argblob 0, SPACE_C64, $fff0, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "ADDR LIMIT"
+
+; ----------------------------------------------------------------------
+; Opcode and class validation.
+; ----------------------------------------------------------------------
+
+	lda #$0a				; gap between VBLANK_SYNC and CLEAR
+	jsr cmd0
+	#wantErr ERR_BAD_OPCODE
+	#check "BAD OP 0A"
+
+	lda #$6f				; gap between READ_RECT and the math set
+	jsr cmd0
+	#wantErr ERR_BAD_OPCODE
+	#check "BAD OP 6F"
+
+	lda #$a0				; first opcode past the math set
+	jsr cmd0
+	#wantErr ERR_BAD_OPCODE
+	#check "BAD OP A0"
+
+	lda #$ff
+	jsr cmd0
+	#wantErr ERR_BAD_OPCODE
+	#check "BAD OP FF"
+
+	; A class this firmware does not implement. CMD_HI is sticky, so this
+	; also proves it can be moved off 0 and back.
+	lda #2
+	sta CMD_HI
+	lda #OP_NOP
+	sta CMD_LO
+	lda ERRCODE
+	#wantErr ERR_BAD_CLASS
+	#check "BAD CLASS"
+
+	lda #7
+	sta CMD_HI
+	lda #OP_NOP
+	sta CMD_LO
+	lda ERRCODE
+	#wantErr ERR_BAD_CLASS
+	#check "BAD CLASS 7"
+
+; ----------------------------------------------------------------------
+; ERRCODE and STATUS discipline.
+;
+; ERRCODE is written by every dispatch, successful ones included, so a
+; stale value can never be mistaken for a fresh failure. That is a stronger
+; guarantee than "set on error" and it is worth testing directly: the
+; failure it prevents is a program seeing yesterday's error and giving up.
+; ----------------------------------------------------------------------
+
+	lda #$ff				; guarantee a non-OK ERRCODE
+	jsr cmd0
+	lda #OP_NOP
+	jsr cmd0
+	#wantOk
+	#check "ERR CLEARED"
+
+	; STATUS bit1 is simply ERRCODE != OK, in both directions.
+	lda #OP_NOP
+	jsr cmd0
+	lda STATUS
+	and #ST_ERROR
+	jsr kitWantClear
+	#check "STATUS OK"
+
+	lda #$ff
+	jsr cmd0
+	lda STATUS
+	and #ST_ERROR
+	jsr kitWantSet
+	#check "STATUS ERR"
+
+; ----------------------------------------------------------------------
+; Flag bytes.
+;
+; Every one-byte flag argument in class 0 has exactly two legal values, and
+; anything else is BAD_ARGS. Each is checked on both sides of that line.
+; ----------------------------------------------------------------------
+
+	#argb 0, 1
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#wantOk
+	#check "DRAWPAGE 1"
+
+	#argb 0, 0
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#wantOk
+	#check "DRAWPAGE 0"
+
+	#argb 0, 2
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "DRAWPAGE 2"
+
+	#argb 0, 1
+	lda #OP_LOG_ENABLE
+	jsr cmd0
+	#wantOk
+	#check "LOG ON"
+
+	#argb 0, 0
+	lda #OP_LOG_ENABLE
+	jsr cmd0
+	#wantOk
+	#check "LOG OFF"
+
+	#argb 0, 2
+	lda #OP_LOG_ENABLE
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "LOG 2"
+
+	#argb 0, 2
+	lda #OP_VBLANK_ARM
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "ARM 2"
+
+	#argb 0, 2
+	lda #OP_PAGE_FLIP
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "FLIP 2"
+
+	lda #OP_VBLANK_ACK
+	jsr cmd0
+	#wantOk
+	#check "VBLANK ACK"
+
+	#argb 0, 0
+	lda #OP_SET_BORDER
+	jsr cmd0
+	#wantOk
+	#check "SET BORDER"
+
+; ----------------------------------------------------------------------
+; The palette.
+;
+; The palette cannot be read back through the API, so what is checked here
+; is the argument contract rather than the colours. The colours themselves
+; are a visual result: gpu64_test_draw paints bars in the entries this
+; program loads.
+; ----------------------------------------------------------------------
+
+	#argb 0, 200				; index
+	#argb 1, $ff
+	#argb 2, $80
+	#argb 3, $00
+	lda #OP_PAL_SET
+	jsr cmd0
+	#wantOk
+	#check "PAL SET"
+
+	jsr makePalette
+
+	; count = 0 is specified as a no-op, not an error. The descriptor is
+	; deliberately left nonsense to prove the count is checked first.
+	#argblob 0, SPACE_C64, $ffff, $ffff
+	#argb 6, 0
+	#argb 7, 0
+	lda #OP_PAL_LOAD
+	jsr cmd0
+	#wantOk
+	#check "PAL COUNT 0"
+
+	; len must equal count * 3 exactly.
+	#argblob 0, SPACE_C64, PALBUF, 47
+	#argb 6, 100
+	#argb 7, 16
+	lda #OP_PAL_LOAD
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "PAL BAD LEN"
+
+	; first + count must not run past entry 255.
+	#argblob 0, SPACE_C64, PALBUF, 48
+	#argb 6, 250
+	#argb 7, 16
+	lda #OP_PAL_LOAD
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "PAL OVERRUN"
+
+	; ...and the boundary on the good side: 240 + 16 is exactly 256.
+	#argblob 0, SPACE_C64, PALBUF, 48
+	#argb 6, 240
+	#argb 7, 16
+	lda #OP_PAL_LOAD
+	jsr cmd0
+	#wantOk
+	#check "PAL LIMIT"
+
+	#argblob 0, SPACE_C64, PALBUF, 48
+	#argb 6, 100
+	#argb 7, 16
+	lda #OP_PAL_LOAD
+	jsr cmd0
+	#wantOk
+	#check "PAL LOAD"
+
+; ----------------------------------------------------------------------
+; Housekeeping.
+; ----------------------------------------------------------------------
+
+	lda #OP_RESET_STATE
+	jsr cmd0
+	#wantOk
+	#check "RESET STATE"
+
+	; RESET_STATE clears STATUS outright, so nothing may be left set.
+	lda STATUS
+	tax
+	#check "RESET STATUS"
+
+	; Restore the palette entries this program moved, so a suite run leaves
+	; the display in the state the next program expects.
+	lda #OP_RESET_STATE
+	jsr cmd0
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+; A 16-entry ramp, so PAL LOAD moves data that is visibly not zero.
+; ----------------------------------------------------------------------
+
+makePalette
+	ldx #0
+	ldy #0
+mpLoop
+	tya
+	asl
+	asl
+	asl
+	asl
+	sta PALBUF,x
+	inx
+	sta PALBUF,x
+	inx
+	lda #$40
+	sta PALBUF,x
+	inx
+	iny
+	cpy #16
+	bne mpLoop
+	rts
+
+	.include "gpu64_testkit_rt.inc"

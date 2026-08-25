@@ -15,6 +15,28 @@ display while the HDMI-side scene keeps rendering) — genuinely needs an
 architecture milestone 4 doesn't, and it's worth having settled before
 milestone 6 implementation starts rather than discovered mid-build.
 
+## Binding constraint: the bus drops writes
+
+Before designing anything that streams data C64-side to GPU-side, know that
+**an IO2 register write is occasionally not sampled** — roughly 1 in 35000 REU
+transfers and 1 in 180000 gpu64 command writes, with no retry and no error.
+This is pre-existing and reproduces with `GPU64_3D_ENABLED` off. See
+*IO2 write sampling* in [progress_tracker.md](progress_tracker.md) (handle
+`io2-sampling`) for the full characterisation.
+
+Three consequences bind on everything below:
+
+- **Commands need a sequence number** with a firmware-side gap detector, so a
+  dropped argument write is reported rather than executed against a
+  half-written argument block.
+- **Mesh and texture upload through REU DMA needs a checksum or a length
+  readback.** That path carries a second, larger and still unattributed defect
+  that latches to 100% failure under REU-register write pressure.
+- **Do not add per-write work to either IO2 decode path in `rad_reu.cpp`.** The
+  REU window already resets `reu.pl`/`reu.pl2` and calls `reuPrefetch()` on
+  every write; the gpu64 window deliberately does neither, and that difference
+  is why command traffic has never reproduced the latch.
+
 ## Philosophy
 
 - **Resources live and stay GPU-side.** A texture or mesh, once uploaded,
@@ -584,6 +606,7 @@ class 0, and every opcode reads exactly the byte count in its row.
 | $06 | `LOOP_START` | 1 | `ARG0` 0 = handshake, 1 = free-running | Starts the render loop. `NO_CAMERA` if none is active. |
 | $07 | `LOOP_STOP` | 0 | — | Stops it after the current frame. |
 | $08 | `SCENE_COMMIT` | 0 | — | Publishes the shadow scene; in handshake mode also flips at vblank and releases the next frame. `RESULT` = the page the just-finished frame is in. |
+| $09 | `ARENA_STATUS` | 0 | — | `RESULT` = free resource RAM in 128 KB units. Added in phase 1; see below. |
 
 #### Resources — $10-$1F
 
@@ -627,7 +650,193 @@ Legal only with the loop stopped; otherwise `BUSY`.
 | $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Returns when done. |
 | $42 | `DRAW_NODE` | 0 | — | Same, for a scene node already positioned via $30-$35 — no re-staging of a transform. |
 
+## Phase 1, as built (2026-08-24)
+
+Everything above is design. This section is the record of what the first
+implementation actually settled, including the places it departs from the
+sketch above. Status and history stay in
+[progress_tracker.md](progress_tracker.md); what is here is API and
+architecture, because a reader of this file needs it to write against the
+thing that exists.
+
+### The renderer runs on core 0, and immediate mode is why
+
+The architecture section puts the render loop on core 1. Phase 1 does not:
+`CLEAR_VIEWPORT` and `DRAW_MESH` execute synchronously on core 0, inside the
+dispatch window where the C64 is already DMA-halted, exactly like every
+class 0 draw op.
+
+This is not a retreat from the design — it falls out of what immediate mode
+already is. `DRAW_MESH` is specified to return when the mesh is drawn and to
+be illegal while the loop runs, so there is exactly one owner of the
+framebuffer and the z-buffer at any instant. Making that owner core 0 means
+the whole pipeline — transform, cull, light, clip, rasterise — can be brought
+up on hardware with the cross-core question still open, which is the same
+reason `DRAW_MESH` exists at all.
+
+The ring is still fed: every accepted class 1 command is pushed onto it and
+counted by core 1, so the cross-core path stays under real command traffic
+while the pipeline is built. Core 1 executes nothing.
+
+`LOOP_START` and `SCENE_COMMIT` answer `UNSUPPORTED` — the opcode is real and
+this build cannot do it, which is a different thing for a program to branch on
+than an opcode that does not exist. The scene-node and transform opcodes
+($20-$36) answer `BAD_OPCODE` until phase 2 implements them.
+
+### The arena is owned by core 0
+
+The Resource lifecycle section had core 1 allocating. It does not: an upload
+is a DMA pull off the C64 bus, which only core 0 can do, so core 1 allocating
+would mean core 0 pulling into a staging buffer and core 1 copying it out
+again, with a hand-off protocol to stop core 0 reusing the staging buffer too
+early. Core 0 allocating removes the copy and the protocol together, and there
+is still no lock, still for the original reason: nothing core 0 could block on.
+
+**The allocator is bump-only, so `FREE_RESOURCE` and re-upload reclaim the
+table slot but not the bytes.** The whole arena comes back at session reset.
+This is a phase-1 limit, stated rather than hidden: a program that re-uploads
+in a loop will exhaust the arena and get `OUT_OF_MEMORY`, which is at least a
+truthful error. The arena is 32 MB.
+
+Because "you get `OUT_OF_MEMORY` eventually" is truthful and undebuggable
+against 32 MB, **`ARENA_STATUS` ($09) makes the remaining space readable**:
+`RESULT` is the free arena in 128 KB units, which is exactly 0..256 for a
+32 MB arena and so fits RESULT's single byte. The HDMI log's `a####` field
+carries the same number in KB for the case where no program is driving.
+
+`Source/TestPRG/gpu64_3d_arena_test.a` drives the arena to exhaustion on
+purpose — 8192 uploads of the same 4 KB texture to the same live ID, which is
+exactly 32 MB — and asserts that the error comes back as `OUT_OF_MEMORY`. An
+error path that has never fired is not a tested error path, and this one is
+now cheap to fire.
+
+### A class 1 dispatch must re-warm the polling loop
+
+`DRAW_MESH` runs inside the dispatch window and walks a framebuffer, a
+z-buffer and up to 32 MB of arena. That evicts the caches the polling loop
+depends on, and the project already has a rule about it — rule 4 of the
+polling-loop timing rules: *"preloaded at start-up" is not durable*. A single
+class 0 `CLEAR` walking 64000 bytes was enough to evict `warmCache()`'s work;
+a renderer does far more.
+
+Two specific casualties:
+
+- **The polling loop's instruction window.** This one partly self-heals — the
+  loop rolls a `CACHE_PRELOADIKEEP` 64 bytes forward every pass across the
+  `GPU64_POLL_IPL_WINDOW` — but that is ~106 passes to come fully back, and
+  the loop runs cold for all of them.
+- **`gpu64Regs` and `gpu64Vsync`.** `warmCache()` preloads these `L1KEEP`
+  precisely because the loop touches them on every ARG write and every STATUS
+  read, and nothing re-warms them after a dispatch.
+
+`PAGE_FLIP` already faced exactly this and solved it: `gpu64_vsyncWarmCommit()`
+re-warms from the dispatch that queues the flip. That is rule 5 — warm from
+upstream, where the bus is already held. Class 1 does the same, through
+`gpu64_apiWarmPollingLoop()` (rad_reu.cpp), called at the end of every class 1
+dispatch before DMA release. The cost lands inside the window the C64 is
+already stopped for, so it is free of the rule-5 trap.
+
+It is called unconditionally rather than only after the heavy opcodes: a
+dispatch is the biggest instruction-cache consumer in the system whatever it
+does, and the warm is one window preload and two data preloads against a
+dispatch that has already paid for a DMA round trip.
+
+**Class 0's heavy opcodes have the same exposure and do not do this.** `CLEAR`,
+`BLIT` and a 64 KB blob transfer all evict the same lines, and only the flip
+path re-warms. That is a pre-existing gap, not one phase 1 introduced, and it
+is left alone here rather than changed underneath a hardware-verified path —
+but it is worth a deliberate decision rather than an omission.
+
+### The store-burst budget is not yet load-bearing — and will be
+
+`gpu64_3d_span.h` carries milestone 6a's budget and the yield that enforces
+it, and the rasteriser already chunks its inner loop at
+`GPU64_3D_SPAN_BYTES / 3` pixels (three bytes leave the core per pixel: one
+colour, two z).
+
+**None of that is under test today.** With the renderer on core 0 the C64 is
+halted for the whole render, so nothing is contending and the budget costs a
+`DSB` that protects against nothing. The moment phase 2 or phase 4 moves the
+rasteriser to core 1, the budget becomes load-bearing for the first time, and
+the constraint is hard: the limit is a **7-line store burst**, with burst
+length the only axis that matters — rate, footprint and L2 residency all
+turned out not to be. A span-filling inner loop is a long store burst by
+nature, so what the rasteriser needs is chunking, which it has, not merely a
+yield at triangle boundaries, which would be useless.
+
+Two more rules that bind core 1 the day it renders:
+
+- **Core 1 must never spin on an MMIO register while waiting for work.** Any
+  MMIO poll from a second core breaks core 0's bus timing — that was ladder
+  round 1, and it corrupted command arguments while writing zero bytes of
+  DRAM traffic. Use `CNTVCT_EL0`, which is core-local and costs no bus cycle.
+  The current worker parks on `WFE` against the generic-timer event stream,
+  which satisfies this.
+- **Core 0 must not read a line core 1 writes.** The ring's cached-tail design
+  is what satisfies this: on a ring that is not full, core 0 never touches
+  core 1's line at all. Separating the cache lines was *not* what fixed
+  milestone 6a round 10 — removing core 0's read was.
+
+### Conventions the wire format did not pin down
+
+- **Axes are left-handed**: +x right, +y up, +z away from the camera.
+- **Winding is clockwise as seen from outside the model.** A face is
+  front-facing when its normal points back towards the camera; the normal
+  comes from `cross(v1-v0, v2-v0)`. Get this backwards and every face of a
+  closed mesh is culled, which looks exactly like an upload that never
+  arrived — which is why `DRAW_MESH` returns a triangle count.
+- **A positive pitch tips a node's own +z towards -y**, so a camera with a
+  positive pitch looks *down*.
+- **Face blob byte 11 is padding.** The eleven meaningful bytes are
+  `i0,i1,i2, u0,v0,u1,v1,u2,v2, texid, flags`; the stride the design fixed at
+  12 is a power of two so faces do not straddle cache lines.
+- **A texcoord byte is a texel coordinate directly**, wrapped by the
+  rasteriser's mask — so 0..255 addresses a 256-wide texture exactly and tiles
+  a narrower one.
+- **Colormap level 15 is full brightness** and resolves to the identity; level
+  0 is 1/15 of the way up, not black, so a face turned fully away still reads
+  as its own colour rather than as a hole.
+- **The z-buffer holds `near/z`**, so a bigger value is nearer and an
+  untouched pixel (0) loses to every real fragment.
+
+### Limits the formats impose, discovered by using them
+
+- **`near` and `far` are 8.8, so the far plane cannot exceed 127.99 units.**
+  A scene lives at z=70, not z=700. Nothing in the design says otherwise; it
+  is simply not obvious until a demo is written. **This is a scale convention,
+  not a distance ceiling** — a scene is authored in units where the far plane
+  fits, exactly as a model is authored to fit the 8.8 vertex format's ±128.
+  Nothing about the pipeline stops a "kilometre" being one unit. What it does
+  mean is that the unit has to be chosen once, up front, for the whole scene.
+- **The z-buffer holds `near/z`, so depth precision is set entirely by
+  `near`.** A needlessly small near plane throws it away: half the buffer's
+  range is spent between `near` and `2 * near`, wherever that happens to be.
+  The instinct is to set near tiny so nothing ever clips; the cost is z
+  fighting everywhere else in the scene. Set it as far out as the closest
+  thing the camera will ever get to.
+- Rotation matrices are held internally in **1.15**, not 8.8. A matrix entry
+  quantised to 1/256 puts a rotating box's edge a whole pixel from where it
+  belongs at 320 px wide, and the error is systematic, so it reads as wobble.
+- `RESULT` after `DRAW_MESH` is the **triangle count**, saturated to a byte.
+  `UPLOAD_MESH` leaves the face count there.
+
+### The renderer is portable, and is tested on a PC
+
+`gpu64_3d_math`, `gpu64_3d_raster`, `gpu64_3d_colormap` and `gpu64_3d_render`
+depend on nothing but `<circle/types.h>`. `tools/hostsim` compiles them
+unchanged with a native g++ against a stubbed header and writes PPM images:
+a turning box, a z-buffer interpenetration case, a near-plane straddle, the
+flat-colour path, and the exact scene `Source/TestPRG/gpu64_3d_cube.a` asks
+for — which gives a bench run a reference picture to hold the HDMI output
+against.
+
+This is not a nicety. The first thing it found was four transposed signs in
+the Euler matrix, which do not look like a sign error: they make the matrix
+non-orthogonal, so the model *shears* as it turns and reads as a perspective
+artefact. Finding that on hardware would have cost a bench session.
+
 ## Open questions
+
 
 1. Core-split feasibility (see Architecture above) — ladder round 7's edge
    is the number `GPU64_3D_BUDGET` is provisionally guessing at. Nothing in

@@ -428,6 +428,31 @@ void gpu64_vsyncWarmCommit( void )
 	gpu64_flipWarm();
 }
 
+// gpu64: forces every cache line of a buffer resident before a DMA burst
+// walks it, and does it with real loads rather than a prfm hint -- prfm is
+// advisory and the hardware is free to drop it, and this is the one place
+// where "mostly warmed" and "warmed" differ by a corrupted byte.
+//
+// This replaced a 1024-byte warm that was the cause of the last failing
+// conformance check. An 8000-byte upload came back with a handful of wrong
+// bytes, always beyond offset 1024 -- eleven of them across five hardware
+// runs, the lowest at 1057 -- and a second, warm upload of the same data was
+// clean every time. Past the warm window every 64th store lands on a cold
+// line, the core has to read-allocate it from an SDRAM the VideoCore is also
+// using, and the stall outlasts the C64 cycle the burst is riding. The byte
+// sampled is then whatever the bus moved on to.
+//
+// Free in bus terms: the C64 is DMA-halted here, and the warm costs one load
+// per cache line against a burst that spends a whole C64 cycle per byte.
+static inline void gpu64_warmBuffer( const u8 *p, u32 len )
+{
+	__attribute__( ( unused ) ) volatile u8 forceRead;
+	for ( u32 i = 0; i < len; i += 64 )
+		forceRead = p[ i ];
+	if ( len )
+		forceRead = p[ len - 1 ];
+}
+
 // gpu64: milestone 4 blob transfers -- the "commands by reference" half of
 // the API (docs/api_design.md). A C64-space transfer is the same brief,
 // bounded DMA burst gpu64_mirrorSnapshot() above already proves on hardware,
@@ -476,15 +501,10 @@ u8 gpu64_blobRead( u8 space, u32 addr, u32 len, u8 *pDst )
 	// so nothing is racing us.
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobRead, 1024 * 2 );
 	FORCE_READ_LINEARa( (void*)gpu64_blobRead, 1024 * 2, 1024 * 2 );
-	// ...and the first stretch of the destination, so the very first store
-	// of the burst isn't a cache miss either.
-	// nWarm in a local, not inline: these are unparenthesised macro
-	// arguments, so a ternary here gets torn apart by operator precedence.
-	// Passed as `acc` to FORCE_READ_LINEARa below it produced `i < len <
-	// 1024 ? len : 1024` -- a loop condition that is always true, which hung
-	// the firmware inside a DMA hold and left the C64 halted forever.
-	const u32 nWarm = len < 1024 ? len : 1024;
-	CACHE_PRELOAD_DATA_CACHE( pDst, nWarm, CACHE_PRELOADL1KEEP )
+	// ...and the destination, ALL of it. This used to warm the first 1024
+	// bytes only, which is what made every large transfer come back with a
+	// few wrong bytes -- see gpu64_warmBuffer() above for the evidence.
+	gpu64_warmBuffer( pDst, len );
 
 	// gpu64: WAIT_FOR_CPU_HALFCYCLE first, so this catches the *transition*
 	// into the VIC half-cycle. WAIT_FOR_VIC_HALFCYCLE alone returns
@@ -551,8 +571,7 @@ u8 gpu64_blobWrite( u8 space, u32 addr, u32 len, const u8 *pSrc )
 	// so nothing is racing us.
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_blobWrite, 1024 * 2 );
 	FORCE_READ_LINEARa( (void*)gpu64_blobWrite, 1024 * 2, 1024 * 2 );
-	const u32 nWarm = len < 1024 ? len : 1024;		// see gpu64_blobRead()
-	FORCE_READ_LINEARa( pSrc, len, nWarm );
+	gpu64_warmBuffer( pSrc, len );			// all of it -- see gpu64_blobRead()
 
 	// gpu64: WAIT_FOR_CPU_HALFCYCLE first, so this catches the *transition*
 	// into the VIC half-cycle. WAIT_FOR_VIC_HALFCYCLE alone returns
@@ -577,6 +596,41 @@ u8 gpu64_blobWrite( u8 space, u32 addr, u32 len, const u8 *pSrc )
 	return GPU64_ERR_OK;
 }
 
+// gpu64: reuUsingPolling()'s own entry address, captured on the way in. Only
+// used by gpu64_apiWarmPollingLoop() below.
+static void *s_PollLoopBase = 0;
+
+// gpu64: re-warms everything the polling loop depends on and a command
+// dispatch has just evicted. Called at the end of a class 1 dispatch, with
+// the bus still held -- rule 5 in docs/progress_tracker.md's polling-loop
+// timing rules: warm from upstream, where the C64 is already stopped, never
+// at the point of use.
+//
+// Why this is needed at all is rule 4: "preloaded at start-up" is not
+// durable. A single class 0 CLEAR walking 64000 bytes was enough to evict
+// warmCache()'s work; a DRAW_MESH walks a framebuffer, a z-buffer and an
+// arena, which is far more. Two distinct casualties:
+//
+//   1. The loop's instruction window. It partly self-heals -- the loop rolls
+//      a CACHE_PRELOADIKEEP 64 bytes forward every pass -- but that is ~106
+//      passes to come fully back, and the loop runs cold for all of them.
+//   2. gpu64Regs and gpu64Vsync. rad_main.cpp's warmCache() preloads these
+//      L1KEEP precisely because the loop touches them on every ARG write and
+//      every STATUS read, and *nothing* re-warms them after a dispatch. This
+//      is the same hole gpu64_vsyncWarmCommit() already plugs for the flip
+//      commit path.
+void gpu64_apiWarmPollingLoop( void )
+{
+	if ( s_PollLoopBase )
+		CACHE_PRELOAD_INSTRUCTION_CACHE( s_PollLoopBase, GPU64_POLL_IPL_WINDOW );
+
+	CACHE_PRELOAD_DATA_CACHE( &gpu64Regs, sizeof( GPU64REGS ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64Regs, sizeof( GPU64REGS ), sizeof( GPU64REGS ) * 8 );
+
+	CACHE_PRELOAD_DATA_CACHE( &gpu64Vsync, sizeof( GPU64VSYNC ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64Vsync, sizeof( GPU64VSYNC ), sizeof( GPU64VSYNC ) * 8 );
+}
+
 #if 1
 __attribute__( ( optimize( "align-functions=256" ) ) )
 __attribute__( ( section( "section_polling" ) ) )
@@ -593,6 +647,12 @@ u8 reuUsingPolling( int step )
 	GPU64_LADDER_LOCALS
 
 	u16 ipl = 0;
+
+	// gpu64: the loop's own base address, published so a dispatch can re-warm
+	// the window it just evicted (gpu64_apiWarmPollingLoop() below). The label
+	// is local to this function, so there is no other way to reach it from
+	// another translation unit.
+	s_PollLoopBase = (void *)( && reuEmulationMainLoop );
 
 	if ( step <= 1 )
 	{

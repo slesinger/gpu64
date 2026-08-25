@@ -12,32 +12,10 @@
 
 #ifdef GPU64_3D_ENABLED
 
-// --- the store-burst budget ---------------------------------------------
-//
-// Milestone 6a's result, in one constant. Core 1 may write at most 7
-// consecutive cache lines (448 bytes) before yielding -- 8 if the target is
-// cache-resident -- or core 0's PHI-locked polling loop misses its deadline
-// and the C64 derails. Rate is not an axis and neither is working-set size;
-// only the length of an unbroken run of stores is. Full measurements:
-// docs/milestone6_3d_design.md, "The real risk: store bursts".
-//
-// 256 is the design figure rather than 448: it is 57% of the measured edge,
-// it was clean at every rate tested, and it maps onto a natural unit -- a
-// 320-pixel 8bpp scanline is 320 bytes, so one yield per scanline (or two)
-// falls out of the geometry instead of being bolted on.
-#define GPU64_3D_SPAN_BYTES		256
-
-// gpu64: the yield itself. What milestone 6a actually measured was the burst
-// *length* at which core 0 breaks -- the ladder's own pacing supplied the gap
-// between bursts, so the cheapest sufficient barrier is NOT yet a measured
-// quantity. DSB is the conservative choice: it retires the outstanding stores
-// before the next span starts, which is the property the budget assumes.
-//
-// OPEN ITEM for phase 3: bench a DMB, and a plain nothing-at-all, against a
-// real REU round-trip. If a weaker barrier holds, the rasteriser's inner loop
-// gets measurably cheaper. Do not weaken this on reasoning alone -- three
-// published diagnoses in milestone 6a were killed by later rounds.
-#define GPU64_3D_YIELD()	asm volatile( "DSB ISH" ::: "memory" )
+// The store-burst budget and the yield that enforces it now live in
+// gpu64_3d_span.h, so the portable renderer can obey the same rule while
+// still compiling for tools/hostsim. See that file for the measurement.
+#include "gpu64_3d_span.h"
 
 // --- the command ring ---------------------------------------------------
 //
@@ -122,6 +100,10 @@ struct Gpu64_3dHostStats
 
 extern Gpu64_3dHostStats gpu64_3dHost;
 
+// Core 0 side, implemented in gpu64_3d_core1.cpp next to the worker it pairs
+// with. FALSE means the ring is full, which is GPU64_ERR_QUEUE_FULL.
+boolean gpu64_3dRingPush( u8 op );
+
 // --- the resource arena -------------------------------------------------
 //
 // A bump allocator over one static block, per docs/milestone6_3d_design.md's
@@ -136,10 +118,14 @@ extern Gpu64_3dHostStats gpu64_3dHost;
 // runs.
 #define GPU64_3D_ARENA_BYTES	( 32 * 1024 * 1024 )
 
-// Owned by core 1. Core 0 never allocates -- it pushes a command and core 1
-// does the work -- so there is no lock here, and deliberately so: a lock core
-// 0 could block on would be exactly the thing the QUEUE_FULL rule exists to
-// prevent.
+// Owned by core 0, and that is a deliberate change from the design doc's
+// first sketch, which had core 1 allocating. An upload is a DMA pull off the
+// C64 bus, which only core 0 can do; making core 1 allocate would mean core 0
+// pulling into a staging buffer and core 1 copying it out again, with a
+// hand-off protocol to stop core 0 reusing the staging buffer too early. Core
+// 0 allocating and pulling straight into the arena removes the copy and the
+// protocol together. There is still no lock, and still for the original
+// reason: nothing core 0 could block on.
 void *gpu64_3dArenaAlloc( u32 nBytes );
 void  gpu64_3dArenaReset( void );
 u32   gpu64_3dArenaUsed( void );

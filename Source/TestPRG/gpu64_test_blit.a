@@ -1,0 +1,519 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 -- API conformance suite 3/6: blits and the blob descriptor.
+;
+;      WHAT THIS TESTS
+;
+;      BLIT, BLIT_KEYED and READ_RECT -- which together are the only path
+;      bulk data takes between the C64 and gpu64. Everything else in the API
+;      is a handful of argument bytes; this is the part that moves a payload
+;      across the bus, and it is the part where a wrong stride or a dropped
+;      byte hides.
+;
+;      The centrepiece is BIG BLIT: 8000 bytes of non-uniform data pushed
+;      into the framebuffer and pulled straight back out, compared byte for
+;      byte. Uniform test data would be worthless here -- a blit that got
+;      the stride wrong, or dropped every other byte, still compares equal
+;      against a buffer full of one value. The pattern this program uses
+;      never repeats within a row.
+;
+;      It also covers the descriptor rules that BLIT shares with every other
+;      bulk opcode: len must agree with the shape it describes, a zero
+;      dimension is a no-op rather than an error and is checked BEFORE the
+;      length is, and a descriptor running off the end of its space is
+;      OUT_OF_RANGE with no clamping and no wraparound.
+;
+;      REU BLIT is the one test in the suite of a source in REU space
+;      rather than C64 RAM. It stashes a tile through the REU's own
+;      controller and then asks gpu64 to blit from where it landed.
+;
+;      HOW TO READ THE RESULT
+;
+;      $E1 means two buffers that should have been identical were not --
+;      that is the big blit's failure code, and it means the payload did not
+;      survive the round trip. $E2 means a region that should have been one
+;      colour was not.
+;
+;      Requires the RAD menu switched to REU mode with T. REU BLIT also
+;      needs an REU size of at least 64 bytes, which every configuration
+;      has.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+RB	= $3000				; 8x8 readback
+RB2	= $3100				; second 8x8, for the round trip
+; The bulk-transfer pair. BOTH must live below $8000: gpu64's DMA writes
+; C64 RAM, but the 6502 reading back above $A000 sees BASIC ROM unless it
+; banks it out, so a destination up there compares against ROM and fails on
+; hardware no matter what the transfer did. The host sim models flat RAM and
+; cannot see that class of mistake -- this one was found by reading the map,
+; not by a red line.
+BIGSRC	= $4000				; 320 x 25, ends $5F3F
+BIGDST	= $6000				; ends $7F3F
+; The second readback goes one byte higher on purpose. Buffer index k lands
+; at C64 page offset k+1 there but at page offset k in both the source and
+; the framebuffer, so the two readbacks disagree about exactly one thing. If
+; the failures sit at the same k in both, the destination address had no part
+; in it and the fault is upstream; if they shift by one, it is the write.
+BIGDST2	= $6001				; ends $7F40
+; ...and the third pass uploads from a source one byte higher, which is the
+; same question asked of the read side. The framebuffer rectangle is
+; identical in all three passes and its base is a multiple of 256, so buffer
+; index k is at framebuffer page offset k throughout; only the C64 source
+; page offset moves. Failures at the same k as pass 1 mean the source address
+; does not select them either; failures one lower mean it does. It overwrites
+; BIGSRC, which is finished with by then.
+BIGSRC2	= $4001				; ends $5F40
+BIGLEN	= 320*25
+
+BG	= 2
+KEY	= $c7
+
+; The REU's own registers. Used once, to get a tile into REU space so the
+; "space = 1" half of the blob descriptor is exercised.
+REU_CMD		= $df01
+REU_C64LO	= $df02
+REU_C64HI	= $df03
+REU_EXT0	= $df04
+REU_EXT1	= $df05
+REU_EXT2	= $df06
+REU_LENLO	= $df07
+REU_LENHI	= $df08
+REU_CTRL	= $df0a
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 3 - BLIT"
+
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+	#wantOk
+	#check "CLEAR"
+
+; ----------------------------------------------------------------------
+; A plain opaque blit, checked against its own source.
+; ----------------------------------------------------------------------
+
+	#stgBlit tile, 100, 100, 8, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "BLIT"
+
+	#poison RB, 64
+	#stgRead RB, 100, 100, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantOk
+	#check "BLIT READBACK"
+
+	#setptr P1, tile
+	#setptr P2, RB
+	#setlen 64
+	jsr kitCmp
+	#check "BLIT EXACT"
+
+	; The row below and the column right of the tile must be untouched --
+	; a stride of 9 instead of 8 would still pass the compare above.
+	#poison RB, 10
+	#stgRead RB, 100, 108, 10, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setlen 10
+	lda #BG
+	sta kitVal
+	jsr kitChkFill
+	#check "BLIT NO SPILL"
+
+; ----------------------------------------------------------------------
+; The keyed blit. Source pixels equal to the key leave the destination
+; alone -- the sprite case, and the only op in class 0 that reads the
+; framebuffer while writing it.
+; ----------------------------------------------------------------------
+
+	#stgBlit tileKey, 120, 100, 8, 8
+	#argb 14, KEY
+	lda #OP_BLIT_KEYED
+	jsr cmd0
+	#wantOk
+	#check "BLIT KEYED"
+
+	#poison RB, 64
+	#stgRead RB, 120, 100, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	; tileKey carries the key on its main diagonal, so those eight pixels
+	; must still be background and every other one must have been written.
+	#expectb RB+0, BG
+	#expectb RB+9, BG
+	#expectb RB+27, BG
+	#expectb RB+63, BG
+	#expectb RB+1, $11
+	#expectb RB+8, $18
+	#expectb RB+62, $4e
+	#useacc
+	#check "KEYED EXACT"
+
+	; The same tile blitted opaquely must put the key value itself on
+	; screen -- proving the key is a blit argument and not a property of
+	; the source data.
+	#stgBlit tileKey, 140, 100, 8, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#poison RB, 64
+	#stgRead RB, 140, 100, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, KEY
+	#expectb RB+63, KEY
+	#useacc
+	#check "KEY NOT MAGIC"
+
+; ----------------------------------------------------------------------
+; The round trip: read a rectangle out, blit it back somewhere else, read
+; that, and require the two readbacks to be identical.
+; ----------------------------------------------------------------------
+
+	#poison RB, 64
+	#stgRead RB, 100, 100, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#stgBlit RB, 160, 100, 8, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#poison RB2, 64, $55
+	#stgRead RB2, 160, 100, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setptr P2, RB2
+	#setlen 64
+	jsr kitCmp
+	#check "ROUND TRIP"
+
+; ----------------------------------------------------------------------
+; Clipping. A blit partly off the page keeps the part that is on it, and
+; the clip is per-pixel, not per-row.
+; ----------------------------------------------------------------------
+
+	#stgBlit tile, -2, -2, 8, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "BLIT CLIP TL"
+
+	#poison RB, 64
+	#stgRead RB, 0, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	; Source (2,2) landed at page (0,0); source (7,7) at page (5,5).
+	#expectb RB+0, $22
+	#expectb RB+1, $23
+	#expectb RB+45, $4f
+	#expectb RB+6, BG			; past the right edge of what survived
+	#expectb RB+48, BG			; and past the bottom
+	#useacc
+	#check "CLIP TL EXACT"
+
+	#stgBlit tile, 316, 196, 8, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "BLIT CLIP BR"
+
+	#poison RB, 64
+	#stgRead RB, 312, 192, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+36, $10			; source (0,0) at page (316,196)
+	#expectb RB+39, $13
+	#expectb RB+63, $2b			; source (3,3) at the page's last pixel
+	#expectb RB+35, BG
+	#useacc
+	#check "CLIP BR EXACT"
+
+; ----------------------------------------------------------------------
+; The descriptor rules.
+; ----------------------------------------------------------------------
+
+	; len must equal w * h exactly.
+	#argblob 0, SPACE_C64, tile, 63
+	#argw 6, 100
+	#argw 8, 150
+	#argw 10, 8
+	#argw 12, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "BLIT BAD LEN"
+
+	; A zero dimension is a no-op, and is checked before the length is --
+	; so the nonsense len here must not turn it into an error.
+	#argblob 0, SPACE_C64, tile, 999
+	#argw 6, 100
+	#argw 8, 150
+	#argw 10, 0
+	#argw 12, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "BLIT W0"
+
+	#argblob 0, SPACE_C64, tile, 999
+	#argw 6, 100
+	#argw 8, 150
+	#argw 10, 8
+	#argw 12, 0
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "BLIT H0"
+
+	; ...and nothing was painted by either of them.
+	#poison RB, 64
+	#stgRead RB, 100, 150, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setlen 64
+	lda #BG
+	sta kitVal
+	jsr kitChkFill
+	#check "ZERO NO PAINT"
+
+	; A source running off the end of C64 RAM.
+	#argblob 0, SPACE_C64, $ffe0, 64
+	#argw 6, 0
+	#argw 8, 0
+	#argw 10, 8
+	#argw 12, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantErr ERR_OUT_OF_RANGE
+	#check "BLIT OVERRUN"
+
+	; A space that is neither C64 RAM nor REU.
+	#argblob 0, 3, tile, 64
+	#argw 6, 0
+	#argw 8, 0
+	#argw 10, 8
+	#argw 12, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantErr ERR_OUT_OF_RANGE
+	#check "BLIT BAD SPACE"
+
+; ----------------------------------------------------------------------
+; A source in REU space.
+; ----------------------------------------------------------------------
+
+	jsr stashTile
+	#argblob 0, SPACE_REU, 0, 64
+	#argw 6, 180
+	#argw 8, 100
+	#argw 10, 8
+	#argw 12, 8
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "REU BLIT"
+
+	#poison RB, 64
+	#stgRead RB, 180, 100, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, tile
+	#setptr P2, RB
+	#setlen 64
+	jsr kitCmp
+	#check "REU EXACT"
+
+; ----------------------------------------------------------------------
+; The big one: 8000 bytes out and back, compared in full.
+; ----------------------------------------------------------------------
+
+	#setptr P1, BIGSRC
+	#setlen BIGLEN
+	jsr kitSeq
+
+	#argblob 0, SPACE_C64, BIGSRC, BIGLEN
+	#argw 6, 0
+	#argw 8, 100
+	#argw 10, 320
+	#argw 12, 25
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "BIG BLIT"
+
+	#argblob 0, SPACE_C64, BIGDST, BIGLEN
+	#argw 6, 0
+	#argw 8, 100
+	#argw 10, 320
+	#argw 12, 25
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantOk
+	#check "BIG READ"
+
+	#setptr P1, BIGSRC
+	#setptr P2, BIGDST
+	#setlen BIGLEN
+	jsr kitCmp
+	#check "BIG EXACT"
+	#showw kitOff, "BIG AT"
+	#showw kitDiffN, "BIG N"
+	#cmpmore "BIG AT2", "BIG AT3", "BIG GOT23"
+
+; The same framebuffer content read back a SECOND time, to a destination one
+; byte higher up. Nothing is uploaded in between, so both readbacks see
+; identical framebuffer bytes and read them from identical framebuffer
+; offsets; the only thing that differs is where in C64 memory they land.
+;
+;   failures at the same k    -> the C64 destination address is not what
+;                                selects them, so the fault is upstream: the
+;                                source read or the framebuffer;
+;   failures shifted by one   -> the destination write (gpu64_blobWrite) is
+;                                what picks the byte it damages.
+;
+; Reading back to the SAME address twice, which is what this used to do, does
+; not separate anything: the failure is deterministic, so a readback keyed on
+; an address or on a value repeats itself exactly, and matching results are
+; equally consistent with both halves.
+
+	#argblob 0, SPACE_C64, BIGDST2, BIGLEN
+	#argw 6, 0
+	#argw 8, 100
+	#argw 10, 320
+	#argw 12, 25
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantOk
+	#check "BIG READ 2"
+
+	#setptr P1, BIGSRC
+	#setptr P2, BIGDST2
+	#setlen BIGLEN
+	jsr kitCmp
+	#check "BIG EXACT 2"
+	#cmpwhere "BIG2 AT", "BIG2 N", "BIG2 AT2", "BIG2 AT3"
+
+; Pass three: a fresh upload, from a source one byte higher up. Pass two
+; exonerated the destination; this asks the same of the source. And because
+; it is a new upload rather than a re-read of the same framebuffer, it also
+; answers whether the damage is chosen freshly every transfer -- two
+; readbacks of one upload agree trivially if the upload is what corrupted
+; the framebuffer, which is the reading pass two leaves standing.
+
+	#setptr P1, BIGSRC2
+	#setlen BIGLEN
+	jsr kitSeq
+
+	#argblob 0, SPACE_C64, BIGSRC2, BIGLEN
+	#argw 6, 0
+	#argw 8, 100
+	#argw 10, 320
+	#argw 12, 25
+	lda #OP_BLIT
+	jsr cmd0
+	#wantOk
+	#check "BIG BLIT 3"
+
+	#argblob 0, SPACE_C64, BIGDST, BIGLEN
+	#argw 6, 0
+	#argw 8, 100
+	#argw 10, 320
+	#argw 12, 25
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantOk
+	#check "BIG READ 3"
+
+	#setptr P1, BIGSRC2
+	#setptr P2, BIGDST
+	#setlen BIGLEN
+	jsr kitCmp
+	#check "BIG EXACT 3"
+	#cmpwhere "BIG3 AT", "BIG3 N", "BIG3 AT2", "BIG3 AT3"
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+; Push the tile into REU address 0 with the REU's own controller, so the
+; blit that follows has something to find there. Command $90 is execute
+; plus immediate, transfer type 00 = C64 to REU.
+; ----------------------------------------------------------------------
+
+stashTile
+	lda #0
+	sta REU_CTRL
+	lda #<tile
+	sta REU_C64LO
+	lda #>tile
+	sta REU_C64HI
+	lda #0
+	sta REU_EXT0
+	sta REU_EXT1
+	sta REU_EXT2
+	lda #64
+	sta REU_LENLO
+	lda #0
+	sta REU_LENHI
+	lda #$90
+	sta REU_CMD
+	rts
+
+; ----------------------------------------------------------------------
+; An 8x8 tile whose every byte is distinct, so a blit cannot pass by
+; accident, and a second copy carrying the key on its main diagonal.
+; ----------------------------------------------------------------------
+
+tile
+	.byte $10, $11, $12, $13, $14, $15, $16, $17
+	.byte $18, $19, $1a, $1b, $1c, $1d, $1e, $1f
+	.byte $20, $21, $22, $23, $24, $25, $26, $27
+	.byte $28, $29, $2a, $2b, $2c, $2d, $2e, $2f
+	.byte $30, $31, $32, $33, $34, $35, $36, $37
+	.byte $38, $39, $3a, $3b, $3c, $3d, $3e, $3f
+	.byte $40, $41, $42, $43, $44, $45, $46, $47
+	.byte $48, $49, $4a, $4b, $4c, $4d, $4e, $4f
+
+tileKey
+	.byte KEY, $11, $12, $13, $14, $15, $16, $17
+	.byte $18, KEY, $1a, $1b, $1c, $1d, $1e, $1f
+	.byte $20, $21, KEY, $23, $24, $25, $26, $27
+	.byte $28, $29, $2a, KEY, $2c, $2d, $2e, $2f
+	.byte $30, $31, $32, $33, KEY, $35, $36, $37
+	.byte $38, $39, $3a, $3b, $3c, KEY, $3e, $3f
+	.byte $40, $41, $42, $43, $44, $45, KEY, $47
+	.byte $48, $49, $4a, $4b, $4c, $4d, $4e, KEY
+
+	.include "gpu64_testkit_rt.inc"

@@ -1,0 +1,189 @@
+;
+;      gpu64 -- first-command probe.
+;
+;      WHY THIS EXISTS
+;
+;      gpu64_probe_soak reports 448 dispatches with zero failures, including
+;      64 CLEARs, and gpu64_test_system's opening NOP passes. So dispatch
+;      works and ERRCODE reads back correctly. Yet gpu64_test_draw and
+;      gpu64_test_blit fail every single check, and both open with CLEAR.
+;
+;      The one difference left between the two situations is ORDER. In the
+;      soak probe the first command is a NOP and the CLEARs come after 256
+;      dispatches have already gone by. In draw and blit, CLEAR is the very
+;      first command the program issues -- the one that runs while the
+;      polling loop is still doing mirror snapshots, and the one whose
+;      success flips gpu64ApiActive and changes what the loop does on every
+;      pass afterwards.
+;
+;      This program does nothing but that, so there is nowhere else to look.
+;      It issues the same opening draw and blit do, one command at a time,
+;      and reports each one's ERRCODE separately instead of folding them
+;      into a verdict.
+;
+;      HOW TO READ IT
+;
+;      Nine hex numbers.
+;
+;        C1 CODE   ERRCODE of the FIRST command of the program: CLEAR 2.
+;        R1 CODE   ERRCODE of the READ_RECT straight after it.
+;        R1 BYTE   the first byte that READ_RECT brought back. The buffer
+;                  was poisoned with $AA first, so $00AA means the read
+;                  wrote nothing at all, and $0002 is the colour CLEAR
+;                  should have left there.
+;
+;        C2/R2     the same three, second time round -- by now the API has
+;                  been engaged and the mirror has stopped.
+;
+;        C16 FAIL  how many of a further 16 CLEARs did not return OK.
+;
+;      What each outcome means:
+;
+;        C1 CODE $00FF, C2 CODE $0000
+;              the first heavy command's own ERRCODE read is being lost.
+;              The dispatch ran; the read straight after it did not survive.
+;
+;        C1 and C2 both $00FF
+;              CLEAR never answers, and the soak probe's clean CLEARs need
+;              explaining -- look at what the 256 NOPs before them changed.
+;
+;        codes $0000 but R1 BYTE $00AA
+;              commands succeed and the blob write back into C64 RAM is
+;              what is broken. That is the path GET_INFO uses too, which
+;              would also explain gpu64_test_system stopping after NOP.
+;
+;        everything $0000 and R1 BYTE $0002
+;              the opening works in isolation and the fault is something
+;              the suite does that this program does not.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+RB	= $3000
+BG	= 2
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 PROBE - FIRST COMMAND"
+
+; ----------------------------------------------------------------------
+; Round 1. Nothing has engaged the API yet -- the mirror is still running
+; and gpu64ApiActive is still 0. This is exactly draw's and blit's
+; opening.
+; ----------------------------------------------------------------------
+
+	#poison RB, 64
+
+	; Each dispatch is reported TWICE: once as a printed value, once
+	; through the harness's own verdict path. The two cannot disagree
+	; unless the harness is what is broken -- which is the last
+	; difference left between this program and gpu64_test_draw, whose
+	; identical opening fails every line.
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+	pha
+	jsr pfCode
+	#showw pfVal, "C1 CODE"
+	pla
+	#wantOk
+	#check "C1 CHECK"
+
+	#stgRead RB, 0, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	pha
+	jsr pfCode
+	#showw pfVal, "R1 CODE"
+	pla
+	#wantOk
+	#check "R1 CHECK"
+
+	lda RB
+	jsr pfByte
+	#showw pfVal, "R1 BYTE"
+
+	; And the data-comparison path the drawing tests lean on entirely:
+	; the whole 8x8 readback must be the clear colour.
+	#setptr P1, RB
+	#setlen 64
+	lda #BG
+	sta kitVal
+	jsr kitChkFill
+	#check "R1 FILL"
+
+; ----------------------------------------------------------------------
+; Round 2. Identical, but the API has now been engaged at least once.
+; ----------------------------------------------------------------------
+
+	#poison RB, 64
+
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+	jsr pfCode
+	#showw pfVal, "C2 CODE"
+
+	#stgRead RB, 0, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	jsr pfCode
+	#showw pfVal, "R2 CODE"
+
+	lda RB
+	jsr pfByte
+	#showw pfVal, "R2 BYTE"
+
+; ----------------------------------------------------------------------
+; And a short run of CLEARs, to separate "the first one" from "all of
+; them" without needing the soak probe's 64.
+; ----------------------------------------------------------------------
+
+	lda #0
+	sta pfN
+	sta pfVal
+	sta pfVal+1
+pfLoop
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+	cmp #ERR_OK
+	beq +
+	inc pfVal
++
+	inc pfN
+	lda pfN
+	cmp #16
+	bcc pfLoop
+	#showw pfVal, "C16 FAIL"
+
+	jsr kitFinish
+
+; A = a byte. Widens it into pfVal so #showw can print it.
+pfCode
+pfByte
+	sta pfVal
+	lda #0
+	sta pfVal+1
+	rts
+
+pfVal	.word 0
+pfN	.byte 0
+
+	.include "gpu64_testkit_rt.inc"

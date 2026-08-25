@@ -53,6 +53,11 @@
 #define GPU64_3D_OP_LOOP_START		0x06
 #define GPU64_3D_OP_LOOP_STOP		0x07
 #define GPU64_3D_OP_SCENE_COMMIT	0x08
+// gpu64: not in the design doc's original table -- added in phase 1 because
+// "you get OUT_OF_MEMORY eventually" is truthful and undebuggable against a
+// 32 MB arena. RESULT is the free arena in 128 KB units, which is exactly
+// 0..256 for a 32 MB arena and so fits the one byte RESULT has.
+#define GPU64_3D_OP_ARENA_STATUS	0x09
 
 // Resources -- $10-$1F
 #define GPU64_3D_OP_UPLOAD_MESH		0x10

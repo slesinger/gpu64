@@ -1,0 +1,198 @@
+;
+;      gpu64 -- dispatch soak probe.
+;
+;      WHAT THIS IS FOR
+;
+;      The conformance suite reports one OK and then a wall of errors. That
+;      pattern is opcode-independent -- the six programs open with NOP,
+;      CLEAR, GET_INFO and MAT_IDENTITY respectively and all four behave the
+;      same -- so what fails is not any particular command. Something about
+;      *having dispatched once* breaks the next dispatch.
+;
+;      This program does nothing but dispatch, so the failure has nowhere to
+;      hide. Three phases, and which of them goes red says which mechanism
+;      it is:
+;
+;        NOP   256 back-to-back NOPs. The cheapest possible command: no
+;              framebuffer, no blob, no cache footprint. If NOP #1 fails,
+;              the trigger is the gpu64ApiActive transition itself -- the
+;              first successful command turns on the frame-clock block in
+;              the polling loop, and from then on every pass runs more code
+;              ahead of the bus sampling.
+;
+;        CLR   64 back-to-back CLEARs. Each walks 64000 bytes and evicts the
+;              polling loop's instruction window. If NOP is clean and this
+;              is not, the mechanism is cache eviction, and the fix is to
+;              give class 0 the re-warm that class 1 already gets.
+;
+;        MIX   64 x (CLEAR, then NOP), counting only the NOPs. Isolates
+;              "the command after a heavy one" from "the heavy one itself".
+;
+;      Each phase reports three numbers, all hex:
+;
+;        xxx FAILS  how many of that phase's dispatches did not return OK
+;        xxx 1ST    the index of the first one that did not (0-based)
+;        xxx CODE   the ERRCODE that first failure returned
+;
+;      All three zero is a clean phase. FAILS=0100 on the NOP phase means
+;      all 256 failed.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 PROBE - DISPATCH SOAK"
+
+; ----------------------------------------------------------------------
+; Phase 1: 256 NOPs.
+; ----------------------------------------------------------------------
+
+	jsr pbReset
+pb1
+	lda #OP_NOP
+	jsr cmd0
+	jsr pbTally
+	jsr pbNext
+	bne pb1
+	jsr pbReport1
+
+; ----------------------------------------------------------------------
+; Phase 2: 64 CLEARs.
+; ----------------------------------------------------------------------
+
+	jsr pbReset
+pb2
+	#argb 0, 0
+	lda #OP_CLEAR
+	jsr cmd0
+	jsr pbTally
+	jsr pbNext
+	lda pbIdx
+	cmp #64
+	bcc pb2
+	jsr pbReport2
+
+; ----------------------------------------------------------------------
+; Phase 3: 64 x (CLEAR, NOP) -- only the NOPs are counted.
+; ----------------------------------------------------------------------
+
+	jsr pbReset
+pb3
+	#argb 0, 0
+	lda #OP_CLEAR
+	jsr cmd0			; result deliberately ignored
+
+	lda #OP_NOP
+	jsr cmd0
+	jsr pbTally
+	jsr pbNext
+	lda pbIdx
+	cmp #64
+	bcc pb3
+	jsr pbReport3
+
+	jsr kitFinish
+
+; ----------------------------------------------------------------------
+; A = ERRCODE from the dispatch just made. Counts it, and remembers the
+; first one that was not OK together with the index it happened at.
+; ----------------------------------------------------------------------
+
+pbTally
+	cmp #ERR_OK
+	beq pbtDone
+
+	pha
+	lda pbSeen
+	bne pbtCount
+
+	inc pbSeen
+	lda pbIdx
+	sta pbFirst
+	lda pbIdx+1
+	sta pbFirst+1
+	pla
+	pha
+	sta pbCode
+	lda #0
+	sta pbCode+1
+
+pbtCount
+	inc pbFails
+	bne +
+	inc pbFails+1
++
+	pla
+pbtDone
+	rts
+
+; Advances the index. Returns with Z clear while the low byte has not
+; wrapped, so phase 1 can simply loop until 256 have gone by.
+pbNext
+	inc pbIdx
+	bne +
+	inc pbIdx+1
++
+	lda pbIdx
+	rts
+
+pbReset
+	lda #0
+	sta pbIdx
+	sta pbIdx+1
+	sta pbFails
+	sta pbFails+1
+	sta pbFirst
+	sta pbFirst+1
+	sta pbCode
+	sta pbCode+1
+	sta pbSeen
+	rts
+
+; ----------------------------------------------------------------------
+; Reporting. Three lines per phase -- written out per phase rather than
+; through a shared helper because #showw takes its name inline.
+; ----------------------------------------------------------------------
+
+pbReport1
+	#showw pbFails, "NOP FAILS"
+	#showw pbFirst, "NOP 1ST"
+	#showw pbCode,  "NOP CODE"
+	rts
+
+pbReport2
+	#showw pbFails, "CLR FAILS"
+	#showw pbFirst, "CLR 1ST"
+	#showw pbCode,  "CLR CODE"
+	rts
+
+pbReport3
+	#showw pbFails, "MIX FAILS"
+	#showw pbFirst, "MIX 1ST"
+	#showw pbCode,  "MIX CODE"
+	rts
+
+pbIdx	.word 0
+pbFails	.word 0
+pbFirst	.word 0
+pbCode	.word 0
+pbSeen	.byte 0
+
+	.include "gpu64_testkit_rt.inc"

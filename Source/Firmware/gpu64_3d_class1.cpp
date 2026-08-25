@@ -1,0 +1,535 @@
+/*
+ gpu64 milestone 6 -- class 1 on core 0: session state, the resource table,
+ and the opcode dispatcher.
+
+ Why core 0, when the design's architecture section puts the renderer on core
+ 1: because immediate mode is the bring-up path, and immediate mode has no
+ cross-core state by construction. DRAW_MESH is specified to return when the
+ mesh is drawn and to be illegal while the render loop runs -- so there is
+ exactly one owner of the framebuffer and the z-buffer at any instant, and
+ running it here makes that owner core 0, inside the dispatch window where the
+ C64 is already DMA-halted. That is precisely the model every class 0 draw op
+ already uses, and it means the entire pipeline can be brought up on hardware
+ with the cross-core question still open.
+
+ The ring is still fed -- every accepted class 1 command is pushed to it and
+ counted by core 1 (gpu64_3d_core1.cpp) -- so the cross-core path stays under
+ real traffic while that question is settled.
+
+ Nothing here is portable; the pipeline it drives (gpu64_3d_render.h) is, and
+ is exercised on a PC by tools/hostsim.
+*/
+#include "gpu64_3d_internals.h"
+#include "gpu64_3d_render.h"
+#include "gpu64_api.h"
+#include "gpu64_fb.h"
+#include <circle/util.h>
+
+#ifdef GPU64_3D_ENABLED
+
+// --- the arena ----------------------------------------------------------
+
+static u8  s_Arena[ GPU64_3D_ARENA_BYTES ] __attribute__(( aligned( 64 ) ));
+static u32 s_ArenaUsed;
+
+void *gpu64_3dArenaAlloc( u32 nBytes )
+{
+	// Every allocation starts on a cache line. Wasteful at the byte level and
+	// worth it: a texture whose rows share a line with the end of a mesh is a
+	// false-sharing bug waiting for the frame core 1 and core 0 happen to
+	// touch both in.
+	nBytes = ( nBytes + 63 ) & ~63u;
+
+	if ( nBytes > GPU64_3D_ARENA_BYTES - s_ArenaUsed )
+		return 0;					// caller answers OUT_OF_MEMORY
+
+	void *p = s_Arena + s_ArenaUsed;
+	s_ArenaUsed += nBytes;
+	return p;
+}
+
+void gpu64_3dArenaReset( void )
+{
+	// Bump allocator: reset is the whole free path. Nothing is zeroed --
+	// every allocation is written before it is read, and zeroing 32 MB here
+	// would be the longest unbroken store burst in the firmware.
+	s_ArenaUsed = 0;
+}
+
+u32 gpu64_3dArenaUsed( void )
+{
+	return s_ArenaUsed;
+}
+
+static void *arenaAllocFn( void *, u32 nBytes )
+{
+	return gpu64_3dArenaAlloc( nBytes );
+}
+
+// --- session state ------------------------------------------------------
+
+static Gpu64_3dState	s_State;
+static Gpu64_3dResource	s_Res[ GPU64_3D_MAX_RESOURCES ];
+static Gpu64_3dScratch	s_Scratch;
+
+// The z-buffer, sized for the largest viewport SET_VIEWPORT will accept.
+// Static rather than out of the arena so a program cannot exhaust resource
+// RAM and then find it cannot draw.
+static u16 s_Depth[ GPU64_3D_SURFACE_W * GPU64_3D_SURFACE_H ] __attribute__(( aligned( 64 ) ));
+
+// Blob staging. An upload is pulled off the bus into one of these and then
+// parsed into the arena -- the parse is what turns the wire format into the
+// form the rasteriser wants (unpacked faces, precomputed normals), so a
+// staging step exists whether or not it is spelled out.
+static u8 s_StageA[ 65536 ];
+static u8 s_StageB[ 65536 ];
+
+#define sArg	gpu64Regs.arg
+
+static inline u16 argU16( unsigned i )
+{
+	return (u16)( sArg[ i ] | ( sArg[ i + 1 ] << 8 ) );
+}
+
+static inline s16 argS16( unsigned i )
+{
+	return (s16)argU16( i );
+}
+
+static inline void argBlob( unsigned i, u8 *pSpace, u32 *pAddr, u32 *pLen )
+{
+	*pSpace = sArg[ i ];
+	*pAddr  = (u32)sArg[ i + 1 ] | ( (u32)sArg[ i + 2 ] << 8 ) | ( (u32)sArg[ i + 3 ] << 16 );
+	*pLen   = (u32)sArg[ i + 4 ] | ( (u32)sArg[ i + 5 ] << 8 );
+}
+
+static inline u16 stagedId( void )
+{
+	return (u16)( gpu64Regs.id[ 0 ] | ( gpu64Regs.id[ 1 ] << 8 ) );
+}
+
+// --- the resource table -------------------------------------------------
+
+static Gpu64_3dResource *resFind( u16 nId, u8 nType )
+{
+	for ( unsigned i = 0; i < GPU64_3D_MAX_RESOURCES; i++ )
+		if ( s_Res[ i ].type != GPU64_3D_RES_NONE && s_Res[ i ].id == nId )
+			return ( nType == GPU64_3D_RES_NONE || s_Res[ i ].type == nType )
+				? &s_Res[ i ] : 0;
+	return 0;
+}
+
+// Finds the slot for an ID, reusing it if the ID is already live. Re-upload
+// to a live ID replaces it, per the design's Resource lifecycle.
+//
+// The bytes of the old allocation are NOT reclaimed: the arena is a bump
+// allocator, so a replaced resource leaks until the session resets. That is a
+// deliberate phase-1 limit, not an oversight -- it keeps the allocator out of
+// a path core 1 will one day share, and 32 MB absorbs a great many reloads.
+// Anything that re-uploads in a loop will exhaust it and get OUT_OF_MEMORY,
+// which is at least a truthful error.
+static Gpu64_3dResource *resSlot( u16 nId )
+{
+	Gpu64_3dResource *pFree = 0;
+
+	for ( unsigned i = 0; i < GPU64_3D_MAX_RESOURCES; i++ )
+	{
+		if ( s_Res[ i ].type != GPU64_3D_RES_NONE && s_Res[ i ].id == nId )
+			return &s_Res[ i ];
+		if ( s_Res[ i ].type == GPU64_3D_RES_NONE && !pFree )
+			pFree = &s_Res[ i ];
+	}
+
+	return pFree;
+}
+
+static const Gpu64_3dTexture *lookupTexture( void *, u16 nId )
+{
+	const Gpu64_3dResource *pR = resFind( nId, GPU64_3D_RES_TEXTURE );
+	// A face naming a texture that was never uploaded falls back to flat
+	// colour rather than failing the draw: one missing texture should not
+	// blank a scene, and the wrong-looking face is a better diagnostic than
+	// an error code the C64 sees after the fact.
+	return pR ? &pR->tex : 0;
+}
+
+// --- lifecycle ----------------------------------------------------------
+
+void gpu64_3dInit( void )
+{
+	memset( &gpu64_3dRing, 0, sizeof( gpu64_3dRing ) );
+	memset( (void *)&gpu64_3dWorkerStats, 0, sizeof( gpu64_3dWorkerStats ) );
+	memset( &gpu64_3dHost, 0, sizeof( gpu64_3dHost ) );
+	memset( s_Res, 0, sizeof( s_Res ) );
+	gpu64_3dArenaReset();
+	gpu64_3dStateDefaults( &s_State );
+}
+
+void gpu64_3dReset( void )
+{
+	// A session reset has to leave the ring empty, and only core 0 can say
+	// so: core 1 is mid-drain and would happily execute commands belonging to
+	// the program that just died. Moving the tail forward from core 0 is the
+	// one place that rule is broken, and it is safe precisely because the C64
+	// is halted and no new command can arrive while it happens.
+	gpu64_3dRing.tail = gpu64_3dRing.head;
+	gpu64_3dRing.tailCache = gpu64_3dRing.head;
+
+	// Every resource of the session goes with it -- design doc, Resource
+	// lifecycle. Without this a RUN/STOP+RESTORE leaks the whole arena and
+	// the next program starts against stale IDs.
+	memset( s_Res, 0, sizeof( s_Res ) );
+	gpu64_3dArenaReset();
+	gpu64_3dStateDefaults( &s_State );
+
+	memset( &gpu64_3dHost, 0, sizeof( gpu64_3dHost ) );
+}
+
+// --- the draw target ----------------------------------------------------
+
+static boolean makeTarget( Gpu64_3dTarget *pTarget )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 || !pFB->IsInitialized() )
+		return FALSE;
+
+	pTarget->pPixels = pFB->PageBuffer( pFB->GetDrawPage() );
+	pTarget->pitch   = pFB->GetPitch();
+	pTarget->pDepth  = s_Depth;
+	return pTarget->pPixels != 0;
+}
+
+// The VideoCore scans DRAM directly and is not coherent with the ARM, so
+// nothing drawn is visible until the rows are cleaned -- same rule every
+// class 0 draw op follows. Only the viewport is cleaned: the rest of the page
+// belongs to the C64's HUD and was cleaned when the C64 drew it.
+static void cleanViewport( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB )
+		pFB->CleanRows( pFB->GetDrawPage(), s_State.vpY, s_State.vpY + s_State.vpH );
+}
+
+// --- opcodes ------------------------------------------------------------
+
+static u8 opSetViewport( void )
+{
+	const u16 x = argU16( 0 ), y = argU16( 2 ), w = argU16( 4 ), h = argU16( 6 );
+
+	if ( w == 0 || h == 0 )
+		return GPU64_ERR_BAD_ARGS;
+	if ( (u32)x + w > GPU64_3D_SURFACE_W || (u32)y + h > GPU64_3D_SURFACE_H )
+		return GPU64_ERR_BAD_ARGS;
+	if ( (u32)w * h * 3 > GPU64_3D_BUDGET )
+		return GPU64_ERR_OUT_OF_RANGE;
+
+	s_State.vpX = x;
+	s_State.vpY = y;
+	s_State.vpW = w;
+	s_State.vpH = h;
+
+	// The focal length is derived from the fov and the viewport width, so a
+	// viewport change re-derives it. Not doing so is a subtle one: the scene
+	// keeps rendering and quietly has the wrong field of view.
+	s_State.focal = gpu64_3dFocalFromFov( s_State.fov, w );
+	return GPU64_ERR_OK;
+}
+
+static u8 opSetPerspective( void )
+{
+	const u16 fov  = argU16( 0 );
+	const s32 near = (s32)(s16)argU16( 2 ) << 8;		// 8.8 -> 16.16
+	const s32 far  = (s32)(s16)argU16( 4 ) << 8;
+
+	if ( near <= 0 || far <= near )
+		return GPU64_ERR_BAD_ARGS;
+
+	const s32 focal = gpu64_3dFocalFromFov( fov, s_State.vpW );
+	if ( focal <= 0 )
+		return GPU64_ERR_BAD_ARGS;
+
+	s_State.fov   = fov;
+	s_State.focal = focal;
+	s_State.nearZ = near;
+	s_State.farZ  = far;
+	return GPU64_ERR_OK;
+}
+
+static u8 opSetLight( void )
+{
+	if ( sArg[ 6 ] > 15 )
+		return GPU64_ERR_BAD_ARGS;
+
+	if ( !gpu64_3dNormalise( s_State.lightDir, argS16( 0 ), argS16( 2 ), argS16( 4 ) ) )
+		return GPU64_ERR_BAD_ARGS;		// a zero-length direction
+
+	s_State.ambient = sArg[ 6 ];
+	return GPU64_ERR_OK;
+}
+
+static u8 opBuildColormap( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 )
+		return GPU64_ERR_UNSUPPORTED;
+
+	gpu64_3dBuildColormap( &s_State, pFB->GetPaletteRGB() );
+	return GPU64_ERR_OK;
+}
+
+static u8 opUploadMesh( void )
+{
+	u8 spaceV, spaceF;
+	u32 addrV, lenV, addrF, lenF;
+
+	argBlob( 0, &spaceV, &addrV, &lenV );
+	argBlob( 6, &spaceF, &addrF, &lenF );
+
+	if ( lenV == 0 || lenF == 0 || lenV > sizeof( s_StageA ) || lenF > sizeof( s_StageB ) )
+		return GPU64_ERR_BAD_ARGS;
+
+	u8 res = gpu64_blobRead( spaceV, addrV, lenV, s_StageA );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	res = gpu64_blobRead( spaceF, addrF, lenF, s_StageB );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	Gpu64_3dResource *pR = resSlot( stagedId() );
+	if ( pR == 0 )
+		return GPU64_ERR_OUT_OF_MEMORY;		// the table, not the arena
+
+	Gpu64_3dMesh mesh;
+	res = gpu64_3dBuildMesh( &mesh, s_StageA, lenV, s_StageB, lenF, arenaAllocFn, 0 );
+	if ( res != GPU64_3D_OK )
+		return res;				// the slot is untouched on failure
+
+	pR->id   = stagedId();
+	pR->type = GPU64_3D_RES_MESH;
+	pR->mesh = mesh;
+
+	gpu64Regs.result = (u8)mesh.nFaces;
+	return GPU64_ERR_OK;
+}
+
+static u8 opUploadTexture( void )
+{
+	u8 space;
+	u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+
+	if ( len == 0 || len > sizeof( s_StageA ) )
+		return GPU64_ERR_BAD_ARGS;
+
+	u8 res = gpu64_blobRead( space, addr, len, s_StageA );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	Gpu64_3dResource *pR = resSlot( stagedId() );
+	if ( pR == 0 )
+		return GPU64_ERR_OUT_OF_MEMORY;
+
+	Gpu64_3dTexture tex;
+	res = gpu64_3dBuildTexture( &tex, s_StageA, len, sArg[ 6 ], sArg[ 7 ], arenaAllocFn, 0 );
+	if ( res != GPU64_3D_OK )
+		return res;
+
+	pR->id   = stagedId();
+	pR->type = GPU64_3D_RES_TEXTURE;
+	pR->tex  = tex;
+	return GPU64_ERR_OK;
+}
+
+static u8 opFreeResource( void )
+{
+	Gpu64_3dResource *pR = resFind( stagedId(), GPU64_3D_RES_NONE );
+	if ( pR == 0 )
+		return GPU64_ERR_BAD_ID;
+
+	// Table slot only -- see resSlot() on why the bytes stay allocated.
+	pR->type = GPU64_3D_RES_NONE;
+	return GPU64_ERR_OK;
+}
+
+static u8 opClearViewport( void )
+{
+	Gpu64_3dTarget target;
+	if ( !makeTarget( &target ) )
+		return GPU64_ERR_UNSUPPORTED;
+
+	gpu64_3dClearViewport( &s_State, &target );
+	cleanViewport();
+	return GPU64_ERR_OK;
+}
+
+static u8 opDrawMesh( void )
+{
+	const Gpu64_3dResource *pR = resFind( stagedId(), GPU64_3D_RES_MESH );
+	if ( pR == 0 )
+		return GPU64_ERR_BAD_ID;
+
+	Gpu64_3dTarget target;
+	if ( !makeTarget( &target ) )
+		return GPU64_ERR_UNSUPPORTED;
+
+	Gpu64_3dVec pos;
+	pos.x = (s32)argS16( 0 ) << 8;			// 8.8 -> 16.16
+	pos.y = (s32)argS16( 2 ) << 8;
+	pos.z = (s32)argS16( 4 ) << 8;
+
+	Gpu64_3dMat rot;
+	gpu64_3dMatFromEuler( &rot, argU16( 6 ), argU16( 8 ), argU16( 10 ) );
+
+	u16 scale = argU16( 12 );
+	if ( scale == 0 )
+		return GPU64_ERR_BAD_ARGS;
+
+	const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
+					     &pos, &rot, scale, lookupTexture, 0 );
+	cleanViewport();
+
+	// RESULT is the triangle count, saturated to a byte. It is the difference
+	// between "the mesh was drawn and you are looking at the wrong part of
+	// the screen" and "every face was culled", which a blank viewport cannot
+	// tell you -- and on this hardware that distinction is otherwise a trip
+	// to the bench.
+	gpu64Regs.result = (u8)( n > 255 ? 255 : n );
+	return GPU64_ERR_OK;
+}
+
+// --- dispatch -----------------------------------------------------------
+
+static u8 execute( u8 op )
+{
+	switch ( op )
+	{
+	case GPU64_3D_OP_SCENE_RESET:
+		// Nodes and the loop are phase 2 and phase 4; what exists to reset
+		// today is the render state. Resources deliberately survive, per the
+		// opcode's own definition.
+		gpu64_3dStateDefaults( &s_State );
+		return GPU64_ERR_OK;
+
+	case GPU64_3D_OP_SET_VIEWPORT:		return opSetViewport();
+	case GPU64_3D_OP_SET_PERSPECTIVE:	return opSetPerspective();
+	case GPU64_3D_OP_SET_LIGHT:		return opSetLight();
+	case GPU64_3D_OP_BUILD_COLORMAP:	return opBuildColormap();
+
+	case GPU64_3D_OP_SET_BACKGROUND:
+		s_State.background = sArg[ 0 ];
+		return GPU64_ERR_OK;
+
+	case GPU64_3D_OP_ARENA_STATUS:
+	{
+		// Free arena in 128 KB units. A 32 MB arena is exactly 256 of them,
+		// so a full arena reads 255 (saturated) and an exhausted one reads 0
+		// -- the whole range is usable and no scaling constant has to be
+		// agreed with the C64 side beyond "128 KB".
+		const u32 free = GPU64_3D_ARENA_BYTES - gpu64_3dArenaUsed();
+		const u32 units = free >> 17;
+		gpu64Regs.result = (u8)( units > 255 ? 255 : units );
+		return GPU64_ERR_OK;
+	}
+
+	case GPU64_3D_OP_LOOP_STOP:
+		// No loop runs yet, so stopping one always succeeds. Answering
+		// BAD_OPCODE instead would make a correctly-written program fail at
+		// its teardown.
+		return GPU64_ERR_OK;
+
+	case GPU64_3D_OP_UPLOAD_MESH:		return opUploadMesh();
+	case GPU64_3D_OP_UPLOAD_TEXTURE:	return opUploadTexture();
+	case GPU64_3D_OP_FREE_RESOURCE:		return opFreeResource();
+
+	case GPU64_3D_OP_CLEAR_VIEWPORT:	return opClearViewport();
+	case GPU64_3D_OP_DRAW_MESH:		return opDrawMesh();
+
+	case GPU64_3D_OP_LOOP_START:
+	case GPU64_3D_OP_SCENE_COMMIT:
+		// Both belong to the retained scene and the autonomous loop, which is
+		// phase 4. UNSUPPORTED rather than BAD_OPCODE: the opcode is real and
+		// this build cannot do it, which is a different thing for a program
+		// to branch on than an opcode that does not exist.
+		return GPU64_ERR_UNSUPPORTED;
+	}
+
+	// Scene nodes and transforms ($20-$36) are phase 2 and land here. A class
+	// that silently accepts what it cannot do is worse than one that rejects
+	// it -- the C64 side gets no signal and debugs the wrong layer.
+	return GPU64_ERR_BAD_OPCODE;
+}
+
+u8 gpu64_3dDispatch( u8 op )
+{
+	// The ring is fed first, and a full ring refuses the command outright:
+	// the design's rule is that a failed dispatch does nothing, so a command
+	// must not execute and then be reported as rejected.
+	if ( !gpu64_3dRingPush( op ) )
+	{
+		gpu64_3dHost.rejected++;
+		return GPU64_ERR_QUEUE_FULL;
+	}
+
+	const u8 res = execute( op );
+
+	// gpu64: put back what this dispatch just evicted, while the bus is still
+	// held. A DRAW_MESH walks a framebuffer, a z-buffer and the arena, which
+	// is far more than the class 0 CLEAR that was already enough to evict
+	// warmCache()'s work -- rule 4 in docs/progress_tracker.md's polling-loop
+	// timing rules, "preloaded at start-up is not durable". Doing it here
+	// rather than in the loop is rule 5, and it is what makes the cost free:
+	// it lands inside the window the C64 is already stopped for.
+	//
+	// Unconditional rather than only after the heavy opcodes: a dispatch is
+	// the biggest instruction-cache consumer in the system whatever it does,
+	// and the warm is two data preloads and one window preload against a
+	// dispatch that has already paid for a DMA round trip.
+	gpu64_apiWarmPollingLoop();
+
+	if ( res == GPU64_ERR_BAD_OPCODE )
+		gpu64_3dHost.badOpcode++;
+	else
+		gpu64_3dHost.pushed++;
+
+	return res;
+}
+
+char *gpu64_3dReport( char *p )
+{
+	static const char hex[] = "0123456789ABCDEF";
+
+	// Deliberately terse: this goes into the HDMI log overlay, which is 40
+	// columns.
+	const char *pLabel = "3D ok/rej/bad ";
+	while ( *pLabel )
+		*p++ = *pLabel++;
+
+	u32 v[ 3 ] = { gpu64_3dHost.pushed, gpu64_3dHost.rejected, gpu64_3dHost.badOpcode };
+	for ( unsigned i = 0; i < 3; i++ )
+	{
+		if ( i ) *p++ = '/';
+		*p++ = hex[ ( v[ i ] >> 12 ) & 0xf ];
+		*p++ = hex[ ( v[ i ] >>  8 ) & 0xf ];
+		*p++ = hex[ ( v[ i ] >>  4 ) & 0xf ];
+		*p++ = hex[   v[ i ]         & 0xf ];
+	}
+
+	*p++ = ' ';
+	*p++ = 'c';
+	*p++ = hex[ ( gpu64_3dWorkerStats.consumed >> 12 ) & 0xf ];
+	*p++ = hex[ ( gpu64_3dWorkerStats.consumed >>  8 ) & 0xf ];
+	*p++ = hex[ ( gpu64_3dWorkerStats.consumed >>  4 ) & 0xf ];
+	*p++ = hex[   gpu64_3dWorkerStats.consumed         & 0xf ];
+
+	// Arena use in KB, so an upload that silently failed to land is visible
+	// without a second command.
+	*p++ = ' ';
+	*p++ = 'a';
+	const u32 kb = gpu64_3dArenaUsed() >> 10;
+	*p++ = hex[ ( kb >> 12 ) & 0xf ];
+	*p++ = hex[ ( kb >>  8 ) & 0xf ];
+	*p++ = hex[ ( kb >>  4 ) & 0xf ];
+	*p++ = hex[   kb         & 0xf ];
+
+	return p;
+}
+
+#endif	// GPU64_3D_ENABLED

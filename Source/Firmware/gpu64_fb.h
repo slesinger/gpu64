@@ -113,6 +113,11 @@ public:
 	// --- palette --------------------------------------------------------
 	void SetPaletteEntry( u8 nIndex, u8 r, u8 g, u8 b );
 	boolean CommitPalette( void );
+	// gpu64: the palette as the ARM last set it, 3 bytes an entry. Circle's
+	// CBcmFrameBuffer takes palette writes and never gives them back, and
+	// milestone 6's BUILD_COLORMAP has to search the palette for nearest
+	// matches -- so this class keeps a shadow copy. Always 256 entries.
+	const u8 *GetPaletteRGB( void ) const	{ return m_Palette; }
 
 	// --- on-screen log overlay -----------------------------------------
 	void LogWrite( const char *pString, unsigned nLength );
@@ -143,6 +148,8 @@ private:
 	u8		m_nPendingVisible;
 
 	u8		m_nBorder;
+
+	u8		m_Palette[ 256 * 3 ];
 
 	boolean		m_bLogEnabled;
 	char		m_LogText[ GPU64_LOG_ROWS ][ GPU64_LOG_COLS ];

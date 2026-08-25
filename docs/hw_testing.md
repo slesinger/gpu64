@@ -52,6 +52,254 @@ mechanical details):
 None of this touches gpu64-specific behavior -- it's exactly what milestone 1
 asked for: get the *existing* RAD image to build.
 
+## Testing the 3D renderer without hardware
+
+Most of milestone 6 does not need the Pi. The maths, the rasteriser, the
+colormap builder and the mesh parsers depend on nothing but
+`<circle/types.h>`, and `tools/hostsim` compiles those firmware sources
+unchanged with a native g++ against a stubbed header:
+
+```
+make -C tools/hostsim run          # writes tools/hostsim/out/*.ppm
+```
+
+It renders a turning box, a z-buffer interpenetration case, a near-plane
+straddle, the flat-colour path, and `out/prgpreview.ppm` — the exact scene
+`Source/TestPRG/gpu64_3d_cube.a` asks for, from the same code the firmware
+runs. **That file is the expected result of the hardware test.** Hold the HDMI
+output against it: any difference is the firmware's plumbing — the blob pull,
+the palette, the page flip, the cache clean — and not the pipeline.
+
+Every per-image checksum is printed, so a change that was meant to be
+cosmetic and was not is visible without opening a viewer.
+
+Do this before a bench trip, not after. The first run of the sim found four
+transposed signs in the Euler matrix, a bug that presents as a perspective
+artefact rather than as a maths error and would have cost a whole session to
+chase on hardware.
+
+## The API conformance suite
+
+`Source/TestPRG/gpu64_test_*.a` is a six-program suite that checks class 0
+against [api_design.md](api_design.md) and prints its own verdict. It exists
+so that a bench session starts from a known-good baseline instead of from a
+demo that looks about right.
+
+| Program | Covers |
+|---|---|
+| `gpu64_test_system` | `NOP`, `GET_INFO` field by field, flag-byte validation, and **every error code class 0 can produce** |
+| `gpu64_test_draw` | `CLEAR`, `SET_PIXEL`, `LINE`, `RECT`, `RECT_FILL` — verified by reading the framebuffer back, plus clipping at both corners |
+| `gpu64_test_blit` | `BLIT`, `BLIT_KEYED`, `READ_RECT`, the blob descriptor rules, an REU-space source, and a 16000-byte round trip compared byte for byte |
+| `gpu64_test_math` | `$80`–`$86`, 8.8 fixed point: products, rounding on both signs, saturation, inverse, and `SINGULAR` leaving the destination untouched |
+| `gpu64_test_float` | `$90`–`$96`, IEEE 754: the same shapes, as the control for the fixed-point rounding cases |
+| `gpu64_test_pages` | `SET_DRAW_PAGE`, both forms of `PAGE_FLIP`, `VBLANK_ARM`/`ACK`/`SYNC` — and it adapts to a display with no frame clock |
+
+Each prints one line per assertion — a name and either `OK` or `F<hex>` — and
+a verdict line at the bottom. **The fail code is the byte that was wrong**,
+almost always the `ERRCODE` that came back, so a red line is usually readable
+without opening the source. The codes that are not an `ERRCODE` are `$E1` (two
+buffers differed), `$E2` (a region was not uniformly filled), `$E3` (a byte
+was wrong and happened to be zero), `$E4` (a value was in range when it should
+not have been, or a timed wait expired) and `$FE` — **a command returned OK
+where an error was demanded**, which is the important one: an error path that
+never fires is not a tested error path.
+
+Results stay on screen until RUN/STOP, which also clears it so BASIC's
+`READY.` cannot land on a result line.
+
+### Desk-check before the bench
+
+```
+tools/testprg.sh                # assemble all six and desk-check them
+tools/testprg.sh -v system      # ...and print the screen it produced
+```
+
+`tools/prgsim/` is a 6502 core plus a reference model of the class 0 API
+written from `api_design.md`. `testprg.sh` runs each program against it and
+requires `VERDICT PASS`, in both display modes — with a frame clock and
+without.
+
+The direction matters. The model is built from the same document the suite
+asserts against, so **a failure on the PC means the TEST is wrong** and a
+failure on hardware means the **firmware** is. Getting the first kind out of
+the way costs a second here and a session at the bench, which is the same
+argument as `tools/hostsim` above — and it paid the same way: the first run
+caught two transposed row/column offsets in the blit clipping expectations,
+which on hardware would have looked exactly like a clipping defect in the
+firmware.
+
+The model is not a second implementation to be trusted over the firmware. It
+is a second opinion. Where the two disagree, one of them is wrong and the
+disagreement is the finding.
+
+### Hardware results (2026-08-24)
+
+The suite has been run on real hardware. 174 assertions, and every failure it
+found was a real defect:
+
+| Program | Result |
+|---|---|
+| `gpu64_test_system` | 39 / 39 |
+| `gpu64_test_draw` | 36 / 36 |
+| `gpu64_test_float` | 26 / 26 |
+| `gpu64_test_pages` | 24 / 24 |
+| `gpu64_test_math` | 30 / 30 (3 red before the `fixWrite()` fix) |
+| `gpu64_test_blit` | 22 / 24 — `BIG EXACT` and `REU EXACT`, both open |
+
+`gpu64_test_math` is the case worth remembering. `runsim.py
+--firmware-rounding` predicted, on a PC, that exactly `ROUND NEG`,
+`MUL MINUS ONE` and `SCALE NEG` would go red and nothing else. Hardware
+produced exactly those three. The cause was `fixWrite()` biasing the
+accumulator by ±128 and then arithmetic-shifting right by 8: the shift
+floors, so on a negative accumulator the bias landed twice and every
+negative 8.8 product came back one LSB further from zero than it should
+(`-1.0 * 1.0` returned `$FEFF`, −1.00391, instead of `$FF00`). Positive
+products were unaffected, which is why it survived a hardware-verified
+milestone — a one-LSB error on negatives only is invisible in a rendered
+frame. Fixed by biasing and dividing toward zero rather than shifting;
+confirmed green on hardware.
+
+**Two failures are still open**, both in the bulk-transfer path and both
+reporting `$E1`:
+
+- `BIG EXACT` — 8000 bytes to the framebuffer and back. First mismatch at
+  offset `$1CE1` (7393), expected `$06`, got `$5C`.
+- `REU EXACT` — a tile stashed into REU space through the REU's own
+  controller and blitted from `space = 1`. First mismatch at offset 0,
+  expected `$10`, got `$A9`.
+
+Both commands returned OK, so the dispatches were accepted and the data did
+not survive. This is the path CLAUDE.md flags as carrying both known REU
+defects. `kitCmp` now also reports the total number of differing bytes,
+which is what separates a single dropped byte (this project has a known drop
+floor) from a stream that shifted.
+
+**Anything else red is a new finding.** And a bench run showing a single
+otherwise inexplicable glitch should be weighed against the known dropped
+register write — roughly 1 transfer in 35000, always at the start of a
+transfer — before it is attributed to anything here.
+
+### Reading a bulk-transfer failure
+
+`BIG` and `REU` each report three numbers beyond the verdict:
+
+```
+xxx DIFF AT    offset of the first mismatching byte
+xxx DIFF N     how many bytes differ in total
+xxx WANT/GOT   the expected byte and the actual one
+```
+
+`DIFF N` is the one that decides what happened. `0001` is a single corrupted
+byte. A count that runs to the end of the buffer is a shifted stream, which
+means the transfer lost or gained a byte rather than corrupting one — a
+different bug with a different fix. Without the count, both report `$E1`.
+
+`BIG` runs the same 8000 bytes through the API three times, and the three
+passes differ in exactly one thing each so that the offsets can be compared:
+
+| pass | source | framebuffer rect | destination |
+|------|--------|------------------|-------------|
+| `BIG`  | `$4000` | (0,100) 320x25 | `$6000` |
+| `BIG2` | *(no new upload — re-reads the same framebuffer)* | same | `$6001` |
+| `BIG3` | `$4001` | same | `$6000` |
+
+The framebuffer base is a multiple of 256 in all three, so buffer index *k*
+sits at framebuffer page offset *k* throughout; only the C64 addresses move.
+
+* `BIG2` failing at the same *k* as `BIG` — the **destination** write address
+  does not select the damaged byte.
+* `BIG3` failing at the same *k* — the **source** read address does not
+  either, and since `BIG3` is a fresh upload, the damage is chosen anew every
+  transfer.
+* `BIG3` failing one lower — the source address does select it.
+
+`BIG2` alone cannot separate much: it re-reads a framebuffer that was
+uploaded once, so if the upload is what corrupted it, every readback repeats
+the same bytes faithfully and the results match whatever the cause. That is
+why `BIG3` uploads again.
+
+### What the three passes found (2026-08-25) -- FIXED, hardware-confirmed
+
+`BIG3` came back **clean on both runs** while `BIG` failed on both: a second,
+warm upload of the same 8000 bytes is correct, the first, cold one is not.
+And every mismatch ever recorded -- eleven of them across five runs -- sits
+beyond offset **1024**, the lowest at 1057.
+
+1024 was `nWarm` in `gpu64_blobRead()`. The burst warmed the first 1024 bytes
+of its destination and nothing after, so past that window every 64th store
+landed on a cold cache line, the core had to read-allocate it from an SDRAM
+the VideoCore is also driving, and the stall outlasted the C64 cycle the
+burst was riding. The byte sampled was then whatever the bus had moved on to.
+`gpu64_warmBuffer()` now warms the whole length, with real loads rather than
+an advisory `prfm` -- `prfm` may be dropped by the hardware, and this is the
+one place where "mostly warmed" and "warmed" differ by a corrupted byte.
+`BIG2` showed no damage beyond `BIG`'s for the same reason it could not: the
+upload had just warmed that staging buffer for the readback to re-read.
+
+Two readings died on the way here, both artefacts of the test data: "the
+wrong byte is always `$5C`, the page's last byte", and then "failures cluster
+at page offset `$E1`". `kitSeq`'s original add-and-xor step was a bijection
+on the byte, so its period was exactly **256, the same as a page**: every
+byte value lived at one fixed page offset, which made "the value is `$06`"
+and "the page offset is `$E1`" the same statement. `kitSeq` is now a Galois
+LFSR of period 255, coprime with 256, and the clustering did not survive.
+
+Confirmed on hardware the same day: with `src:cf073b3a` all three passes
+report `0000` across the board, and the other five programs stayed green --
+`gpu64_blobWrite()` took the same change and every test uses it.
+
+One failure stays outside this account, and it is **not** the drop floor.
+`REU EXACT` -- and once `BLIT EXACT` -- has failed on three of seven runs, on
+a **64-byte** transfer. 64 bytes is inside any warm window, so the cold-line
+defect cannot reach it; and three in seven is orders of magnitude above the
+~1/35000 register-write drop rate. `gpu64_probe_reu` was written to measure
+it: see below.
+
+### gpu64_probe_reu
+
+`REU EXACT` does three things at once, and any of them could be at fault: it
+stashes a tile into REU space using the REU's **own** controller (ten
+consecutive writes to `$df01`-`$df08`, exactly the register-write pressure
+the `$df00`-`$df0a` decode path is known to be fragile under), blits it out
+of space 1, then reads the framebuffer back. The probe repeats each part 64
+times and reports `FAILS` / `1ST` / `OFF` / `W/G` per phase:
+
+* **RAW** — stash and fetch back with the REU controller alone, no gpu64
+  command involved. Red here means the defect is in RAD's REU emulation and
+  gpu64 is only the messenger.
+* **API** — the whole `REU EXACT` path repeated, stash included.
+* **ONCE** — one stash, then 64 blit-and-read cycles. Clean here but red in
+  API pins it on the stash rather than on reading REU memory.
+
+`1ST = 0000` with `FAILS = 0001` would be the notable case: only the very
+first transfer after start-up affected, which is all a single-stash program
+like `gpu64_test_blit` can ever see.
+
+64 iterations is deliberately modest — each writes ten REU registers, and
+heavy REU register traffic is the documented way to latch the emulation into
+total transfer failure. `FAILS` jumping to a large number from some `1ST`
+onward is that latch, not this defect, and needs a power cycle.
+
+**First result (2026-08-25): all three phases clean, 0 failures in 192
+iterations.** That is not a null result, it is a constraint. If `REU EXACT`
+failed as an independent event at anything like the observed 3-in-7 rate, a
+run of 192 would be all but certain to catch it, and it caught none. So the
+failure is **not** a property of the REU-space path repeated in isolation —
+not the controller stash, not the space-1 blit, not the readback. What
+remains is either something about the state `gpu64_test_blit` is in when it
+reaches that line, some twenty commands in, or an event rarer than three runs
+in seven made it look.
+
+Cheapest things to check next: whether the framebuffer rectangle `REU EXACT`
+reads back at (180,100) overlaps anything an earlier check in the same
+program painted — the probe used (0,0) and could not have seen that — and
+whether the probe stays clean with those twenty-odd commands replayed ahead
+of it.
+
+`tools/prgsim/runsim.py --alias-drop=OFF[,OFF...]` injects a byte-level fault
+at chosen offsets, so the suite's diagnostic lines can be read against a
+known answer on a PC before a bench run is spent on them.
+
 ## Testing on hardware
 
 The friction the progress tracker calls out -- "physically move the SD card

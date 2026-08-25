@@ -1,0 +1,491 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 -- API conformance suite 2/6: the drawing primitives.
+;
+;      WHAT THIS TESTS
+;
+;      CLEAR, SET_PIXEL, LINE, RECT and RECT_FILL -- and it tests them by
+;      reading the framebuffer back, not by looking at the screen.
+;
+;      That is the whole idea of this program. READ_RECT copies a rectangle
+;      of the draw page into C64 RAM, so the C64 can check what gpu64
+;      actually painted, byte by byte, and say PASS or FAIL on its own. A
+;      drawing test nobody has to squint at is a drawing test that can be
+;      run in thirty seconds and trusted.
+;
+;      Three things are asserted about every primitive:
+;
+;        the pixels that should be set are set,
+;        the pixels next to them are NOT -- an off-by-one that paints one
+;        column too many is the classic rasteriser bug and is invisible to
+;        the eye at this scale,
+;        and geometry that runs off the page CLIPS rather than erroring or
+;        wrapping. Clipping is specified as normal, never an error, so a
+;        clipped draw that returns anything but OK is a failure even though
+;        it looks like caution.
+;
+;      HOW TO READ THE RESULT
+;
+;      One line per assertion, OK or F<hex>. A fail code of $E3 means a byte
+;      read back from the framebuffer was not what it should have been and
+;      the byte itself was zero; any other value in the $00-$0F range on a
+;      pixel test IS the wrong byte, so F0A on a test expecting colour 3
+;      means something painted colour 10 there. $E2 means a whole region
+;      that should have been one colour was not.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+RB	= $3000				; readback buffer, 256 bytes is plenty
+
+BG	= 3				; the colour everything is cleared to
+INK	= 7
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 2 - DRAWING"
+
+; ----------------------------------------------------------------------
+; CLEAR, and the readback path everything below depends on.
+;
+; If CLEAR or READ_RECT is broken, every later result is meaningless -- so
+; these two are checked at both corners of the page before anything else
+; runs, which also proves the read is not silently reading page 0 twice.
+; ----------------------------------------------------------------------
+
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+	#wantOk
+	#check "CLEAR"
+
+	#poison RB, 64
+	#stgRead RB, 0, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantOk
+	#check "READ RECT"
+
+	#setptr P1, RB
+	#setlen 64
+	lda #BG
+	sta kitVal
+	jsr kitChkFill
+	#check "CLEAR TOPLEFT"
+
+	#poison RB, 64
+	#stgRead RB, 312, 192, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setlen 64
+	lda #BG
+	sta kitVal
+	jsr kitChkFill
+	#check "CLEAR BOTRIGHT"
+
+; ----------------------------------------------------------------------
+; SET_PIXEL.
+; ----------------------------------------------------------------------
+
+	#stgPixel 10, 10, INK
+	lda #OP_SET_PIXEL
+	jsr cmd0
+	#wantOk
+	#check "SET PIXEL"
+
+	; A 3x3 window centred on it: the pixel, and the eight that must not
+	; have moved.
+	#poison RB, 9
+	#stgRead RB, 9, 9, 3, 3
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+4, INK			; the pixel itself
+	#expectb RB+0, BG
+	#expectb RB+1, BG
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#expectb RB+5, BG
+	#expectb RB+6, BG
+	#expectb RB+7, BG
+	#expectb RB+8, BG
+	#useacc
+	#check "PIXEL EXACT"
+
+	; Every way off the page. All five are specified to clip silently.
+	#clracc
+	#stgPixel -1, 5, 9
+	lda #OP_SET_PIXEL
+	jsr cmd0
+	#accOk
+	#stgPixel 320, 5, 9
+	lda #OP_SET_PIXEL
+	jsr cmd0
+	#accOk
+	#stgPixel 5, -1, 9
+	lda #OP_SET_PIXEL
+	jsr cmd0
+	#accOk
+	#stgPixel 5, 200, 9
+	lda #OP_SET_PIXEL
+	jsr cmd0
+	#accOk
+	#stgPixel 1000, 1000, 9
+	lda #OP_SET_PIXEL
+	jsr cmd0
+	#accOk
+	#useacc
+	#check "PIXEL OFFPAGE"
+
+	; ...and nothing wrapped round to the other edge, which is what a
+	; missing sign check on x actually does to a linear framebuffer.
+	#poison RB, 64
+	#stgRead RB, 312, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setlen 64
+	lda #BG
+	sta kitVal
+	jsr kitChkFill
+	#check "NO WRAPAROUND"
+
+; ----------------------------------------------------------------------
+; LINE. Both endpoints are inclusive, which is the part worth pinning:
+; an exclusive endpoint is a one-pixel error nobody sees until two lines
+; are supposed to meet at a corner.
+; ----------------------------------------------------------------------
+
+	#stgLine 4, 20, 11, 20, 5
+	lda #OP_LINE
+	jsr cmd0
+	#wantOk
+	#check "LINE H"
+
+	#poison RB, 16
+	#stgRead RB, 0, 20, 16, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+3, BG			; just before the start
+	#expectb RB+4, 5			; first endpoint, inclusive
+	#expectb RB+7, 5
+	#expectb RB+11, 5			; last endpoint, inclusive
+	#expectb RB+12, BG			; just past the end
+	#useacc
+	#check "LINE H EXACT"
+
+	#stgLine 20, 4, 20, 11, 5
+	lda #OP_LINE
+	jsr cmd0
+	#poison RB, 16
+	#stgRead RB, 20, 0, 1, 16
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+3, BG
+	#expectb RB+4, 5
+	#expectb RB+11, 5
+	#expectb RB+12, BG
+	#useacc
+	#check "LINE V EXACT"
+
+	; A line whose endpoints coincide is one pixel, not nothing: the loop
+	; has to paint before it tests for the end.
+	#stgLine 30, 30, 30, 30, 6
+	lda #OP_LINE
+	jsr cmd0
+	#poison RB, 9
+	#stgRead RB, 29, 29, 3, 3
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+4, 6
+	#expectb RB+3, BG
+	#expectb RB+5, BG
+	#useacc
+	#check "LINE DOT"
+
+	; A 45-degree diagonal is the one case where the slope cannot be got
+	; subtly wrong without showing: every step moves in both axes.
+	#stgLine 40, 40, 47, 47, 6
+	lda #OP_LINE
+	jsr cmd0
+	#poison RB, 64
+	#stgRead RB, 40, 40, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 6
+	#expectb RB+9, 6
+	#expectb RB+18, 6
+	#expectb RB+27, 6
+	#expectb RB+36, 6
+	#expectb RB+45, 6
+	#expectb RB+54, 6
+	#expectb RB+63, 6
+	#expectb RB+1, BG			; off the diagonal
+	#expectb RB+8, BG
+	#useacc
+	#check "LINE DIAGONAL"
+
+	; A line entirely off the page is legal and draws nothing.
+	#stgLine -50, -50, -10, -10, 9
+	lda #OP_LINE
+	jsr cmd0
+	#wantOk
+	#check "LINE OFFPAGE"
+
+	; ...and one that crosses the whole page from outside to outside keeps
+	; the part that is on it, at both ends.
+	#stgLine -10, 100, 330, 100, 12
+	lda #OP_LINE
+	jsr cmd0
+	#wantOk
+	#check "LINE CROSSING"
+
+	#poison RB, 8
+	#stgRead RB, 0, 100, 8, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setlen 8
+	lda #12
+	sta kitVal
+	jsr kitChkFill
+	#check "LINE CLIP L"
+
+	#poison RB, 8
+	#stgRead RB, 312, 100, 8, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setlen 8
+	lda #12
+	sta kitVal
+	jsr kitChkFill
+	#check "LINE CLIP R"
+
+; ----------------------------------------------------------------------
+; RECT and RECT_FILL.
+;
+; w and h include the outline, so RECT 6 wide has its two vertical edges at
+; x and x+5 with four columns of untouched page between them.
+; ----------------------------------------------------------------------
+
+	#stgRect 50, 50, 6, 5, 8
+	lda #OP_RECT
+	jsr cmd0
+	#wantOk
+	#check "RECT"
+
+	; Read an 8x7 window with the 6x5 rect inset by one, so the ring of
+	; page around it is checked at the same time.
+	#poison RB, 56
+	#stgRead RB, 49, 49, 8, 7
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+9, 8			; corner (50,50)
+	#expectb RB+14, 8			; corner (55,50)
+	#expectb RB+41, 8			; corner (50,54)
+	#expectb RB+46, 8			; corner (55,54)
+	#expectb RB+11, 8			; a top edge pixel
+	#expectb RB+43, 8			; a bottom edge pixel
+	#expectb RB+17, 8			; a left edge pixel
+	#expectb RB+22, 8			; a right edge pixel
+	#expectb RB+19, BG			; the hollow middle
+	#expectb RB+27, BG
+	#expectb RB+0, BG			; outside, all four sides
+	#expectb RB+7, BG
+	#expectb RB+48, BG
+	#expectb RB+55, BG
+	#useacc
+	#check "RECT EXACT"
+
+	#stgRect 60, 60, 6, 5, 9
+	lda #OP_RECT_FILL
+	jsr cmd0
+	#wantOk
+	#check "RECT FILL"
+
+	#poison RB, 56
+	#stgRead RB, 59, 59, 8, 7
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+9, 9			; first filled pixel
+	#expectb RB+14, 9			; last of its row
+	#expectb RB+19, 9			; the middle, filled this time
+	#expectb RB+41, 9
+	#expectb RB+46, 9			; last filled pixel
+	#expectb RB+8, BG			; one column left of the fill
+	#expectb RB+15, BG			; one column right of it
+	#expectb RB+6, BG			; one row above
+	#expectb RB+54, BG			; one row below
+	#useacc
+	#check "FILL EXACT"
+
+	; A zero width or height is a no-op, not an error, and must not paint
+	; a degenerate line.
+	#stgRect 70, 70, 0, 5, 10
+	lda #OP_RECT_FILL
+	jsr cmd0
+	#wantOk
+	#check "FILL W0"
+
+	#stgRect 70, 70, 6, 0, 10
+	lda #OP_RECT_FILL
+	jsr cmd0
+	#wantOk
+	#check "FILL H0"
+
+	#stgRect 70, 70, 0, 0, 10
+	lda #OP_RECT
+	jsr cmd0
+	#wantOk
+	#check "RECT W0H0"
+
+	#poison RB, 9
+	#stgRead RB, 70, 70, 3, 3
+	lda #OP_READ_RECT
+	jsr cmd0
+	#setptr P1, RB
+	#setlen 9
+	lda #BG
+	sta kitVal
+	jsr kitChkFill
+	#check "ZERO NO PAINT"
+
+; ----------------------------------------------------------------------
+; Clipping, at both corners.
+; ----------------------------------------------------------------------
+
+	#stgRect -4, -4, 8, 8, 10
+	lda #OP_RECT_FILL
+	jsr cmd0
+	#wantOk
+	#check "FILL CLIP TL"
+
+	#poison RB, 64
+	#stgRead RB, 0, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 10			; the surviving quarter
+	#expectb RB+3, 10
+	#expectb RB+24, 10
+	#expectb RB+27, 10
+	#expectb RB+4, BG			; and nothing past it
+	#expectb RB+32, BG
+	#expectb RB+36, BG
+	#useacc
+	#check "CLIP TL EXACT"
+
+	#stgRect 316, 196, 8, 8, 11
+	lda #OP_RECT_FILL
+	jsr cmd0
+	#wantOk
+	#check "FILL CLIP BR"
+
+	#poison RB, 64
+	#stgRead RB, 312, 192, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+36, 11			; (316,196)
+	#expectb RB+39, 11			; (319,196)
+	#expectb RB+63, 11			; (319,199), the last pixel of the page
+	#expectb RB+35, BG			; one column short of the fill
+	#expectb RB+28, BG			; one row short of it
+	#useacc
+	#check "CLIP BR EXACT"
+
+; ----------------------------------------------------------------------
+; READ_RECT's own contract. Unlike every drawing op, it does NOT clip: a
+; rectangle partly off the page has no defined content to return, so it is
+; an error instead.
+; ----------------------------------------------------------------------
+
+	#stgRead RB, -1, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "READ NEG X"
+
+	#stgRead RB, 0, -1, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "READ NEG Y"
+
+	#stgRead RB, 313, 0, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "READ OFF R"
+
+	#stgRead RB, 0, 193, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "READ OFF B"
+
+	; The boundary on the good side: a rectangle ending exactly at the last
+	; pixel of the page must be allowed.
+	#stgRead RB, 312, 192, 8, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantOk
+	#check "READ LIMIT"
+
+	; len has to agree with w * h, the same rule BLIT follows.
+	#argblob 0, SPACE_C64, RB, 63
+	#argw 6, 0
+	#argw 8, 0
+	#argw 10, 8
+	#argw 12, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "READ BAD LEN"
+
+	; w = 0 is a no-op, checked before the bounds are, so the nonsense
+	; rectangle around it must not matter.
+	#argblob 0, SPACE_C64, RB, 0
+	#argw 6, -100
+	#argw 8, -100
+	#argw 10, 0
+	#argw 12, 8
+	lda #OP_READ_RECT
+	jsr cmd0
+	#wantOk
+	#check "READ W0"
+
+	jmp kitFinish
+
+	.include "gpu64_testkit_rt.inc"

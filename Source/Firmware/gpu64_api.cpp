@@ -102,10 +102,20 @@ static inline s16 fixRead( const u8 *p, u32 i )
 	return (s16)( p[ 2 * i ] | ( p[ 2 * i + 1 ] << 8 ) );
 }
 
+// gpu64: rounds half away from zero, which is what docs/api_design.md
+// specifies. The bias has to be paired with a division that truncates
+// toward zero, NOT with an arithmetic shift: >> floors, so on a negative
+// accumulator the -128 bias is applied a second time and every negative
+// 8.8 product came back one LSB further from zero than it should --
+// -1.0 * 1.0 returned $FEFF (-1.00391) instead of $FF00. Positive products
+// were never affected, which is why this survived a hardware-verified
+// milestone: a one-LSB error on negatives only is invisible in a rendered
+// frame. Found by gpu64_test_math, predicted on a PC and confirmed on
+// hardware as exactly three red lines (ROUND NEG, MUL MINUS ONE,
+// SCALE NEG) and no others.
 static inline void fixWrite( u8 *p, u32 i, s64 acc )
 {
-	acc += ( acc >= 0 ) ? 128 : -128;
-	acc >>= 8;
+	acc = ( acc >= 0 ) ? ( acc + 128 ) / 256 : -( ( -acc + 128 ) / 256 );
 	if ( acc >  32767 ) acc =  32767;
 	if ( acc < -32768 ) acc = -32768;
 	p[ 2 * i ]     = (u8)( (u16)acc & 0xff );

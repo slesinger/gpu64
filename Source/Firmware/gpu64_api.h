@@ -141,6 +141,12 @@ static inline u8 gpu64_apiReadReg( u8 addr )
 u8 gpu64_blobRead( u8 space, u32 addr, u32 len, u8 *pDst );
 u8 gpu64_blobWrite( u8 space, u32 addr, u32 len, const u8 *pSrc );
 
+// gpu64: re-warms the polling loop's instruction window and the two data
+// structures it touches every pass (gpu64Regs, gpu64Vsync), both of which a
+// command dispatch evicts. Must be called with the bus still held -- see the
+// implementation in rad_reu.cpp for which rule this is and why.
+void gpu64_apiWarmPollingLoop( void );
+
 // gpu64: dumps the milestone 6a ladder table (and the flip stats) to the
 // on-screen log immediately, from wherever the bus-watch loop is giving up.
 // See gpu64_api.cpp. Compiles to an empty call in a normal build.

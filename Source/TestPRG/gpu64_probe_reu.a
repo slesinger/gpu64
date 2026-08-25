@@ -1,0 +1,272 @@
+;
+;      gpu64 -- REU-space transfer probe.
+;
+;      WHAT THIS IS FOR
+;
+;      gpu64_test_blit's REU EXACT line has now failed on three of seven
+;      hardware runs. That is far too often to be the register-write drop
+;      floor the working agreement documents (~1 in 35000), and at 64 bytes
+;      it is far too small to be the cold-cache-line defect that produced
+;      every large-transfer failure. It is something else, and one stash per
+;      program run cannot measure it.
+;
+;      REU EXACT does three things at once: it stashes a tile into REU space
+;      with the REU's OWN controller (ten consecutive writes to $df01-$df08,
+;      which is precisely the register-write pressure the $df00-$df0a decode
+;      path is known to be fragile under), then blits it out of space 1, then
+;      reads the framebuffer back. Any of the three could be at fault. The
+;      three phases here take them apart:
+;
+;        RAW   64 x (stash to REU, fetch back with the REU controller,
+;              compare). No gpu64 command is involved at all. If this is
+;              red, the defect is in RAD's REU emulation and gpu64 is merely
+;              the messenger.
+;
+;        API   64 x (stash, BLIT from space 1, READ_RECT, compare). The
+;              whole REU EXACT path, repeated. Red here but clean in RAW
+;              means gpu64's own space-1 handling.
+;
+;        ONCE  one stash, then 64 x (BLIT from space 1, READ_RECT, compare).
+;              The stash is taken out of the loop. Clean here but red in API
+;              pins it on the stash rather than on reading REU memory.
+;
+;      Each phase reports four numbers, all hex:
+;
+;        xxx FAILS  how many of the 64 iterations compared unequal
+;        xxx 1ST    the iteration it first went wrong at (0-based)
+;        xxx OFF    the offset of the first differing byte in that iteration
+;        xxx W/G    that byte expected, then actual
+;
+;      1ST = 0000 with FAILS = 0001 is the interesting case: it would mean
+;      only the very first transfer after start-up is affected, which is what
+;      a single-stash program like gpu64_test_blit would see.
+;
+;      NOTE: 64 iterations is deliberately modest. Each one writes ten REU
+;      registers, and heavy REU register traffic is the documented way to
+;      latch the emulation into total transfer failure; if that happens the
+;      cartridge needs a power cycle. FAILS jumping to a large number from
+;      some 1ST onward is that latch, not this defect.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+TSRC	= $3000				; the 64-byte pattern
+RB	= $3100				; where it comes back
+NITER	= 64
+
+REU_CMD		= $df01
+REU_C64LO	= $df02
+REU_C64HI	= $df03
+REU_EXT0	= $df04
+REU_EXT1	= $df05
+REU_EXT2	= $df06
+REU_LENLO	= $df07
+REU_LENHI	= $df08
+REU_CTRL	= $df0a
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 PROBE - REU SPACE"
+
+	#setptr P1, TSRC
+	#setlen 64
+	jsr kitSeq
+
+; ----------------------------------------------------------------------
+; Phase 1: the REU controller on its own. No gpu64 command at all.
+; ----------------------------------------------------------------------
+
+	jsr rpReset
+rp1
+	#poison RB, 64, $5a
+	jsr stashTile
+	jsr fetchTile
+	jsr rpCompare
+	jsr rpNext
+	bne rp1
+	#showw rpFails, "RAW FAILS"
+	#showw rpFirst, "RAW 1ST"
+	#showw rpOff,   "RAW OFF"
+	#showw rpWG,    "RAW W/G"
+
+; ----------------------------------------------------------------------
+; Phase 2: the whole REU EXACT path, stash included.
+; ----------------------------------------------------------------------
+
+	jsr rpReset
+rp2
+	jsr stashTile
+	jsr blitFromReu
+	#poison RB, 64, $5a
+	jsr readBack
+	jsr rpCompare
+	jsr rpNext
+	bne rp2
+	#showw rpFails, "API FAILS"
+	#showw rpFirst, "API 1ST"
+	#showw rpOff,   "API OFF"
+	#showw rpWG,    "API W/G"
+
+; ----------------------------------------------------------------------
+; Phase 3: the same, with the stash lifted out of the loop.
+; ----------------------------------------------------------------------
+
+	jsr rpReset
+	jsr stashTile
+rp3
+	jsr blitFromReu
+	#poison RB, 64, $5a
+	jsr readBack
+	jsr rpCompare
+	jsr rpNext
+	bne rp3
+	#showw rpFails, "ONCE FAILS"
+	#showw rpFirst, "ONCE 1ST"
+	#showw rpOff,   "ONCE OFF"
+	#showw rpWG,    "ONCE W/G"
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+; The transfers.
+; ----------------------------------------------------------------------
+
+; C64 -> REU. Command $90 is execute plus FF00-trigger-disabled, transfer
+; type 00.
+stashTile
+	lda #0
+	sta REU_CTRL
+	lda #<TSRC
+	sta REU_C64LO
+	lda #>TSRC
+	sta REU_C64HI
+	lda #0
+	sta REU_EXT0
+	sta REU_EXT1
+	sta REU_EXT2
+	lda #64
+	sta REU_LENLO
+	lda #0
+	sta REU_LENHI
+	lda #$90
+	sta REU_CMD
+	rts
+
+; REU -> C64, transfer type 01.
+fetchTile
+	lda #0
+	sta REU_CTRL
+	lda #<RB
+	sta REU_C64LO
+	lda #>RB
+	sta REU_C64HI
+	lda #0
+	sta REU_EXT0
+	sta REU_EXT1
+	sta REU_EXT2
+	lda #64
+	sta REU_LENLO
+	lda #0
+	sta REU_LENHI
+	lda #$91
+	sta REU_CMD
+	rts
+
+blitFromReu
+	#argblob 0, SPACE_REU, 0, 64
+	#argw 6, 0
+	#argw 8, 0
+	#argw 10, 8
+	#argw 12, 8
+	lda #OP_BLIT
+	jmp cmd0
+
+readBack
+	#stgRead RB, 0, 0, 8, 8
+	lda #OP_READ_RECT
+	jmp cmd0
+
+; ----------------------------------------------------------------------
+; Tally. Compares TSRC against RB and folds the verdict into the counters,
+; keeping the detail of the first iteration that went wrong.
+; ----------------------------------------------------------------------
+
+rpCompare
+	#setptr P1, TSRC
+	#setptr P2, RB
+	#setlen 64
+	jsr kitCmp
+	cpx #0
+	beq rpcDone
+
+	lda rpSeen
+	bne rpcCount
+	inc rpSeen
+	lda rpIdx
+	sta rpFirst
+	lda rpIdx+1
+	sta rpFirst+1
+	lda kitOff
+	sta rpOff
+	lda kitOff+1
+	sta rpOff+1
+	lda kitDiffB
+	sta rpWG
+	lda kitDiffA
+	sta rpWG+1
+
+rpcCount
+	inc rpFails
+	bne rpcDone
+	inc rpFails+1
+rpcDone
+	rts
+
+rpNext
+	inc rpIdx
+	bne +
+	inc rpIdx+1
++
+	lda rpIdx
+	cmp #NITER
+	rts
+
+rpReset
+	lda #0
+	sta rpIdx
+	sta rpIdx+1
+	sta rpFails
+	sta rpFails+1
+	sta rpFirst
+	sta rpFirst+1
+	sta rpOff
+	sta rpOff+1
+	sta rpWG
+	sta rpWG+1
+	sta rpSeen
+	rts
+
+rpIdx	.word 0
+rpFails	.word 0
+rpFirst	.word 0
+rpOff	.word 0
+rpWG	.word 0
+rpSeen	.byte 0
+
+	.include "gpu64_testkit_rt.inc"
