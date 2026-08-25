@@ -84,7 +84,7 @@ dmvPoll
 	lda STATUS
 	and #ST_VB_PEND
 	beq dmvPoll
-	#cmd OP_VBLANK_ACK
+	#cmd0 OP_VBLANK_ACK
 	rts
 dmvFree
 	; Nothing to sync to. Burn a little time so the animation is not
@@ -99,11 +99,15 @@ dmvDelay
 ; which lands on a real frame boundary and cannot tear; without one it is
 ; an immediate flip, which can. Either way the wait on STATUS bit0 is a
 ; register spin, not a halt: the C64 is free to do something else instead.
+;
+; The opcode is written with #cmd0, not #cmd: CMD_HI is sticky, and a
+; caller that was last in class 2 would otherwise fire $05 as a class 2
+; opcode -- which is SET_CAMERA, and which flips nothing at all.
 dmFlip
 	lda dmVbOk
 	beq dmfNow
 	#argb 0, 1			; 1 = at next vblank
-	#cmd OP_PAGE_FLIP
+	#cmd0 OP_PAGE_FLIP
 dmfWait
 	lda STATUS
 	and #ST_BUSY
@@ -111,7 +115,7 @@ dmfWait
 	rts
 dmfNow
 	#argb 0, 0			; 0 = immediately
-	#cmd OP_PAGE_FLIP
+	#cmd0 OP_PAGE_FLIP
 	rts
 
 ; ----------------------------------------------------------------------

@@ -296,6 +296,7 @@ class 0 and class 2 can draw into the same page in the same frame.
 | $04 | `FILL_VIEW` | 1 | `ARG0` palette index | Fills the view rectangle with one raw index. No colormap, no clipping beyond the view. **Also empties the class 2 depth buffer over the same rectangle** — a pixel just painted background has nothing in it, so this is the op a frame starts with. |
 | $05 | `SET_CAMERA` | 15 | `ARG0-1` x, `ARG2-3` y, `ARG4` angle, `ARG5` flags, `ARG6-7` eye height, `ARG8-9` ceiling height, `ARG10-11` projection, `ARG12` floor colour, `ARG13` ceiling colour, `ARG14` horizon | The camera `DRAW_WALLS` projects through. Position and heights are signed 8.8 world units; angle is binary, 256 to the circle, 0 looking along +x. Projection is the distance to the projection plane in pixels as 8.8 — 160.0 (`$A000`) across a 320-wide view is a 90° field of view. Horizon is a signed pixel offset from the view's centre row. Flags bit 0 (`CAM_PAINT`) has each wall column also fill its own ceiling above and floor below in the two colours. A projection of 0, an eye height at or below 0, or a ceiling at or below the eye is `BAD_ARGS`. For `DRAW_SECTORS` the eye height is an **absolute** world height rather than a height above the floor, the ceiling height is not read at all (send the level's tallest, so the validation passes), and the two flat colours are not read either — they come from the sector. |
 | $06 | `SET_SECTORS` | 8 | `ARG0-5` blob descriptor, `ARG6-7` count | Loads the sector table `DRAW_SECTORS` reads heights and flat colours from — see the sector record below. `count = 0` drops the table. Max 128 sectors; `len` must equal `count * 8`. A sector whose ceiling is at or below its own floor rejects the **whole** upload with `BAD_ARGS` and leaves the table that was already there untouched. |
+| $07 | `SET_CAMERA3D` | 11 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` z, `ARG6` yaw, `ARG7` pitch, `ARG8-9` projection, `ARG10` flags | The camera `DRAW_POLYS` projects through — a free camera in three dimensions, with a real pitch rather than `SET_CAMERA`'s horizon shear. Position is signed 8.8 world units, `z` upwards. Yaw is binary, 256 to the circle, 0 looking along +x, and turns the same way `SET_CAMERA`'s angle does. Pitch is **signed** binary, $00 level, positive looking **up**; $40 is straight up and $C0 straight down, though a Quake game normally clamps well inside that. Projection is as `SET_CAMERA`: distance to the projection plane in pixels, 8.8, so 160.0 (`$A000`) across a 320-wide view is 90°. A projection of 0 is `BAD_ARGS`; there is no other validation, because there is no floor to be under. `ARG10` is reserved, write 0. This camera is entirely separate from `SET_CAMERA`'s: both can be live at once and a frame may use both. |
 
 ### Resources — $10–$1F
 
@@ -303,6 +304,8 @@ class 0 and class 2 can draw into the same page in the same frame.
 |---|---|---|---|---|
 | $10 | `UPLOAD_TEXTURE` | 11 | `ARG0-5` blob descriptor, `ARG6-7` w, `ARG8-9` h, `ARG10` flags; **`ID`** = texture id | Copies `w * h` bytes into gpu64's texture arena under id `1..255`. **`h` must be a power of two** (it is masked per pixel); `w` need not be, unless the texture is used by `DRAW_SPANS`, which masks both. Either dimension 0 or over 1024 is `BAD_ARGS`, as is a `w * h` over 65536; `len` must equal `w * h`. `ID = 0` is `BAD_ID`, and so is an id past 255. Re-uploading a live id replaces it. Arena exhausted is `OUT_OF_MEMORY`. |
 | $11 | `FREE_TEXTURE` | 0 | **`ID`** = texture id | Releases the id. An id that is not live is `BAD_ID`. |
+| $12 | `UPLOAD_VERTS` | 8 | `ARG0-5` blob descriptor, `ARG6-7` count | Loads the vertex pool `DRAW_POLYS` indexes into — see the vertex record below. `count = 0` drops the pool. Max 4096 vertices; `len` must equal `count * 8`. |
+| $13 | `UPLOAD_TEXINFO` | 8 | `ARG0-5` blob descriptor, `ARG6-7` count | Loads the texture-axis table a textured polygon names — see the texinfo record below. `count = 0` drops the table. Max 255 entries; `len` must equal `count * 16`. |
 
 The texture arena is a bump allocator: freeing an id, or re-uploading over a
 live one, releases the **id** but not the bytes. Load a level's textures
@@ -324,6 +327,7 @@ once at upload rather than per pixel.
 | $23 | `DRAW_WALLS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` wall records — see below. |
 | $24 | `DRAW_SECTORS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` **32-byte** sector-wall records — see below. `BAD_ARGS` if `SET_SECTORS` has not been sent. |
 | $25 | `DRAW_THINGS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte thing records — billboards in world space, depth-tested against the buffer `DRAW_SECTORS` filled. See below. |
+| $26 | `DRAW_POLYS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte polygon records — arbitrary convex polygons in world space, through `SET_CAMERA3D`, depth-tested per pixel. See below. `BAD_ARGS` if `SET_CAMERA3D` or `UPLOAD_VERTS` has not been sent. |
 | $22 | `DRAW_SPRITE` | 15 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` w, `ARG6-7` h, `ARG8` light, `ARG9` key, `ARG10-11` clipY0, `ARG12-13` clipY1, `ARG14` flags; **`ID`** = texture id | Scales one texture into the screen rectangle `x,y,w,h`, clipped to the view **and** to the inclusive row range `clipY0..clipY1`. Flags: bit0 mask on `key`, bit1 flip horizontally. `w` or `h` of 0 draws nothing (and counts as one rejected primitive); an unknown id is `BAD_ID`. |
 
 `count = 0` is a no-op, not an error. Otherwise `len` must be exactly
@@ -530,6 +534,109 @@ behind the near plane is **rejected**; one that is well formed and clips
 away entirely, or is too far off to cover a pixel, is **accepted** and draws
 nothing. That distinction is the whole value of the counters: rejected means
 the record was wrong, not that it missed.
+
+#### Vertex record — 8 bytes
+
+The pool `UPLOAD_VERTS` loads and polygon records index into. A vertex is
+shared by every face that touches it, so a level is uploaded once and the
+per-frame batch is nothing but indices.
+
+| Bytes | Field | Meaning |
+|---|---|---|
+| 0-1 | x | world position, signed 8.8 |
+| 2-3 | y | |
+| 4-5 | z | upwards |
+| 6-7 | — | reserved, write 0 |
+
+The two pad bytes are there so a vertex is 8 bytes and the 6502 reaches
+index *n* with three shifts instead of a multiply.
+
+Coordinates are 8.8, so the world is ±128 units across and no vertex may be
+more than 127.99 units from the origin — the same far plane the rest of the
+3D pipeline works in. Pick a scale where a room is a few units wide rather
+than a few hundred.
+
+#### Texinfo record — 16 bytes
+
+Where a texture's texels land in the world, as a pair of axes — the same
+idea Quake's `texinfo` lump carries. A face names one entry and gpu64
+derives its own texture coordinates from the vertex positions, so a wall and
+the floor it meets stay aligned however the face is split.
+
+| Bytes | Field | Meaning |
+|---|---|---|
+| 0-1 | sx | s axis, signed 8.8 |
+| 2-3 | sy | |
+| 4-5 | sz | |
+| 6-7 | sOff | s offset in texels, signed 8.8 |
+| 8-9 | tx | t axis, signed 8.8 |
+| 10-11 | ty | |
+| 12-13 | tz | |
+| 14-15 | tOff | t offset in texels, signed 8.8 |
+
+For a vertex at world position `P`:
+
+    s = ((P · sAxis) >> 8) + sOff
+    t = ((P · tAxis) >> 8) + tOff
+
+both in 8.8 texels, and both wrap by masking, so an axis of length 1.0
+(`$0100`) gives one texel per world unit and `$0400` gives four. The axes
+need not be perpendicular and need not lie in the face's plane — only the
+values at the vertices matter, and everything between them is interpolated
+in perspective.
+
+Entries are numbered **from 1**: a polygon record's `texinfo` byte of 1 is
+the first record you uploaded. 0 means "none", which is only legal on an
+untextured face.
+
+#### Polygon record — 16 bytes
+
+A convex polygon in world space, drawn through `SET_CAMERA3D` and
+depth-tested per pixel. This is the Quake-shaped layer: arbitrary planes at
+arbitrary angles, rather than `DRAW_SECTORS`' vertical walls and horizontal
+flats.
+
+| Bytes | Field | Meaning |
+|---|---|---|
+| 0-1 | first | index of the polygon's first vertex in the pool |
+| 2 | nVerts | 3 to 16, taken consecutively from `first` |
+| 3 | texinfo | 1-based texinfo index; ignored when `tex` is 0 |
+| 4 | tex | texture id, or **0 for a flat-shaded face** drawn in `col` |
+| 5 | col | palette index used when `tex` is 0 |
+| 6 | light | base light level, darkened by distance unless `POLY_FLATLIT` |
+| 7 | flags | bit0 (`POLY_MASKED`) skip texels equal to the batch `key`; bit1 (`POLY_FLATLIT`) use `light` unchanged; bit2 (`POLY_TWOSIDED`) no backface cull |
+| 8-15 | — | reserved, write 0 |
+
+The vertices must be **convex** and listed so that the face reads
+**clockwise on screen** when you are looking at its front — the same
+convention `DRAW_WALLS` states as "drawn only from the side that projects it
+left to right". A face seen from behind is culled and counts as rejected,
+which is what makes a sealed room cost only the polygons facing you; set
+`POLY_TWOSIDED` for a face that has no back, such as a grate or a banner.
+
+A textured face needs **both dimensions a power of two** — polys mask `u`
+and `v` alike, so a texture that is legal for `DRAW_COLUMNS` may still be
+rejected here.
+
+**Depth is written as well as tested**, at drawn pixels only, into the same
+buffer `DRAW_SECTORS` and `DRAW_THINGS` use. That means a batch of polygons
+is order-independent, a masked texel is a hole in the depth too, and a Quake
+level and a Doom level can be drawn into one frame if you want them to be.
+
+**`DRAW_POLYS` does not clear the depth buffer.** `DRAW_SECTORS` clears it
+because a Doom frame is one batch; a Quake frame is usually several — the
+world, then the moving brushes, then the sprites — so the clear belongs to
+`FILL_VIEW`, which is the op that starts the frame. Send `FILL_VIEW` first
+or you are depth-testing against last frame.
+
+A record is **rejected** if `nVerts` is outside 3..16, if `first + nVerts`
+runs past the uploaded pool, if a non-zero `tex` names a dead texture or one
+whose width is not a power of two, if a non-zero `tex` carries a `texinfo`
+of 0 or past the uploaded table, if it is culled as backfacing, or if it
+lies entirely behind the near plane. It is **accepted** if it is well formed
+and merely clips away off the sides of the view, or is edge-on and covers no
+pixels. Rejected means the record was wrong; accepted-and-invisible means it
+missed.
 
 #### Column record — 16 bytes
 

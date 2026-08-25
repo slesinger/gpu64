@@ -1681,3 +1681,97 @@ Verified 2026-08-25, the same round as 8c: `gpu64_test_things` green,
   a corridor pokes through its ceiling. Doom behaves the same way.
 - Nothing tells the C64 which things are visible, so a level with a thousand
   of them sends a thousand records a frame.
+
+## 9. `DRAW_POLYS` -- arbitrary convex polygons in world space
+
+Class 2 up to 8d renders a Doom-shaped world: everything is a vertical wall
+on a floor plan, the camera cannot look up or down, and the horizon is a
+shear. A Quake level is none of those things. Milestone 9 is the polygon
+layer that lifts the restriction, and it is deliberately additive -- nothing
+in 8a-8d changed, and a level being ported can send both kinds of batch into
+the same frame.
+
+Four opcodes, and the split is the point:
+
+- **`SET_CAMERA3D` ($07)** -- position, yaw, a *real* pitch, and a
+  projection scale. Entirely separate from `SET_CAMERA`; the two coexist so
+  a sector batch and a polygon batch in one frame each keep their own view.
+- **`UPLOAD_VERTS` ($12)** -- the vertex pool, 8 bytes each, uploaded once
+  per level rather than once per frame. This is what keeps the per-frame
+  6502 cost down to face records that are mostly indices.
+- **`UPLOAD_TEXINFO` ($13)** -- Quake's texture axes, 16 bytes each. gpu64
+  computes `s` and `t` per vertex from the world position, so the 6502 never
+  computes a texture coordinate.
+- **`DRAW_POLYS` ($26)** -- a batch of 16-byte face records: first vertex,
+  count, texinfo, texture, colour, light, flags.
+
+Together they mean a frame from the 6502 is ten bytes of camera plus sixteen
+bytes per visible face. Everything else -- transform, clip, project, cull,
+scan-convert, perspective-correct texture, depth-test -- is on the Pi.
+
+### Conventions this pins down
+
+Each of these was a choice with a live alternative, and each is now load
+bearing in the firmware, the model and the test PRG at once:
+
+1. **Clockwise on screen is front facing.** The cull is a signed screen-area
+   sum after projection, not a world-space normal, so it costs nothing extra
+   and needs no normal in the record. A zero-area face is accepted and draws
+   nothing; a back-facing one is *rejected*, so the counter tells a level
+   author which it was.
+2. **Positive pitch looks up**, $00 level, $40 straight up, $C0 straight
+   down. Signed binary, one byte, the same encoding yaw uses.
+3. **Texinfo indices are 1-based**, so 0 in a record means "no texinfo" and
+   a flat-shaded face needs no entry at all.
+4. **Both texture dimensions must be powers of two.** Walls only ever masked
+   `u`; a polygon masks `v` as well, so the old width-only rule is not
+   enough and a face with a non-conforming texture is rejected.
+
+### The depth buffer's lifecycle, restated
+
+`DRAW_SECTORS` clears depth for the batch it draws. `DRAW_POLYS`
+deliberately **does not**: a Quake frame is several batches -- world, then
+models, then whatever the game sorts separately -- and a per-batch clear
+would make the second batch erase the first one's occlusion. `FILL_VIEW`
+already owns the clear as of 8d, and that is the op a frame starts with, so
+the rule is unchanged from the caller's point of view and the cross-layer
+case works: a sector batch and a polygon batch occlude each other correctly
+because they share one 320x200 buffer.
+
+### Verified, all on a PC
+
+- `tools/rastercheck` grew two scenario kinds: **6** a polygon batch, and
+  **7** a sector batch and then a polygon batch into one depth buffer.
+  **3200 scenarios across eight seeds, 808 of them polygons and 227 of them
+  the cross-layer case, zero disagreements** between the firmware core and
+  the independently written Python model -- 64000 pixels and three counters
+  compared per scenario.
+- `gpu64_test_polys` -- **37 assertions**, expected numbers worked out by
+  hand from the geometry in its own header. It does not check the
+  arithmetic, which is rastercheck's job; it checks that the vertex pool,
+  the texinfo table and the face records the *C64* wrote are the ones the
+  core was handed, and that the depth buffer really is the one
+  `DRAW_SECTORS` and `DRAW_THINGS` use. Green under `tools/testprg.sh`, as
+  are all eleven conformance PRGs.
+- `gpu64_demo_quake` -- a walkable room of arbitrary polygons with real
+  pitch, **401 frames with `ERR OK` on every one**, and all ten demos green
+  under `tools/demos.sh`.
+
+A page-flip bug fell out of this work that had nothing to do with polygons:
+`dmFlip` and `dmVbWait` used `#cmd`, and CMD_HI is sticky, so a caller whose
+last command was class 2 fired `$05` and `$06` as `R2_SET_CAMERA` and
+`R2_SET_SECTORS` instead of flipping. Fixed with `#cmd0`. It had been latent
+in every demo that mixed classes.
+
+### On hardware
+
+**Not yet run.** Everything above is desk work.
+
+### Not done
+
+- `DRAW_THINGS` still projects through `SET_CAMERA`, so a Quake game has no
+  monsters yet. Giving it a 3D-camera path is the obvious next piece.
+- Lightmaps. Light is per face, as it is for walls and sectors.
+- Sky, water and translucency.
+- Any visibility structure. gpu64 draws what it is sent; a BSP and a PVS are
+  the 6502's problem, and on a C64 that is the interesting problem.

@@ -25,6 +25,7 @@ rejected), sprites clipped by clipY0/clipY1, masked draws, and lighting.
   python3 check.py --dump 3   # write out/scn3-{core,model}.ppm on a failure
 """
 import argparse
+import math
 import os
 import random
 import struct
@@ -40,6 +41,7 @@ BIN = os.path.join(HERE, "rastercheck")
 MAGIC = 0x4B433252
 REC = 16
 WALL2 = 32
+POLY = 16
 
 
 # ----------------------------------------------------------------------
@@ -107,8 +109,94 @@ def make_sectors(rnd, sectors):
     return out
 
 
+def make_camera3(rnd, polys):
+    """The milestone 9 camera. Illegal (proj 0) about one time in ten for a
+    polygon scenario, for the same reason the 2D one is: the branch that
+    rejects a whole batch has to agree too."""
+    if polys and rnd.random() < 0.1:
+        return dict(x=0, y=0, z=0, yaw=0, pitch=0, proj=0, flags=0)
+    return dict(
+        x=rnd.randint(-0x2000, 0x2000),
+        y=rnd.randint(-0x2000, 0x2000),
+        z=rnd.randint(-0x200, 0x200),
+        yaw=rnd.randint(0, 255),
+        pitch=rnd.choice([0, 0, rnd.randint(-40, 40)]),
+        proj=rnd.randint(0x2000, 0xE000),
+        flags=0,
+    )
+
+
+def clamp16(v):
+    return max(-32768, min(32767, v))
+
+
+def make_polys(rnd, cam3, ids):
+    """A vertex pool, a texinfo table and a batch of face records.
+
+    Faces are generated as convex n-gons in a random plane rather than as
+    random vertices, because a random triple is a degenerate sliver almost
+    every time and would test the clipper instead of the rasteriser. The
+    malformed ones are generated deliberately and counted: an index past the
+    pool, a vertex count of 0/1/17, and a texinfo a textured face does not
+    have.
+    """
+    verts = []
+    faces = bytearray()
+    nfaces = rnd.randint(0, 12)
+
+    ntexinfo = rnd.randint(0, 4)
+    texinfo = []
+    for _ in range(ntexinfo):
+        texinfo.append(tuple([rnd.randint(-0x400, 0x400) for _ in range(3)]
+                             + [rnd.randint(-2000, 2000)]
+                             + [rnd.randint(-0x400, 0x400) for _ in range(3)]
+                             + [rnd.randint(-2000, 2000)]))
+
+    for _ in range(nfaces):
+        n = rnd.randint(3, 6)
+        ox = cam3["x"] + rnd.randint(-0x500, 0x500)
+        oy = cam3["y"] + rnd.randint(-0x500, 0x500)
+        oz = cam3["z"] + rnd.randint(-0x300, 0x300)
+        e1 = [rnd.randint(-0x300, 0x300) for _ in range(3)]
+        e2 = [rnd.randint(-0x300, 0x300) for _ in range(3)]
+        first = len(verts)
+        pts = []
+        for k in range(n):
+            ang = 2 * math.pi * k / n
+            ca, sa = math.cos(ang), math.sin(ang)
+            pts.append((clamp16(int(ox + ca * e1[0] + sa * e2[0])),
+                        clamp16(int(oy + ca * e1[1] + sa * e2[1])),
+                        clamp16(int(oz + ca * e1[2] + sa * e2[2]))))
+        if rnd.random() < 0.5:
+            pts.reverse()           # the other winding: a backface
+        verts += pts
+
+        nrec = n
+        firstrec = first
+        if rnd.random() < 0.15:
+            # Malformed on purpose, one of the three ways a record can be.
+            which = rnd.randint(0, 2)
+            if which == 0:
+                nrec = rnd.choice([0, 1, 2, 17, 255])
+            elif which == 1:
+                firstrec = rnd.randint(4000, 5000)
+        texid = rnd.choice(ids)
+        # Mostly a texinfo that exists -- a face rejected for naming one that
+        # does not tests the guard, not the rasteriser.
+        if ntexinfo and rnd.random() < 0.8:
+            ti = rnd.randint(1, ntexinfo)
+        else:
+            ti = rnd.randint(0, max(ntexinfo, 1) + 1)
+        faces += struct.pack("<HBBBBBBxxxxxxxx", firstrec & 0xFFFF, nrec,
+                             ti, texid, rnd.randint(0, 255),
+                             rnd.randint(0, 70), rnd.randint(0, 7))
+
+    assert len(faces) == nfaces * POLY
+    return verts, texinfo, nfaces, bytes(faces)
+
+
 def make_scenario(rnd):
-    kind = rnd.choice([0, 0, 0, 1, 1, 2, 3, 3, 4, 4, 4, 5, 5, 5])
+    kind = rnd.choice([0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7])
 
     # The view: full surface half the time, otherwise a rectangle that
     # actually clips something.
@@ -135,8 +223,11 @@ def make_scenario(rnd):
 
     fill = rnd.randint(0, 255)
     key = rnd.randint(0, 255)
-    cam = make_camera(rnd, kind in (3, 4, 5))
-    sectors = make_sectors(rnd, kind in (4, 5))
+    cam = make_camera(rnd, kind in (3, 4, 5, 7))
+    sectors = make_sectors(rnd, kind in (4, 5, 7))
+    cam3 = make_camera3(rnd, kind in (6, 7))
+    ids_for_polys = sorted(texs) + [0, rnd.randint(9, 255)]
+    verts, texinfo, npolys, polyrecs = make_polys(rnd, cam3, ids_for_polys)
 
     if kind == 2:
         texid = rnd.choice(sorted(texs))
@@ -155,7 +246,17 @@ def make_scenario(rnd):
         )
         return dict(kind=2, view=view, levels=levels, cmap=cmap,
                     texs=texs, fill=fill, key=key, cam=cam,
-                    sectors=sectors, spr=spr)
+                    sectors=sectors, spr=spr, cam3=cam3, verts=verts,
+                    texinfo=texinfo, polys=npolys, polyrecs=polyrecs)
+
+    if kind == 6:
+        # The polygon batch IS the scenario here; the shared generator above
+        # already built it.
+        return dict(kind=6, view=view, levels=levels, cmap=cmap, texs=texs,
+                    fill=fill, key=key, cam=cam, sectors=sectors, cam3=cam3,
+                    verts=verts, texinfo=texinfo, count=npolys,
+                    recs=polyrecs, polys=0, polyrecs=b"",
+                    things=0, thingrecs=b"")
 
     count = rnd.randint(0, 60)
     recs = bytearray()
@@ -163,7 +264,7 @@ def make_scenario(rnd):
     for _ in range(count):
         texid = rnd.choice(ids)
         light = rnd.randint(0, 70)
-        if kind in (4, 5):
+        if kind in (4, 5, 7):
             # Same near-plane bias as the wall scenarios, plus sector ids
             # that are out of range about one time in six and a back sector
             # that is $FF -- one-sided -- about half the time.
@@ -215,7 +316,7 @@ def make_scenario(rnd):
             dv = rnd.randint(-900, 900)
             recs += struct.pack("<hhhBBhhhh", y, x0, x1, texid, light,
                                 u, v, du, dv)
-    assert len(recs) == count * (WALL2 if kind in (4, 5) else REC)
+    assert len(recs) == count * (WALL2 if kind in (4, 5, 7) else REC)
 
     # kind 5: the same wall batch, then a batch of things to be occluded by
     # it. Positions are drawn near the camera so a fair share of them land in
@@ -239,7 +340,10 @@ def make_scenario(rnd):
     return dict(kind=kind, view=view, levels=levels, cmap=cmap, texs=texs,
                 fill=fill, key=key, cam=cam, sectors=sectors,
                 count=count, recs=bytes(recs),
-                things=nthings, thingrecs=bytes(things))
+                things=nthings, thingrecs=bytes(things),
+                cam3=cam3, verts=verts, texinfo=texinfo,
+                polys=(npolys if kind == 7 else 0),
+                polyrecs=(polyrecs if kind == 7 else b""))
 
 
 def encode(scn):
@@ -260,6 +364,16 @@ def encode(scn):
     for sec in scn["sectors"]:
         b += struct.pack("<hhBBBB", sec["floor"], sec["ceil"], sec["floorc"],
                          sec["ceilc"], sec["light"], sec["flags"])
+    c3 = scn["cam3"]
+    b += struct.pack("<hhhBbHB", c3["x"], c3["y"], c3["z"], c3["yaw"],
+                     c3["pitch"], c3["proj"], c3["flags"])
+    b += struct.pack("<H", len(scn["verts"]))
+    for v in scn["verts"]:
+        b += struct.pack("<hhhh", v[0], v[1], v[2], 0)
+    b += struct.pack("<H", len(scn["texinfo"]))
+    for ti in scn["texinfo"]:
+        b += struct.pack("<8h", *ti)
+
     if scn["kind"] == 2:
         s = scn["spr"]
         b += struct.pack("<BiiIIBBiiB", s["texid"], s["x"], s["y"],
@@ -269,6 +383,8 @@ def encode(scn):
         b += struct.pack("<I", scn["count"]) + scn["recs"]
         if scn["kind"] == 5:
             b += struct.pack("<I", scn["things"]) + scn["thingrecs"]
+        if scn["kind"] == 7:
+            b += struct.pack("<I", scn["polys"]) + scn["polyrecs"]
     return bytes(b)
 
 
@@ -296,6 +412,9 @@ def run_model(scn):
     m.rbatch = [0, 0, 0]
     m.rcam = dict(scn["cam"])
     m.rsectors = [dict(x) for x in scn["sectors"]]
+    m.rcam3 = dict(scn["cam3"])
+    m.rverts = list(scn["verts"])
+    m.rtexinfo = list(scn["texinfo"])
 
     if scn["kind"] == 2:
         s = scn["spr"]
@@ -317,10 +436,14 @@ def run_model(scn):
         m.r_spans(scn["recs"], scn["count"])
     elif scn["kind"] == 3:
         m.r_walls(scn["recs"], scn["count"], scn["key"])
+    elif scn["kind"] == 6:
+        m.r_polys(scn["recs"], scn["count"], scn["key"])
     else:
         m.r_sectors(scn["recs"], scn["count"], scn["key"])
         if scn["kind"] == 5:
             m.r_things(scn["thingrecs"], scn["things"], scn["key"])
+        if scn["kind"] == 7:
+            m.r_polys(scn["polyrecs"], scn["polys"], scn["key"])
     return tuple(m.rbatch), bytes(m.pages[m.draw_page])
 
 
@@ -340,7 +463,8 @@ def write_ppm(path, pixels):
 def describe(scn):
     name = {0: "DRAW_COLUMNS", 1: "DRAW_SPANS", 2: "DRAW_SPRITE",
             3: "DRAW_WALLS", 4: "DRAW_SECTORS",
-            5: "SECTORS+THINGS"}[scn["kind"]]
+            5: "SECTORS+THINGS", 6: "DRAW_POLYS",
+            7: "SECTORS+POLYS"}[scn["kind"]]
     bits = ["view=%d,%d %dx%d" % scn["view"], "levels=%d" % scn["levels"]]
     if scn["kind"] == 2:
         s = scn["spr"]
@@ -351,6 +475,13 @@ def describe(scn):
         bits.append("count=%d key=$%02X" % (scn["count"], scn["key"]))
     if scn["kind"] == 5:
         bits.append("things=%d" % scn["things"])
+    if scn["kind"] in (6, 7):
+        c3 = scn["cam3"]
+        bits.append("cam3=%d,%d,%d yaw=%d pitch=%d proj=%d verts=%d ti=%d"
+                    % (c3["x"], c3["y"], c3["z"], c3["yaw"], c3["pitch"],
+                       c3["proj"], len(scn["verts"]), len(scn["texinfo"])))
+        if scn["kind"] == 7:
+            bits.append("polys=%d" % scn["polys"])
     if scn["kind"] in (3, 5):
         c = scn["cam"]
         bits.append("cam=%d,%d ang=%d eye=%d ceil=%d proj=%d hor=%d fl=%d"
@@ -374,7 +505,7 @@ def main():
     tmp = os.path.join(HERE, ".scenario.bin")
     rnd = random.Random(args.seed)
     fails = 0
-    kinds = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    kinds = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
     for i in range(args.n):
         scn = make_scenario(rnd)
         kinds[scn["kind"]] += 1
@@ -410,9 +541,10 @@ def main():
         os.unlink(tmp)
 
     print("%d scenarios (%d columns, %d spans, %d sprites, %d walls, "
-          "%d sectors, %d things), %d disagreements"
+          "%d sectors, %d things, %d polys, %d sectors+polys), "
+          "%d disagreements"
           % (args.n, kinds[0], kinds[1], kinds[2], kinds[3], kinds[4],
-             kinds[5], fails))
+             kinds[5], kinds[6], kinds[7], fails))
     return 1 if fails else 0
 
 

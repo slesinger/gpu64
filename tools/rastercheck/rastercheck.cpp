@@ -155,6 +155,39 @@ int main( int argc, char **argv )
 		g_p += (size_t) nSec * GPU64_RASTER_SEC_BYTES;
 	}
 
+	// The 3D camera and the two level tables, milestone 9. In every
+	// scenario for the same reason the 2D camera is: it costs a few bytes
+	// and it removes any question of which scenarios carry them.
+	state.cam3X	= (s16) rd16();
+	state.cam3Y	= (s16) rd16();
+	state.cam3Z	= (s16) rd16();
+	state.cam3Yaw	= rd8();
+	state.cam3Pitch	= (s8) rd8();
+	state.cam3Proj	= rd16();
+	state.cam3Flags	= rd8();
+
+	static Gpu64RasterVertex verts[ GPU64_RASTER_MAX_VERTS ];
+	unsigned nVerts = rd16();
+	if( nVerts )
+	{
+		need( (size_t) nVerts * GPU64_RASTER_VERT_BYTES );
+		gpu64_rasterBuildVerts( verts, g_p, nVerts );
+		state.pVerts = verts;
+		state.verts  = (u16) nVerts;
+		g_p += (size_t) nVerts * GPU64_RASTER_VERT_BYTES;
+	}
+
+	static Gpu64RasterTexinfo texinfo[ GPU64_RASTER_MAX_TEXINFO ];
+	unsigned nTI = rd16();
+	if( nTI )
+	{
+		need( (size_t) nTI * GPU64_RASTER_TEXINFO_BYTES );
+		gpu64_rasterBuildTexinfo( texinfo, g_p, nTI );
+		state.pTexinfo = texinfo;
+		state.texinfos = (u16) nTI;
+		g_p += (size_t) nTI * GPU64_RASTER_TEXINFO_BYTES;
+	}
+
 	if( kind == 2 )
 	{
 		u8 id = rd8();
@@ -172,7 +205,7 @@ int main( int argc, char **argv )
 	else
 	{
 		u32 count = rd32();
-		const size_t stride = ( kind == 4 || kind == 5 )
+		const size_t stride = ( kind == 4 || kind == 5 || kind == 7 )
 					? GPU64_RASTER_WALL2_BYTES
 					: GPU64_RASTER_REC_BYTES;
 		need( (size_t) count * stride );
@@ -184,6 +217,9 @@ int main( int argc, char **argv )
 					   lookup, 0, &res );
 		else if( kind == 3 )
 			gpu64_rasterWalls( &state, &target, g_p, count, key,
+					   lookup, 0, &res );
+		else if( kind == 6 )
+			gpu64_rasterPolys( &state, &target, g_p, count, key,
 					   lookup, 0, &res );
 		else
 			gpu64_rasterSectors( &state, &target, g_p, count, key,
@@ -200,6 +236,18 @@ int main( int argc, char **argv )
 			need( (size_t) things * GPU64_RASTER_REC_BYTES );
 			gpu64_rasterThings( &state, &target, g_p, things, key,
 					    lookup, 0, &res );
+		}
+
+		// kind 7 is the cross-layer case: a Doom level and a Quake one
+		// into the same depth buffer. Nothing in the API forbids it and
+		// a level being ported would do exactly this.
+		if( kind == 7 )
+		{
+			g_p += (size_t) count * stride;
+			u32 polys = rd32();
+			need( (size_t) polys * GPU64_RASTER_POLY_BYTES );
+			gpu64_rasterPolys( &state, &target, g_p, polys, key,
+					   lookup, 0, &res );
 		}
 	}
 

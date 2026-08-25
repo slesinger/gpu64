@@ -72,6 +72,13 @@ static Gpu64RasterSector s_Sectors[ GPU64_RASTER_MAX_SECTORS ];
 // cost the polling loop should not be asked to carry.
 static Gpu64RasterSector s_SectorsNew[ GPU64_RASTER_MAX_SECTORS ];
 
+// The vertex pool and the texinfo table, UPLOAD_VERTS / UPLOAD_TEXINFO.
+// Copied out of the blob for the same reason the sector table is: the C64
+// owns the RAM it uploaded from again the moment the command returns, and
+// DRAW_POLYS reads these on every vertex of every face.
+static Gpu64RasterVertex  s_Verts[ GPU64_RASTER_MAX_VERTS ];
+static Gpu64RasterTexinfo s_Texinfo[ GPU64_RASTER_MAX_TEXINFO ];
+
 // Blob staging. Static for the same reason gpu64_api.cpp's are: this runs on
 // reuUsingPolling()'s stack. One buffer is enough -- no class 2 opcode has
 // both a source and a destination blob.
@@ -133,6 +140,8 @@ void gpu64_rasterReset( void )
 	s_ArenaUsed = 0;
 	gpu64_rasterStateDefaults( &s_State );
 	memset( s_Sectors, 0, sizeof( s_Sectors ) );
+	memset( s_Verts, 0, sizeof( s_Verts ) );
+	memset( s_Texinfo, 0, sizeof( s_Texinfo ) );
 	memset( &s_LastBatch, 0, sizeof( s_LastBatch ) );
 	s_LastRequested = 0;
 }
@@ -233,6 +242,28 @@ static u8 opSetCamera( void )
 	s_State.camFloorCol = sArg[ 12 ];
 	s_State.camCeilCol  = sArg[ 13 ];
 	s_State.camHorizon  = (s16)(s8)sArg[ 14 ];
+	return GPU64_ERR_OK;
+}
+
+// SET_CAMERA3D. Twelve inline argument bytes rather than a blob: it is the
+// only thing a frame of a static level has to say, and twelve STAs beat a
+// descriptor and a DMA fetch. A separate opcode from SET_CAMERA and not an
+// extension of it because SET_CAMERA's fifteen bytes are full, and because
+// its horizon is a shear where this pitch is a rotation.
+static u8 opSetCamera3D( void )
+{
+	const u16 proj = argU16( 8 );
+
+	if ( proj == 0 )
+		return GPU64_ERR_BAD_ARGS;
+
+	s_State.cam3X	  = (s16)argU16( 0 );
+	s_State.cam3Y	  = (s16)argU16( 2 );
+	s_State.cam3Z	  = (s16)argU16( 4 );
+	s_State.cam3Yaw	  = sArg[ 6 ];
+	s_State.cam3Pitch = (s8)sArg[ 7 ];
+	s_State.cam3Proj  = proj;
+	s_State.cam3Flags = sArg[ 10 ];
 	return GPU64_ERR_OK;
 }
 
@@ -470,6 +501,89 @@ static u8 opSetSectors( void )
 	return GPU64_ERR_OK;
 }
 
+// UPLOAD_VERTS and UPLOAD_TEXINFO. Both are level-lifetime tables and both
+// follow SET_SECTORS' shape exactly: count 0 drops the table, a bad count or
+// a length that does not match rejects the upload and leaves what was there
+// alone.
+static u8 opUploadVerts( void )
+{
+	u8 space; u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+	const u16 count = argU16( 6 );
+
+	if ( count == 0 )
+	{
+		s_State.pVerts = 0;
+		s_State.verts = 0;
+		return GPU64_ERR_OK;
+	}
+	if ( count > GPU64_RASTER_MAX_VERTS )
+		return GPU64_ERR_BAD_ARGS;
+	if ( len != (u32)count * GPU64_RASTER_VERT_BYTES )
+		return GPU64_ERR_BAD_ARGS;
+
+	const u8 res = gpu64_blobRead( space, addr, len, s_Stage );
+	if ( res != GPU64_ERR_OK )
+		return res;
+
+	gpu64_rasterBuildVerts( s_Verts, s_Stage, count );
+	s_State.pVerts = s_Verts;
+	s_State.verts = count;
+	return GPU64_ERR_OK;
+}
+
+static u8 opUploadTexinfo( void )
+{
+	u8 space; u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+	const u16 count = argU16( 6 );
+
+	if ( count == 0 )
+	{
+		s_State.pTexinfo = 0;
+		s_State.texinfos = 0;
+		return GPU64_ERR_OK;
+	}
+	if ( count > GPU64_RASTER_MAX_TEXINFO )
+		return GPU64_ERR_BAD_ARGS;
+	if ( len != (u32)count * GPU64_RASTER_TEXINFO_BYTES )
+		return GPU64_ERR_BAD_ARGS;
+
+	const u8 res = gpu64_blobRead( space, addr, len, s_Stage );
+	if ( res != GPU64_ERR_OK )
+		return res;
+
+	gpu64_rasterBuildTexinfo( s_Texinfo, s_Stage, count );
+	s_State.pTexinfo = s_Texinfo;
+	s_State.texinfos = count;
+	return GPU64_ERR_OK;
+}
+
+// DRAW_POLYS. Unlike DRAW_SECTORS this does NOT clear the depth buffer: a
+// Quake frame may be several batches, and FILL_VIEW is the op that owns the
+// clear -- see docs/milestone9_poly_design.md.
+static u8 opDrawPolys( void )
+{
+	u32 count;
+	u8 res = pullBatchStride( &count, GPU64_RASTER_POLY_BYTES );
+	if ( res != GPU64_ERR_OK || count == 0 )
+		return res;
+
+	if ( s_State.cam3Proj == 0 )
+		return GPU64_ERR_BAD_ARGS;	// SET_CAMERA3D was never sent
+	if ( s_State.pVerts == 0 )
+		return GPU64_ERR_BAD_ARGS;	// UPLOAD_VERTS was never sent
+
+	Gpu64RasterTarget target;
+	if ( !makeTarget( &target ) )
+		return GPU64_ERR_UNSUPPORTED;
+
+	gpu64_rasterPolys( &s_State, &target, s_Stage, count, sArg[ 9 ],
+			   lookupTexture, 0, &s_LastBatch );
+	cleanView();
+	return GPU64_ERR_OK;
+}
+
 static u8 opDrawSectors( void )
 {
 	u32 count;
@@ -563,9 +677,12 @@ u8 gpu64_rasterDispatch( u8 op )
 	case GPU64_RASTER_OP_FILL_VIEW:		res = opFillView(); break;
 	case GPU64_RASTER_OP_SET_CAMERA:	res = opSetCamera(); break;
 	case GPU64_RASTER_OP_SET_SECTORS:	res = opSetSectors(); break;
+	case GPU64_RASTER_OP_SET_CAMERA3D:	res = opSetCamera3D(); break;
 
 	case GPU64_RASTER_OP_UPLOAD_TEXTURE:	res = opUploadTexture(); break;
 	case GPU64_RASTER_OP_FREE_TEXTURE:	res = opFreeTexture(); break;
+	case GPU64_RASTER_OP_UPLOAD_VERTS:	res = opUploadVerts(); break;
+	case GPU64_RASTER_OP_UPLOAD_TEXINFO:	res = opUploadTexinfo(); break;
 
 	case GPU64_RASTER_OP_DRAW_COLUMNS:	res = opDrawColumns(); break;
 	case GPU64_RASTER_OP_DRAW_SPANS:	res = opDrawSpans(); break;
@@ -573,6 +690,7 @@ u8 gpu64_rasterDispatch( u8 op )
 	case GPU64_RASTER_OP_DRAW_WALLS:	res = opDrawWalls(); break;
 	case GPU64_RASTER_OP_DRAW_SECTORS:	res = opDrawSectors(); break;
 	case GPU64_RASTER_OP_DRAW_THINGS:	res = opDrawThings(); break;
+	case GPU64_RASTER_OP_DRAW_POLYS:	res = opDrawPolys(); break;
 
 	default:
 		res = GPU64_ERR_BAD_OPCODE;

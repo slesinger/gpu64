@@ -31,6 +31,21 @@
 // per frame -- a level is uploaded once and its checksum computed once.
 #define GPU64_RASTER_WALL2_BYTES	32
 
+// DRAW_POLYS' face record, and the two tables it indexes. Milestone 9: a
+// convex polygon in world space, which is the primitive a wall record and a
+// sector both are special cases of -- see docs/milestone9_poly_design.md.
+#define GPU64_RASTER_POLY_BYTES		16
+#define GPU64_RASTER_VERT_BYTES		8
+#define GPU64_RASTER_TEXINFO_BYTES	16
+
+#define GPU64_RASTER_MAX_VERTS		4096
+#define GPU64_RASTER_MAX_TEXINFO	255
+
+// Vertices in one face. Quake's own limit before it subdivides; the near
+// clip can add one, hence the working buffer being larger.
+#define GPU64_RASTER_MAX_POLY_VERTS	16
+#define GPU64_RASTER_POLY_CLIP_VERTS	20
+
 // A sector record, SET_SECTORS.
 #define GPU64_RASTER_SEC_BYTES		8
 #define GPU64_RASTER_MAX_SECTORS	128
@@ -70,6 +85,12 @@
 // DRAW_SECTORS wall flags. MASKED and FLATLIT above are shared.
 #define GPU64_RASTER_WALL_NOFLATS 0x04	// this wall's columns paint no floor
 					// and no ceiling, whatever the camera says
+
+// DRAW_POLYS face flags.
+#define GPU64_RASTER_POLY_MASKED   0x01	// skip texels equal to the batch key
+#define GPU64_RASTER_POLY_FLATLIT  0x02	// the record's light unchanged
+#define GPU64_RASTER_POLY_TWOSIDED 0x04	// no backface cull: draw it from
+					// either side
 
 // Sector flags.
 #define GPU64_RASTER_SEC_SKY	0x01	// the ceiling is not painted and no
@@ -115,6 +136,24 @@ struct Gpu64RasterSector
 	u8	flags;
 };
 
+// One vertex of the pool, UPLOAD_VERTS. Eight bytes rather than six so the
+// 6502 indexes the table with a shift, the same reason every batch record is
+// a power of two long.
+struct Gpu64RasterVertex
+{
+	s16	x, y, z;		// 8.8 world units, z is up
+	s16	pad;
+};
+
+// Quake's texinfo: the two axes that turn a world position into texture
+// coordinates. s = ( P . sAxis ) >> 8 + sOff, in 8.8 texels. Shared by every
+// face on a surface, which is what makes two faces align for free.
+struct Gpu64RasterTexinfo
+{
+	s16	sx, sy, sz, sOff;
+	s16	tx, ty, tz, tOff;
+};
+
 // --- render state -------------------------------------------------------
 struct Gpu64RasterState
 {
@@ -141,6 +180,26 @@ struct Gpu64RasterState
 	u16	camProj;		// projection distance in pixels, 8.8
 	u8	camFloorCol, camCeilCol;
 	s16	camHorizon;		// pixels from the view's centre row
+
+	// --- the 3D camera, SET_CAMERA3D -------------------------------
+	//
+	// Deliberately not the same fields as SET_CAMERA above: this one has a
+	// world z and a real pitch rotation, and no floor/ceiling colours,
+	// because a polygon carries its own surface. camProj3 == 0 means it
+	// was never set, and DRAW_POLYS rejects the batch.
+	s16	cam3X, cam3Y, cam3Z;	// 8.8 world units, z is up
+	u8	cam3Yaw;		// 0 looks along +x, 256 to the circle
+	s8	cam3Pitch;		// positive looks up, same units
+	u16	cam3Proj;		// projection distance in pixels, 8.8
+	u8	cam3Flags;		// reserved, 0
+
+	// --- the vertex pool and the texinfo table ---------------------
+	// Uploaded once per level; a face record names both by index. Neither
+	// is owned: the caller keeps them alive.
+	const struct Gpu64RasterVertex  *pVerts;
+	u16	verts;
+	const struct Gpu64RasterTexinfo *pTexinfo;
+	u16	texinfos;
 
 	// --- the sector table, SET_SECTORS -----------------------------
 	//
@@ -242,6 +301,26 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 			 const u8 *pRecs, u32 nCount, u8 nKey,
 			 Gpu64RasterLookupFn pLookup, void *pCtx,
 			 Gpu64RasterBatchResult *pResult );
+
+// UPLOAD_VERTS / UPLOAD_TEXINFO table builds: nCount records straight off
+// the bus. Neither can fail on content -- there is no such thing as an
+// impossible vertex -- so neither returns a verdict; the wire layer has
+// already checked the count and the length.
+void gpu64_rasterBuildVerts( Gpu64RasterVertex *pDst, const u8 *pRecs, u32 nCount );
+void gpu64_rasterBuildTexinfo( Gpu64RasterTexinfo *pDst, const u8 *pRecs, u32 nCount );
+
+// DRAW_POLYS: convex polygons in WORLD space, projected through the 3D
+// camera in pState, perspective-texture-mapped and depth-tested per pixel
+// against the same buffer DRAW_SECTORS and DRAW_THINGS use. Records are 16
+// bytes and index the vertex pool and the texinfo table.
+//
+// It does NOT clear the depth buffer: a Quake frame may be several batches,
+// and FILL_VIEW is the op that owns the clear.
+void gpu64_rasterPolys( const Gpu64RasterState *pState,
+			const Gpu64RasterTarget *pTarget,
+			const u8 *pRecs, u32 nCount, u8 nKey,
+			Gpu64RasterLookupFn pLookup, void *pCtx,
+			Gpu64RasterBatchResult *pResult );
 
 // DRAW_SPRITE: the texture scaled into the screen rectangle x,y,w,h, clipped
 // to the view and to the inclusive row range clipY0..clipY1.

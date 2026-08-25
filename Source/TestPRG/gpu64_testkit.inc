@@ -129,14 +129,18 @@ R2_STATS	= $03
 R2_FILL_VIEW	= $04
 R2_SET_CAMERA	= $05
 R2_SET_SECTORS	= $06
+R2_SET_CAMERA3D	= $07
 R2_UPLOAD_TEX	= $10
 R2_FREE_TEX	= $11
+R2_UPLOAD_VERTS	= $12
+R2_UPLOAD_TEXINFO = $13
 R2_DRAW_COLUMNS	= $20
 R2_DRAW_SPANS	= $21
 R2_DRAW_SPRITE	= $22
 R2_DRAW_WALLS	= $23
 R2_DRAW_SECTORS	= $24
 R2_DRAW_THINGS	= $25
+R2_DRAW_POLYS	= $26
 
 ; Record stride, both batch kinds -- a power of two so indexing record n is
 ; a shift and not a multiply.
@@ -173,6 +177,15 @@ R2_THING_FLIPX	 = $02
 R2_THING_NODEPTH = $04		; ignore the depth buffer: neither tested
 				; nor written, so the thing is on top
 R2_THING_FLATLIT = $08
+
+; DRAW_POLYS. A face record is 16 bytes and indexes the vertex pool and the
+; texinfo table; a vertex is 8 bytes and a texinfo 16.
+R2_POLY		 = 16
+R2_VERT		 = 8
+R2_TEXINFO	 = 16
+R2_POLY_MASKED	 = $01
+R2_POLY_FLATLIT	 = $02
+R2_POLY_TWOSIDED = $04		; no backface cull: drawn from either side
 
 ; texid 0 in a record is not an error: it means "solid colour", the palette
 ; index being the low byte of the record's u field.
@@ -372,6 +385,62 @@ r2cam	.macro	x, y, ang, eye, ceil, proj, flags=0, floorc=0, ceilc=0, horizon=0
 	#argb 12, \floorc
 	#argb 13, \ceilc
 	#argb 14, \horizon
+	.endm
+
+; The 3D camera, for DRAW_POLYS. Position is world 8.8 with z up, measured
+; the same way the sector table's absolute floor heights are. Yaw is binary,
+; 256 to the circle, 0 looking along +x -- SET_CAMERA's convention. Pitch is
+; the same units and is a real rotation, positive looking up.
+r2cam3	.macro	x, y, z, yaw, pitch, proj, flags=0
+	#argw 0, \x
+	#argw 2, \y
+	#argw 4, \z
+	#argb 6, \yaw
+	#argb 7, \pitch
+	#argw 8, \proj
+	#argb 10, \flags
+	.endm
+
+; One vertex of the pool, UPLOAD_VERTS. Eight bytes and not six so the 6502
+; indexes the table with a shift.
+r2vertd	.macro	x, y, z
+	.word	(\x) & $ffff, (\y) & $ffff, (\z) & $ffff, 0
+	.endm
+
+; One texinfo, UPLOAD_TEXINFO: Quake's two texture axes. A face's texel
+; coordinates are s = ( P . sAxis ) >> 8 + sOff, in 8.8 texels, so two faces
+; naming one texinfo are guaranteed to align whatever their shapes.
+r2texinfod .macro sx, sy, sz, soff, tx, ty, tz, toff
+	.word	(\sx) & $ffff, (\sy) & $ffff, (\sz) & $ffff, (\soff) & $ffff
+	.word	(\tx) & $ffff, (\ty) & $ffff, (\tz) & $ffff, (\toff) & $ffff
+	.endm
+
+; One face: a convex polygon, its vertices consecutive in the pool starting
+; at `first`. tex = 0 draws the flat colour in `col` and needs no texinfo.
+r2polyd	.macro	first, nverts, texinfo, tex, col, light, flags=0
+	.word	\first
+	.byte	\nverts, \texinfo, \tex, \col, \light, \flags
+	.fill	8, 0			; reserved -- must be zero
+	.endm
+
+; UPLOAD_VERTS / UPLOAD_TEXINFO: where the table is and how many entries.
+; count = 0 drops it.
+r2verts	.macro	addr, count
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_VERT
+	#argw 6, \count
+	.endm
+
+r2texinfo .macro addr, count
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_TEXINFO
+	#argw 6, \count
+	.endm
+
+; DRAW_POLYS' batch. Same shape as r2batch; the stride happens to match.
+r2batchp .macro	addr, count, flags=0, key=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_POLY+((\flags)&1)*2
+	#argw 6, \count
+	#argb 8, \flags
+	#argb 9, \key
 	.endm
 
 ; A wall segment in WORLD space -- it does not change when the player moves,

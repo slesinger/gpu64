@@ -74,6 +74,21 @@ void gpu64_rasterStateDefaults( Gpu64RasterState *pState )
 	pState->camHorizon = 0;
 	pState->pSectors = 0;
 	pState->sectors = 0;
+
+	// The 3D camera has no drawing default: proj 0 means SET_CAMERA3D was
+	// never sent, and DRAW_POLYS rejects a batch against it rather than
+	// projecting through a camera the program did not choose.
+	pState->cam3X = 0;
+	pState->cam3Y = 0;
+	pState->cam3Z = 0;
+	pState->cam3Yaw = 0;
+	pState->cam3Pitch = 0;
+	pState->cam3Proj = 0;
+	pState->cam3Flags = 0;
+	pState->pVerts = 0;
+	pState->verts = 0;
+	pState->pTexinfo = 0;
+	pState->texinfos = 0;
 }
 
 // --- textures -----------------------------------------------------------
@@ -1350,4 +1365,437 @@ u16 gpu64_rasterChecksum( const u8 *p, u32 nLen )
 	for ( u32 i = 0; i < nLen; i++ )
 		sum = (u16)( sum + p[ i ] );
 	return sum;
+}
+
+// --- DRAW_POLYS ---------------------------------------------------------
+//
+// A convex polygon in world space, arbitrarily oriented: the primitive both
+// a wall record and a sector's flats are special cases of. Rationale is in
+// docs/milestone9_poly_design.md; what matters here is the arithmetic.
+//
+// The pipeline per face is: gather from the vertex pool, transform to view
+// space, clip against five planes, project, backface-cull, scan-convert.
+// Per pixel it is one depth compare and three divides -- 1/z, s/z and t/z --
+// which is Quake's own arithmetic without Quake's sixteen-pixel subdivision
+// of it. An exact answer per pixel is what makes tools/rastercheck able to
+// diff this against a model written from the document.
+//
+// The five-plane clip is not only about not drawing off-screen pixels: it is
+// what BOUNDS the projected coordinates. A vertex a hair past the near plane
+// projects to millions, and the products in the edge and span interpolation
+// would then overflow even 64 bits. Clipped to the view, every screen
+// coordinate is inside +/-2^17 and every product below has room.
+
+// s64-returning divide, for the interpolants that do not fit in 32 bits.
+// Same truncating semantics as idiv() above, and the model's idiv().
+static inline s64 idiv64( s64 n, s64 d )
+{
+	return n / d;
+}
+
+// Ceiling of a 8.8 value in whole pixels. The sampling rule is: a pixel
+// belongs to the polygon whose interior contains its top-left corner, and
+// the spans are half-open -- so two faces sharing an edge neither draw it
+// twice nor leave a seam between them.
+static inline int ceilPix( s32 v )
+{
+	return (int)( ( v + 255 ) >> 8 );
+}
+
+// A vertex in view space, with the texture coordinates that are affine in
+// world space and so interpolate linearly here too.
+struct PolyVert
+{
+	s32 vx, vy, vz;		// right, up, forward -- 8.8
+	s32 s, t;		// texels, 8.8
+};
+
+// The same vertex projected, with the three quantities that are linear in
+// SCREEN space: 1/z, s/z and t/z. Everything the scan converter walks.
+struct PolyScreen
+{
+	s32 x, y;		// screen position, 8.8
+	s64 w;			// ( 1 << 30 ) / vz
+	s64 s, t;		// s * w, t * w
+};
+
+// One Sutherland-Hodgman pass. The plane is given as a distance function
+// evaluated at each vertex by the caller's kind selector: inside is d >= 0.
+// Returns the new vertex count; a pass adds at most one vertex.
+static s32 polyPlaneDist( const PolyVert *v, int nPlane, s32 proj,
+			  s32 kL, s32 kR, s32 kT, s32 kB )
+{
+	switch ( nPlane )
+	{
+	case 0: return v->vz - GPU64_RASTER_NEAR;
+	case 1: return (s32)( ( (s64)v->vx * proj - (s64)kL * v->vz ) >> 8 );
+	case 2: return (s32)( ( (s64)kR * v->vz - (s64)v->vx * proj ) >> 8 );
+	case 3: return (s32)( ( (s64)kT * v->vz - (s64)v->vy * proj ) >> 8 );
+	default:return (s32)( ( (s64)v->vy * proj - (s64)kB * v->vz ) >> 8 );
+	}
+}
+
+static u32 polyClipPlane( const PolyVert *pIn, u32 n, PolyVert *pOut,
+			  int nPlane, s32 proj, s32 kL, s32 kR, s32 kT, s32 kB )
+{
+	u32 m = 0;
+	for ( u32 i = 0; i < n; i++ )
+	{
+		const PolyVert *a = &pIn[ i ];
+		const PolyVert *b = &pIn[ ( i + 1 ) % n ];
+		const s32 da = polyPlaneDist( a, nPlane, proj, kL, kR, kT, kB );
+		const s32 db = polyPlaneDist( b, nPlane, proj, kL, kR, kT, kB );
+
+		if ( da >= 0 )
+			pOut[ m++ ] = *a;
+
+		if ( ( da >= 0 ) != ( db >= 0 ) )
+		{
+			const s64 num = -da, den = (s64)db - da;
+			PolyVert *o = &pOut[ m++ ];
+			o->vx = a->vx + (s32)idiv64( (s64)( b->vx - a->vx ) * num, den );
+			o->vy = a->vy + (s32)idiv64( (s64)( b->vy - a->vy ) * num, den );
+			o->vz = a->vz + (s32)idiv64( (s64)( b->vz - a->vz ) * num, den );
+			o->s  = a->s  + (s32)idiv64( (s64)( b->s  - a->s  ) * num, den );
+			o->t  = a->t  + (s32)idiv64( (s64)( b->t  - a->t  ) * num, den );
+		}
+	}
+	return m;
+}
+
+// One row's worth of interpolated values, at the point an edge crosses it.
+struct PolyEdgeHit
+{
+	s32 x;
+	s64 w, s, t;
+};
+
+void gpu64_rasterPolys( const Gpu64RasterState *pState,
+			const Gpu64RasterTarget *pTarget,
+			const u8 *pRecs, u32 nCount, u8 nKey,
+			Gpu64RasterLookupFn pLookup, void *pCtx,
+			Gpu64RasterBatchResult *pResult )
+{
+	const int vx0 = viewX0( pState ), vx1 = viewX1( pState );
+	const int vy0 = viewY0( pState ), vy1 = viewY1( pState );
+
+	zbufReady();
+
+	// No camera, or no vertex pool, and there is nothing a record could
+	// mean. The wire layer says the same thing; this is the second line,
+	// because the core is also called directly by tools/rastercheck.
+	if ( pState->cam3Proj == 0 || pState->pVerts == 0 || pState->verts == 0 )
+	{
+		pResult->rejected += nCount;
+		return;
+	}
+
+	const s32 proj = pState->cam3Proj;
+	const int centreX = vx0 + (int)pState->viewW / 2;
+	const int centreY = vy0 + (int)pState->viewH / 2;
+
+	// The four side planes, as the constants polyPlaneDist() needs. They
+	// are the view rectangle expressed in the projection's own units.
+	const s32 kL = (s32)( vx0 - centreX ) * 256;
+	const s32 kR = (s32)( vx1 - centreX ) * 256;
+	const s32 kT = (s32)( centreY - vy0 ) * 256;
+	const s32 kB = (s32)( centreY - vy1 ) * 256;
+
+	const s32 cyaw = fcos( pState->cam3Yaw ), syaw = fsin( pState->cam3Yaw );
+	const s32 cpit = fcos( (u8)pState->cam3Pitch ), spit = fsin( (u8)pState->cam3Pitch );
+	const unsigned pitch = pTarget->pitch;
+
+	PolyVert   bufA[ GPU64_RASTER_POLY_CLIP_VERTS + 8 ];
+	PolyVert   bufB[ GPU64_RASTER_POLY_CLIP_VERTS + 8 ];
+	PolyScreen scr [ GPU64_RASTER_POLY_CLIP_VERTS + 8 ];
+
+	for ( u32 i = 0; i < nCount; i++ )
+	{
+		const u8 *r = pRecs + i * GPU64_RASTER_POLY_BYTES;
+
+		const u16 first  = recU16( r, 0 );
+		const u8  nVerts = r[ 2 ];
+		const u8  tinfo  = r[ 3 ];
+		const u8  texid  = r[ 4 ];
+		const u8  colour = r[ 5 ];
+		const u8  light  = r[ 6 ];
+		const u8  flags  = r[ 7 ];
+
+		if ( nVerts < 3 || nVerts > GPU64_RASTER_MAX_POLY_VERTS )
+		{
+			pResult->rejected++;
+			continue;
+		}
+		if ( (u32)first + nVerts > pState->verts )
+		{
+			pResult->rejected++;
+			continue;
+		}
+
+		// A textured face needs both a live texture and the texinfo
+		// that says where its texels land. Either missing is the same
+		// kind of mistake an unknown texture id is anywhere else in
+		// class 2: the record is rejected, the batch carries on.
+		const Gpu64RasterTexture *pTex = 0;
+		const Gpu64RasterTexinfo *pTI = 0;
+		if ( texid != 0 )
+		{
+			pTex = pLookup( pCtx, texid );
+			if ( pTex == 0 || !pTex->wIsPow2 )
+			{
+				// Both dimensions are masked per pixel here, so
+				// a width that is not a power of two is a
+				// rejected record and not an upload error -- the
+				// same texture is legal for DRAW_COLUMNS.
+				pResult->rejected++;
+				continue;
+			}
+			if ( tinfo == 0 || tinfo > pState->texinfos
+			     || pState->pTexinfo == 0 )
+			{
+				pResult->rejected++;
+				continue;
+			}
+			pTI = &pState->pTexinfo[ tinfo - 1 ];
+		}
+
+		// --- gather and transform ------------------------------
+		for ( u32 k = 0; k < nVerts; k++ )
+		{
+			const Gpu64RasterVertex *pv = &pState->pVerts[ first + k ];
+			const s32 dx = (s32)pv->x - pState->cam3X;
+			const s32 dy = (s32)pv->y - pState->cam3Y;
+			const s32 dz = (s32)pv->z - pState->cam3Z;
+
+			// Yaw first: forward is ( cos, sin ), right is a
+			// quarter turn clockwise from it -- toView()'s
+			// convention, so the two layers agree about north.
+			const s32 fwd = ( dx * cyaw + dy * syaw ) >> 8;
+			const s32 rgt = ( dx * syaw - dy * cyaw ) >> 8;
+
+			// Then pitch, in the forward/up plane. Positive pitch
+			// looks up, which moves the world down the screen.
+			bufA[ k ].vx = rgt;
+			bufA[ k ].vz = ( fwd * cpit + dz * spit ) >> 8;
+			bufA[ k ].vy = ( dz * cpit - fwd * spit ) >> 8;
+
+			if ( pTI )
+			{
+				const s64 sd = (s64)pv->x * pTI->sx
+					     + (s64)pv->y * pTI->sy
+					     + (s64)pv->z * pTI->sz;
+				const s64 td = (s64)pv->x * pTI->tx
+					     + (s64)pv->y * pTI->ty
+					     + (s64)pv->z * pTI->tz;
+				bufA[ k ].s = (s32)( sd >> 8 ) + pTI->sOff;
+				bufA[ k ].t = (s32)( td >> 8 ) + pTI->tOff;
+			} else
+			{
+				bufA[ k ].s = 0;
+				bufA[ k ].t = 0;
+			}
+		}
+
+		// --- clip ----------------------------------------------
+		u32 n = polyClipPlane( bufA, nVerts, bufB, 0, proj, kL, kR, kT, kB );
+		if ( n < 3 )
+		{
+			// Entirely behind the near plane. Rejected, the same
+			// verdict a wall with both endpoints behind it earns.
+			pResult->rejected++;
+			continue;
+		}
+		n = polyClipPlane( bufB, n, bufA, 1, proj, kL, kR, kT, kB );
+		if ( n >= 3 ) n = polyClipPlane( bufA, n, bufB, 2, proj, kL, kR, kT, kB );
+		if ( n >= 3 ) n = polyClipPlane( bufB, n, bufA, 3, proj, kL, kR, kT, kB );
+		if ( n >= 3 ) n = polyClipPlane( bufA, n, bufB, 4, proj, kL, kR, kT, kB );
+		if ( n < 3 )
+		{
+			// Off the side of the view. Well formed, drew nothing:
+			// accepted, which is the distinction the counters exist
+			// to make.
+			pResult->accepted++;
+			continue;
+		}
+
+		// --- project -------------------------------------------
+		for ( u32 k = 0; k < n; k++ )
+		{
+			const PolyVert *v = &bufB[ k ];
+			const s32 vz = v->vz < GPU64_RASTER_NEAR
+					? GPU64_RASTER_NEAR : v->vz;
+
+			scr[ k ].x = ( (s32)centreX << 8 )
+				   + (s32)idiv64( (s64)v->vx * proj, vz );
+			scr[ k ].y = ( (s32)centreY << 8 )
+				   - (s32)idiv64( (s64)v->vy * proj, vz );
+			scr[ k ].w = idiv64( (s64)1 << 30, vz );
+			scr[ k ].s = (s64)v->s * scr[ k ].w;
+			scr[ k ].t = (s64)v->t * scr[ k ].w;
+		}
+
+		// --- backface ------------------------------------------
+		// Clockwise on screen, y downwards, is the front -- which is
+		// the same convention DRAW_WALLS states as "drawn only from the
+		// side that projects it left to right".
+		s64 area = 0;
+		for ( u32 k = 0; k < n; k++ )
+		{
+			const PolyScreen *a = &scr[ k ];
+			const PolyScreen *b = &scr[ ( k + 1 ) % n ];
+			area += (s64)a->x * b->y - (s64)b->x * a->y;
+		}
+		if ( area == 0 )
+		{
+			pResult->accepted++;		// edge-on, no pixels
+			continue;
+		}
+		if ( area < 0 && !( flags & GPU64_RASTER_POLY_TWOSIDED ) )
+		{
+			pResult->rejected++;
+			continue;
+		}
+
+		pResult->accepted++;
+
+		// --- scan ----------------------------------------------
+		s32 minY = scr[ 0 ].y, maxY = scr[ 0 ].y;
+		for ( u32 k = 1; k < n; k++ )
+		{
+			if ( scr[ k ].y < minY ) minY = scr[ k ].y;
+			if ( scr[ k ].y > maxY ) maxY = scr[ k ].y;
+		}
+
+		int yTop = ceilPix( minY ), yBot = ceilPix( maxY );
+		if ( yTop < vy0 ) yTop = vy0;
+		if ( yBot > vy1 ) yBot = vy1;
+
+		const u16 wMask = pTex ? (u16)( pTex->w - 1 ) : 0;
+		const u16 hMask = pTex ? pTex->hMask : 0;
+		const unsigned texH = pTex ? pTex->h : 0;
+		const boolean bFlatLit = ( flags & GPU64_RASTER_POLY_FLATLIT ) != 0;
+		const boolean bMasked  = ( flags & GPU64_RASTER_POLY_MASKED ) != 0;
+
+		for ( int y = yTop; y < yBot; y++ )
+		{
+			const s32 Y = (s32)y << 8;
+
+			PolyEdgeHit hitL = { 0, 0, 0, 0 }, hitR = { 0, 0, 0, 0 };
+			boolean bAny = FALSE;
+
+			for ( u32 k = 0; k < n; k++ )
+			{
+				const PolyScreen *a = &scr[ k ];
+				const PolyScreen *b = &scr[ ( k + 1 ) % n ];
+
+				// Half-open in y: the row belongs to the edge
+				// that contains it at its top, never to both.
+				const boolean bDown = ( a->y <= Y && Y < b->y );
+				const boolean bUp   = ( b->y <= Y && Y < a->y );
+				if ( !bDown && !bUp )
+					continue;
+
+				const s64 num = (s64)Y - a->y;
+				const s64 den = (s64)b->y - a->y;
+
+				PolyEdgeHit h;
+				h.x = a->x + (s32)idiv64( (s64)( b->x - a->x ) * num, den );
+				h.w = a->w + idiv64( ( b->w - a->w ) * num, den );
+				h.s = a->s + idiv64( ( b->s - a->s ) * num, den );
+				h.t = a->t + idiv64( ( b->t - a->t ) * num, den );
+
+				if ( !bAny )
+				{
+					hitL = hitR = h;
+					bAny = TRUE;
+				}
+				else if ( h.x < hitL.x ) hitL = h;
+				else if ( h.x > hitR.x ) hitR = h;
+			}
+
+			if ( !bAny || hitR.x <= hitL.x )
+				continue;
+
+			int xs = ceilPix( hitL.x ), xe = ceilPix( hitR.x );
+			if ( xs < vx0 ) xs = vx0;
+			if ( xe > vx1 ) xe = vx1;
+			if ( xs >= xe )
+				continue;
+
+			const s64 dx88 = (s64)hitR.x - hitL.x;
+			const s64 off  = ( (s64)xs << 8 ) - hitL.x;
+
+			s64 w = hitL.w + idiv64( ( hitR.w - hitL.w ) * off, dx88 );
+			s64 s = hitL.s + idiv64( ( hitR.s - hitL.s ) * off, dx88 );
+			s64 t = hitL.t + idiv64( ( hitR.t - hitL.t ) * off, dx88 );
+			const s64 dw = idiv64( ( hitR.w - hitL.w ) << 8, dx88 );
+			const s64 ds = idiv64( ( hitR.s - hitL.s ) << 8, dx88 );
+			const s64 dt = idiv64( ( hitR.t - hitL.t ) << 8, dx88 );
+
+			u8  *pDst = pTarget->pPixels + (unsigned)y * pitch + xs;
+			u16 *pZ	  = s_ZBuf + (unsigned)y * GPU64_RASTER_SURFACE_W + xs;
+
+			for ( int x = xs; x < xe;
+			      x++, pDst++, pZ++, w += dw, s += ds, t += dt )
+			{
+				if ( w <= 0 )
+					continue;
+
+				const s32 z = (s32)idiv64( (s64)1 << 30, w );
+				const u16 zs = zStore( z );
+				if ( zs >= *pZ )
+					continue;
+
+				u8 c;
+				if ( pTex )
+				{
+					const s32 uu = (s32)idiv64( s, w );
+					const s32 vv = (s32)idiv64( t, w );
+					const unsigned ui = (unsigned)( ( uu >> 8 ) & wMask );
+					const unsigned vi = (unsigned)( ( vv >> 8 ) & hMask );
+					c = pTex->pTexels[ ui * texH + vi ];
+					if ( bMasked && c == nKey )
+						continue;
+				} else
+				{
+					c = colour;
+				}
+
+				const u8 *pMap = lightRow( pState, litLevel( light, z, bFlatLit ) );
+				*pZ = zs;
+				*pDst = pMap ? pMap[ c ] : c;
+				pResult->pixels++;
+			}
+		}
+	}
+}
+
+// --- UPLOAD_VERTS / UPLOAD_TEXINFO --------------------------------------
+
+void gpu64_rasterBuildVerts( Gpu64RasterVertex *pDst, const u8 *pRecs, u32 nCount )
+{
+	for ( u32 i = 0; i < nCount; i++ )
+	{
+		const u8 *r = pRecs + i * GPU64_RASTER_VERT_BYTES;
+		pDst[ i ].x = (s16)recS16( r, 0 );
+		pDst[ i ].y = (s16)recS16( r, 2 );
+		pDst[ i ].z = (s16)recS16( r, 4 );
+		pDst[ i ].pad = 0;
+	}
+}
+
+void gpu64_rasterBuildTexinfo( Gpu64RasterTexinfo *pDst, const u8 *pRecs, u32 nCount )
+{
+	for ( u32 i = 0; i < nCount; i++ )
+	{
+		const u8 *r = pRecs + i * GPU64_RASTER_TEXINFO_BYTES;
+		pDst[ i ].sx   = (s16)recS16( r, 0 );
+		pDst[ i ].sy   = (s16)recS16( r, 2 );
+		pDst[ i ].sz   = (s16)recS16( r, 4 );
+		pDst[ i ].sOff = (s16)recS16( r, 6 );
+		pDst[ i ].tx   = (s16)recS16( r, 8 );
+		pDst[ i ].ty   = (s16)recS16( r, 10 );
+		pDst[ i ].tz   = (s16)recS16( r, 12 );
+		pDst[ i ].tOff = (s16)recS16( r, 14 );
+	}
 }

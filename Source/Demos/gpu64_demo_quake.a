@@ -1,0 +1,746 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 -- DRAW_POLYS: a level a Doom renderer cannot draw at all.
+;
+;      WHAT THIS DEMONSTRATES
+;
+;      gpu64_demo_sectors draws a level of vertical walls standing between
+;      horizontal floors, because that is everything DRAW_SECTORS can
+;      express. This program draws the three things it cannot:
+;
+;        * a RAMP -- a sloped surface you walk up, which is neither a wall
+;          nor a flat and has no representation in a sector at all
+;        * a BRIDGE across the room, with a walkway on top and an
+;          underside below, so there is floor above floor: the geometry
+;          that made Quake a different renderer and not a faster Doom.
+;          The player walks under it at the start of his lap and looks
+;          back down onto it from the top of the ramp
+;        * real PITCH -- the camera looks up and down by rotating, so the
+;          walls converge as you tilt. SET_CAMERA's horizon shears the
+;          picture instead, which is exact for vertical walls and wrong for
+;          everything here
+;
+;      WHAT THE 6502 DOES PER FRAME
+;
+;      One 16-bit add for the walk, one shift for the height of the ramp
+;      under his feet, twelve bytes of camera, and one batch command. The
+;      level -- 16 faces, 62 vertices and 3 texinfos -- is uploaded once at
+;      start-up and never touched again; the projection, the clipping, the
+;      perspective texture mapping and the depth sorting are all gpu64's.
+;
+;      THE PART THAT IS EASY TO MISS
+;
+;      Nothing here is sorted, and there is no BSP tree. The faces are sent
+;      in the order they were written down, which for the bridge means its
+;      underside arrives before the floor it hangs over. Every pixel is
+;      depth-tested against the same buffer DRAW_SECTORS and DRAW_THINGS
+;      use, so the order simply does not matter -- which is the whole
+;      reason a 1 MHz CPU can drive this.
+;
+;      The face batch is a few hundred bytes of unchanging data, so
+;      R2_BATCH_SUM is free: it is computed once at start-up and every byte is
+;      verified on arrival on every frame.
+;
+;      Run it: LOAD"GPU64-QUAKE",8,1 then RUN. RUN/STOP finishes.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_demo.inc"
+
+VIEW_H	= 160			; the 3D view; the status bar is below it
+TEXW	= 32
+TEXH	= 32			; a power of two -- and for DRAW_POLYS the
+TEXLEN	= TEXW * TEXH		; width must be one too: both are masked
+
+TEX_BRICK = 1
+TEX_STONE = 2
+TEX_GUN	  = 3
+
+CMAP_LEVELS = 16
+
+; --- the level, in world units (8.8, so 1.0 = $0100) -------------------
+; The room is 10 x 10 x 3. The ramp climbs from x=6 to x=9 across the
+; middle four units of it, and a bridge crosses the whole width at x=2..4,
+; low enough to walk under and low enough to look down on from the top of
+; the ramp -- floor above floor, seen from both sides of it.
+WU	.function n
+	.endf n * 256
+
+Z_TOP	= 3 * 256		; the ceiling
+Z_RAMP	= 384			; 1.5 -- the top of the ramp and the platform
+Z_SLABB	= 256			; 1.0  -- the underside of the bridge
+Z_SLABT	= 320			; 1.25 -- the walkway on top of it
+
+RAMP_X0	= 6 * 256
+EYE_UP	= $0080			; the eye, half a unit above whatever he is on
+PROJ	= $a000			; 160.0 pixels: a 90-degree field of view
+SKY_COL	= 2*32+6		; what shows where nothing was drawn
+
+WALK_LO	= 384			; 1.5 -- he walks the length of the room
+WALK_HI	= 8 * 256 + 128		; 8.5, which is up the ramp and onto the top
+SPEED	= $0020			; 1/8 of a world unit a frame
+
+; Zero page. $f7-$fe is the RS232 area every gpu64 program uses.
+posX	= $f7			; the player, 8.8 world units
+eyeZ	= $f9			; his eye, absolute world height
+sumPtr	= $fb			; only used at start-up
+
+	#basicStub
+
+; ======================================================================
+; Start-up
+; ======================================================================
+start
+	jsr dmInit
+
+	#argb 0, BLACK
+	#cmd OP_SET_BORDER
+	#argb 0, BLACK
+	#cmd OP_CLEAR
+
+	; The palette: 8 hues x 32 brightnesses, so a colormap can darken by
+	; walking down a hue. PAL_LOAD's count is a byte, so 256 entries take
+	; two calls.
+	#argblob 0, SPACE_C64, palData, 128*3
+	#argb 6, 0
+	#argb 7, 128
+	#cmd OP_PAL_LOAD
+	#argblob 0, SPACE_C64, palData+128*3, 128*3
+	#argb 6, 128
+	#argb 7, 128
+	#cmd OP_PAL_LOAD
+
+	lda #2
+	sta CMD_HI
+	#cmd R2_RESET
+
+	#argw 0, 0
+	#argw 2, 0
+	#argw 4, FB_W
+	#argw 6, VIEW_H
+	#cmd R2_SET_VIEW
+
+	#argblob 0, SPACE_C64, brickTex, TEXLEN
+	#argw 6, TEXW
+	#argw 8, TEXH
+	#argb 10, 0
+	lda #TEX_BRICK
+	sta ID_LO
+	lda #0
+	sta ID_HI
+	#cmd R2_UPLOAD_TEX
+
+	#argblob 0, SPACE_C64, stoneTex, TEXLEN
+	#argw 6, TEXW
+	#argw 8, TEXH
+	#argb 10, 0
+	lda #TEX_STONE
+	sta ID_LO
+	#cmd R2_UPLOAD_TEX
+
+	#argblob 0, SPACE_C64, gunTex, TEXLEN
+	#argw 6, TEXW
+	#argw 8, TEXH
+	#argb 10, 0
+	lda #TEX_GUN
+	sta ID_LO
+	#cmd R2_UPLOAD_TEX
+
+	; 16 light levels. A face carries a base level and gpu64 adds half
+	; the distance to it, so the far end of the room darkens by itself.
+	#argblob 0, SPACE_C64, cmapData, CMAP_LEVELS*256
+	#argb 6, CMAP_LEVELS
+	#cmd R2_SET_COLORMAP
+
+	; The level. Both tables are as static as the faces that index them,
+	; so both are uploaded once and never sent again.
+	#r2verts vertTab, NVERT
+	#cmd2 R2_UPLOAD_VERTS
+	#r2texinfo texinfoTab, NTI
+	#cmd2 R2_UPLOAD_TEXINFO
+
+	jsr sumFaces
+
+	lda #<WALK_LO
+	sta posX
+	lda #>WALK_LO
+	sta posX+1
+	jsr eyeHeight
+
+; ======================================================================
+; A frame
+; ======================================================================
+frame
+	; 1. Where he is and where he is looking. Twelve bytes, of which
+	;    five change.
+	lda posX
+	sta ARG+0
+	lda posX+1
+	sta ARG+1
+	#argw 2, 0			; he walks the line y = 0
+	lda eyeZ
+	sta ARG+4
+	lda eyeZ+1
+	sta ARG+5
+	lda plYaw
+	sta ARG+6
+	lda plPitch
+	sta ARG+7
+	#argw 8, PROJ
+	#argb 10, 0
+	#cmd2 R2_SET_CAMERA3D
+
+	; 2. FILL_VIEW is not only the background: it is also what empties
+	;    the depth buffer. DRAW_POLYS does not clear it -- a frame may be
+	;    several batches, and a batch that cleared would erase the one
+	;    before it -- so this is the op the frame has to start with.
+	#argb 0, SKY_COL
+	#cmd2 R2_FILL_VIEW
+
+	; 3. The level, in the order it was written down. 256 bytes, the same
+	;    ones as last frame, checksummed once at start-up and verified by
+	;    gpu64 on every arrival.
+	#r2batchp faces, NFACES, R2_BATCH_SUM
+	#cmd2 R2_DRAW_POLYS
+	lda ERRCODE
+	beq +
+	sta lastErr
+	inc errCnt
+	bne +
+	inc errCnt+1
++
+
+	#argblob 0, SPACE_C64, statBuf, 16
+	#cmd2 R2_STATS
+
+	; 4. The weapon. Still a DRAW_SPRITE: it is at a screen position, not
+	;    a world one, and nothing in the world may ever occlude it.
+	lda frameCt
+	lsr a
+	lsr a
+	and #$03
+	clc
+	adc #64
+	sta sprY
+	#argw 0, 112
+	lda sprY
+	sta ARG+2
+	lda #0
+	sta ARG+3
+	#argw 4, 96
+	#argw 6, 96
+	#argb 8, 1
+	#argb 9, 0
+	#argw 10, 0
+	#argw 12, VIEW_H-1
+	#argb 14, R2_SPR_MASKED
+	lda #TEX_GUN
+	sta ID_LO
+	lda #0
+	sta ID_HI
+	#cmd2 R2_DRAW_SPRITE
+
+	jsr statusBar
+
+	jsr dmFlip
+	jsr dmVbWait
+	jsr report
+	jsr movePlayer
+
+	jsr dmStop
+	beq frDone
+	jmp frame
+frDone
+	lda #0
+	sta CMD_HI
+	jsr dmHold
+	rts
+
+; ======================================================================
+; The player
+;
+; He walks the length of the room and back along y = 0, up the ramp and
+; onto the platform, while his head tilts through a slow triangle wave --
+; which is the point: pitch is a rotation here, so the room converges as
+; he looks up instead of merely sliding.
+; ======================================================================
+movePlayer
+	inc frameCt
+
+	; The tilt: 0..31..0..-16, one step every other frame.
+	lda frameCt
+	lsr a
+	and #$3f
+	cmp #$20
+	bcc +
+	eor #$3f			; 63 - p, the way back down
++
+	sec
+	sbc #16
+	sta plPitch
+
+	lda plYaw
+	bne mpBack
+
+	clc
+	lda posX
+	adc #<SPEED
+	sta posX
+	lda posX+1
+	adc #>SPEED
+	sta posX+1
+	lda posX+1
+	cmp #>WALK_HI
+	bcc mpDone
+	bne mpTurnBack
+	lda posX
+	cmp #<WALK_HI
+	bcc mpDone
+mpTurnBack
+	lda #128			; about face
+	sta plYaw
+	jmp mpDone
+
+mpBack
+	sec
+	lda posX
+	sbc #<SPEED
+	sta posX
+	lda posX+1
+	sbc #>SPEED
+	sta posX+1
+	lda posX+1
+	cmp #>WALK_LO
+	bcc mpTurnFwd
+	bne mpDone
+	lda posX
+	cmp #<WALK_LO
+	bcs mpDone
+mpTurnFwd
+	lda #0
+	sta plYaw
+
+mpDone
+	jsr eyeHeight
+	rts
+
+; ======================================================================
+; The height of the ramp under his feet, plus half a unit for the eye.
+;
+; The ramp climbs 1.5 units over the 3 from x=6 to x=9, so the floor he is
+; standing on is ( x - 6 ) / 2, clamped to the top. One subtract and one
+; shift: this is the whole of what a sloped floor costs the 6502, and it is
+; the same shape as gpu64_demo_sectors' lookup of the sector he is in.
+; ======================================================================
+eyeHeight
+	lda posX+1
+	cmp #6
+	bcc ehFlat
+
+	sec
+	lda posX
+	sbc #<RAMP_X0
+	sta eyeZ
+	lda posX+1
+	sbc #>RAMP_X0
+	sta eyeZ+1
+	lsr eyeZ+1
+	ror eyeZ
+
+	lda eyeZ+1
+	cmp #>Z_RAMP
+	bcc ehAdd
+	bne ehClamp
+	lda eyeZ
+	cmp #<Z_RAMP
+	bcc ehAdd
+ehClamp
+	lda #<Z_RAMP
+	sta eyeZ
+	lda #>Z_RAMP
+	sta eyeZ+1
+ehAdd
+	clc
+	lda eyeZ
+	adc #<EYE_UP
+	sta eyeZ
+	lda eyeZ+1
+	adc #>EYE_UP
+	sta eyeZ+1
+	rts
+
+ehFlat
+	lda #<EYE_UP
+	sta eyeZ
+	lda #>EYE_UP
+	sta eyeZ+1
+	rts
+
+; ======================================================================
+; The status bar, drawn on the HDMI screen below the view.
+; ======================================================================
+statusBar
+	#argw 0, 0
+	#argw 2, VIEW_H
+	#argw 4, FB_W
+	#argw 6, 200-VIEW_H
+	#argb 8, 1*32+8
+	#cmd0 OP_RECT_FILL
+
+	; A bar whose length is where he is in the room: the cheapest
+	; possible proof that the frame loop is still running.
+	#argw 0, 8
+	#argw 2, VIEW_H+8
+	lda posX+1
+	asl a
+	asl a
+	asl a
+	asl a
+	sta ARG+4
+	lda #0
+	sta ARG+5
+	#argw 6, 8
+	#argb 8, 7*32+28
+	#cmd0 OP_RECT_FILL
+	lda #2
+	sta CMD_HI
+	rts
+
+; ======================================================================
+; What the C64 has to say about it, on its own screen.
+; ======================================================================
+report
+	lda #22
+	jsr dmRow
+	jsr dmText
+	.text "POLYS  ACC "
+	.byte 0
+	lda statBuf+3
+	jsr dmHexA
+	lda statBuf+2
+	jsr dmHexA
+	jsr dmText
+	.text "  REJ "
+	.byte 0
+	lda statBuf+5
+	jsr dmHexA
+	lda statBuf+4
+	jsr dmHexA
+	jsr dmText
+	.text "  PIX "
+	.byte 0
+	lda statBuf+9
+	jsr dmHexA
+	lda statBuf+8
+	jsr dmHexA
+
+	; ACC and REJ are one frame's snapshot and cannot be read off a
+	; moving screen; ERRS and LAST only ever go up.
+	lda #23
+	jsr dmRow
+	jsr dmText
+	.text "X "
+	.byte 0
+	lda posX+1
+	jsr dmHexA
+	lda posX
+	jsr dmHexA
+	jsr dmText
+	.text "  EYE "
+	.byte 0
+	lda eyeZ+1
+	jsr dmHexA
+	lda eyeZ
+	jsr dmHexA
+	jsr dmText
+	.text "  PITCH "
+	.byte 0
+	lda plPitch
+	jsr dmHexA
+	jsr dmText
+	.text "  ERRS "
+	.byte 0
+	lda errCnt+1
+	jsr dmHexA
+	lda errCnt
+	jsr dmHexA
+	jsr dmText
+	.text " "
+	.byte 0
+	lda lastErr
+	jsr dmHexA
+
+	lda #24
+	jsr dmRow
+	jsr dmText
+	.text "RUN/STOP TO END   ERR "
+	.byte 0
+	jsr dmErr
+	rts
+
+; ======================================================================
+; The face batch's checksum, computed once because the level never
+; changes. Rule 3 in CLAUDE.md for free.
+; ======================================================================
+sumFaces
+	lda #<faces
+	sta sumPtr
+	lda #>faces
+	sta sumPtr+1
+	lda #0
+	sta tmp
+	sta tmp+1
+	ldy #0
+	ldx #>(NFACES*R2_POLY)		; whole pages first
+	beq sfTail
+sfPage
+	clc
+	lda tmp
+	adc (sumPtr),y
+	sta tmp
+	bcc +
+	inc tmp+1
++
+	iny
+	bne sfPage
+	inc sumPtr+1
+	dex
+	bne sfPage
+sfTail
+	cpy #<(NFACES*R2_POLY)
+	beq sfDone
+	clc
+	lda tmp
+	adc (sumPtr),y
+	sta tmp
+	bcc +
+	inc tmp+1
++
+	iny
+	bne sfTail
+sfDone
+	lda tmp
+	sta faces+NFACES*R2_POLY
+	lda tmp+1
+	sta faces+NFACES*R2_POLY+1
+	rts
+
+; ======================================================================
+; State
+; ======================================================================
+plYaw	.byte 0			; 0 = looking along +x, 128 = back again
+plPitch	.byte 0
+frameCt	.byte 0
+sprY	.byte 0
+tmp	.word 0
+errCnt	.word 0
+lastErr	.byte 0
+statBuf	.fill 16, 0
+
+; ======================================================================
+; The level.
+;
+; A face's vertices are consecutive in the pool, so each face owns its own
+; run and shared corners are written twice -- which is what keeps a face
+; record down to sixteen bytes, eight of them still spare.
+;
+; WINDING: a face is drawn from the side it projects CLOCKWISE from, y
+; downwards. For an upright wall that is the same rule DRAW_WALLS has --
+; the side that projects its first edge left to right -- so an interior
+; wall loop runs clockwise in map coordinates, a floor is wound the same
+; way round and a ceiling the other.
+; ======================================================================
+
+vertTab
+V_FLOOR	= ( * - vertTab ) / R2_VERT
+	#r2vertd WU(0),  WU(-5), 0
+	#r2vertd WU(0),  WU(5),  0
+	#r2vertd WU(10), WU(5),  0
+	#r2vertd WU(10), WU(-5), 0
+
+V_CEIL	= ( * - vertTab ) / R2_VERT
+	#r2vertd WU(0),  WU(-5), Z_TOP
+	#r2vertd WU(10), WU(-5), Z_TOP
+	#r2vertd WU(10), WU(5),  Z_TOP
+	#r2vertd WU(0),  WU(5),  Z_TOP
+
+V_WALLS	= ( * - vertTab ) / R2_VERT	; y = -5, seen from inside
+	#r2vertd WU(10), WU(-5), Z_TOP
+	#r2vertd WU(0),  WU(-5), Z_TOP
+	#r2vertd WU(0),  WU(-5), 0
+	#r2vertd WU(10), WU(-5), 0
+
+V_WALLW	= ( * - vertTab ) / R2_VERT	; x = 0
+	#r2vertd WU(0),  WU(-5), Z_TOP
+	#r2vertd WU(0),  WU(5),  Z_TOP
+	#r2vertd WU(0),  WU(5),  0
+	#r2vertd WU(0),  WU(-5), 0
+
+V_WALLN	= ( * - vertTab ) / R2_VERT	; y = 5
+	#r2vertd WU(0),  WU(5),  Z_TOP
+	#r2vertd WU(10), WU(5),  Z_TOP
+	#r2vertd WU(10), WU(5),  0
+	#r2vertd WU(0),  WU(5),  0
+
+V_WALLE	= ( * - vertTab ) / R2_VERT	; x = 10
+	#r2vertd WU(10), WU(5),  Z_TOP
+	#r2vertd WU(10), WU(-5), Z_TOP
+	#r2vertd WU(10), WU(-5), 0
+	#r2vertd WU(10), WU(5),  0
+
+V_RAMP	= ( * - vertTab ) / R2_VERT	; the slope itself
+	#r2vertd WU(6),  WU(-2), 0
+	#r2vertd WU(6),  WU(2),  0
+	#r2vertd WU(9),  WU(2),  Z_RAMP
+	#r2vertd WU(9),  WU(-2), Z_RAMP
+
+V_PLAT	= ( * - vertTab ) / R2_VERT	; the platform at the top of it
+	#r2vertd WU(9),  WU(-2), Z_RAMP
+	#r2vertd WU(9),  WU(2),  Z_RAMP
+	#r2vertd WU(10), WU(2),  Z_RAMP
+	#r2vertd WU(10), WU(-2), Z_RAMP
+
+V_RAMPS	= ( * - vertTab ) / R2_VERT	; the ramp's south cheek, a triangle
+	#r2vertd WU(9),  WU(-2), Z_RAMP
+	#r2vertd WU(6),  WU(-2), 0
+	#r2vertd WU(9),  WU(-2), 0
+
+V_PLATS	= ( * - vertTab ) / R2_VERT	; and the platform's south side
+	#r2vertd WU(10), WU(-2), Z_RAMP
+	#r2vertd WU(9),  WU(-2), Z_RAMP
+	#r2vertd WU(9),  WU(-2), 0
+	#r2vertd WU(10), WU(-2), 0
+
+V_RAMPN	= ( * - vertTab ) / R2_VERT	; the north cheek
+	#r2vertd WU(6),  WU(2),  0
+	#r2vertd WU(9),  WU(2),  Z_RAMP
+	#r2vertd WU(9),  WU(2),  0
+
+V_PLATN	= ( * - vertTab ) / R2_VERT
+	#r2vertd WU(9),  WU(2),  Z_RAMP
+	#r2vertd WU(10), WU(2),  Z_RAMP
+	#r2vertd WU(10), WU(2),  0
+	#r2vertd WU(9),  WU(2),  0
+
+; The slab: floor above floor, which is the whole reason this is not a
+; sector renderer. It hangs from x=2..4 across the west end of the room,
+; open at the north so you can see it end-on as you walk under it.
+V_SLABB	= ( * - vertTab ) / R2_VERT	; the underside, seen from below
+	#r2vertd WU(2),  WU(-5), Z_SLABB
+	#r2vertd WU(4),  WU(-5), Z_SLABB
+	#r2vertd WU(4),  WU(5),  Z_SLABB
+	#r2vertd WU(2),  WU(5),  Z_SLABB
+
+V_SLABT	= ( * - vertTab ) / R2_VERT	; the walkway, seen from above
+	#r2vertd WU(2),  WU(-5), Z_SLABT
+	#r2vertd WU(2),  WU(5),  Z_SLABT
+	#r2vertd WU(4),  WU(5),  Z_SLABT
+	#r2vertd WU(4),  WU(-5), Z_SLABT
+
+; The bridge reaches both side walls, so it has no end caps: the two faces
+; below are its west and east sides, the ones the player sees as he walks
+; up to it and as he looks back at it from the ramp.
+V_SLABW	= ( * - vertTab ) / R2_VERT	; x = 2, seen from the west
+	#r2vertd WU(2),  WU(-5), Z_SLABT
+	#r2vertd WU(2),  WU(5),  Z_SLABT
+	#r2vertd WU(2),  WU(5),  Z_SLABB
+	#r2vertd WU(2),  WU(-5), Z_SLABB
+
+V_SLABX	= ( * - vertTab ) / R2_VERT	; x = 4, seen from the east
+	#r2vertd WU(4),  WU(5),  Z_SLABT
+	#r2vertd WU(4),  WU(-5), Z_SLABT
+	#r2vertd WU(4),  WU(-5), Z_SLABB
+	#r2vertd WU(4),  WU(5),  Z_SLABB
+
+NVERT	= ( * - vertTab ) / R2_VERT
+
+; The texture axes. Eight texels to the world unit, so a 32-texel brick
+; tiles every four units; t runs with -z so the texture is the right way
+; up. Two faces naming one of these are guaranteed to align, which is why
+; the room's four walls need no per-face alignment at all.
+texinfoTab
+TI_WALLX = 1				; a wall running along x
+	#r2texinfod  2048, 0, 0, 0,      0, 0, -2048, 0
+TI_WALLY = 2				; a wall running along y
+	#r2texinfod  0, 2048, 0, 0,      0, 0, -2048, 0
+TI_FLAT	 = 3				; anything roughly horizontal
+	#r2texinfod  2048, 0, 0, 0,      0, 2048, 0, 0
+NTI	= ( * - texinfoTab ) / R2_TEXINFO
+
+; The faces. Order is the order they were written; nothing sorts them and
+; nothing needs to.
+faces
+	#r2polyd V_FLOOR, 4, TI_FLAT,  TEX_STONE, 0, 1
+	#r2polyd V_CEIL,  4, TI_FLAT,  TEX_STONE, 0, 3
+	#r2polyd V_WALLS, 4, TI_WALLX, TEX_BRICK, 0, 1
+	#r2polyd V_WALLW, 4, TI_WALLY, TEX_BRICK, 0, 2
+	#r2polyd V_WALLN, 4, TI_WALLX, TEX_BRICK, 0, 1
+	#r2polyd V_WALLE, 4, TI_WALLY, TEX_BRICK, 0, 2
+	#r2polyd V_RAMP,  4, TI_FLAT,  TEX_BRICK, 0, 0
+	#r2polyd V_PLAT,  4, TI_FLAT,  TEX_BRICK, 0, 0
+	#r2polyd V_RAMPS, 3, TI_WALLX, TEX_STONE, 0, 2
+	#r2polyd V_PLATS, 4, TI_WALLX, TEX_STONE, 0, 2
+	#r2polyd V_RAMPN, 3, TI_WALLX, TEX_STONE, 0, 2
+	#r2polyd V_PLATN, 4, TI_WALLX, TEX_STONE, 0, 2
+	#r2polyd V_SLABB, 4, TI_FLAT,  TEX_BRICK, 0, 4
+	#r2polyd V_SLABT, 4, TI_FLAT,  TEX_STONE, 0, 0
+	#r2polyd V_SLABW, 4, TI_WALLY, TEX_BRICK, 0, 3
+	#r2polyd V_SLABX, 4, TI_WALLY, TEX_BRICK, 0, 3
+NFACES	= ( * - faces ) / R2_POLY
+	.word	0			; R2_BATCH_SUM, filled in at start-up
+
+; --- the palette: 8 hues x 32 brightnesses -----------------------------
+palHues = [[80,60,50], [150,120,95], [110,110,120], [90,130,90],  [170,150,60], [70,90,150], [180,90,60], [200,200,200]]
+
+palData
+	.for h = 0, h < 8, h += 1
+	  .for s = 0, s < 32, s += 1
+	  .byte round(palHues[h][0] * s / 31.0), round(palHues[h][1] * s / 31.0), round(palHues[h][2] * s / 31.0)
+	  .next
+	.next
+
+; --- the colormap: 16 levels, each two shades darker than the last -----
+cmapData
+	.for l = 0, l < CMAP_LEVELS, l += 1
+	  .for c = 0, c < 256, c += 1
+	  .byte (c & $e0) | ((c & 31) - 2 * l < 0 ? 0 : (c & 31) - 2 * l)
+	  .next
+	.next
+
+; --- the textures, column-major: texel(u,v) at u * TEXH + v ------------
+brickTex
+	.for u = 0, u < TEXW, u += 1
+	  .for v = 0, v < TEXH, v += 1
+	  .byte ((v % 8) == 0) || (((u + ((v / 8) % 2) * 8) % 16) < 2) ? 0*32+20 : 1*32+18+((u*5+v*3) % 6)
+	  .next
+	.next
+
+stoneTex
+	.for u = 0, u < TEXW, u += 1
+	  .for v = 0, v < TEXH, v += 1
+	  .byte ((v % 16) < 1) || ((u % 16) < 1) ? 2*32+12 : 2*32+20+((u*3+v*7) % 5)
+	  .next
+	.next
+
+; The weapon: index 0 is the key, so the shape is what is not 0.
+gunTex
+	.for u = 0, u < TEXW, u += 1
+	  .for v = 0, v < TEXH, v += 1
+	  .byte (u >= 12 && u < 20 && v >= 8) ? (u < 14 || u >= 18 ? 7*32+14 : 7*32+24) :  ((u >= 10 && u < 22 && v >= 20) ? 7*32+8 : 0)
+	  .next
+	.next
+
+	.include "gpu64_demo_rt.inc"

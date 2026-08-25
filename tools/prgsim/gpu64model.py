@@ -53,6 +53,15 @@ RASTER_MAX_DIM = 1024
 RASTER_MAX_LEVELS = 64
 RASTER_MAX_TEXTURES = 255
 RASTER_ARENA_BYTES = 8 * 1024 * 1024
+RASTER_POLY_BYTES = 16
+RASTER_VERT_BYTES = 8
+RASTER_TEXINFO_BYTES = 16
+RASTER_MAX_VERTS = 4096
+RASTER_MAX_TEXINFO = 255
+RASTER_MAX_POLY_VERTS = 16
+POLY_MASKED = 0x01
+POLY_FLATLIT = 0x02
+POLY_TWOSIDED = 0x04
 COL_MASKED = 0x01
 SPR_MASKED = 0x01
 SPR_FLIPX = 0x02
@@ -204,6 +213,11 @@ class Gpu64Model:
         self.rcam = dict(x=0, y=0, ang=0, flags=0, eye=0x0080, ceil=0x0200,
                          proj=0xA000, floorc=0, ceilc=0, horizon=0)
         self.rsectors = []
+        # Milestone 9's polygon layer: a 3D camera that has never been set
+        # (proj 0), and the two level-lifetime tables a face record indexes.
+        self.rcam3 = dict(x=0, y=0, z=0, yaw=0, pitch=0, proj=0, flags=0)
+        self.rverts = []
+        self.rtexinfo = []
         self.rrequested = 0
         # Persistent, exactly like the firmware's static s_ZBuf: DRAW_SECTORS
         # clears it and DRAW_THINGS reads what DRAW_SECTORS left.
@@ -794,6 +808,9 @@ class Gpu64Model:
                              ceil=0x0200, proj=0xA000, floorc=0, ceilc=0,
                              horizon=0)
             self.rsectors = []
+            self.rcam3 = dict(x=0, y=0, z=0, yaw=0, pitch=0, proj=0, flags=0)
+            self.rverts = []
+            self.rtexinfo = []
             # The depth buffer's lifecycle matches the firmware's: RESET
             # makes it empty again, so a program that sends things but no
             # sectors does not inherit the previous one's depth.
@@ -953,6 +970,63 @@ class Gpu64Model:
                 built.append(dict(floor=f, ceil=c, floorc=r[4], ceilc=r[5],
                                   light=r[6], flags=r[7]))
             self.rsectors = built
+            return ERR_OK
+
+        if op == 0x07:                                  # SET_CAMERA3D
+            proj = self.a_u16(8)
+            if proj == 0:
+                return ERR_BAD_ARGS
+            self.rcam3 = dict(x=self.a_s16(0), y=self.a_s16(2),
+                              z=self.a_s16(4), yaw=a[6], pitch=s8(a[7]),
+                              proj=proj, flags=a[10])
+            return ERR_OK
+
+        if op == 0x12:                                  # UPLOAD_VERTS
+            space, addr, length = self.a_blob(0)
+            count = self.a_u16(6)
+            if count == 0:
+                self.rverts = []
+                return ERR_OK
+            if count > RASTER_MAX_VERTS:
+                return ERR_BAD_ARGS
+            if length != count * RASTER_VERT_BYTES:
+                return ERR_BAD_ARGS
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            self.rverts = [
+                (s16(data[i * 8] | (data[i * 8 + 1] << 8)),
+                 s16(data[i * 8 + 2] | (data[i * 8 + 3] << 8)),
+                 s16(data[i * 8 + 4] | (data[i * 8 + 5] << 8)))
+                for i in range(count)]
+            return ERR_OK
+
+        if op == 0x13:                                  # UPLOAD_TEXINFO
+            space, addr, length = self.a_blob(0)
+            count = self.a_u16(6)
+            if count == 0:
+                self.rtexinfo = []
+                return ERR_OK
+            if count > RASTER_MAX_TEXINFO:
+                return ERR_BAD_ARGS
+            if length != count * RASTER_TEXINFO_BYTES:
+                return ERR_BAD_ARGS
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            self.rtexinfo = [
+                tuple(s16(data[i * 16 + 2 * k] | (data[i * 16 + 2 * k + 1] << 8))
+                      for k in range(8))
+                for i in range(count)]
+            return ERR_OK
+
+        if op == 0x26:                                  # DRAW_POLYS
+            res, recs, count = self.r_pull_batch(RASTER_POLY_BYTES)
+            if res != ERR_OK or count == 0:
+                return res
+            if self.rcam3['proj'] == 0 or not self.rverts:
+                return ERR_BAD_ARGS
+            self.r_polys(recs, count, a[9])
             return ERR_OK
 
         if op == 0x24:                                  # DRAW_SECTORS
@@ -1561,6 +1635,214 @@ class Gpu64Model:
                     if not nodepth:
                         zbuf[sy * FB_W + sx] = zs
                     page[sy * FB_W + sx] = cmap[t] if cmap is not None else t
+                    self.rbatch[2] += 1
+
+    # ------------------------------------------------------------------
+    # DRAW_POLYS -- milestone 9's polygon layer.
+    #
+    # Written from docs/api_design.md and docs/milestone9_poly_design.md,
+    # not from gpu64_raster_core.cpp. Every division goes through idiv() and
+    # every shift is arithmetic, because the two implementations have to
+    # agree on a truncation, not merely on a picture.
+    # ------------------------------------------------------------------
+
+    def r_poly_plane(self, v, plane, proj, kl, kr, kt, kb):
+        vx, vy, vz = v[0], v[1], v[2]
+        if plane == 0:
+            return vz - self.NEAR
+        if plane == 1:
+            return (vx * proj - kl * vz) >> 8
+        if plane == 2:
+            return (kr * vz - vx * proj) >> 8
+        if plane == 3:
+            return (kt * vz - vy * proj) >> 8
+        return (vy * proj - kb * vz) >> 8
+
+    def r_poly_clip(self, verts, plane, proj, kl, kr, kt, kb):
+        out = []
+        n = len(verts)
+        for i in range(n):
+            a = verts[i]
+            b = verts[(i + 1) % n]
+            da = self.r_poly_plane(a, plane, proj, kl, kr, kt, kb)
+            db = self.r_poly_plane(b, plane, proj, kl, kr, kt, kb)
+            if da >= 0:
+                out.append(a)
+            if (da >= 0) != (db >= 0):
+                num, den = -da, db - da
+                out.append(tuple(a[k] + idiv((b[k] - a[k]) * num, den)
+                                 for k in range(5)))
+        return out
+
+    def r_polys(self, recs, count, key):
+        vx, vy, vw, vh = self.rview
+        vx0, vx1 = vx, vx + vw
+        vy0, vy1 = vy, vy + vh
+        cam = self.rcam3
+
+        if cam['proj'] == 0 or not self.rverts:
+            self.rbatch[1] += count
+            return
+
+        proj = cam['proj']
+        centre_x = vx0 + vw // 2
+        centre_y = vy0 + vh // 2
+        kl = (vx0 - centre_x) * 256
+        kr = (vx1 - centre_x) * 256
+        kt = (centre_y - vy0) * 256
+        kb = (centre_y - vy1) * 256
+
+        cyaw, syaw = fcos(cam['yaw']), fsin(cam['yaw'])
+        cpit = fcos(cam['pitch'] & 0xFF)
+        spit = fsin(cam['pitch'] & 0xFF)
+
+        zbuf = self.zbuf
+        page = self.page()
+
+        for i in range(count):
+            r = recs[i * RASTER_POLY_BYTES:(i + 1) * RASTER_POLY_BYTES]
+            first = r[0] | (r[1] << 8)
+            nverts, tinfo, texid = r[2], r[3], r[4]
+            colour, light, flags = r[5], r[6], r[7]
+
+            if nverts < 3 or nverts > RASTER_MAX_POLY_VERTS:
+                self.rbatch[1] += 1
+                continue
+            if first + nverts > len(self.rverts):
+                self.rbatch[1] += 1
+                continue
+
+            tex = ti = None
+            if texid:
+                tex = self.r_lookup(texid)
+                if tex is None or (tex[0] & (tex[0] - 1)):
+                    # Both coordinates are masked per pixel, so a width that
+                    # is not a power of two is a rejected record here even
+                    # though the same texture is legal for DRAW_COLUMNS.
+                    self.rbatch[1] += 1
+                    continue
+                if tinfo == 0 or tinfo > len(self.rtexinfo):
+                    self.rbatch[1] += 1
+                    continue
+                ti = self.rtexinfo[tinfo - 1]
+
+            poly = []
+            for k in range(nverts):
+                wx, wy, wz = self.rverts[first + k]
+                dx, dy, dz = wx - cam['x'], wy - cam['y'], wz - cam['z']
+                fwd = (dx * cyaw + dy * syaw) >> 8
+                rgt = (dx * syaw - dy * cyaw) >> 8
+                pvz = (fwd * cpit + dz * spit) >> 8
+                pvy = (dz * cpit - fwd * spit) >> 8
+                if ti is not None:
+                    sc = ((wx * ti[0] + wy * ti[1] + wz * ti[2]) >> 8) + ti[3]
+                    tc = ((wx * ti[4] + wy * ti[5] + wz * ti[6]) >> 8) + ti[7]
+                else:
+                    sc = tc = 0
+                poly.append((rgt, pvy, pvz, sc, tc))
+
+            poly = self.r_poly_clip(poly, 0, proj, kl, kr, kt, kb)
+            if len(poly) < 3:
+                self.rbatch[1] += 1          # entirely behind the near plane
+                continue
+            for plane in (1, 2, 3, 4):
+                if len(poly) < 3:
+                    break
+                poly = self.r_poly_clip(poly, plane, proj, kl, kr, kt, kb)
+            if len(poly) < 3:
+                self.rbatch[0] += 1          # off the side: drew nothing
+                continue
+
+            scr = []
+            for v in poly:
+                vz = max(v[2], self.NEAR)
+                sx = (centre_x << 8) + idiv(v[0] * proj, vz)
+                sy = (centre_y << 8) - idiv(v[1] * proj, vz)
+                w = idiv(1 << 30, vz)
+                scr.append([sx, sy, w, v[3] * w, v[4] * w])
+
+            n = len(scr)
+            area = 0
+            for k in range(n):
+                a, b = scr[k], scr[(k + 1) % n]
+                area += a[0] * b[1] - b[0] * a[1]
+            if area == 0:
+                self.rbatch[0] += 1
+                continue
+            if area < 0 and not (flags & POLY_TWOSIDED):
+                self.rbatch[1] += 1
+                continue
+
+            self.rbatch[0] += 1
+
+            min_y = min(v[1] for v in scr)
+            max_y = max(v[1] for v in scr)
+            y_top = max((min_y + 255) >> 8, vy0)
+            y_bot = min((max_y + 255) >> 8, vy1)
+
+            tw = th = 0
+            texels = None
+            if tex is not None:
+                tw, th, texels = tex
+            flatlit = bool(flags & POLY_FLATLIT)
+            masked = bool(flags & POLY_MASKED)
+
+            for y in range(y_top, y_bot):
+                Y = y << 8
+                hit_l = hit_r = None
+                for k in range(n):
+                    a, b = scr[k], scr[(k + 1) % n]
+                    if not ((a[1] <= Y < b[1]) or (b[1] <= Y < a[1])):
+                        continue
+                    num, den = Y - a[1], b[1] - a[1]
+                    h = [a[j] + idiv((b[j] - a[j]) * num, den)
+                         for j in (0, 2, 3, 4)]
+                    if hit_l is None:
+                        hit_l = hit_r = h
+                    elif h[0] < hit_l[0]:
+                        hit_l = h
+                    elif h[0] > hit_r[0]:
+                        hit_r = h
+
+                if hit_l is None or hit_r[0] <= hit_l[0]:
+                    continue
+
+                xs = max((hit_l[0] + 255) >> 8, vx0)
+                xe = min((hit_r[0] + 255) >> 8, vx1)
+                if xs >= xe:
+                    continue
+
+                dx88 = hit_r[0] - hit_l[0]
+                off = (xs << 8) - hit_l[0]
+                w = hit_l[1] + idiv((hit_r[1] - hit_l[1]) * off, dx88)
+                sq = hit_l[2] + idiv((hit_r[2] - hit_l[2]) * off, dx88)
+                tq = hit_l[3] + idiv((hit_r[3] - hit_l[3]) * off, dx88)
+                dw = idiv((hit_r[1] - hit_l[1]) << 8, dx88)
+                ds = idiv((hit_r[2] - hit_l[2]) << 8, dx88)
+                dt = idiv((hit_r[3] - hit_l[3]) << 8, dx88)
+
+                for x in range(xs, xe):
+                    ww, ss, tt = w, sq, tq
+                    w += dw
+                    sq += ds
+                    tq += dt
+                    if ww <= 0:
+                        continue
+                    z = idiv(1 << 30, ww)
+                    zs = self.r_zstore(z)
+                    if zs >= zbuf[y * FB_W + x]:
+                        continue
+                    if texels is not None:
+                        ui = (idiv(ss, ww) >> 8) & (tw - 1)
+                        vi = (idiv(tt, ww) >> 8) & (th - 1)
+                        c = texels[ui * th + vi]
+                        if masked and c == key:
+                            continue
+                    else:
+                        c = colour
+                    cmap = self.r_light_row(self.r_lit(light, z, flatlit))
+                    zbuf[y * FB_W + x] = zs
+                    page[y * FB_W + x] = cmap[c] if cmap is not None else c
                     self.rbatch[2] += 1
 
     def r_sprite(self):
