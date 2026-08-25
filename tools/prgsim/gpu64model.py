@@ -70,6 +70,7 @@ THING_FLIPX = 0x02
 THING_NODEPTH = 0x04
 THING_FLATLIT = 0x08
 BATCH_CHECKSUM = 0x01
+BATCH_CAM3D = 0x02
 
 ST_BUSY = 0x01
 ST_ERROR = 0x02
@@ -1042,7 +1043,9 @@ class Gpu64Model:
             res, recs, count = self.r_pull_batch()
             if res != ERR_OK or count == 0:
                 return res
-            self.r_things(recs, count, a[9])
+            if (a[8] & BATCH_CAM3D) and self.rcam3['proj'] == 0:
+                return ERR_BAD_ARGS
+            self.r_things(recs, count, a[9], a[8])
             return ERR_OK
 
         return ERR_BAD_OPCODE
@@ -1551,11 +1554,12 @@ class Gpu64Model:
     # so a batch is order-independent.
     # ------------------------------------------------------------------
 
-    def r_things(self, recs, count, key):
+    def r_things(self, recs, count, key, batch_flags=0):
         vx, vy, vw, vh = self.rview
         vx0, vx1 = vx, vx + vw
         vy0, vy1 = vy, vy + vh
-        cam = self.rcam
+        cam3 = bool(batch_flags & BATCH_CAM3D)
+        cam = self.rcam3 if cam3 else self.rcam
 
         if cam['proj'] == 0:
             self.rbatch[1] += count
@@ -1565,8 +1569,11 @@ class Gpu64Model:
         page = self.page()
         proj = cam['proj']
         centre_x = vx0 + vw // 2
-        horizon = vy0 + vh // 2 + cam['horizon']
-        eye = cam['eye']
+        horizon = vy0 + vh // 2 + (0 if cam3 else cam['horizon'])
+        eye = self.rcam['eye']
+        c3 = self.rcam3
+        cyaw, syaw = fcos(c3['yaw']), fsin(c3['yaw'])
+        cpit, spit = fcos(c3['pitch'] & 0xFF), fsin(c3['pitch'] & 0xFF)
 
         for i in range(count):
             r = recs[i * RASTER_REC_BYTES:(i + 1) * RASTER_REC_BYTES]
@@ -1576,10 +1583,29 @@ class Gpu64Model:
             world_w = r[8] | (r[9] << 8)
             texid, light, flags = r[10], r[11], r[12]
 
-            vxx, vzz = self.r_to_view(wx, wy)
+            # hbase/htop are heights measured downward from the eye, so
+            # the row arithmetic below is one expression for both cameras.
+            if cam3:
+                dx, dy = wx - c3['x'], wy - c3['y']
+                dzb = base - c3['z']
+                dzt = dzb + world_h
+                fwd = (dx * cyaw + dy * syaw) >> 8
+                vxx = (dx * syaw - dy * cyaw) >> 8
+                vzz = (fwd * cpit + dzb * spit) >> 8
+                vz_top = (fwd * cpit + dzt * spit) >> 8
+                hbase = (fwd * spit - dzb * cpit) >> 8
+                htop = (fwd * spit - dzt * cpit) >> 8
+            else:
+                vxx, vzz = self.r_to_view(wx, wy)
+                vz_top = vzz
+                hbase = eye - base
+                htop = hbase - world_h
+
             if vzz < self.NEAR:
                 self.rbatch[1] += 1
                 continue
+            if vz_top < self.NEAR:
+                vz_top = self.NEAR
             if world_w == 0 or world_h == 0:
                 self.rbatch[1] += 1
                 continue
@@ -1592,8 +1618,8 @@ class Gpu64Model:
 
             wpx = idiv(world_w * proj, vzz) >> 8
             sxc = centre_x + (idiv(vxx * proj, vzz) >> 8)
-            y_bot = horizon + (idiv((eye - base) * proj, vzz) >> 8)
-            y_top = horizon + (idiv((eye - base - world_h) * proj, vzz) >> 8)
+            y_bot = horizon + (idiv(hbase * proj, vzz) >> 8)
+            y_top = horizon + (idiv(htop * proj, vz_top) >> 8)
             hpx = y_bot - y_top
             if wpx <= 0 or hpx <= 0:
                 continue

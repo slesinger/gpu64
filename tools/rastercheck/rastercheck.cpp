@@ -218,9 +218,13 @@ int main( int argc, char **argv )
 		else if( kind == 3 )
 			gpu64_rasterWalls( &state, &target, g_p, count, key,
 					   lookup, 0, &res );
-		else if( kind == 6 )
+		else if( kind == 6 || kind == 9 )
 			gpu64_rasterPolys( &state, &target, g_p, count, key,
 					   lookup, 0, &res );
+		else if( kind == 8 )
+			gpu64_rasterThings( &state, &target, g_p, count, key,
+					    GPU64_RASTER_BATCH_CAM3D,
+					    lookup, 0, &res );
 		else
 			gpu64_rasterSectors( &state, &target, g_p, count, key,
 					     lookup, 0, &res );
@@ -234,7 +238,7 @@ int main( int argc, char **argv )
 			g_p += (size_t) count * stride;
 			u32 things = rd32();
 			need( (size_t) things * GPU64_RASTER_REC_BYTES );
-			gpu64_rasterThings( &state, &target, g_p, things, key,
+			gpu64_rasterThings( &state, &target, g_p, things, key, 0,
 					    lookup, 0, &res );
 		}
 
@@ -248,6 +252,20 @@ int main( int argc, char **argv )
 			need( (size_t) polys * GPU64_RASTER_POLY_BYTES );
 			gpu64_rasterPolys( &state, &target, g_p, polys, key,
 					   lookup, 0, &res );
+		}
+
+		// kind 9 is milestone 10's whole point: a Quake level and then
+		// its monsters, both through SET_CAMERA3D, sharing one depth
+		// buffer. Occlusion across the two layers is the part a single
+		// batch cannot exercise.
+		if( kind == 9 )
+		{
+			g_p += (size_t) count * stride;
+			u32 things = rd32();
+			need( (size_t) things * GPU64_RASTER_REC_BYTES );
+			gpu64_rasterThings( &state, &target, g_p, things, key,
+					    GPU64_RASTER_BATCH_CAM3D,
+					    lookup, 0, &res );
 		}
 	}
 

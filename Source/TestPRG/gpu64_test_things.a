@@ -491,6 +491,162 @@ start
 	#useacc
 	#check "THING MASK KEEPS"
 
+	; ---------------------------------------------------------------
+	; THE 3D CAMERA. A batch may ask to be projected through
+	; SET_CAMERA3D instead of SET_CAMERA, which is what puts monsters
+	; into a level drawn with DRAW_POLYS.
+	;
+	; The first thing to establish is that the two paths agree. Put the
+	; 3D camera where the 2D one is -- at the origin, looking along +x,
+	; eye at absolute 0.5, projecting 160 pixels -- with no pitch, and
+	; thing A must land on exactly the columns and rows asserted at the
+	; top of this program. Anything else is a shifted horizon or a
+	; rounding difference between the two transforms.
+	; ---------------------------------------------------------------
+
+	; Asking for a camera that was never sent is an error, not an
+	; empty view: SET_CAMERA3D has not been issued in this program yet,
+	; so every record would be rejected and the caller would read OK.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingA, 1, R2_BATCH_CAM3D
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "THING NO CAM3D"
+
+	#r2cam3 0, 0, $0080, 0, 0, $a000
+	lda #R2_SET_CAMERA3D
+	jsr cmd2
+	#wantOk
+	#check "SET CAMERA3D"
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingA, 1, R2_BATCH_CAM3D
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#wantOk
+	#check "DRAW THINGS 3D"
+
+	#stgRead RB, 138, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; x=138
+	#expectb RB+1, BG		; x=139
+	#expectb RB+2, THA		; x=140, the same first column
+	#expectb RB+3, THA
+	#useacc
+	#check "CAM3D LEFT EDGE"
+
+	#stgRead RB, 178, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA
+	#expectb RB+1, THA		; x=179, the same last column
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "CAM3D RIGHT EDGE"
+
+	#stgRead RB, 160, 78, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG
+	#expectb RB+1, BG
+	#expectb RB+2, THA		; y=80, the same top
+	#expectb RB+3, THA
+	#useacc
+	#check "CAM3D TOP EDGE"
+
+	#stgRead RB, 160, 118, 1, 4
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA
+	#expectb RB+1, THA		; y=119, the same bottom
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "CAM3D BOT EDGE"
+
+	; YAW. Turn the camera 64 -- a quarter circle, looking along +y --
+	; and a thing 4.0 units along +y must land on A's rectangle. This
+	; is the assertion that says the yaw sign and the screen-x sign
+	; agree; get either backwards and the thing is behind the camera or
+	; mirrored to the far side.
+	#r2cam3 0, 0, $0080, 64, 0, $a000
+	lda #R2_SET_CAMERA3D
+	jsr cmd2
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingY, 1, R2_BATCH_CAM3D
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 138, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+1, BG		; x=139
+	#expectb RB+2, THA		; x=140, exactly where +x put it
+	#useacc
+	#check "CAM3D YAW"
+
+	; PITCH. Positive pitch looks UP, so the world moves DOWN. At pitch
+	; 16 -- an eighth of a quarter circle -- A's rows run 143..189, so
+	; the row it used to occupy is now empty and a row well below it is
+	; not. Exact edges are rastercheck's job; what this asserts is the
+	; sign, which no amount of pixel-level agreement would catch if the
+	; two implementations were wrong the same way.
+	#r2cam3 0, 0, $0080, 0, 16, $a000
+	lda #R2_SET_CAMERA3D
+	jsr cmd2
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingA, 1, R2_BATCH_CAM3D
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; row 100 is empty now
+	#useacc
+	#check "CAM3D PITCH UP"
+
+	#stgRead RB, 160, 160, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA		; and the thing is below it
+	#useacc
+	#check "CAM3D PITCH ROW"
+
+	; The 2D camera is untouched by any of that: a batch without the
+	; flag still projects through SET_CAMERA, which is what lets a
+	; program keep a DRAW_SECTORS level and a DRAW_POLYS one in the
+	; same session.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingA, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, THA		; back on the 2D horizon
+	#useacc
+	#check "CAM2D UNCHANGED"
+
 	jmp kitFinish
 
 ; ----------------------------------------------------------------------
@@ -543,6 +699,9 @@ thingBd	.macro
 thingA	#thingAd
 thingB	#thingBd
 thingC	#r2thingd $0200, $0000, $0000, $0100, $0100, IDC, 0
+
+; A's twin, moved a quarter circle round: 4.0 units along +y instead of +x.
+thingY	#r2thingd $0000, $0400, $0000, $0100, $0100, IDA, 0
 
 thingAB	#thingAd
 	#thingBd

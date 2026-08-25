@@ -136,6 +136,8 @@ R2_COL_MASKED	= $01
 R2_SPR_MASKED	= $01
 R2_SPR_FLIPX	= $02
 R2_BATCH_SUM	= $01
+R2_BATCH_CAM3D	= $02		; DRAW_THINGS: project through SET_CAMERA3D
+				; instead of SET_CAMERA
 
 ; Wall record flags (byte 14) and SET_CAMERA flags (ARG5).
 R2_WALL_MASKED	= $01
@@ -463,7 +465,7 @@ r2sectors .macro addr, count
 ;
 ; A thing is always textured; tex = 0 is a rejected record.
 r2thingd .macro	x, y, base, w, h, tex, light, flags=0
-	.word	\x, \y, \base, \h, \w
+	.word	(\x) & $ffff, (\y) & $ffff, (\base) & $ffff, \h, \w
 	.byte	\tex, \light, \flags
 	.byte	0, 0, 0			; reserved -- must be zero
 	.endm

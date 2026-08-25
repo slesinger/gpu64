@@ -1222,11 +1222,19 @@ void gpu64_rasterSectors( const Gpu64RasterState *pState,
 // two things that overlap come out the same way round whichever order they
 // arrive in -- the property the rest of class 2 has, and the reason none of
 // this needs a sort on the C64.
+//
+// Milestone 10: GPU64_RASTER_BATCH_CAM3D projects the batch through
+// SET_CAMERA3D instead, so a Quake game gets monsters. The card stays upright
+// and screen-axis-aligned -- Quake's own vp-parallel-upright sprite -- but its
+// two ends are transformed separately, so a thing seen under pitch sits at the
+// right rows and grows or shrinks the way the wall behind it does. With a
+// pitch of zero the two ends land at the same depth and the arithmetic
+// collapses, term for term, onto the 2D path above.
 // ======================================================================
 
 void gpu64_rasterThings( const Gpu64RasterState *pState,
 			 const Gpu64RasterTarget *pTarget,
-			 const u8 *pRecs, u32 nCount, u8 nKey,
+			 const u8 *pRecs, u32 nCount, u8 nKey, u8 nBatchFlags,
 			 Gpu64RasterLookupFn pLookup, void *pCtx,
 			 Gpu64RasterBatchResult *pResult )
 {
@@ -1235,24 +1243,30 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 
 	zbufReady();
 
-	if ( pState->camProj == 0 )
+	const boolean bCam3 = ( nBatchFlags & GPU64_RASTER_BATCH_CAM3D ) != 0;
+
+	if ( bCam3 ? pState->cam3Proj == 0 : pState->camProj == 0 )
 	{
 		pResult->rejected += nCount;
 		return;
 	}
 
-	const s32 proj    = pState->camProj;
+	// The two cameras share every line below this one. What differs is the
+	// projection distance, where the horizon row is (SET_CAMERA shears it,
+	// SET_CAMERA3D rotates instead) and how a world point reaches view
+	// space.
+	const s32 proj    = bCam3 ? (s32)pState->cam3Proj : (s32)pState->camProj;
 	const int centreX = vx0 + (int)pState->viewW / 2;
-	const int horizon = vy0 + (int)pState->viewH / 2 + pState->camHorizon;
+	const int horizon = vy0 + (int)pState->viewH / 2
+			  + ( bCam3 ? 0 : (int)pState->camHorizon );
 	const s32 eyeH    = pState->camEyeH;
+	const s32 cyaw = fcos( pState->cam3Yaw ), syaw = fsin( pState->cam3Yaw );
+	const s32 cpit = fcos( (u8)pState->cam3Pitch ), spit = fsin( (u8)pState->cam3Pitch );
 	const unsigned pitch = pTarget->pitch;
 
 	for ( u32 i = 0; i < nCount; i++ )
 	{
 		const u8 *r = pRecs + i * GPU64_RASTER_REC_BYTES;
-
-		s32 vx, vz;
-		toView( pState, recS16( r, 0 ), recS16( r, 2 ), &vx, &vz );
 
 		const s32 baseH  = recS16( r, 4 );
 		const s32 worldH = (s32)recU16( r, 6 );
@@ -1260,6 +1274,33 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 		const u8  texid  = r[ 10 ];
 		const u8  light  = r[ 11 ];
 		const u8  flags  = r[ 12 ];
+
+		// The card's two ends: hBase and hTop are heights measured
+		// DOWNWARD from the eye, so a row is horizon + h*proj/depth in
+		// both paths and the 2D expressions survive unchanged.
+		s32 vx, vz, vzTop, hBase, hTop;
+
+		if ( bCam3 )
+		{
+			const s32 dx = recS16( r, 0 ) - (s32)pState->cam3X;
+			const s32 dy = recS16( r, 2 ) - (s32)pState->cam3Y;
+			const s32 dzB = baseH - (s32)pState->cam3Z;
+			const s32 dzT = dzB + worldH;
+
+			const s32 fwd = ( dx * cyaw + dy * syaw ) >> 8;
+			vx = ( dx * syaw - dy * cyaw ) >> 8;
+
+			vz    = ( fwd * cpit + dzB * spit ) >> 8;
+			vzTop = ( fwd * cpit + dzT * spit ) >> 8;
+			hBase = ( fwd * spit - dzB * cpit ) >> 8;
+			hTop  = ( fwd * spit - dzT * cpit ) >> 8;
+		} else
+		{
+			toView( pState, recS16( r, 0 ), recS16( r, 2 ), &vx, &vz );
+			vzTop = vz;
+			hBase = eyeH - baseH;
+			hTop  = hBase - worldH;
+		}
 
 		// Behind the near plane: not an error. Most of a level's things
 		// are behind the player in any given frame, exactly as most of
@@ -1269,6 +1310,14 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 			pResult->rejected++;
 			continue;
 		}
+
+		// The top of a tall thing standing very close can cross the
+		// near plane while its base is still in front of it. Clamping
+		// rather than rejecting keeps the thing on screen -- a monster
+		// must not vanish because the player walked into it -- and the
+		// card simply runs off the top of the view.
+		if ( vzTop < GPU64_RASTER_NEAR )
+			vzTop = GPU64_RASTER_NEAR;
 		if ( worldW == 0 || worldH == 0 )
 		{
 			pResult->rejected++;
@@ -1291,8 +1340,8 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 		// view, so the card faces the camera with no rotation to do.
 		const int wpx  = (int)( idiv( (s64)worldW * proj, vz ) >> 8 );
 		const int sxc  = centreX + (int)( idiv( (s64)vx * proj, vz ) >> 8 );
-		const int yBot = horizon + (int)( idiv( (s64)( eyeH - baseH ) * proj, vz ) >> 8 );
-		const int yTop = horizon + (int)( idiv( (s64)( eyeH - baseH - worldH ) * proj, vz ) >> 8 );
+		const int yBot = horizon + (int)( idiv( (s64)hBase * proj, vz ) >> 8 );
+		const int yTop = horizon + (int)( idiv( (s64)hTop * proj, vzTop ) >> 8 );
 		const int hpx  = yBot - yTop;
 
 		// Well-formed but too far away to have a pixel: accepted and

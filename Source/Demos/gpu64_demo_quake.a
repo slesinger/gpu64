@@ -22,6 +22,11 @@
 ;          that made Quake a different renderer and not a faster Doom.
 ;          The player walks under it at the start of his lap and looks
 ;          back down onto it from the top of the ramp
+;        * MONSTERS -- DRAW_THINGS batches may now ask to be projected
+;          through SET_CAMERA3D too, so the same billboards a Doom level
+;          uses stand in a Quake one, depth-tested against its faces: the
+;          one under the bridge is hidden by the slab until you walk out
+;          from under it
 ;        * real PITCH -- the camera looks up and down by rotating, so the
 ;          walls converge as you tilt. SET_CAMERA's horizon shears the
 ;          picture instead, which is exact for vertical walls and wrong for
@@ -68,6 +73,7 @@ TEXLEN	= TEXW * TEXH		; width must be one too: both are masked
 TEX_BRICK = 1
 TEX_STONE = 2
 TEX_GUN	  = 3
+TEX_MON	  = 4
 
 CMAP_LEVELS = 16
 
@@ -159,6 +165,14 @@ start
 	sta ID_LO
 	#cmd R2_UPLOAD_TEX
 
+	#argblob 0, SPACE_C64, monTex, TEXLEN
+	#argw 6, TEXW
+	#argw 8, TEXH
+	#argb 10, 0
+	lda #TEX_MON
+	sta ID_LO
+	#cmd R2_UPLOAD_TEX
+
 	; 16 light levels. A face carries a base level and gpu64 adds half
 	; the distance to it, so the far end of the room darkens by itself.
 	#argblob 0, SPACE_C64, cmapData, CMAP_LEVELS*256
@@ -215,6 +229,25 @@ frame
 	;    gpu64 on every arrival.
 	#r2batchp faces, NFACES, R2_BATCH_SUM
 	#cmd2 R2_DRAW_POLYS
+	lda ERRCODE
+	beq +
+	sta lastErr
+	inc errCnt
+	bne +
+	inc errCnt+1
++
+
+	; 3b. The monsters. Screen-upright billboards in the world, in the
+	;     same depth buffer the faces went into, so the one standing
+	;     under the bridge is cut off by the slab from every angle that
+	;     ought to cut it off -- and nothing here had to be sorted
+	;     against the geometry either.
+	;
+	;     R2_BATCH_CAM3D is the whole of what milestone 10 added: without
+	;     it this batch would project through SET_CAMERA, which this
+	;     program never sends.
+	#r2batch monsters, NMON, R2_BATCH_CAM3D
+	#cmd2 R2_DRAW_THINGS
 	lda ERRCODE
 	beq +
 	sta lastErr
@@ -333,7 +366,30 @@ mpTurnFwd
 	lda #0
 	sta plYaw
 
+	; The patrolling monster walks the width of the room and back. Its
+	; record is the only thing in the batch that changes, and the two
+	; bytes below are the whole cost of animating it.
 mpDone
+	lda frameCt
+	and #$7f
+	cmp #$40
+	bcc +
+	eor #$7f			; 127 - p: the way back
++
+	sec
+	sbc #32				; -32..31, a fifth of a unit a step
+	sta tmp
+	asl a				; x 8 -> -4.0 .. 3.9 world units
+	asl a
+	asl a
+	sta monsters+2*R2_REC+2
+	lda tmp
+	and #$80			; sign-extend the high byte
+	beq +
+	lda #$ff
++
+	sta monsters+2*R2_REC+3
+
 	jsr eyeHeight
 	rts
 
@@ -702,6 +758,22 @@ faces
 NFACES	= ( * - faces ) / R2_POLY
 	.word	0			; R2_BATCH_SUM, filled in at start-up
 
+; The monsters. A thing is a card that always faces the viewer, so it needs
+; no vertices and no winding -- just where its feet are, how big it is, and
+; a texture whose index 0 is see-through.
+;
+; The first stands under the bridge, which is the interesting one: it is
+; occluded by a face that arrives in the batch BEFORE it, from a program
+; that sorts nothing.
+MON_W	= $00c0				; 0.75 x 1.5 world units
+MON_H	= $0180
+
+monsters
+	#r2thingd WU(3),  WU(-3), 0,      MON_W, MON_H, TEX_MON, 4, R2_THING_MASKED
+	#r2thingd WU(10), WU(1),  Z_RAMP, MON_W, MON_H, TEX_MON, 0, R2_THING_MASKED
+	#r2thingd WU(5),  WU(0),  0,      MON_W, MON_H, TEX_MON, 2, R2_THING_MASKED
+NMON	= ( * - monsters ) / R2_REC
+
 ; --- the palette: 8 hues x 32 brightnesses -----------------------------
 palHues = [[80,60,50], [150,120,95], [110,110,120], [90,130,90],  [170,150,60], [70,90,150], [180,90,60], [200,200,200]]
 
@@ -740,6 +812,14 @@ gunTex
 	.for u = 0, u < TEXW, u += 1
 	  .for v = 0, v < TEXH, v += 1
 	  .byte (u >= 12 && u < 20 && v >= 8) ? (u < 14 || u >= 18 ? 7*32+14 : 7*32+24) :  ((u >= 10 && u < 22 && v >= 20) ? 7*32+8 : 0)
+	  .next
+	.next
+
+; The monster: a squat two-legged silhouette with two eyes, index 0 clear.
+monTex
+	.for u = 0, u < TEXW, u += 1
+	  .for v = 0, v < TEXH, v += 1
+	  .byte (v < 4) || (u < 6) || (u >= 26) || ((v >= 26) && ((u % 12) >= 6)) ? 0 : ((v >= 8) && (v < 12) && (((u >= 10) && (u < 13)) || ((u >= 19) && (u < 22)))) ? 7*32+30 : 6*32+12+((u*3+v*5) % 8)
 	  .next
 	.next
 

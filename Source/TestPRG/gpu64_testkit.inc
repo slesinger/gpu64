@@ -159,6 +159,7 @@ R2_COL_MASKED	= $01
 R2_SPR_MASKED	= $01
 R2_SPR_FLIPX	= $02
 R2_BATCH_SUM	= $01
+R2_BATCH_CAM3D	= $02		; DRAW_THINGS: project through SET_CAMERA3D
 
 ; Wall record flags (byte 14) and SET_CAMERA flags (ARG5).
 R2_WALL_MASKED	= $01

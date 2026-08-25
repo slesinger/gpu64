@@ -35,7 +35,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "prgsim"))
 
-from gpu64model import Gpu64Model, FB_W, FB_H, C64_PALETTE  # noqa: E402
+from gpu64model import (Gpu64Model, FB_W, FB_H, C64_PALETTE,  # noqa: E402
+                        BATCH_CAM3D)
 
 BIN = os.path.join(HERE, "rastercheck")
 MAGIC = 0x4B433252
@@ -195,8 +196,32 @@ def make_polys(rnd, cam3, ids):
     return verts, texinfo, nfaces, bytes(faces)
 
 
+def make_things(rnd, cx, cy, cz, ids, n):
+    """A batch of thing records scattered around a camera at (cx, cy, cz).
+
+    The spread is deliberately tight: things far off to the side clip away
+    and test nothing, whereas things a few hundred units out straddle the
+    near plane, the view edges and -- for the 3D camera -- the rows that
+    pitch sweeps past."""
+    recs = bytearray()
+    for _ in range(n):
+        recs += struct.pack("<hhhHHBBBxxx",
+                            cx + rnd.randint(-0x600, 0x600),
+                            cy + rnd.randint(-0x600, 0x600),
+                            cz + rnd.randint(-0x400, 0x400),
+                            rnd.choice([0, rnd.randint(1, 0x300)]),
+                            rnd.choice([0, rnd.randint(1, 0x300)]),
+                            rnd.choice(ids),
+                            rnd.randint(0, 70),
+                            rnd.randint(0, 15))
+    assert len(recs) == n * REC
+    return bytes(recs)
+
+
 def make_scenario(rnd):
-    kind = rnd.choice([0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7])
+    # 8 and 9 are milestone 10: things projected through SET_CAMERA3D, alone
+    # and then behind a polygon level sharing the same depth buffer.
+    kind = rnd.choice([0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 7, 8, 8, 9, 9])
 
     # The view: full surface half the time, otherwise a rectangle that
     # actually clips something.
@@ -225,7 +250,7 @@ def make_scenario(rnd):
     key = rnd.randint(0, 255)
     cam = make_camera(rnd, kind in (3, 4, 5, 7))
     sectors = make_sectors(rnd, kind in (4, 5, 7))
-    cam3 = make_camera3(rnd, kind in (6, 7))
+    cam3 = make_camera3(rnd, kind in (6, 7, 8, 9))
     ids_for_polys = sorted(texs) + [0, rnd.randint(9, 255)]
     verts, texinfo, npolys, polyrecs = make_polys(rnd, cam3, ids_for_polys)
 
@@ -249,14 +274,29 @@ def make_scenario(rnd):
                     sectors=sectors, spr=spr, cam3=cam3, verts=verts,
                     texinfo=texinfo, polys=npolys, polyrecs=polyrecs)
 
-    if kind == 6:
+    if kind in (6, 9):
         # The polygon batch IS the scenario here; the shared generator above
-        # already built it.
-        return dict(kind=6, view=view, levels=levels, cmap=cmap, texs=texs,
+        # already built it. kind 9 hangs a batch of things off the back of it.
+        n3 = rnd.randint(0, 20) if kind == 9 else 0
+        t3 = make_things(rnd, cam3["x"], cam3["y"], cam3["z"],
+                         sorted(texs) + [0, rnd.randint(9, 255)], n3)
+        return dict(kind=kind, view=view, levels=levels, cmap=cmap, texs=texs,
                     fill=fill, key=key, cam=cam, sectors=sectors, cam3=cam3,
                     verts=verts, texinfo=texinfo, count=npolys,
                     recs=polyrecs, polys=0, polyrecs=b"",
-                    things=0, thingrecs=b"")
+                    things=n3, thingrecs=t3)
+
+    if kind == 8:
+        # Things alone, through the 3D camera. No geometry in the depth
+        # buffer, so what this exercises is the projection itself and the
+        # thing-against-thing ordering.
+        n3 = rnd.randint(0, 60)
+        t3 = make_things(rnd, cam3["x"], cam3["y"], cam3["z"],
+                         sorted(texs) + [0, rnd.randint(9, 255)], n3)
+        return dict(kind=8, view=view, levels=levels, cmap=cmap, texs=texs,
+                    fill=fill, key=key, cam=cam, sectors=sectors, cam3=cam3,
+                    verts=verts, texinfo=texinfo, count=n3, recs=t3,
+                    polys=0, polyrecs=b"", things=0, thingrecs=b"")
 
     count = rnd.randint(0, 60)
     recs = bytearray()
@@ -321,26 +361,16 @@ def make_scenario(rnd):
     # kind 5: the same wall batch, then a batch of things to be occluded by
     # it. Positions are drawn near the camera so a fair share of them land in
     # front of, behind and straddling the geometry rather than off the side.
-    things = bytearray()
+    things = b""
     nthings = 0
     if kind == 5:
         nthings = rnd.randint(0, 20)
-        for _ in range(nthings):
-            things += struct.pack("<hhhHHBBBxxx",
-                                  cam["x"] + rnd.randint(-0x600, 0x600),
-                                  cam["y"] + rnd.randint(-0x600, 0x600),
-                                  rnd.randint(-0x400, 0x400),
-                                  rnd.choice([0, rnd.randint(1, 0x300)]),
-                                  rnd.choice([0, rnd.randint(1, 0x300)]),
-                                  rnd.choice(ids),
-                                  rnd.randint(0, 70),
-                                  rnd.randint(0, 15))
-        assert len(things) == nthings * REC
+        things = make_things(rnd, cam["x"], cam["y"], 0, ids, nthings)
 
     return dict(kind=kind, view=view, levels=levels, cmap=cmap, texs=texs,
                 fill=fill, key=key, cam=cam, sectors=sectors,
                 count=count, recs=bytes(recs),
-                things=nthings, thingrecs=bytes(things),
+                things=nthings, thingrecs=things,
                 cam3=cam3, verts=verts, texinfo=texinfo,
                 polys=(npolys if kind == 7 else 0),
                 polyrecs=(polyrecs if kind == 7 else b""))
@@ -381,7 +411,7 @@ def encode(scn):
                          s["cy0"], s["cy1"], s["flags"])
     else:
         b += struct.pack("<I", scn["count"]) + scn["recs"]
-        if scn["kind"] == 5:
+        if scn["kind"] in (5, 9):
             b += struct.pack("<I", scn["things"]) + scn["thingrecs"]
         if scn["kind"] == 7:
             b += struct.pack("<I", scn["polys"]) + scn["polyrecs"]
@@ -436,8 +466,13 @@ def run_model(scn):
         m.r_spans(scn["recs"], scn["count"])
     elif scn["kind"] == 3:
         m.r_walls(scn["recs"], scn["count"], scn["key"])
-    elif scn["kind"] == 6:
+    elif scn["kind"] in (6, 9):
         m.r_polys(scn["recs"], scn["count"], scn["key"])
+        if scn["kind"] == 9:
+            m.r_things(scn["thingrecs"], scn["things"], scn["key"],
+                       BATCH_CAM3D)
+    elif scn["kind"] == 8:
+        m.r_things(scn["recs"], scn["count"], scn["key"], BATCH_CAM3D)
     else:
         m.r_sectors(scn["recs"], scn["count"], scn["key"])
         if scn["kind"] == 5:
@@ -464,7 +499,8 @@ def describe(scn):
     name = {0: "DRAW_COLUMNS", 1: "DRAW_SPANS", 2: "DRAW_SPRITE",
             3: "DRAW_WALLS", 4: "DRAW_SECTORS",
             5: "SECTORS+THINGS", 6: "DRAW_POLYS",
-            7: "SECTORS+POLYS"}[scn["kind"]]
+            7: "SECTORS+POLYS", 8: "THINGS3D",
+            9: "POLYS+THINGS3D"}[scn["kind"]]
     bits = ["view=%d,%d %dx%d" % scn["view"], "levels=%d" % scn["levels"]]
     if scn["kind"] == 2:
         s = scn["spr"]
@@ -473,9 +509,9 @@ def describe(scn):
                        s["cy0"], s["cy1"], s["flags"]))
     else:
         bits.append("count=%d key=$%02X" % (scn["count"], scn["key"]))
-    if scn["kind"] == 5:
+    if scn["kind"] in (5, 9):
         bits.append("things=%d" % scn["things"])
-    if scn["kind"] in (6, 7):
+    if scn["kind"] in (6, 7, 8, 9):
         c3 = scn["cam3"]
         bits.append("cam3=%d,%d,%d yaw=%d pitch=%d proj=%d verts=%d ti=%d"
                     % (c3["x"], c3["y"], c3["z"], c3["yaw"], c3["pitch"],
@@ -505,7 +541,7 @@ def main():
     tmp = os.path.join(HERE, ".scenario.bin")
     rnd = random.Random(args.seed)
     fails = 0
-    kinds = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
+    kinds = {k: 0 for k in range(10)}
     for i in range(args.n):
         scn = make_scenario(rnd)
         kinds[scn["kind"]] += 1
@@ -541,10 +577,10 @@ def main():
         os.unlink(tmp)
 
     print("%d scenarios (%d columns, %d spans, %d sprites, %d walls, "
-          "%d sectors, %d things, %d polys, %d sectors+polys), "
-          "%d disagreements"
+          "%d sectors, %d things, %d polys, %d sectors+polys, "
+          "%d things3d, %d polys+things3d), %d disagreements"
           % (args.n, kinds[0], kinds[1], kinds[2], kinds[3], kinds[4],
-             kinds[5], kinds[6], kinds[7], fails))
+             kinds[5], kinds[6], kinds[7], kinds[8], kinds[9], fails))
     return 1 if fails else 0
 
 

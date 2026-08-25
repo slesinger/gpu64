@@ -326,7 +326,7 @@ once at upload rather than per pixel.
 | $21 | `DRAW_SPANS` | 9 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags | Draws `count` span records. |
 | $23 | `DRAW_WALLS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` wall records — see below. |
 | $24 | `DRAW_SECTORS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` **32-byte** sector-wall records — see below. `BAD_ARGS` if `SET_SECTORS` has not been sent. |
-| $25 | `DRAW_THINGS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte thing records — billboards in world space, depth-tested against the buffer `DRAW_SECTORS` filled. See below. |
+| $25 | `DRAW_THINGS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte thing records — billboards in world space, depth-tested against the buffer `DRAW_SECTORS` or `DRAW_POLYS` filled. `ARG8` bit 1 (`BATCH_CAM3D`) projects the batch through `SET_CAMERA3D` instead of `SET_CAMERA`; with that bit set it is `BAD_ARGS` if `SET_CAMERA3D` has not been sent. See below. |
 | $26 | `DRAW_POLYS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte polygon records — arbitrary convex polygons in world space, through `SET_CAMERA3D`, depth-tested per pixel. See below. `BAD_ARGS` if `SET_CAMERA3D` or `UPLOAD_VERTS` has not been sent. |
 | $22 | `DRAW_SPRITE` | 15 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` w, `ARG6-7` h, `ARG8` light, `ARG9` key, `ARG10-11` clipY0, `ARG12-13` clipY1, `ARG14` flags; **`ID`** = texture id | Scales one texture into the screen rectangle `x,y,w,h`, clipped to the view **and** to the inclusive row range `clipY0..clipY1`. Flags: bit0 mask on `key`, bit1 flip horizontally. `w` or `h` of 0 draws nothing (and counts as one rejected primitive); an unknown id is `BAD_ID`. |
 
@@ -342,6 +342,14 @@ is free: on a batch that is built once and re-sent unchanged, the sum is
 computed once too. For a batch rebuilt every frame, the `rejected` counter
 in the stats block is the cheaper watch — see
 [the note on the bus](#what-a-command-costs-the-c64).
+
+**`ARG8` bit 1 — the 3D camera (`DRAW_THINGS` only).** With it set, the
+batch projects through `SET_CAMERA3D` rather than `SET_CAMERA`, which is
+what puts monsters into a level drawn with `DRAW_POLYS`. It is a property of
+the batch and not of a record because a frame's things all belong to one
+world: a game that has moved to the 3D camera has moved every one of them. A
+frame may still send both kinds — one batch flagged and one not — and both
+land in the same depth buffer. Every other opcode ignores this bit.
 
 #### Wall record — 16 bytes
 
@@ -490,9 +498,10 @@ this buffer are `DRAW_THINGS`, below.
 
 #### Thing record — 16 bytes
 
-A billboard at a **world** position, projected by the same camera as
-`DRAW_SECTORS` and depth-tested per pixel against the buffer it filled —
-which is what lets a monster stand behind a wall.
+A billboard at a **world** position, projected by the batch's camera —
+`SET_CAMERA` by default, or `SET_CAMERA3D` if `ARG8` bit 1 is set — and
+depth-tested per pixel against the buffer `DRAW_SECTORS` or `DRAW_POLYS`
+filled, which is what lets a monster stand behind a wall.
 
 `DRAW_SPRITE` cannot do this. It takes a screen rectangle, so the C64 has to
 do the projection, and it has no argument room left for a depth. Keep
@@ -517,13 +526,23 @@ view and there is no rotation to send. A thing is `w` wide and `h` tall in
 world units at any distance; the screen rectangle is whatever the projection
 makes of that, centred on the column the world position projects to.
 
+Under the 3D camera the card stays **upright on the screen** — it does not
+tilt with pitch, which is what a billboard is for — but its two ends are
+projected separately, so looking up at a tall thing standing close makes it
+taller on screen and pushes it down the view, as the walls beside it do.
+`SET_CAMERA`'s horizon offset is not applied to a `BATCH_CAM3D` batch:
+`SET_CAMERA3D`'s pitch is the whole of the vertical aim. Nothing else in the
+record changes meaning — `base` is still the absolute world height of the
+thing's feet, now measured on `SET_CAMERA3D`'s `z` axis.
+
 **Depth is written as well as tested**, at drawn pixels only — so a masked
 texel is a hole in the depth too, and a batch of things is order-independent
 exactly as a batch of walls is. `THING_NODEPTH` opts out of both, which is
 how a muzzle flash gets painted over the world; things drawn that way *do*
 depend on the order they arrive in.
 
-**Send this batch after `DRAW_SECTORS` for the same frame.** The depth
+**Send this batch after the level's geometry for the same frame** —
+`DRAW_SECTORS`, or `DRAW_POLYS` for a `BATCH_CAM3D` batch. The depth
 buffer is shared and persists: it is emptied by `FILL_VIEW`, by
 `DRAW_SECTORS` (over the view, at the start of each batch) and by
 `RASTER_RESET`, and by nothing else. Things sent before the level's walls

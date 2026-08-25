@@ -606,7 +606,10 @@ static u8 opDrawSectors( void )
 
 // DRAW_THINGS. No table to validate and no state to touch: a thing batch is
 // the one part of a level that changes every frame, so it goes straight
-// through, exactly like DRAW_COLUMNS.
+// through, exactly like DRAW_COLUMNS. The one thing worth checking is that
+// a batch asking for the 3D camera has actually been given one, because
+// otherwise every record would be silently rejected and the caller would
+// see an empty view with an OK status.
 static u8 opDrawThings( void )
 {
 	u32 count;
@@ -614,11 +617,14 @@ static u8 opDrawThings( void )
 	if ( res != GPU64_ERR_OK || count == 0 )
 		return res;
 
+	if ( ( sArg[ 8 ] & GPU64_RASTER_BATCH_CAM3D ) && s_State.cam3Proj == 0 )
+		return GPU64_ERR_BAD_ARGS;	// SET_CAMERA3D was never sent
+
 	Gpu64RasterTarget target;
 	if ( !makeTarget( &target ) )
 		return GPU64_ERR_UNSUPPORTED;
 
-	gpu64_rasterThings( &s_State, &target, s_Stage, count, sArg[ 9 ],
+	gpu64_rasterThings( &s_State, &target, s_Stage, count, sArg[ 9 ], sArg[ 8 ],
 			    lookupTexture, 0, &s_LastBatch );
 	cleanView();
 	return GPU64_ERR_OK;

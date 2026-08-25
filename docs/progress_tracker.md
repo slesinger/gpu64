@@ -1765,13 +1765,90 @@ in every demo that mixed classes.
 
 ### On hardware
 
-**Not yet run.** Everything above is desk work.
+Verified 2026-08-25: `gpu64_test_polys` green, `gpu64_test_sectors` and
+`gpu64_test_things` still green beside it, and `gpu64_demo_quake` rendering
+the ramp, the bridge with floor above floor, and walls that converge under
+real pitch.
 
 ### Not done
 
-- `DRAW_THINGS` still projects through `SET_CAMERA`, so a Quake game has no
-  monsters yet. Giving it a 3D-camera path is the obvious next piece.
+- ~~`DRAW_THINGS` still projects through `SET_CAMERA`, so a Quake game has
+  no monsters yet.~~ Done in milestone 10, below.
 - Lightmaps. Light is per face, as it is for walls and sectors.
 - Sky, water and translucency.
 - Any visibility structure. gpu64 draws what it is sent; a BSP and a PVS are
   the 6502's problem, and on a C64 that is the interesting problem.
+
+
+## 10. Monsters -- `DRAW_THINGS` through the 3D camera
+
+Milestone 9 left a Quake level with no inhabitants: `DRAW_THINGS` projected
+through `SET_CAMERA`, the Doom-style camera, and the polygon demo never
+sends one. This milestone gives the thing batch a second projection path.
+
+### The design decision worth recording
+
+**The camera is a property of the batch, not of a record and not of a new
+opcode.** `ARG8` bit 1 -- `GPU64_RASTER_BATCH_CAM3D`, beside the existing
+checksum bit -- makes the whole batch project through `SET_CAMERA3D`.
+
+A per-record flag was rejected because it answers a question nobody asks: a
+frame's things all belong to one world, and a game that has moved to the 3D
+camera has moved every one of them. A second opcode was rejected because
+the record layout, the depth test, the masking and the light are identical
+either way -- only eight lines of transform differ. A frame may still send
+one flagged batch and one unflagged batch, and both land in the same depth
+buffer.
+
+Asking for `BATCH_CAM3D` when `SET_CAMERA3D` has never been sent is
+`ERR_BAD_ARGS` ($04), which is what `DRAW_POLYS` already does. (`gpu64_api.h`
+defines `GPU64_ERR_NO_CAMERA` $0B, but no firmware path has ever used it and
+this was not the milestone to start.)
+
+### What the 3D path does with a billboard
+
+The card stays **upright on the screen** -- it does not tilt with pitch,
+which is the entire point of a billboard -- but its base and its top are
+transformed separately and each keeps its own `vz`. So a tall thing standing
+close grows taller and slides down the view as you look up at it, exactly as
+the walls beside it do. Width, the x centre, the stored depth and the light
+level all use the **base** `vz`; `vz < NEAR` rejects the record and a
+`vzTop` short of `NEAR` is clamped rather than rejected. `SET_CAMERA`'s
+horizon offset is not applied to a CAM3D batch: pitch is the whole of the
+vertical aim.
+
+Both paths then feed **one shared tail**, written as a height measured
+*downward from the eye*, so the 2D numbers come out bit-identical to what
+they were before the change. That is not just tidiness -- it is what let the
+conformance PRG prove the new path by reusing its old, hand-worked
+rectangle: at yaw 0 and pitch 0 the 3D camera must reproduce the 2D
+rectangle to the pixel, and it does.
+
+### Verified, all on a PC
+
+- `tools/rastercheck` grew two scenario kinds: **8** a thing batch through
+  the 3D camera, and **9** a polygon batch and then a CAM3D thing batch into
+  one depth buffer. **1200 scenarios across three seeds, roughly 150 of each
+  new kind, zero disagreements** between the firmware core and the Python
+  model.
+- `gpu64_test_things` grew a CAM3D section: the `BAD_ARGS` refusal before
+  any `SET_CAMERA3D`, the four exact edges of the pitch-0 rectangle (which
+  are the 2D numbers unchanged), the same rectangle again with the thing and
+  the camera both rotated a quarter turn, a directional pitch check, and a
+  final unflagged batch proving the 2D path still lands where it did.
+- `gpu64_demo_quake` gained three monsters, one of them patrolling on two
+  bytes of 6502 arithmetic a frame. The one standing under the bridge is
+  occluded by a slab that arrives in the batch *before* it, from a program
+  that sorts nothing.
+
+Two 64tass traps cost a round each and are worth not repeating:
+backslash line-continuation inside a `.byte` expression is a syntax error,
+and `.word` refuses a negative value -- `r2thingd` in `gpu64_demo.inc` had
+to mask with `& $ffff` the way `r2vertd` already did.
+
+### Not done
+
+- Not yet run on hardware.
+- Things still cannot be lit per-pixel, rotated to face a direction, or
+  animated by the firmware; a frame of animation is a texture id the 6502
+  chooses.

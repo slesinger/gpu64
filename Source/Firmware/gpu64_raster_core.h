@@ -82,6 +82,13 @@
 #define GPU64_RASTER_THING_FLATLIT 0x08	// the record's light unchanged, with
 					// no darkening by distance
 
+// DRAW_THINGS batch flags (ARG8), beside GPU64_RASTER_BATCH_CHECKSUM. The
+// camera is a property of the batch and not of a record: a frame's things all
+// belong to one world, and a game that has moved to SET_CAMERA3D has moved
+// every one of them. Milestone 10.
+#define GPU64_RASTER_BATCH_CAM3D   0x02	// project through SET_CAMERA3D
+					// instead of SET_CAMERA
+
 // DRAW_SECTORS wall flags. MASKED and FLATLIT above are shared.
 #define GPU64_RASTER_WALL_NOFLATS 0x04	// this wall's columns paint no floor
 					// and no ceiling, whatever the camera says
@@ -296,9 +303,13 @@ void gpu64_rasterZReset( void );
 //
 // It does NOT clear the depth buffer: DRAW_SECTORS owns that, and DRAW_THINGS
 // is meant to run after it in the same frame.
+//
+// nBatchFlags selects the camera: GPU64_RASTER_BATCH_CAM3D projects through
+// SET_CAMERA3D, so the same records serve a Quake game with a real pitch.
+// Without it the batch goes through SET_CAMERA, unchanged from milestone 8d.
 void gpu64_rasterThings( const Gpu64RasterState *pState,
 			 const Gpu64RasterTarget *pTarget,
-			 const u8 *pRecs, u32 nCount, u8 nKey,
+			 const u8 *pRecs, u32 nCount, u8 nKey, u8 nBatchFlags,
 			 Gpu64RasterLookupFn pLookup, void *pCtx,
 			 Gpu64RasterBatchResult *pResult );
 
