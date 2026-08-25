@@ -18,6 +18,19 @@ import struct
 FB_W, FB_H, FB_PAGES = 320, 200, 2
 BORDER_W, BORDER_H = 32, 36
 
+# The palette a reset gpu64 comes up with (Source/Firmware/gpu64_fb.cpp):
+# entries 0-15 are the C64's own colours in the C64's own numbering, 16-254
+# black, 255 white for the on-screen log. Only the PPM dump reads this --
+# nothing in the API can read the palette back -- but a demo rendered with
+# the wrong reset palette would look wrong for a reason that is not the
+# demo's fault.
+C64_PALETTE = (
+    (  0,   0,   0), (255, 255, 255), (104,  55,  43), (112, 164, 178),
+    (111,  61, 134), ( 88, 141,  67), ( 53,  40, 121), (184, 199, 111),
+    (111,  79,  37), ( 67,  57,   0), (154, 103,  89), ( 68,  68,  68),
+    (108, 108, 108), (154, 210, 132), (108,  94, 181), (149, 149, 149),
+)
+
 ERR_OK = 0x00
 ERR_BAD_OPCODE = 0x01
 ERR_BAD_CLASS = 0x02
@@ -122,6 +135,9 @@ class Gpu64Model:
         self.visible_page = 0
         self.border = 0
         self.palette = bytearray(256 * 3)
+        for i, rgb in enumerate(C64_PALETTE):
+            self.palette[i * 3:i * 3 + 3] = bytes(rgb)
+        self.palette[255 * 3:256 * 3] = b'\xff\xff\xff'
         self.log_enabled = True
         self.api_active = False
 

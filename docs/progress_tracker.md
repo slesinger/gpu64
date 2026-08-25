@@ -995,6 +995,39 @@ run is most likely that floor and not the renderer. See *IO2 write sampling*
 below.
 
 
+## Demonstration programs (written and HARDWARE-VERIFIED 2026-08-25)
+
+Six developer-facing PRGs in `Source/Demos/`, built and rendered on a PC by
+`tools/demos.sh`, indexed in [demos.md](demos.md): `hello`, `palette`,
+`sprites`, `bounce`, `rotate`, `matrix`. They are what a developer copies
+from; the conformance suite below is what proves the firmware. Nothing in
+them asserts anything.
+
+All six ran correctly on hardware on 2026-08-25, first bench round, no
+defects found and no firmware change needed -- the card was already running
+`src:cf073b3a`. That is the result the PC rendering was for: six programs
+went from written to hardware-verified in one round rather than six.
+
+Two pieces of tooling came out of it, both in `tools/prgsim/runsim.py`:
+
+- **`--ppm=PATH` renders the visible page** through the current palette,
+  inside the border, exactly as the display would show it. A demo can now be
+  *looked at* on a PC, which is the only reason writing six of them did not
+  cost six bench rounds. `Source/Demos/out/*.ppm` is the expected HDMI
+  output for each.
+- **`--demo` drops the VERDICT requirement**, since a demo has nothing to
+  judge; returning cleanly is the pass condition.
+
+The model's reset palette was also filled in (entries 0-15 = the C64
+colours, 255 = white), which it had never needed while only the suite ran
+against it.
+
+Each demo is run in both display cases, with a frame clock and without. The
+fallback that makes the no-frame-clock case work -- free-run the pacing,
+flip immediately -- lives in `gpu64_demo_rt.inc` and is the shape real
+programs should copy: refusing to run because the display cannot be measured
+is worse than tearing.
+
 ## The class 0 conformance suite (written 2026-08-24, HARDWARE-VERIFIED)
 
 Six self-verdicting PRGs (`Source/TestPRG/gpu64_test_*.a`) plus a PC oracle

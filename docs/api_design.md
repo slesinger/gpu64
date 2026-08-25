@@ -344,6 +344,8 @@ A failed dispatch does nothing: no drawing, no data fetch, no state change.
 
 ## Examples
 
+Six complete, commented programs are in [`Source/Demos/`](../Source/Demos/) — one per area of the API, buildable and viewable on a PC with `tools/demos.sh`. See [demos.md](demos.md) for what each one shows. The fragments below are the same idioms in isolation.
+
 Clear the screen to blue (index 6), then draw a filled white box:
 
 ```asm

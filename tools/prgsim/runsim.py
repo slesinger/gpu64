@@ -28,6 +28,15 @@ Options:
                     round 8.8 products the way the firmware currently does
                     rather than the way the reference specifies, to predict
                     which suite lines a given firmware will fail.
+    --ppm=PATH      write what the HDMI output would be showing when the
+                    program returned -- the visible page, through the
+                    current palette, inside the border -- as a PPM. This is
+                    how a demo gets verified on a PC instead of at the
+                    bench.
+    --demo          do not require a VERDICT line. The conformance suite
+                    judges itself and exit status follows its verdict; a
+                    demo has nothing to judge, so returning cleanly is the
+                    whole of the pass condition.
     --trace N       dump the last N instructions if something goes wrong
     --max N         instruction budget (default 200 million)
 """
@@ -168,6 +177,28 @@ class Machine:
         return rows
 
 
+def write_ppm(path, gpu):
+    """The visible page as the display would show it, border included."""
+    w = gpu64model.FB_W + 2 * gpu64model.BORDER_W
+    h = gpu64model.FB_H + 2 * gpu64model.BORDER_H
+    pal = gpu.palette
+    page = gpu.pages[gpu.visible_page]
+    border = bytes(pal[gpu.border * 3:gpu.border * 3 + 3])
+    rows = [border * w] * gpu64model.BORDER_H
+    for y in range(gpu64model.FB_H):
+        line = bytearray(border * gpu64model.BORDER_W)
+        base = y * gpu64model.FB_W
+        for x in range(gpu64model.FB_W):
+            c = page[base + x] * 3
+            line += pal[c:c + 3]
+        line += border * gpu64model.BORDER_W
+        rows.append(bytes(line))
+    rows += [border * w] * gpu64model.BORDER_H
+    with open(path, 'wb') as f:
+        f.write(b'P6\n%d %d\n255\n' % (w, h))
+        f.write(b''.join(rows))
+
+
 def main(argv):
     args = [a for a in argv[1:] if not a.startswith('--')]
     opts = [a for a in argv[1:] if a.startswith('--')]
@@ -182,11 +213,15 @@ def main(argv):
             gpu64model.ALIAS_DROP[0] = [int(x, 0) for x in o.split('=')[1].split(',')]
     trace = 0
     max_insns = 200_000_000
+    ppm = None
+    demo = '--demo' in opts
     for o in opts:
         if o.startswith('--trace'):
             trace = int(o.split('=')[1]) if '=' in o else 40
         if o.startswith('--max='):
             max_insns = int(o.split('=')[1])
+        if o.startswith('--ppm='):
+            ppm = o.split('=', 1)[1]
 
     m = Machine(calibrated=calibrated)
     addr, size = m.load_prg(args[0])
@@ -204,9 +239,15 @@ def main(argv):
             print("%2d| %s" % (i, r))
     print("--- %d dispatches ---" % m.gpu.dispatches)
 
+    if ppm is not None and ok:
+        write_ppm(ppm, m.gpu)
+        print("--- wrote %s ---" % ppm)
+
     if not ok:
         print("PROGRAM DID NOT RETURN (instruction budget or fault)", file=sys.stderr)
         return 1
+    if demo:
+        return 0
     verdict = '\n'.join(rows)
     if 'VERDICT PASS' in verdict:
         return 0

@@ -78,6 +78,28 @@ transposed signs in the Euler matrix, a bug that presents as a perspective
 artefact rather than as a maths error and would have cost a whole session to
 chase on hardware.
 
+## The demonstration programs
+
+`Source/Demos/gpu64_demo_*.a` is six developer-facing programs -- `hello`,
+`palette`, `sprites`, `bounce`, `rotate`, `matrix` -- indexed in
+[demos.md](demos.md). They assert nothing and reach no verdict; they are what
+a developer copies from, and on the bench they are a fast visual smoke test
+of the whole API surface. `hello` is the go/no-go: if it draws, the cartridge
+is wired up and the menu is in REU mode.
+
+```
+tools/demos.sh              # assemble, run on the PC in both display cases
+                            # and render Source/Demos/out/<name>.ppm
+```
+
+Those PPMs are the expected HDMI output. Compare against them before
+concluding that hardware is wrong -- the same argument as `tools/hostsim` and
+the suite below, and it paid the same way: all six passed on hardware in a
+single round.
+
+Deploy by copying the `.prg` files into `RAD_PRG/` on the card. RAD reads
+those at launch time, so unlike the kernel image they never go stale.
+
 ## The API conformance suite
 
 `Source/TestPRG/gpu64_test_*.a` is a six-program suite that checks class 0
