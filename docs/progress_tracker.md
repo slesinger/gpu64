@@ -1846,9 +1846,23 @@ backslash line-continuation inside a `.byte` expression is a syntax error,
 and `.word` refuses a negative value -- `r2thingd` in `gpu64_demo.inc` had
 to mask with `& $ffff` the way `r2vertd` already did.
 
+### On hardware
+
+Verified on the bench 2026-08-26, build `320306e8`. `gpu64_test_things`
+reports every line `OK` with `00` errors, the six `CAM3D` sections included,
+and the quake demo draws its three monsters correctly -- upright through the
+pitch, and the one under the bridge occluded by the slab.
+
+One thing worth writing down because it read as a defect and is not: the test
+PRG leaves a **steady white rectangle on black** on the HDMI screen when it
+finishes. It draws to the visible page and never flips, so the screen holds
+whatever the last assertion drew -- and the last assertion, `CAM2D UNCHANGED`,
+is a `FILL_VIEW` to colour 0 with thing A (a single texel of colour 1, white)
+at rows 140..179. The picture *is* the check. Every test PRG behaves this way;
+the verdict lives on the C64 screen, not on HDMI.
+
 ### Not done
 
-- Not yet run on hardware.
 - Things still cannot be lit per-pixel, rotated to face a direction, or
   animated by the firmware; a frame of animation is a texture id the 6502
   chooses.
