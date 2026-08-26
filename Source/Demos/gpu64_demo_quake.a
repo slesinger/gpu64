@@ -63,6 +63,7 @@
 ;        A / D     turn left and right
 ;        Q / E     strafe left and right
 ;        F1 / F3   look up and down, F7 centres
+;        SPACE     fire -- a muzzle flash that lights the room
 ;        RUN/STOP  quit
 ;
 ;      The player is free in the room now rather than walking a fixed lap,
@@ -140,6 +141,18 @@ KB_S	= $20
 KB_E	= $40
 KC_D	= $04
 KD_Q	= $40
+KD_SPC	= $10
+
+; Milestone 12: the two dynamic lights. Slot 1 is the torch on the far
+; wall, slot 0 the muzzle flash at the player's own eye. A light reaches
+; TORCH_R/FLASH_R world units and its strength is how many colormap
+; levels it lifts a pixel at its centre -- of sixteen, so six is a lot.
+TORCH_X	= 8 * 256
+TORCH_Y	= 0
+TORCH_Z	= Z_RAMP
+TORCH_R	= $0500			; 5.0 world units of reach
+FLASH_R	= $0300			; 3.0
+FLASH_N	= 6			; frames a shot stays lit
 
 ; Zero page. $f7-$fe is the RS232 area every gpu64 program uses.
 posX	= $f7			; the player, 8.8 world units
@@ -291,6 +304,11 @@ frame
 	#argb 10, 0
 	#cmd2 R2_SET_CAMERA3D
 
+	; 1b. The dynamic lights. They are set after the camera and before
+	;     anything is drawn, because a light applies to every batch that
+	;     follows it -- the walls below and the monsters after them.
+	jsr sendLights
+
 	; 2. FILL_VIEW is not only the background: it is also what empties
 	;    the depth buffer. DRAW_POLYS does not clear it -- a frame may be
 	;    several batches, and a batch that cleared would erase the one
@@ -380,9 +398,9 @@ frDone
 ; The player
 ;
 ; He goes where he is driven. W and S walk along the direction he is
-; facing, A and D turn him, Q and E strafe, F1 and F3 tilt his head and F7
-; levels it again. That is two table lookups and two 16-bit adds a frame:
-; the walk vector is (cos yaw, sin yaw) read straight out of the same sine
+; facing, A and D turn him, Q and E strafe, F1 and F3 tilt his head, F7
+; levels it again and SPACE fires. The walk is two table lookups and two
+; 16-bit adds a frame: the walk vector is (cos yaw, sin yaw) out of the same sine
 ; table the 3D camera's angles come from, and the strafe vector is the same
 ; two numbers swapped and one negated.
 ; ======================================================================
@@ -490,6 +508,18 @@ movePlayer
 	ldx #posY
 	jsr addSgn
 +
+
+	; Fire. SPACE raises the muzzle flash and re-arms the one-shot that
+	; puts the light out again; holding the key keeps it lit, which is
+	; what a held trigger should look like.
+	lda keyD
+	and #KD_SPC
+	bne +
+	lda #FLASH_N
+	sta flashCt
+	lda #1
+	sta flashArm
++
 	jsr clampPos
 
 	; The patrolling monster walks the width of the room and back. Its
@@ -526,6 +556,69 @@ movePlayer
 
 	jsr eyeHeight
 	rts
+
+; ======================================================================
+; The dynamic lights.
+;
+; SET_LIGHT carries its arguments inline -- ten register writes and no
+; upload -- which is the whole reason a light can move. A muzzle flash
+; has to be up on the frame the key is hit, and a blob transfer could
+; not do that.
+;
+; The torch never moves; only its strength is stirred, so the far wall
+; never quite settles. The flash is at the player's eye and fades over
+; FLASH_N frames, so what it lights is whatever he is pointing at. When
+; it reaches zero the slot is cleared once -- strength 0 frees it -- and
+; then nothing is sent at all until he fires again.
+; ======================================================================
+sendLights
+	lda #1				; slot 1: the torch
+	sta ARG+0
+	#argw 1, TORCH_X
+	#argw 3, TORCH_Y
+	#argw 5, TORCH_Z
+	#argw 7, TORCH_R
+	lda frameCt
+	and #7
+	tax
+	lda flickTab,x
+	sta ARG+9
+	#cmd2 R2_SET_LIGHT
+
+	lda flashCt			; slot 0: the muzzle flash
+	bne slSend
+	lda flashArm			; out, and already cleared?
+	beq slDone
+	lda #0
+	sta flashArm			; no: this frame is the one that clears it
+slSend
+	lda #0
+	sta ARG+0
+	lda posX
+	sta ARG+1
+	lda posX+1
+	sta ARG+2
+	lda posY
+	sta ARG+3
+	lda posY+1
+	sta ARG+4
+	lda eyeZ
+	sta ARG+5
+	lda eyeZ+1
+	sta ARG+6
+	#argw 7, FLASH_R
+	lda flashCt			; 6..1 -> strength 12..2, 0 -> off
+	asl a
+	sta ARG+9
+	#cmd2 R2_SET_LIGHT
+	lda flashCt
+	beq slDone
+	dec flashCt
+slDone
+	rts
+
+flickTab
+	.byte 5, 7, 6, 8, 5, 8, 7, 6
 
 ; ======================================================================
 ; The keyboard, read straight off the matrix.
@@ -789,7 +882,7 @@ report
 	lda #21
 	jsr dmRow
 	jsr dmText
-	.text "WASD MOVE  QE STRAFE  F1/F3 LOOK"
+	.text "WASD QE MOVE F1/F3 LOOK SPC FIRE"
 	.byte 0
 
 	lda #22
@@ -926,6 +1019,8 @@ plYaw	.byte 0			; 0 = looking along +x, 128 = back again
 plPitch	.byte 0
 frameCt	.byte 0
 sprY	.byte 0
+flashCt	.byte 0			; frames the muzzle flash has left
+flashArm .byte 0		; and whether the slot still needs clearing
 vecX	.byte 0			; one step forward, signed
 vecY	.byte 0
 keyA	.byte $ff		; the four matrix columns, active low

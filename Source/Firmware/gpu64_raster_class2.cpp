@@ -267,6 +267,31 @@ static u8 opSetCamera3D( void )
 	return GPU64_ERR_OK;
 }
 
+// SET_LIGHT. One dynamic point light per call, inline arguments, no blob --
+// because the light a game changes every frame is a muzzle flash or a rocket,
+// and making that cost a DMA fetch would have made it unusable at the one
+// moment it exists for. Ten stores set a light; two turn one off.
+//
+//   ARG0     slot, 0..GPU64_RASTER_MAX_LIGHTS-1
+//   ARG1-2   x, ARG3-4 y, ARG5-6 z	world 8.8, little endian
+//   ARG7-8   radius, world 8.8		0 = slot off
+//   ARG9     strength			colormap levels at the centre, 0 = off
+static u8 opSetLight( void )
+{
+	const unsigned slot = sArg[ 0 ];
+
+	if ( slot >= GPU64_RASTER_MAX_LIGHTS )
+		return GPU64_ERR_BAD_ARGS;
+
+	if ( !gpu64_rasterSetLight( &s_State, slot,
+				    (s16)argU16( 1 ), (s16)argU16( 3 ),
+				    (s16)argU16( 5 ), argU16( 7 ),
+				    sArg[ 9 ] ) )
+		return GPU64_ERR_BAD_ARGS;
+
+	return GPU64_ERR_OK;
+}
+
 static u8 opStats( void )
 {
 	u8 space; u32 addr, len;
@@ -684,6 +709,7 @@ u8 gpu64_rasterDispatch( u8 op )
 	case GPU64_RASTER_OP_SET_CAMERA:	res = opSetCamera(); break;
 	case GPU64_RASTER_OP_SET_SECTORS:	res = opSetSectors(); break;
 	case GPU64_RASTER_OP_SET_CAMERA3D:	res = opSetCamera3D(); break;
+	case GPU64_RASTER_OP_SET_LIGHT:		res = opSetLight(); break;
 
 	case GPU64_RASTER_OP_UPLOAD_TEXTURE:	res = opUploadTexture(); break;
 	case GPU64_RASTER_OP_FREE_TEXTURE:	res = opFreeTexture(); break;

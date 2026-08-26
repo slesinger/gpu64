@@ -188,6 +188,20 @@ int main( int argc, char **argv )
 		g_p += (size_t) nTI * GPU64_RASTER_TEXINFO_BYTES;
 	}
 
+	// Milestone 12's dynamic lights: a count, then one record each. Set
+	// through the same entry point the firmware's SET_LIGHT uses, so the
+	// derived r2/fall are the ones a real program would get.
+	unsigned nLights = rd16();
+	for( unsigned i = 0; i < nLights; i++ )
+	{
+		u8 slot = rd8();
+		int lx = rds32(), ly = rds32(), lz = rds32();
+		unsigned radius = rd16();
+		u8 strength = rd8();
+		gpu64_rasterSetLight( &state, slot, lx, ly, lz,
+				      (u16) radius, strength );
+	}
+
 	if( kind == 2 )
 	{
 		u8 id = rd8();

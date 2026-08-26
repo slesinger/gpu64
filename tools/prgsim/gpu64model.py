@@ -59,6 +59,8 @@ RASTER_TEXINFO_BYTES = 16
 RASTER_MAX_VERTS = 4096
 RASTER_MAX_TEXINFO = 255
 RASTER_MAX_POLY_VERTS = 16
+RASTER_MAX_LIGHTS = 8
+RASTER_LIGHT_SHIFT = 40
 POLY_MASKED = 0x01
 POLY_FLATLIT = 0x02
 POLY_TWOSIDED = 0x04
@@ -232,6 +234,9 @@ class Gpu64Model:
         self.rcam3 = dict(x=0, y=0, z=0, yaw=0, pitch=0, proj=0, flags=0)
         self.rverts = []
         self.rtexinfo = []
+        # Milestone 12's dynamic point lights: eight slots, each either None
+        # (off) or (x, y, z, r2, fall).
+        self.rlights = [None] * RASTER_MAX_LIGHTS
         self.rrequested = 0
         # Persistent, exactly like the firmware's static s_ZBuf: DRAW_SECTORS
         # clears it and DRAW_THINGS reads what DRAW_SECTORS left.
@@ -805,6 +810,35 @@ class Gpu64Model:
         lvl = min(light, self.rlevels - 1)
         return memoryview(self.rcolormap)[lvl * 256:(lvl + 1) * 256]
 
+    def r_set_light(self, slot, x, y, z, radius, strength):
+        if radius == 0 or strength == 0:
+            self.rlights[slot] = None
+            return
+        r2 = radius * radius
+        self.rlights[slot] = (x, y, z, r2,
+                              (strength << RASTER_LIGHT_SHIFT) // r2)
+
+    def r_lights_live(self):
+        return any(l is not None for l in self.rlights)
+
+    def r_light_adjust(self, level, wx, wy, wz):
+        # Mirrors lightAdjust() in gpu64_raster_core.cpp: falloff linear in
+        # d squared, subtracted from the colormap index because higher index
+        # is darker.
+        sub = 0
+        for l in self.rlights:
+            if l is None:
+                continue
+            lx, ly, lz, r2, fall = l
+            dx, dy, dz = wx - lx, wy - ly, wz - lz
+            d2 = dx * dx + dy * dy + dz * dz
+            if d2 >= r2:
+                continue
+            sub += (fall * (r2 - d2)) >> RASTER_LIGHT_SHIFT
+        if sub <= 0:
+            return level
+        return 0 if sub >= level else level - sub
+
     def r_put(self, x, y, c):
         self.page()[y * FB_W + x] = c
 
@@ -825,6 +859,7 @@ class Gpu64Model:
             self.rcam3 = dict(x=0, y=0, z=0, yaw=0, pitch=0, proj=0, flags=0)
             self.rverts = []
             self.rtexinfo = []
+            self.rlights = [None] * RASTER_MAX_LIGHTS
             # The depth buffer's lifecycle matches the firmware's: RESET
             # makes it empty again, so a program that sends things but no
             # sectors does not inherit the previous one's depth.
@@ -993,6 +1028,14 @@ class Gpu64Model:
             self.rcam3 = dict(x=self.a_s16(0), y=self.a_s16(2),
                               z=self.a_s16(4), yaw=a[6], pitch=s8(a[7]),
                               proj=proj, flags=a[10])
+            return ERR_OK
+
+        if op == 0x08:                                  # SET_LIGHT
+            slot = a[0]
+            if slot >= RASTER_MAX_LIGHTS:
+                return ERR_BAD_ARGS
+            self.r_set_light(slot, self.a_s16(1), self.a_s16(3),
+                             self.a_s16(5), self.a_u16(7), a[9])
             return ERR_OK
 
         if op == 0x12:                                  # UPLOAD_VERTS
@@ -1663,8 +1706,11 @@ class Gpu64Model:
             masked = bool(flags & THING_MASKED)
             flip = bool(flags & THING_FLIPX)
             nodepth = bool(flags & THING_NODEPTH)
-            cmap = self.r_light_row(self.r_lit(light, vzz,
-                                               bool(flags & THING_FLATLIT)))
+            lvl = self.r_lit(light, vzz, bool(flags & THING_FLATLIT))
+            if self.r_lights_live():
+                # Once per thing, at the billboard's centre.
+                lvl = self.r_light_adjust(lvl, wx, wy, base + (world_h >> 1))
+            cmap = self.r_light_row(lvl)
             zs = self.r_zstore(vzz)
 
             ustart = (x0 - x_left) * ustep
@@ -1722,8 +1768,10 @@ class Gpu64Model:
                 out.append(a)
             if (da >= 0) != (db >= 0):
                 num, den = -da, db - da
+                # 8 components: view x/y/z, s, t, and the world position the
+                # dynamic lights need (milestone 12).
                 out.append(tuple(a[k] + idiv((b[k] - a[k]) * num, den)
-                                 for k in range(5)))
+                                 for k in range(8)))
         return out
 
     def r_polys(self, recs, count, key):
@@ -1791,7 +1839,7 @@ class Gpu64Model:
                     tc = ((wx * ti[4] + wy * ti[5] + wz * ti[6]) >> 8) + ti[7]
                 else:
                     sc = tc = 0
-                poly.append((rgt, pvy, pvz, sc, tc))
+                poly.append((rgt, pvy, pvz, sc, tc, wx, wy, wz))
 
             poly = self.r_poly_clip(poly, 0, proj, kl, kr, kt, kb)
             if len(poly) < 3:
@@ -1811,7 +1859,8 @@ class Gpu64Model:
                 sx = (centre_x << 8) + idiv(v[0] * proj, vz)
                 sy = (centre_y << 8) - idiv(v[1] * proj, vz)
                 w = idiv(1 << 30, vz)
-                scr.append([sx, sy, w, v[3] * w, v[4] * w])
+                scr.append([sx, sy, w, v[3] * w, v[4] * w,
+                            v[5] * w, v[6] * w, v[7] * w])
 
             n = len(scr)
             area = 0
@@ -1838,6 +1887,7 @@ class Gpu64Model:
                 tw, th, texels = tex
             flatlit = bool(flags & POLY_FLATLIT)
             masked = bool(flags & POLY_MASKED)
+            lit = self.r_lights_live()
 
             for y in range(y_top, y_bot):
                 Y = y << 8
@@ -1848,7 +1898,7 @@ class Gpu64Model:
                         continue
                     num, den = Y - a[1], b[1] - a[1]
                     h = [a[j] + idiv((b[j] - a[j]) * num, den)
-                         for j in (0, 2, 3, 4)]
+                         for j in (0, 2, 3, 4, 5, 6, 7)]
                     if hit_l is None:
                         hit_l = hit_r = h
                     elif h[0] < hit_l[0]:
@@ -1873,11 +1923,22 @@ class Gpu64Model:
                 ds = idiv((hit_r[2] - hit_l[2]) << 8, dx88)
                 dt = idiv((hit_r[3] - hit_l[3]) << 8, dx88)
 
+                lq = [0, 0, 0]
+                dl = [0, 0, 0]
+                if lit:
+                    for j in range(3):
+                        d = hit_r[4 + j] - hit_l[4 + j]
+                        lq[j] = hit_l[4 + j] + idiv(d * off, dx88)
+                        dl[j] = idiv(d << 8, dx88)
+
                 for x in range(xs, xe):
                     ww, ss, tt = w, sq, tq
+                    lw = (lq[0], lq[1], lq[2])
                     w += dw
                     sq += ds
                     tq += dt
+                    for j in range(3):
+                        lq[j] += dl[j]
                     if ww <= 0:
                         continue
                     z = idiv(1 << 30, ww)
@@ -1892,7 +1953,12 @@ class Gpu64Model:
                             continue
                     else:
                         c = colour
-                    cmap = self.r_light_row(self.r_lit(light, z, flatlit))
+                    lvl = self.r_lit(light, z, flatlit)
+                    if lit:
+                        lvl = self.r_light_adjust(lvl, idiv(lw[0], ww),
+                                                  idiv(lw[1], ww),
+                                                  idiv(lw[2], ww))
+                    cmap = self.r_light_row(lvl)
                     zbuf[y * FB_W + x] = zs
                     page[y * FB_W + x] = cmap[c] if cmap is not None else c
                     self.rbatch[2] += 1

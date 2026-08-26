@@ -1944,3 +1944,101 @@ scripted walk is a desk test rather than a bench trip.
 One 64tass trap, again worth not repeating: a loop body containing several
 inline kit macros is well past a relative branch's reach. `bne loop` at the
 bottom becomes `beq done / jmp loop`.
+
+## 12. Dynamic point lights, and a muzzle flash
+
+The shading up to milestone 11 was entirely static: a record carried a
+`light` field, distance darkened it, and nothing in the world could change
+either. A Quake-shaped game needs the opposite -- a torch that pools on a
+wall, a monster that lights up as it walks past one, and a weapon that
+flashes the room on the frame the trigger goes down. Milestone 12 is that:
+`SET_LIGHT $08`, eight slots of point light, layered on top of everything
+the colormap already did.
+
+### The design decisions worth recording
+
+**Inline arguments, not a blob.** Every other batched thing in class 2 is
+uploaded. A light must not be, because the muzzle flash has to be raised on
+the *same frame* as the key press, and a DMA blob cannot do that from inside
+a frame loop cheaply. Ten register writes per light per frame is the price,
+and it is what makes a light able to move at all.
+
+**Falloff linear in d², not in d.** `sub = strength * (r² - d²) / r²`. No
+square root, one multiply and a shift per light per pixel, and the light
+reaches exactly zero at its radius -- so a light leaving range fades out
+instead of popping. `fall = (strength << 40) / r²` is precomputed at
+`SET_LIGHT` time so the per-pixel step is a multiply and a shift. The shift
+is **40**, not 20: at 20 the quotient truncated to zero for any radius past
+about 8 world units, which made large lights silently do nothing.
+
+**Each light truncates before it accumulates.** Two strength-4 lights are
+not exactly one strength-8 light away from their common centre. This is a
+deliberate choice for a reason that has bitten this project before: the
+firmware core and the Python model must agree *bit for bit*, and "accumulate
+in high precision, truncate once" has more places for C and Python integer
+division to disagree than "truncate each, add whole levels".
+
+**One test when no light is live.** `lightMask` is a byte with a bit per
+slot; `lightsLive()` is a single compare. A program that never calls
+`SET_LIGHT` pays one test per span, not eight distance computations.
+
+**Per pixel in `DRAW_POLYS`, per record in `DRAW_THINGS`.** A polygon
+recovers its true world position from the perspective interpolation it is
+already doing, so the light is exact and round and follows the geometry --
+including on a `POLY_FLATLIT` face. A billboard is a flat cut-out facing the
+camera; a gradient across it would be describing a surface that isn't there,
+so the light is evaluated once at the sprite's centre. That is also what
+makes a lit monster cost nothing measurable.
+
+**The Doom layer is left unlit, on purpose.** `DRAW_SECTORS`, `DRAW_WALLS`,
+`DRAW_COLUMNS` and `DRAW_SPANS` ignore dynamic lights entirely. Those
+opcodes take light per column or per span by construction and their whole
+cost model rests on that; putting a per-pixel light test in them would slow
+down the layer that exists precisely to be fast. This is documented in
+`api_design.md` as a property, not a gap.
+
+### Verified, all on a PC
+
+- `tools/rastercheck`: the harness at first could not see lights at all --
+  a generated scenario with a live light differed from an unlit one in only
+  **2 of 47** frames, because the random colormaps were mostly flat. Biasing
+  the generated `levels` to `[32, 64, 64]` whenever a light is live took
+  that to **9 of 47**, i.e. the differential is now actually testing the
+  feature. **~650 scenarios across seeds 1, 5, 11 and 23, zero
+  disagreements.**
+- `gpu64_test_polys` grew thirteen checks, `PASS 50 FAIL 00` in both vblank
+  and `--no-vblank` modes: `SET LIGHT`, `LIGHT BAD SLOT` (slot 8 is
+  `BAD_ARGS`), `DRAW POLYS LIT`, `LIGHT NEAR CENTRE`, `LIGHT FALLOFF`,
+  `LIGHT RADIUS EDGE`, `LIGHT X AXIS`, `LIGHT Z AXIS`, `LIGHT Z FALLOFF`,
+  `TWO LIGHTS ADD` and `LIGHTS OFF`. The test builds its own 16-level
+  colormap so a level change is a readable texel value.
+- `tools/demos.sh` green for all ten demos, quake at 19952 bytes.
+
+### The quake demo, lit
+
+Two lights. Slot 1 is a torch on the far wall, its strength walked around a
+`flickTab` of eight values indexed by `frameCt & 7`. Slot 0 is the muzzle
+flash, positioned at the player's own `posX/posY/eyeZ` and raised by SPACE,
+fading 12 -> 2 over six frames. When it expires a `flashArm` one-shot sends
+the clearing `SET_LIGHT` exactly once and then nothing at all, so an unused
+slot costs no traffic.
+
+Sizing a light against the demo's own colormap matters: that colormap has
+sixteen levels and the faces sit at base light 0..4, so the first draft's
+strengths of 24 down to 4 were far past the end of the table and the flash
+would have been a white flat. The shipped numbers are 5..8 for the torch and
+`flashCt * 2` for the flash.
+
+**Proving the light was actually live**, rather than merely assembled: the
+lit `out/quake.ppm` was saved, `flickTab` was patched to all zeros, the demo
+re-run, and the two PPMs diffed -- **36957 of 313359 bytes differ, about 12%
+of the frame**. A feature that renders is not the same as a feature that is
+wired up, and a diff is the cheap way to tell them apart.
+
+### Not done
+
+- Coloured lights. The colormap is a single luminance ramp; a coloured light
+  would need a second dimension in it.
+- Shadows of any kind. A light passes straight through a wall.
+- Distance culling of slots. Eight is few enough that scanning them all is
+  cheaper than deciding not to.

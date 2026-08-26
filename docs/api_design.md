@@ -297,6 +297,7 @@ class 0 and class 2 can draw into the same page in the same frame.
 | $05 | `SET_CAMERA` | 15 | `ARG0-1` x, `ARG2-3` y, `ARG4` angle, `ARG5` flags, `ARG6-7` eye height, `ARG8-9` ceiling height, `ARG10-11` projection, `ARG12` floor colour, `ARG13` ceiling colour, `ARG14` horizon | The camera `DRAW_WALLS` projects through. Position and heights are signed 8.8 world units; angle is binary, 256 to the circle, 0 looking along +x. Projection is the distance to the projection plane in pixels as 8.8 — 160.0 (`$A000`) across a 320-wide view is a 90° field of view. Horizon is a signed pixel offset from the view's centre row. Flags bit 0 (`CAM_PAINT`) has each wall column also fill its own ceiling above and floor below in the two colours. A projection of 0, an eye height at or below 0, or a ceiling at or below the eye is `BAD_ARGS`. For `DRAW_SECTORS` the eye height is an **absolute** world height rather than a height above the floor, the ceiling height is not read at all (send the level's tallest, so the validation passes), and the two flat colours are not read either — they come from the sector. |
 | $06 | `SET_SECTORS` | 8 | `ARG0-5` blob descriptor, `ARG6-7` count | Loads the sector table `DRAW_SECTORS` reads heights and flat colours from — see the sector record below. `count = 0` drops the table. Max 128 sectors; `len` must equal `count * 8`. A sector whose ceiling is at or below its own floor rejects the **whole** upload with `BAD_ARGS` and leaves the table that was already there untouched. |
 | $07 | `SET_CAMERA3D` | 11 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` z, `ARG6` yaw, `ARG7` pitch, `ARG8-9` projection, `ARG10` flags | The camera `DRAW_POLYS` projects through — a free camera in three dimensions, with a real pitch rather than `SET_CAMERA`'s horizon shear. Position is signed 8.8 world units, `z` upwards. Yaw is binary, 256 to the circle, 0 looking along +x, and turns the same way `SET_CAMERA`'s angle does. Pitch is **signed** binary, $00 level, positive looking **up**; $40 is straight up and $C0 straight down, though a Quake game normally clamps well inside that. Projection is as `SET_CAMERA`: distance to the projection plane in pixels, 8.8, so 160.0 (`$A000`) across a 320-wide view is 90°. A projection of 0 is `BAD_ARGS`; there is no other validation, because there is no floor to be under. `ARG10` is reserved, write 0. This camera is entirely separate from `SET_CAMERA`'s: both can be live at once and a frame may use both. |
+| $08 | `SET_LIGHT` | 10 | `ARG0` slot, `ARG1-2` x, `ARG3-4` y, `ARG5-6` z, `ARG7-8` radius, `ARG9` strength | Sets one of **8** dynamic point lights, or clears it. Position is signed 8.8 world units on the same axes as `SET_CAMERA3D`; radius is **unsigned** 8.8 and is how far the light reaches; strength is how many colormap levels it lifts a pixel at its own centre. A slot of 8 or more is `BAD_ARGS`. A radius of 0 or a strength of 0 clears the slot, and a slot is cleared by `RASTER_RESET`. Arguments are **inline** — no blob, so a light can be moved or raised on the frame it is wanted. Lights apply to `DRAW_POLYS` and `DRAW_THINGS`; see below. |
 
 ### Resources — $10–$1F
 
@@ -676,6 +677,51 @@ lies entirely behind the near plane. It is **accepted** if it is well formed
 and merely clips away off the sides of the view, or is edge-on and covers no
 pixels. Rejected means the record was wrong; accepted-and-invisible means it
 missed.
+
+#### Dynamic lights
+
+`SET_LIGHT` gives the class 2 layer eight point lights on top of the
+colormap. They do not replace a record's `light` field — they *brighten*
+what it and distance darkening already produced:
+
+```
+level = litLevel( record light, distance )        as before
+for each live light within its radius:
+    d2   = squared distance from the pixel to the light, world units
+    sub += strength * ( radius² - d2 ) / radius²  truncated per light
+level = max( 0, level - sub )
+colour = colormap[ level * 256 + texel ]
+```
+
+Falloff is linear in the *square* of the distance, which costs no square
+root and gives a soft edge: a light is at full strength only at its exact
+centre and reaches 0 exactly at its radius, so a light going out of range
+never pops. Each light truncates to a whole level **before** it is added, so
+two strength-4 lights at one point brighten by 8 levels at the centre but
+slightly less than one strength-8 light elsewhere. Lower level is brighter —
+lights subtract.
+
+Where they are evaluated differs by opcode, and this is the cost/quality
+trade:
+
+- **`DRAW_POLYS`** evaluates every live light **per pixel**, at that pixel's
+  true world position recovered from the perspective interpolation. A light
+  on a wall is a round pool that follows the geometry, and it works on a
+  `POLY_FLATLIT` face too.
+- **`DRAW_THINGS`** evaluates them **once per record**, at the billboard's
+  centre. A sprite is a flat cut-out, so a gradient across it would be wrong
+  anyway; what this gives is a monster that lights up as it walks into a
+  torch.
+- **The Doom layer — `DRAW_SECTORS`, `DRAW_WALLS`, `DRAW_COLUMNS` and
+  `DRAW_SPANS` — ignores dynamic lights entirely.** Those opcodes take their
+  light per column or per span by design and their cost model depends on it.
+  Use the record's `light` field there.
+
+Eight slots are always scanned when any light is live, and a whole frame
+with no light live costs one test. There is no per-light distance culling:
+if you have more lights in a level than slots, pick the ones near the camera
+yourself and re-send the slots each frame — that is ten register writes per
+light and no upload, which is what makes it affordable.
 
 #### Column record — 16 bytes
 

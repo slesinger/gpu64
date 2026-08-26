@@ -229,7 +229,48 @@ def make_things(rnd, cx, cy, cz, ids, n, dirbase=0):
     return bytes(recs)
 
 
+def make_lights(rnd, cam, cam3):
+    """Milestone 12. Half the scenarios have no lights at all, because the
+    unlit path is the one every shipped program takes and it has to stay
+    byte-identical. When there are lights they are placed near one of the two
+    cameras, with radii on the scale the geometry is generated at, so they
+    actually reach the pixels being compared."""
+    if rnd.random() < 0.5:
+        return []
+    out = []
+    for slot in range(rnd.randint(1, 8)):
+        c = rnd.choice([cam3, cam3, cam])
+        cz = c.get("z", 0)
+        out.append(dict(
+            slot=rnd.choice([slot, rnd.randint(0, 7)]),
+            x=clamp16(c["x"] + rnd.randint(-0x600, 0x600)),
+            y=clamp16(c["y"] + rnd.randint(-0x600, 0x600)),
+            z=clamp16(cz + rnd.randint(-0x300, 0x300)),
+            # 0 radius and 0 strength are both "off": generated on purpose so
+            # the disable path is exercised alongside the lit one.
+            radius=rnd.choice([0, rnd.randint(0x100, 0x2000),
+                               rnd.randint(0x100, 0x2000)]),
+            strength=rnd.choice([0, rnd.randint(1, 63), rnd.randint(1, 63)]),
+        ))
+    return out
+
+
 def make_scenario(rnd):
+    scn = _make_scenario(rnd)
+    scn["lights"] = make_lights(rnd, scn["cam"], scn["cam3"])
+    if any(l["radius"] and l["strength"] for l in scn["lights"]):
+        # A light can only move a pixel if there is a colormap to move it in,
+        # and only if the base level is not already pinned at the darkest row.
+        # Without this most lit scenarios rendered identically to unlit ones
+        # and the comparison proved nothing: 2 of 47 differed before, 9 after.
+        if scn["levels"] < 32 or rnd.random() < 0.5:
+            scn["levels"] = rnd.choice([32, 64, 64])
+            scn["cmap"] = bytes((i * 7 + (i >> 8) * 13) & 0xFF
+                                for i in range(scn["levels"] * 256))
+    return scn
+
+
+def _make_scenario(rnd):
     # 8 and 9 are milestone 10: things projected through SET_CAMERA3D, alone
     # and then behind a polygon level sharing the same depth buffer.
     kind = rnd.choice([0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 7, 8, 8, 9, 9])
@@ -427,6 +468,11 @@ def encode(scn):
     for ti in scn["texinfo"]:
         b += struct.pack("<8h", *ti)
 
+    b += struct.pack("<H", len(scn["lights"]))
+    for l in scn["lights"]:
+        b += struct.pack("<BiiiHB", l["slot"], l["x"], l["y"], l["z"],
+                         l["radius"], l["strength"])
+
     if scn["kind"] == 2:
         s = scn["spr"]
         b += struct.pack("<BiiIIBBiiB", s["texid"], s["x"], s["y"],
@@ -468,6 +514,9 @@ def run_model(scn):
     m.rcam3 = dict(scn["cam3"])
     m.rverts = list(scn["verts"])
     m.rtexinfo = list(scn["texinfo"])
+    for l in scn["lights"]:
+        m.r_set_light(l["slot"], l["x"], l["y"], l["z"],
+                      l["radius"], l["strength"])
 
     if scn["kind"] == 2:
         s = scn["spr"]
@@ -541,6 +590,9 @@ def describe(scn):
                        c3["proj"], len(scn["verts"]), len(scn["texinfo"])))
         if scn["kind"] == 7:
             bits.append("polys=%d" % scn["polys"])
+    if scn["lights"]:
+        live = [l for l in scn["lights"] if l["radius"] and l["strength"]]
+        bits.append("lights=%d/%d" % (len(live), len(scn["lights"])))
     if scn["kind"] in (3, 5):
         c = scn["cam"]
         bits.append("cam=%d,%d ang=%d eye=%d ceil=%d proj=%d hor=%d fl=%d"

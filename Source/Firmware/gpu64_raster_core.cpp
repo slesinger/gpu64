@@ -43,6 +43,57 @@ static inline const u8 *lightRow( const Gpu64RasterState *pState, u8 nLight )
 	return pState->pColormap + lvl * 256;
 }
 
+#define GPU64_LIGHT_SHIFT	40
+
+// Milestone 12: the dynamic lights, evaluated at a world point.
+//
+// The colormap index runs DARK-WARDS -- 0 is the unattenuated palette and
+// higher rows are dimmer -- so a light BRIGHTENS by subtracting. That is why
+// this returns a level to hand to lightRow() rather than a colour: a dynamic
+// light and the distance falloff it fights against are then the same
+// quantity, measured in the same units, and one clamp at zero settles both.
+//
+// Cost is what makes this shippable at all: per light, three subtracts, three
+// multiplies, a compare and -- only inside the radius -- one more multiply and
+// a shift. No square root and no divide; the divide by r2 was done once, at
+// SET_LIGHT time, into `fall`.
+static inline u8 lightAdjust( const Gpu64RasterState *pState, u8 nLevel,
+			      s32 wx, s32 wy, s32 wz )
+{
+	int sub = 0;
+
+	for ( unsigned i = 0; i < GPU64_RASTER_MAX_LIGHTS; i++ )
+	{
+		const Gpu64RasterLight *pL = &pState->lights[ i ];
+		if ( pL->fall == 0 )
+			continue;
+
+		// 8.8 differences square to 16.16, and three of them summed
+		// can reach 3.2e9 at the far plane -- past what an s32 holds,
+		// which is why this is all in 64 bits.
+		const s64 dx = (s64)wx - pL->x;
+		const s64 dy = (s64)wy - pL->y;
+		const s64 dz = (s64)wz - pL->z;
+		const s64 d2 = dx * dx + dy * dy + dz * dz;
+		if ( d2 >= pL->r2 )
+			continue;
+
+		sub += (int)( ( pL->fall * ( pL->r2 - d2 ) ) >> GPU64_LIGHT_SHIFT );
+	}
+
+	if ( sub <= 0 )
+		return nLevel;
+	return sub >= (int)nLevel ? 0 : (u8)( (int)nLevel - sub );
+}
+
+// The whole dynamic-light path behind one test. Every program written before
+// milestone 12 sets no lights, and for those this is FALSE and the inner
+// loops keep their hoisted colormap row exactly as they had it.
+static inline boolean lightsLive( const Gpu64RasterState *pState )
+{
+	return pState->lightMask != 0;
+}
+
 // --- view clipping ------------------------------------------------------
 
 static inline int viewX0( const Gpu64RasterState *p ) { return (int)p->viewX; }
@@ -89,6 +140,59 @@ void gpu64_rasterStateDefaults( Gpu64RasterState *pState )
 	pState->verts = 0;
 	pState->pTexinfo = 0;
 	pState->texinfos = 0;
+
+	// No dynamic lights. fall == 0 is the per-slot "off", and lightMask
+	// is the fast test the inner loops actually use; the two are kept in
+	// step by gpu64_rasterSetLight().
+	for ( unsigned i = 0; i < GPU64_RASTER_MAX_LIGHTS; i++ )
+	{
+		pState->lights[ i ].x = 0;
+		pState->lights[ i ].y = 0;
+		pState->lights[ i ].z = 0;
+		pState->lights[ i ].r2 = 0;
+		pState->lights[ i ].fall = 0;
+	}
+	pState->lightMask = 0;
+}
+
+// SET_LIGHT's arithmetic, here rather than in the wire layer so that
+// tools/rastercheck sets a light exactly the way the firmware does.
+//
+// nStrength is in colormap levels at the light's centre and nRadius is world
+// 8.8. Either being zero turns the slot off, which is how a game ends a
+// muzzle flash: the same twelve stores it started it with.
+boolean gpu64_rasterSetLight( Gpu64RasterState *pState, unsigned nSlot,
+			      s32 x, s32 y, s32 z, u16 nRadius, u8 nStrength )
+{
+	if ( nSlot >= GPU64_RASTER_MAX_LIGHTS )
+		return FALSE;
+
+	Gpu64RasterLight *pL = &pState->lights[ nSlot ];
+
+	if ( nRadius == 0 || nStrength == 0 )
+	{
+		pL->r2 = 0;
+		pL->fall = 0;
+		pState->lightMask &= (u8)~( 1 << nSlot );
+		return TRUE;
+	}
+
+	pL->x = x;
+	pL->y = y;
+	pL->z = z;
+	pL->r2 = (s64)nRadius * (s64)nRadius;
+
+	// ( strength << SHIFT ) / r2, so that fall * ( r2 - d2 ) >> SHIFT is
+	// strength at the centre and zero at the radius. The shift is 40, not
+	// the 16 the units suggest, because r2 reaches 2^32 at the largest
+	// radius and a smaller shift would round `fall` to zero there -- a
+	// wide, gentle light would silently stop existing. At 40 the product
+	// is bounded above by strength << 40, well inside an s64, and the
+	// quotient has at least eight fractional bits for every legal radius.
+	pL->fall = ( (s64)nStrength << GPU64_LIGHT_SHIFT ) / pL->r2;
+
+	pState->lightMask |= (u8)( 1 << nSlot );
+	return TRUE;
 }
 
 // --- textures -----------------------------------------------------------
@@ -1419,7 +1523,18 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 		const boolean bNoDepth = ( flags & GPU64_RASTER_THING_NODEPTH ) != 0;
 		const boolean bFlatLit = ( flags & GPU64_RASTER_THING_FLATLIT ) != 0;
 
-		const u8 *pMap = lightRow( pState, litLevel( light, vz, bFlatLit ) );
+		// Dynamic lights are evaluated ONCE per thing, at its centre,
+		// not per pixel. A sprite is a billboard a few units across:
+		// the light cannot vary meaningfully over it, and paying a
+		// per-pixel evaluation for a constant would be the one place
+		// in this file where the cost bought nothing.
+		u8 lvl = litLevel( light, vz, bFlatLit );
+		if ( lightsLive( pState ) )
+			lvl = lightAdjust( pState, lvl,
+					   recS16( r, 0 ), recS16( r, 2 ),
+					   baseH + ( worldH >> 1 ) );
+
+		const u8 *pMap = lightRow( pState, lvl );
 		const u16 z = zStore( vz );
 		const unsigned texW = pTex->w, texH = pTex->h;
 
@@ -1504,6 +1619,7 @@ struct PolyVert
 {
 	s32 vx, vy, vz;		// right, up, forward -- 8.8
 	s32 s, t;		// texels, 8.8
+	s32 wx, wy, wz;		// WORLD position, 8.8 -- milestone 12
 };
 
 // The same vertex projected, with the three quantities that are linear in
@@ -1513,6 +1629,7 @@ struct PolyScreen
 	s32 x, y;		// screen position, 8.8
 	s64 w;			// ( 1 << 30 ) / vz
 	s64 s, t;		// s * w, t * w
+	s64 wx, wy, wz;		// world * w -- milestone 12
 };
 
 // One Sutherland-Hodgman pass. The plane is given as a distance function
@@ -1554,6 +1671,9 @@ static u32 polyClipPlane( const PolyVert *pIn, u32 n, PolyVert *pOut,
 			o->vz = a->vz + (s32)idiv64( (s64)( b->vz - a->vz ) * num, den );
 			o->s  = a->s  + (s32)idiv64( (s64)( b->s  - a->s  ) * num, den );
 			o->t  = a->t  + (s32)idiv64( (s64)( b->t  - a->t  ) * num, den );
+			o->wx = a->wx + (s32)idiv64( (s64)( b->wx - a->wx ) * num, den );
+			o->wy = a->wy + (s32)idiv64( (s64)( b->wy - a->wy ) * num, den );
+			o->wz = a->wz + (s32)idiv64( (s64)( b->wz - a->wz ) * num, den );
 		}
 	}
 	return m;
@@ -1564,6 +1684,7 @@ struct PolyEdgeHit
 {
 	s32 x;
 	s64 w, s, t;
+	s64 wx, wy, wz;		// world * w -- milestone 12
 };
 
 void gpu64_rasterPolys( const Gpu64RasterState *pState,
@@ -1675,6 +1796,15 @@ void gpu64_rasterPolys( const Gpu64RasterState *pState,
 			bufA[ k ].vz = ( fwd * cpit + dz * spit ) >> 8;
 			bufA[ k ].vy = ( dz * cpit - fwd * spit ) >> 8;
 
+			// World position, carried through the clipper and the
+			// scan converter untransformed. Dynamic lights live in
+			// world space, so this is what they are evaluated at;
+			// carrying it costs nothing when no light is set,
+			// because bLit gates every use of it below.
+			bufA[ k ].wx = pv->x;
+			bufA[ k ].wy = pv->y;
+			bufA[ k ].wz = pv->z;
+
 			if ( pTI )
 			{
 				const s64 sd = (s64)pv->x * pTI->sx
@@ -1728,6 +1858,14 @@ void gpu64_rasterPolys( const Gpu64RasterState *pState,
 			scr[ k ].w = idiv64( (s64)1 << 30, vz );
 			scr[ k ].s = (s64)v->s * scr[ k ].w;
 			scr[ k ].t = (s64)v->t * scr[ k ].w;
+
+			// world * w, so the span walk interpolates it in
+			// screen space and the per-pixel divide by w recovers
+			// a perspective-correct world position -- the same
+			// trick, and the same three divides, that s and t use.
+			scr[ k ].wx = (s64)v->wx * scr[ k ].w;
+			scr[ k ].wy = (s64)v->wy * scr[ k ].w;
+			scr[ k ].wz = (s64)v->wz * scr[ k ].w;
 		}
 
 		// --- backface ------------------------------------------
@@ -1771,12 +1909,14 @@ void gpu64_rasterPolys( const Gpu64RasterState *pState,
 		const unsigned texH = pTex ? pTex->h : 0;
 		const boolean bFlatLit = ( flags & GPU64_RASTER_POLY_FLATLIT ) != 0;
 		const boolean bMasked  = ( flags & GPU64_RASTER_POLY_MASKED ) != 0;
+		const boolean bLit     = lightsLive( pState );
 
 		for ( int y = yTop; y < yBot; y++ )
 		{
 			const s32 Y = (s32)y << 8;
 
-			PolyEdgeHit hitL = { 0, 0, 0, 0 }, hitR = { 0, 0, 0, 0 };
+			PolyEdgeHit hitL = { 0, 0, 0, 0, 0, 0, 0 };
+			PolyEdgeHit hitR = { 0, 0, 0, 0, 0, 0, 0 };
 			boolean bAny = FALSE;
 
 			for ( u32 k = 0; k < n; k++ )
@@ -1799,6 +1939,15 @@ void gpu64_rasterPolys( const Gpu64RasterState *pState,
 				h.w = a->w + idiv64( ( b->w - a->w ) * num, den );
 				h.s = a->s + idiv64( ( b->s - a->s ) * num, den );
 				h.t = a->t + idiv64( ( b->t - a->t ) * num, den );
+				if ( bLit )
+				{
+					h.wx = a->wx + idiv64( ( b->wx - a->wx ) * num, den );
+					h.wy = a->wy + idiv64( ( b->wy - a->wy ) * num, den );
+					h.wz = a->wz + idiv64( ( b->wz - a->wz ) * num, den );
+				} else
+				{
+					h.wx = h.wy = h.wz = 0;
+				}
 
 				if ( !bAny )
 				{
@@ -1828,11 +1977,23 @@ void gpu64_rasterPolys( const Gpu64RasterState *pState,
 			const s64 ds = idiv64( ( hitR.s - hitL.s ) << 8, dx88 );
 			const s64 dt = idiv64( ( hitR.t - hitL.t ) << 8, dx88 );
 
+			s64 lx = 0, ly = 0, lz = 0, dlx = 0, dly = 0, dlz = 0;
+			if ( bLit )
+			{
+				lx = hitL.wx + idiv64( ( hitR.wx - hitL.wx ) * off, dx88 );
+				ly = hitL.wy + idiv64( ( hitR.wy - hitL.wy ) * off, dx88 );
+				lz = hitL.wz + idiv64( ( hitR.wz - hitL.wz ) * off, dx88 );
+				dlx = idiv64( ( hitR.wx - hitL.wx ) << 8, dx88 );
+				dly = idiv64( ( hitR.wy - hitL.wy ) << 8, dx88 );
+				dlz = idiv64( ( hitR.wz - hitL.wz ) << 8, dx88 );
+			}
+
 			u8  *pDst = pTarget->pPixels + (unsigned)y * pitch + xs;
 			u16 *pZ	  = s_ZBuf + (unsigned)y * GPU64_RASTER_SURFACE_W + xs;
 
 			for ( int x = xs; x < xe;
-			      x++, pDst++, pZ++, w += dw, s += ds, t += dt )
+			      x++, pDst++, pZ++, w += dw, s += ds, t += dt,
+			      lx += dlx, ly += dly, lz += dlz )
 			{
 				if ( w <= 0 )
 					continue;
@@ -1857,7 +2018,13 @@ void gpu64_rasterPolys( const Gpu64RasterState *pState,
 					c = colour;
 				}
 
-				const u8 *pMap = lightRow( pState, litLevel( light, z, bFlatLit ) );
+				u8 lvl = litLevel( light, z, bFlatLit );
+				if ( bLit )
+					lvl = lightAdjust( pState, lvl,
+							   (s32)idiv64( lx, w ),
+							   (s32)idiv64( ly, w ),
+							   (s32)idiv64( lz, w ) );
+				const u8 *pMap = lightRow( pState, lvl );
 				*pZ = zs;
 				*pDst = pMap ? pMap[ c ] : c;
 				pResult->pixels++;

@@ -130,6 +130,7 @@ R2_FILL_VIEW	= $04
 R2_SET_CAMERA	= $05
 R2_SET_SECTORS	= $06
 R2_SET_CAMERA3D	= $07
+R2_SET_LIGHT	= $08
 R2_UPLOAD_TEX	= $10
 R2_FREE_TEX	= $11
 R2_UPLOAD_VERTS	= $12
@@ -404,6 +405,18 @@ r2cam3	.macro	x, y, z, yaw, pitch, proj, flags=0
 	#argb 7, \pitch
 	#argw 8, \proj
 	#argb 10, \flags
+	.endm
+
+; Milestone 12. One dynamic point light, SET_LIGHT. Radius and strength are
+; both inline: a muzzle flash has to be sendable every frame without a DMA.
+; A radius or a strength of zero turns the slot off.
+r2light	.macro	slot, x, y, z, radius, strength
+	#argb 0, \slot
+	#argw 1, \x
+	#argw 3, \y
+	#argw 5, \z
+	#argw 7, \radius
+	#argb 9, \strength
 	.endm
 
 ; One vertex of the pool, UPLOAD_VERTS. Eight bytes and not six so the 6502

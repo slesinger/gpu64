@@ -59,6 +59,11 @@
 // Colormap: levels x 256 bytes, colour = map[ light * 256 + c ].
 #define GPU64_RASTER_MAX_LEVELS	64
 
+// Dynamic point lights, SET_LIGHT. Eight slots: enough for a muzzle flash,
+// a rocket in flight, two explosions and the level's own torches without
+// the per-pixel loop growing a length a game has to think about.
+#define GPU64_RASTER_MAX_LIGHTS		8
+
 // --- record flags -------------------------------------------------------
 // Column records only; span records have no flags byte.
 #define GPU64_RASTER_COL_MASKED	0x01	// skip source texels equal to the key
@@ -168,6 +173,23 @@ struct Gpu64RasterTexinfo
 	s16	tx, ty, tz, tOff;
 };
 
+// One dynamic point light, SET_LIGHT. The position and radius are world
+// 8.8; everything the per-pixel loop needs is precomputed here so that the
+// inner loop is two multiplies and a shift per light and no divide at all.
+//
+// Falloff is linear in the SQUARED distance -- ( r2 - d2 ) / r2 -- not in the
+// distance. That is not physics and not what Quake does, but it needs no
+// square root, it reaches zero exactly at the radius so a light never leaves
+// a hard edge, and its shape (bright core, long soft skirt) reads on a
+// 256-colour ramp much the way an inverse square does. The alternative cost
+// a sqrt or a divide per pixel per light, which is the whole budget.
+struct Gpu64RasterLight
+{
+	s32	x, y, z;		// world 8.8
+	s64	r2;			// radius squared, 16.16
+	s64	fall;			// ( strength << 40 ) / r2
+};
+
 // --- render state -------------------------------------------------------
 struct Gpu64RasterState
 {
@@ -215,6 +237,16 @@ struct Gpu64RasterState
 	const struct Gpu64RasterTexinfo *pTexinfo;
 	u16	texinfos;
 
+	// --- dynamic lights, SET_LIGHT ---------------------------------
+	//
+	// Embedded, not a pointer: eight slots is 160 bytes, they are set from
+	// inline argument bytes rather than uploaded, and a copy in the state
+	// means the core needs no lifetime rule for them. lightMask has a bit
+	// per live slot purely so the unlit path -- which is every existing
+	// program -- can be taken with one test.
+	struct Gpu64RasterLight lights[ GPU64_RASTER_MAX_LIGHTS ];
+	u8	lightMask;
+
 	// --- the sector table, SET_SECTORS -----------------------------
 	//
 	// DRAW_SECTORS reads heights, flat colours and light from here by id,
@@ -245,6 +277,13 @@ extern "C++" {
 
 // Power-on / RASTER_RESET state: full-surface view, identity lighting.
 void gpu64_rasterStateDefaults( Gpu64RasterState *pState );
+
+// SET_LIGHT: put a dynamic point light in a slot, or turn the slot off with
+// a zero radius or a zero strength. FALSE only for a slot out of range --
+// the arithmetic itself cannot fail. nStrength is in colormap levels of
+// brightening at the light's centre; nRadius is world 8.8.
+boolean gpu64_rasterSetLight( Gpu64RasterState *pState, unsigned nSlot,
+			      s32 x, s32 y, s32 z, u16 nRadius, u8 nStrength );
 
 // Fills a Gpu64RasterTexture from raw bytes already in their final storage.
 // nSrcRowMajor transposes on the way in. Returns FALSE if the dimensions are

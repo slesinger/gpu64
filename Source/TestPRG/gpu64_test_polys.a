@@ -91,6 +91,8 @@
 STATS	= $3300				; RASTER_STATS reads back here
 RB	= $3380				; READ_RECT reads back here
 TEX	= $3400			        ; the texture is built here
+CMAP	= $4000				; the 16-level colormap is built here
+NLEV	= 16				; levels in it; map[ l*256+c ] = l+1
 
 BG	= 0				; the colour the page is cleared to
 WFAR	= 7				; the far wall
@@ -537,12 +539,230 @@ start
 	#useacc				;         rotation and not a shear
 	#check "PITCH TRAPEZOID"
 
+	; ---------------------------------------------------------------
+	; Milestone 12: SET_LIGHT, a dynamic point light.
+	;
+	; The colormap is built so that a pixel names its own light level:
+	; every colour in level l reads back as l+1. The face is drawn
+	; R2_POLY_FLATLIT at light 8, so with no light live every pixel of
+	; it is 9, and a light can only ever make it smaller.
+	;
+	; The light sits at the middle of the far wall, (4.0, 0, 0), with
+	; radius 1.0 and strength 8. Falloff is linear in d squared:
+	;
+	;     sub = strength * ( r2 - d2 ) / r2,  truncated
+	;
+	; and on the wall d is the distance from column 160, row 100 in
+	; world units, 40 pixels to the unit. Every number below is that
+	; arithmetic and nothing else:
+	;
+	;   col 143, row 100 -> y = 0.425, d2 = 11837 -> sub 6 -> level 2
+	;   col 134, row 100 -> y = 0.650, d2 = 27689 -> sub 4 -> level 4
+	;   col 160, row  83 -> z = 0.425, d2 = 11837 -> sub 6 -> level 2
+	;   col 160, row  70 -> z = 0.750, d2 = 36864 -> sub 3 -> level 5
+	;   col  90, row 100 -> y = 1.750, outside the radius -> level 8
+	;
+	; Each sample sits in the middle of its band -- the nearest one is
+	; over 1000 in d2 from the level either side of it -- so a pixel
+	; landing a fixed-point LSB out still asserts the same byte, and
+	; a red line here is a defect and not a rounding argument.
+	; ---------------------------------------------------------------
+
+	#r2cam3 0, 0, 0, 0, 0, $a000
+	lda #R2_SET_CAMERA3D
+	jsr cmd2
+
+	jsr buildColormap
+	#argblob 0, SPACE_C64, CMAP, NLEV*256
+	#argb 6, NLEV
+	lda #R2_SET_COLORMAP
+	jsr cmd2
+	#wantOk
+	#check "LIGHT COLORMAP"
+
+	; No light yet. The whole face is level 8, which is the reading
+	; every assertion after this is measured against.
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batchp polyLit, 1
+	lda #R2_DRAW_POLYS
+	jsr cmd2
+	#wantOk
+	#stgRead RB, 143, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 9		; level 8 -> 8+1
+	#useacc
+	#check "LIGHT BASE LEVEL"
+
+	; A slot past the last one is a rejected command, not a silently
+	; ignored one.
+	#r2light NLEV, $0400, 0, 0, $0100, 8
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "LIGHT BAD SLOT"
+
+	#r2light 0, $0400, 0, 0, $0100, 8
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#wantOk
+	#check "SET LIGHT"
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batchp polyLit, 1
+	lda #R2_DRAW_POLYS
+	jsr cmd2
+	#wantOk
+	#check "DRAW POLYS LIT"
+
+	#stgRead RB, 143, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 3		; sub 6 -> level 2
+	#useacc
+	#check "LIGHT NEAR CENTRE"
+
+	#stgRead RB, 134, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 5		; sub 4 -> level 4
+	#useacc
+	#check "LIGHT FALLOFF"
+
+	#stgRead RB, 90, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 9		; outside the radius, untouched
+	#useacc
+	#check "LIGHT RADIUS EDGE"
+
+	; The same distance measured up the wall instead of across it. A
+	; light that had lost its z would read 1 here, not 3.
+	#stgRead RB, 160, 83, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 3		; sub 6 -> level 2
+	#useacc
+	#check "LIGHT Z AXIS"
+
+	#stgRead RB, 160, 70, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 6		; sub 3 -> level 5
+	#useacc
+	#check "LIGHT Z FALLOFF"
+
+	; Two half-strength lights in the same place. They accumulate, but
+	; each truncates on its own: 4*(65536-11837)/65536 is 3.27 twice,
+	; so 3+3 = 6 and not the 6.55 one strength-8 light gave. Getting
+	; that wrong is how a two-light scene ends up a level too bright.
+	#r2light 0, $0400, 0, 0, $0100, 4
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#r2light 1, $0400, 0, 0, $0100, 4
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#wantOk
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batchp polyLit, 1
+	lda #R2_DRAW_POLYS
+	jsr cmd2
+	#stgRead RB, 143, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 3		; 3 + 3 -> level 2
+	#useacc
+	#check "TWO LIGHTS ADD"
+
+	; The light moved two units back along x, so the wall is now
+	; outside its radius. Nothing but the x term can produce this.
+	#r2light 0, $0600, 0, 0, $0100, 4
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#r2light 1, $0600, 0, 0, $0100, 4
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batchp polyLit, 1
+	lda #R2_DRAW_POLYS
+	jsr cmd2
+	#stgRead RB, 143, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 9		; out of reach along x
+	#useacc
+	#check "LIGHT X AXIS"
+
+	; Turning them off, the two ways a game has of doing it: strength
+	; zero and radius zero. After both the face must read exactly what
+	; it read before any light existed.
+	#r2light 0, $0400, 0, 0, $0100, 0
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#wantOk
+	#r2light 1, $0400, 0, 0, 0, 4
+	lda #R2_SET_LIGHT
+	jsr cmd2
+	#wantOk
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batchp polyLit, 1
+	lda #R2_DRAW_POLYS
+	jsr cmd2
+	#stgRead RB, 143, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, 9
+	#useacc
+	#check "LIGHTS OFF"
+
 	jmp kitFinish
 
 ; ----------------------------------------------------------------------
 ; The texture, built at run time so the file carries no blob.
 ; Column-major: texel( u, v ) is at [ u * h + v ].
 ; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+; NLEV levels of colormap, every colour in level l mapping to l+1, so a
+; pixel read back names the level it was drawn at.
+; ----------------------------------------------------------------------
+buildColormap
+	lda #<CMAP
+	sta P1
+	lda #>CMAP
+	sta P1+1
+	lda #1				; level 0 -> 1
+bcLevel
+	ldy #0
+bcByte
+	sta (P1),y
+	iny
+	bne bcByte
+	inc P1+1
+	clc
+	adc #1
+	cmp #NLEV+1
+	bne bcLevel
+	rts
+
 buildTexture
 	ldx #0
 -	txa
@@ -596,6 +816,10 @@ polyFar	#farFace
 polyBack #r2polyd 4, 4, 0, 0, WFAR, 0
 polyBoth #r2polyd 4, 4, 0, 0, WBOTH, 0, R2_POLY_TWOSIDED
 polyTex	#r2polyd 0, 4, TI, IDT, 0, 0
+
+; Flat-lit at level 8: the base every milestone-12 assertion measures a
+; dynamic light against.
+polyLit	#r2polyd 0, 4, 0, 0, WFAR, 8, R2_POLY_FLATLIT
 
 polyNF	#nearFace
 	#farFace
