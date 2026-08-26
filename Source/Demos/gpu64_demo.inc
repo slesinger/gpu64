@@ -156,6 +156,10 @@ R2_THING_FLIPX	 = $02
 R2_THING_NODEPTH = $04		; ignore the depth buffer: neither tested
 				; nor written, so the thing is on top
 R2_THING_FLATLIT = $08
+R2_THING_DIR	 = $10		; eight views: tex is the FIRST of eight
+				; consecutive ids and byte 13 is the
+				; direction the thing faces. gpu64 picks
+				; the view from where the camera stands.
 
 ; DRAW_POLYS. A face record is 16 bytes and indexes the vertex pool and the
 ; texinfo table; a vertex is 8 bytes and a texinfo 16.
@@ -464,10 +468,18 @@ r2sectors .macro addr, count
 ; measured straight across the view and there is no rotation to send.
 ;
 ; A thing is always textured; tex = 0 is a rejected record.
-r2thingd .macro	x, y, base, w, h, tex, light, flags=0
+;
+; With R2_THING_DIR, tex is the first of EIGHT consecutive texture ids -- the
+; thing seen from the front, then every 45 degrees round it -- and face is the
+; direction the thing itself is pointing, in the same 256-to-the-circle units
+; the camera's angles use. gpu64 works out which of the eight you are looking
+; at. Without the flag, face is ignored and the one texture is drawn from
+; every side.
+r2thingd .macro	x, y, base, w, h, tex, light, flags=0, face=0
 	.word	(\x) & $ffff, (\y) & $ffff, (\base) & $ffff, \h, \w
 	.byte	\tex, \light, \flags
-	.byte	0, 0, 0			; reserved -- must be zero
+	.byte	\face			; facing, R2_THING_DIR only
+	.byte	0, 0			; reserved -- must be zero
 	.endm
 
 ; --- DRAW_POLYS -------------------------------------------------------

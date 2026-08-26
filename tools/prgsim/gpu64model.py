@@ -69,6 +69,7 @@ THING_MASKED = 0x01
 THING_FLIPX = 0x02
 THING_NODEPTH = 0x04
 THING_FLATLIT = 0x08
+THING_DIRECTIONAL = 0x10
 BATCH_CHECKSUM = 0x01
 BATCH_CAM3D = 0x02
 
@@ -116,6 +117,18 @@ def fsin(a):
 
 def fcos(a):
     return SINTAB[(a + 64) & 0xFF]
+
+
+# Which of eight 45-degree sectors a vector points into; see octant8() in
+# gpu64_raster_core.cpp, which this must agree with bit for bit.
+def octant8(x, y):
+    if y >= 0:
+        if x >= 0:
+            return 0 if y <= x else 1
+        return 2 if y >= -x else 3
+    if x < 0:
+        return 4 if -y < -x else 5
+    return 6 if -y > x else 7
 
 
 def fix_read(buf, i):
@@ -1583,6 +1596,19 @@ class Gpu64Model:
             world_w = r[8] | (r[9] << 8)
             texid, light, flags = r[10], r[11], r[12]
 
+            # Eight views: byte 13 is where the thing faces, and the id is
+            # the first of eight consecutive ones.
+            usetex = texid
+            if flags & THING_DIRECTIONAL:
+                cx = c3['x'] if cam3 else self.rcam['x']
+                cy = c3['y'] if cam3 else self.rcam['y']
+                dx, dy = cx - wx, cy - wy
+                g = (r[13] - 16) & 0xFF
+                cc, ss = fcos(g), fsin(g)
+                fx = (dx * cc + dy * ss) >> 8
+                fy = (dy * cc - dx * ss) >> 8
+                usetex = (texid + octant8(fx, fy)) & 0xFF
+
             # hbase/htop are heights measured downward from the eye, so
             # the row arithmetic below is one expression for both cameras.
             if cam3:
@@ -1609,7 +1635,7 @@ class Gpu64Model:
             if world_w == 0 or world_h == 0:
                 self.rbatch[1] += 1
                 continue
-            tex = self.r_lookup(texid) if texid else None
+            tex = self.r_lookup(usetex) if (texid and usetex) else None
             if tex is None:
                 self.rbatch[1] += 1
                 continue

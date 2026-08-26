@@ -516,10 +516,30 @@ flash.
 | 4-5 | base | **absolute** height of the bottom of the sprite, signed 8.8 — the same measure the sector table's floor heights use, so a thing standing on the floor of sector *n* carries that sector's floor height |
 | 6-7 | h | height in world units, unsigned 8.8 |
 | 8-9 | w | width in world units, unsigned 8.8 |
-| 10 | texture id | must name a live texture; 0 is a rejected record |
+| 10 | texture id | must name a live texture; 0 is a rejected record. With `THING_DIRECTIONAL`, the first of **eight** consecutive ids |
 | 11 | light | base light level, darkened by distance unless `THING_FLATLIT` |
-| 12 | flags | bit0 mask on the batch `key`; bit1 flip horizontally; bit2 (`THING_NODEPTH`) ignore the depth buffer entirely; bit3 (`THING_FLATLIT`) use `light` unchanged |
-| 13-15 | — | reserved, write 0 |
+| 12 | flags | bit0 mask on the batch `key`; bit1 flip horizontally; bit2 (`THING_NODEPTH`) ignore the depth buffer entirely; bit3 (`THING_FLATLIT`) use `light` unchanged; bit4 (`THING_DIRECTIONAL`) pick one of eight views from byte 13 |
+| 13 | facing | which way the thing itself is pointing, in the camera's 256-to-the-circle units. Read only with `THING_DIRECTIONAL`; write 0 otherwise |
+| 14-15 | — | reserved, write 0 |
+
+**`THING_DIRECTIONAL` — eight views.** A monster that looks the same from
+behind as it does from the front is the one thing that gives a billboard
+away. Set bit 4 and byte 10 becomes the first of eight consecutive texture
+ids: the thing seen from the front, then every 45° round it the way the
+angle units run. Byte 13 says which way the thing is facing, in the same
+units as `SET_CAMERA`'s `ang` and `SET_CAMERA3D`'s `yaw`, and gpu64 works
+out from where the camera is standing which of the eight you are looking at.
+A thing facing straight at the camera draws id + 0; one walking away draws
+id + 4.
+
+The 6502 sends the facing it already keeps for the monster's AI and nothing
+else — no arctangent, no view index, no per-frame table. The camera used is
+the batch's: under `BATCH_CAM3D` it is `SET_CAMERA3D`'s position that
+decides the view. **All eight ids must be live**; a view whose texture is
+missing is a rejected record, so upload the whole set together. Turning the
+camera on the spot does not change the view — only moving does, which is
+correct, and is what makes a strafing player see a monster's flank swing
+round.
 
 The card always faces the camera, so `w` is measured straight across the
 view and there is no rotation to send. A thing is `w` wide and `h` tall in

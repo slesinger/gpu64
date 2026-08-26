@@ -1866,3 +1866,81 @@ the verdict lives on the C64 screen, not on HDMI.
 - Things still cannot be lit per-pixel, rotated to face a direction, or
   animated by the firmware; a frame of animation is a texture id the 6502
   chooses.
+
+## 11. Directional things, and a quake demo you can walk around in
+
+Two halves of one request -- extend the API towards the game, and make the
+demo playable.
+
+### `THING_DIRECTIONAL` (bit 4 of the thing record's flags byte)
+
+A monster in a shooter has to look different depending on where you are
+standing relative to it. The obvious 6502 implementation -- take the vector
+from the monster to the player, work out its angle, subtract the monster's
+own facing, divide by 45 degrees -- costs an arctangent and a division per
+thing per frame, which is exactly the kind of arithmetic gpu64 exists to
+take away.
+
+So the flag moves all of it into the firmware. With bit 4 set:
+
+- byte 10 stops being *the* texture id and becomes **the first of eight
+  consecutive ids** -- front, then every 45 degrees round;
+- byte 13, previously reserved, is the thing's own **facing**, in the same
+  256-to-the-circle units as `SET_CAMERA`'s `ang` and `SET_CAMERA3D`'s `yaw`.
+
+The 6502 writes only what its AI already knows: which way the monster is
+pointing. It never computes a view index, and there is no per-frame table.
+
+The implementation has no arctangent either. It rotates the thing -> **camera**
+vector by `facing - 16` using the sine table that is already there, then
+classifies the result into one of eight octants with sign and magnitude
+comparisons only (`octant8()` in `gpu64_raster_core.cpp`). The `-16` is
+22.5 degrees, which centres view 0 on the facing direction instead of
+starting a band there -- so a monster facing the player draws `id + 0` and
+one walking away draws `id + 4`, with no bias either side.
+
+Two consequences worth stating, because both surprised me once:
+
+- It is the **camera's position** that picks the view, not its angle.
+  Turning on the spot does not change which side of a monster you see;
+  only walking around it does. Under `BATCH_CAM3D` the position read is
+  `SET_CAMERA3D`'s, not the 2D camera's.
+- **All eight ids must be live.** A missing view is a rejected record, not
+  a fallback to the front -- the same rule every other thing id follows.
+
+### The quake demo, driven
+
+`gpu64_demo_quake` no longer walks itself. It reads the keyboard matrix
+directly (`$DC00` column select, `$DC01` rows, with interrupts off around
+the read): **W/S** walk, **A/D** turn, **Q/E** strafe, **F1/F3** look up and
+down, **F7** centre, **RUN/STOP** quit. Eye height follows the floor, and
+the position is clamped inside the room. The three monsters are declared
+`R2_THING_MASKED | R2_THING_DIR` against an eight-view texture set the demo
+generates at start-up, so walking round one shows its side and then its
+back.
+
+`tools/prgsim/runsim.py` grew a keyboard: a `KEY_MATRIX` table, the two CIA
+port intercepts, and a repeatable `--key=NAME:FIRST-LAST` option, so a
+scripted walk is a desk test rather than a bench trip.
+
+### Verified, all on a PC
+
+- `tools/rastercheck`: `make_things()` now marks roughly 40% of generated
+  records directional and registers eight consecutive ids for them 75% of
+  the time. **600 scenarios across three seeds, zero disagreements** between
+  the firmware core and the Python model.
+- `gpu64_test_things` grew four checks, `PASS 48 FAIL 00`:
+  **THING EIGHT VIEWS** patches the facing byte of *one* record through
+  eight mid-band values (16 units clear of every boundary, so the test says
+  which view was chosen and never how a tie was broken) and reads back a
+  texel whose colour *is* the view index; **THING NOT DIRECTIONAL** proves
+  byte 13 is not read without the flag, which is what keeps every existing
+  program working; **CAM3D VIEW FRONT** and **CAM3D VIEW SIDE** move the 3D
+  camera to a different bearing so that a facing which was view 6 under the
+  2D camera is view 0 under the 3D one -- proving `cam3X/cam3Y` is what gets
+  read, which merely *turning* the camera could never have shown.
+- `tools/demos.sh` green for all ten demos, quake at 19769 bytes.
+
+One 64tass trap, again worth not repeating: a loop body containing several
+inline kit macros is well past a relative branch's reach. `bne loop` at the
+bottom becomes `beq done / jmp loop`.

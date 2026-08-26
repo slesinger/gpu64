@@ -22,11 +22,14 @@
 ;          that made Quake a different renderer and not a faster Doom.
 ;          The player walks under it at the start of his lap and looks
 ;          back down onto it from the top of the ramp
-;        * MONSTERS -- DRAW_THINGS batches may now ask to be projected
-;          through SET_CAMERA3D too, so the same billboards a Doom level
-;          uses stand in a Quake one, depth-tested against its faces: the
-;          one under the bridge is hidden by the slab until you walk out
-;          from under it
+;        * MONSTERS with a FRONT AND A BACK -- a DRAW_THINGS record may
+;          name eight consecutive textures and the direction the thing
+;          faces, and gpu64 works out which of the eight you are looking
+;          at from where you are standing. Walk round one and it turns.
+;          The batch is projected through SET_CAMERA3D, so the same
+;          billboards a Doom level uses stand in a Quake one, depth-tested
+;          against its faces: the one under the bridge is hidden by the
+;          slab until you walk out from under it
 ;        * real PITCH -- the camera looks up and down by rotating, so the
 ;          walls converge as you tilt. SET_CAMERA's horizon shears the
 ;          picture instead, which is exact for vertical walls and wrong for
@@ -34,8 +37,9 @@
 ;
 ;      WHAT THE 6502 DOES PER FRAME
 ;
-;      One 16-bit add for the walk, one shift for the height of the ramp
-;      under his feet, twelve bytes of camera, and one batch command. The
+;      Four reads of the keyboard matrix, two table lookups and two 16-bit
+;      adds for the walk, one shift for the height of the ramp under his
+;      feet, twelve bytes of camera, and one batch command. The
 ;      level -- 16 faces, 62 vertices and 3 texinfos -- is uploaded once at
 ;      start-up and never touched again; the projection, the clipping, the
 ;      perspective texture mapping and the depth sorting are all gpu64's.
@@ -52,6 +56,18 @@
 ;      The face batch is a few hundred bytes of unchanging data, so
 ;      R2_BATCH_SUM is free: it is computed once at start-up and every byte is
 ;      verified on arrival on every frame.
+;
+;      THE CONTROLS
+;
+;        W / S     walk forward and back
+;        A / D     turn left and right
+;        Q / E     strafe left and right
+;        F1 / F3   look up and down, F7 centres
+;        RUN/STOP  quit
+;
+;      The player is free in the room now rather than walking a fixed lap,
+;      which is what makes the eight-view monsters worth having: you can
+;      get behind one.
 ;
 ;      Run it: LOAD"GPU64-QUAKE",8,1 then RUN. RUN/STOP finishes.
 ;
@@ -95,14 +111,41 @@ EYE_UP	= $0080			; the eye, half a unit above whatever he is on
 PROJ	= $a000			; 160.0 pixels: a 90-degree field of view
 SKY_COL	= 2*32+6		; what shows where nothing was drawn
 
-WALK_LO	= 384			; 1.5 -- he walks the length of the room
-WALK_HI	= 8 * 256 + 128		; 8.5, which is up the ramp and onto the top
-SPEED	= $0020			; 1/8 of a world unit a frame
+; Where he may stand: half a unit clear of every wall, and off the sides
+; of the ramp the floor is flat again.
+X_LO	= $0080			; 0.5
+X_HI	= $0980			; 9.5
+Y_LO	= $fb80			; -4.5
+Y_HI	= $0480			; 4.5
+START_X	= 384			; 1.5 -- under the bridge, looking up the room
+
+TURN	= 3			; binary degrees a frame, 256 to the circle
+PITCH_LIM = 48			; and how far he may crane his neck
+
+; The keyboard matrix: a column written to $dc00 and the rows read back
+; from $dc01, both active low. Four columns carry every key this program
+; uses, so a frame's input is four writes and four reads.
+CIA_PRA	= $dc00
+CIA_PRB	= $dc01
+COL_A	= %11111110		; F7, F1, F3
+COL_B	= %11111101		; W, A, S, E
+COL_C	= %11111011		; D
+COL_D	= %01111111		; Q, RUN/STOP
+KA_F7	= $08
+KA_F1	= $10
+KA_F3	= $20
+KB_W	= $02
+KB_A	= $04
+KB_S	= $20
+KB_E	= $40
+KC_D	= $04
+KD_Q	= $40
 
 ; Zero page. $f7-$fe is the RS232 area every gpu64 program uses.
 posX	= $f7			; the player, 8.8 world units
-eyeZ	= $f9			; his eye, absolute world height
-sumPtr	= $fb			; only used at start-up
+posY	= $f9			; -- kept next to posX so one routine adds
+eyeZ	= $fb			;    a signed step to either of them
+sumPtr	= $fd			; only used at start-up
 
 	#basicStub
 
@@ -165,13 +208,38 @@ start
 	sta ID_LO
 	#cmd R2_UPLOAD_TEX
 
-	#argblob 0, SPACE_C64, monTex, TEXLEN
+	; Eight views of the monster, at TEX_MON .. TEX_MON+7. A DIRECTIONAL
+	; thing names only the first of them; gpu64 picks which one to draw.
+	; TEXLEN is 1024, so each view starts four pages on from the last and
+	; the blob's address is one add.
+	ldx #0
+mtUpload
+	lda #SPACE_C64
+	sta ARG+0
+	lda #<monTex
+	sta ARG+1
+	txa
+	asl a
+	asl a
+	clc
+	adc #>monTex
+	sta ARG+2
+	lda #0
+	sta ARG+3
+	#argw 4, TEXLEN
 	#argw 6, TEXW
 	#argw 8, TEXH
 	#argb 10, 0
-	lda #TEX_MON
+	txa
+	clc
+	adc #TEX_MON
 	sta ID_LO
-	#cmd R2_UPLOAD_TEX
+	lda #0
+	sta ID_HI
+	#cmd2 R2_UPLOAD_TEX
+	inx
+	cpx #8
+	bne mtUpload
 
 	; 16 light levels. A face carries a base level and gpu64 adds half
 	; the distance to it, so the far end of the room darkens by itself.
@@ -188,10 +256,13 @@ start
 
 	jsr sumFaces
 
-	lda #<WALK_LO
+	lda #<START_X
 	sta posX
-	lda #>WALK_LO
+	lda #>START_X
 	sta posX+1
+	lda #0
+	sta posY
+	sta posY+1
 	jsr eyeHeight
 
 ; ======================================================================
@@ -204,7 +275,10 @@ frame
 	sta ARG+0
 	lda posX+1
 	sta ARG+1
-	#argw 2, 0			; he walks the line y = 0
+	lda posY			; and now he goes where he likes
+	sta ARG+2
+	lda posY+1
+	sta ARG+3
 	lda eyeZ
 	sta ARG+4
 	lda eyeZ+1
@@ -305,77 +379,132 @@ frDone
 ; ======================================================================
 ; The player
 ;
-; He walks the length of the room and back along y = 0, up the ramp and
-; onto the platform, while his head tilts through a slow triangle wave --
-; which is the point: pitch is a rotation here, so the room converges as
-; he looks up instead of merely sliding.
+; He goes where he is driven. W and S walk along the direction he is
+; facing, A and D turn him, Q and E strafe, F1 and F3 tilt his head and F7
+; levels it again. That is two table lookups and two 16-bit adds a frame:
+; the walk vector is (cos yaw, sin yaw) read straight out of the same sine
+; table the 3D camera's angles come from, and the strafe vector is the same
+; two numbers swapped and one negated.
 ; ======================================================================
 movePlayer
 	inc frameCt
+	jsr readKeys
 
-	; The tilt: 0..31..0..-16, one step every other frame.
-	lda frameCt
-	lsr a
-	and #$3f
-	cmp #$20
-	bcc +
-	eor #$3f			; 63 - p, the way back down
-+
-	sec
-	sbc #16
-	sta plPitch
-
-	lda plYaw
-	bne mpBack
-
-	clc
-	lda posX
-	adc #<SPEED
-	sta posX
-	lda posX+1
-	adc #>SPEED
-	sta posX+1
-	lda posX+1
-	cmp #>WALK_HI
-	bcc mpDone
-	bne mpTurnBack
-	lda posX
-	cmp #<WALK_HI
-	bcc mpDone
-mpTurnBack
-	lda #128			; about face
-	sta plYaw
-	jmp mpDone
-
-mpBack
-	sec
-	lda posX
-	sbc #<SPEED
-	sta posX
-	lda posX+1
-	sbc #>SPEED
-	sta posX+1
-	lda posX+1
-	cmp #>WALK_LO
-	bcc mpTurnFwd
-	bne mpDone
-	lda posX
-	cmp #<WALK_LO
-	bcs mpDone
-mpTurnFwd
+	; Look up and down. The limit is 48 binary degrees either way -- far
+	; enough to see the ceiling, not far enough to turn the room over.
+	lda keyA
+	and #KA_F7
+	bne +
 	lda #0
+	sta plPitch
++
+	lda keyA
+	and #KA_F1
+	bne +
+	lda plPitch
+	cmp #PITCH_LIM
+	beq +
+	clc
+	adc #2
+	sta plPitch
++
+	lda keyA
+	and #KA_F3
+	bne +
+	lda plPitch
+	cmp #256-PITCH_LIM
+	beq +
+	sec
+	sbc #2
+	sta plPitch
++
+
+	; Turn first, so the walk that follows uses the angle he is facing by
+	; the end of the frame. Yaw counts anticlockwise: +y is to his left.
+	lda keyB
+	and #KB_A
+	bne +
+	lda plYaw
+	clc
+	adc #TURN
 	sta plYaw
++
+	lda keyC
+	and #KC_D
+	bne +
+	lda plYaw
+	sec
+	sbc #TURN
+	sta plYaw
++
+
+	; vecX,vecY is now one step forward: about an eighth of a world unit,
+	; which is the speed the automatic walk used to run at.
+	lda plYaw
+	jsr setDir
+
+	lda keyB
+	and #KB_W
+	bne +
+	lda vecX
+	ldx #posX
+	jsr addSgn
+	lda vecY
+	ldx #posY
+	jsr addSgn
++
+	lda keyB
+	and #KB_S
+	bne +
+	lda vecX
+	jsr negA
+	ldx #posX
+	jsr addSgn
+	lda vecY
+	jsr negA
+	ldx #posY
+	jsr addSgn
++
+
+	; Strafing right is the forward vector turned a quarter circle:
+	; (sin yaw, -cos yaw). No second lookup, just the two bytes swapped.
+	lda keyB
+	and #KB_E
+	bne +
+	lda vecY
+	ldx #posX
+	jsr addSgn
+	lda vecX
+	jsr negA
+	ldx #posY
+	jsr addSgn
++
+	lda keyD
+	and #KD_Q
+	bne +
+	lda vecY
+	jsr negA
+	ldx #posX
+	jsr addSgn
+	lda vecX
+	ldx #posY
+	jsr addSgn
++
+	jsr clampPos
 
 	; The patrolling monster walks the width of the room and back. Its
-	; record is the only thing in the batch that changes, and the two
-	; bytes below are the whole cost of animating it.
-mpDone
+	; record is the only thing in the batch that changes, and the three
+	; bytes below are the whole cost of animating it -- one of them the
+	; direction it faces, which is what picks the view gpu64 draws.
+	ldy #64				; walking toward +y, so facing +y
 	lda frameCt
 	and #$7f
 	cmp #$40
 	bcc +
 	eor #$7f			; 127 - p: the way back
+	ldy #192
 +
+	sty monsters+2*R2_REC+13
 	sec
 	sbc #32				; -32..31, a fifth of a unit a step
 	sta tmp
@@ -390,7 +519,174 @@ mpDone
 +
 	sta monsters+2*R2_REC+3
 
+	; The one on the platform turns on the spot, a full circle every 256
+	; frames, so all eight of its views come round without moving.
+	lda frameCt
+	sta monsters+1*R2_REC+13
+
 	jsr eyeHeight
+	rts
+
+; ======================================================================
+; The keyboard, read straight off the matrix.
+;
+; A column is written to $dc00 and its eight rows read back from $dc01,
+; both active low, so a pressed key is a ZERO bit. Four columns carry
+; every key this program uses. The KERNAL's own IRQ scans the same matrix
+; sixty times a second and would see -- and leave behind -- a different
+; column, so the whole read runs with interrupts off.
+; ======================================================================
+readKeys
+	sei
+	lda #$ff
+	sta $dc02			; port A drives the columns
+	lda #$00
+	sta $dc03			; port B reads the rows
+	lda #COL_A
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyA
+	lda #COL_B
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyB
+	lda #COL_C
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyC
+	lda #COL_D
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyD
+	lda #$ff			; leave it as the KERNAL expects
+	sta CIA_PRA
+	cli
+	rts
+
+; ======================================================================
+; A = angle -> vecX,vecY, one step in that direction.
+;
+; cos a is sin (a + 64): one table, two lookups. The entries run to +-127
+; and two arithmetic shifts bring a step down to +-31, an eighth of a
+; world unit.
+; ======================================================================
+setDir
+	tax
+	lda sinTab,x
+	jsr asr2
+	sta vecY
+	txa
+	clc
+	adc #64
+	tax
+	lda sinTab,x
+	jsr asr2
+	sta vecX
+	rts
+
+asr2
+	cmp #$80			; carry = sign, so ROR keeps it
+	ror a
+	cmp #$80
+	ror a
+	rts
+
+negA
+	eor #$ff
+	clc
+	adc #1
+	rts
+
+; ======================================================================
+; A = a signed 8-bit step, X = the zero page address of a 16-bit value:
+; add one to the other. posX and posY are adjacent so that one routine
+; serves both, which is why they moved up the page.
+; ======================================================================
+addSgn
+	ldy #0
+	cmp #$80
+	bcc +
+	ldy #$ff			; sign-extend into the high byte
++
+	clc
+	adc $00,x
+	sta $00,x
+	tya
+	adc $01,x
+	sta $01,x
+	rts
+
+; ======================================================================
+; Keep him inside the room: half a unit clear of every wall. There is no
+; collision detection here -- the room is a box, and a box is four
+; compares.
+;
+; x is always positive, so a negative high byte can only mean he walked
+; backwards through the west wall. y is signed, and biasing the high byte
+; by $80 turns the signed compare into the unsigned one the 6502 has.
+; ======================================================================
+YHB	= (>Y_HI) ^ $80
+YLB	= (>Y_LO) ^ $80
+
+clampPos
+	lda posX+1
+	bmi cpLoX
+	cmp #>X_HI
+	bcc cpChkLo
+	bne cpHiX
+	lda posX
+	cmp #<X_HI
+	bcc cpChkLo
+cpHiX
+	lda #<X_HI
+	sta posX
+	lda #>X_HI
+	sta posX+1
+	jmp cpYax
+cpChkLo
+	lda posX+1
+	cmp #>X_LO
+	bcc cpLoX
+	bne cpYax
+	lda posX
+	cmp #<X_LO
+	bcs cpYax
+cpLoX
+	lda #<X_LO
+	sta posX
+	lda #>X_LO
+	sta posX+1
+
+cpYax
+	lda posY+1
+	eor #$80
+	cmp #YHB
+	bcc cpChkYlo
+	bne cpHiY
+	lda posY
+	cmp #<Y_HI
+	bcc cpChkYlo
+cpHiY
+	lda #<Y_HI
+	sta posY
+	lda #>Y_HI
+	sta posY+1
+	rts
+cpChkYlo
+	lda posY+1
+	eor #$80
+	cmp #YLB
+	bcc cpLoY
+	bne cpYdone
+	lda posY
+	cmp #<Y_LO
+	bcs cpYdone
+cpLoY
+	lda #<Y_LO
+	sta posY
+	lda #>Y_LO
+	sta posY+1
+cpYdone
 	rts
 
 ; ======================================================================
@@ -402,6 +698,17 @@ mpDone
 ; the same shape as gpu64_demo_sectors' lookup of the sector he is in.
 ; ======================================================================
 eyeHeight
+	lda posY+1			; the ramp is only three units wide,
+	bpl +				; so off its sides the floor is flat
+	lda posY
+	jsr negA
+	lda posY+1
+	eor #$ff
+	adc #0
++
+	cmp #2
+	bcs ehFlat
+
 	lda posX+1
 	cmp #6
 	bcc ehFlat
@@ -479,6 +786,12 @@ statusBar
 ; What the C64 has to say about it, on its own screen.
 ; ======================================================================
 report
+	lda #21
+	jsr dmRow
+	jsr dmText
+	.text "WASD MOVE  QE STRAFE  F1/F3 LOOK"
+	.byte 0
+
 	lda #22
 	jsr dmRow
 	jsr dmText
@@ -515,34 +828,46 @@ report
 	lda posX
 	jsr dmHexA
 	jsr dmText
-	.text "  EYE "
+	.text " Y "
+	.byte 0
+	lda posY+1
+	jsr dmHexA
+	lda posY
+	jsr dmHexA
+	jsr dmText
+	.text " Z "
 	.byte 0
 	lda eyeZ+1
 	jsr dmHexA
 	lda eyeZ
 	jsr dmHexA
 	jsr dmText
-	.text "  PITCH "
+	.text " YAW "
+	.byte 0
+	lda plYaw
+	jsr dmHexA
+	jsr dmText
+	.text " PIT "
 	.byte 0
 	lda plPitch
 	jsr dmHexA
+
+	lda #24
+	jsr dmRow
 	jsr dmText
-	.text "  ERRS "
+	.text "RUN/STOP=END  ERRS "
 	.byte 0
 	lda errCnt+1
 	jsr dmHexA
 	lda errCnt
 	jsr dmHexA
 	jsr dmText
-	.text " "
+	.text " LAST "
 	.byte 0
 	lda lastErr
 	jsr dmHexA
-
-	lda #24
-	jsr dmRow
 	jsr dmText
-	.text "RUN/STOP TO END   ERR "
+	.text "  ER "
 	.byte 0
 	jsr dmErr
 	rts
@@ -601,6 +926,21 @@ plYaw	.byte 0			; 0 = looking along +x, 128 = back again
 plPitch	.byte 0
 frameCt	.byte 0
 sprY	.byte 0
+vecX	.byte 0			; one step forward, signed
+vecY	.byte 0
+keyA	.byte $ff		; the four matrix columns, active low
+keyB	.byte $ff
+keyC	.byte $ff
+keyD	.byte $ff
+
+; A whole circle of sines, 256 units round, +-127. The 3D camera measures
+; its angles the same way, so the number in plYaw indexes this table
+; directly and cos is the same table 64 entries along.
+sinTab
+	.for i = 0, i < 256, i += 1
+	.byte round(127 * sin(i * 2 * pi / 256)) & $ff
+	.next
+
 tmp	.word 0
 errCnt	.word 0
 lastErr	.byte 0
@@ -769,9 +1109,14 @@ MON_W	= $00c0				; 0.75 x 1.5 world units
 MON_H	= $0180
 
 monsters
-	#r2thingd WU(3),  WU(-3), 0,      MON_W, MON_H, TEX_MON, 4, R2_THING_MASKED
-	#r2thingd WU(10), WU(1),  Z_RAMP, MON_W, MON_H, TEX_MON, 0, R2_THING_MASKED
-	#r2thingd WU(5),  WU(0),  0,      MON_W, MON_H, TEX_MON, 2, R2_THING_MASKED
+	; All three name TEX_MON as the first of eight consecutive views and
+	; the direction they face; gpu64 works out which view you are looking
+	; at. The first stands still in the corner, so walking round it is
+	; what turns it.
+MON_DIR	= R2_THING_MASKED | R2_THING_DIR
+	#r2thingd WU(3),  WU(-3), 0,      MON_W, MON_H, TEX_MON, 4, MON_DIR, 32
+	#r2thingd WU(10), WU(1),  Z_RAMP, MON_W, MON_H, TEX_MON, 0, MON_DIR, 0
+	#r2thingd WU(5),  WU(0),  0,      MON_W, MON_H, TEX_MON, 2, MON_DIR, 64
 NMON	= ( * - monsters ) / R2_REC
 
 ; --- the palette: 8 hues x 32 brightnesses -----------------------------
@@ -815,11 +1160,31 @@ gunTex
 	  .next
 	.next
 
-; The monster: a squat two-legged silhouette with two eyes, index 0 clear.
+; The monster, eight times over: a squat two-legged silhouette seen from
+; eight directions round the compass, index 0 clear. View 0 is its front,
+; view 4 its back, and gpu64 picks between them. Three things change as it
+; turns: the silhouette narrows toward the side views, the eyes slide
+; across the face and then go out of sight altogether, and the back views
+; get a pale plate across the shoulders that the front ones do not -- so
+; which way it is facing reads at a glance, which is the whole point.
+MHW	.function d			; half width: broad face on, narrow side on
+	.endf (d == 0 || d == 4) ? 10 : ((d == 2 || d == 6) ? 6 : 8)
+
+MBODY	.function d, u, v
+	.endf (v >= 4) && (u >= 16 - MHW(d)) && (u < 16 + MHW(d)) && !((v >= 26) && ((u % 12) >= 6))
+
+MEYE	.function d, u, v
+	.endf (v >= 8) && (v < 12) && ((d == 0) ? ((u >= 11 && u < 14) || (u >= 18 && u < 21)) : (d == 1) ? ((u >= 13 && u < 16) || (u >= 20 && u < 23)) : (d == 7) ? ((u >= 9 && u < 12) || (u >= 16 && u < 19)) : (d == 2) ? (u >= 18 && u < 21) : (d == 6) ? (u >= 11 && u < 14) : 0)
+
+MBACK	.function d, u, v
+	.endf (d >= 3) && (d <= 5) && (v >= 7) && (v < 12)
+
 monTex
-	.for u = 0, u < TEXW, u += 1
-	  .for v = 0, v < TEXH, v += 1
-	  .byte (v < 4) || (u < 6) || (u >= 26) || ((v >= 26) && ((u % 12) >= 6)) ? 0 : ((v >= 8) && (v < 12) && (((u >= 10) && (u < 13)) || ((u >= 19) && (u < 22)))) ? 7*32+30 : 6*32+12+((u*3+v*5) % 8)
+	.for d = 0, d < 8, d += 1
+	  .for u = 0, u < TEXW, u += 1
+	    .for v = 0, v < TEXH, v += 1
+	    .byte !MBODY(d, u, v) ? 0 : MEYE(d, u, v) ? 7*32+30 : MBACK(d, u, v) ? 4*32+28 : 6*32+12+((u*3+v*5) % 8)
+	    .next
 	  .next
 	.next
 

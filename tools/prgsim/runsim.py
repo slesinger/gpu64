@@ -33,6 +33,14 @@ Options:
                     current palette, inside the border -- as a PPM. This is
                     how a demo gets verified on a PC instead of at the
                     bench.
+    --key=NAME:FIRST-LAST
+        Hold a key down from frame FIRST to frame LAST, counting page flips
+        the way --stop-after does. Repeatable. Without it every key reads as
+        released, which is what an unwired $dc01 does NOT do -- it reads 0,
+        i.e. the whole keyboard held at once -- so a demo that steers by the
+        keyboard needs this option for its desk run to mean anything.
+        Names: W A S D Q E, F1 F3 F5 F7, SPACE, RETURN, RUNSTOP, and the
+        letters and digits in the table below.
     --demo          do not require a VERDICT line. The conformance suite
                     judges itself and exit status follows its verdict; a
                     demo has nothing to judge, so returning cleanly is the
@@ -65,6 +73,24 @@ from gpu64model import Gpu64Model                             # noqa: E402
 SCREEN = 0x0400
 IO2 = 0xDF00
 
+# The C64 keyboard matrix: name -> (column driven on $dc00, row bit on
+# $dc01). Only what a demo is likely to steer by; add rows as needed.
+KEY_MATRIX = {
+    'DEL': (0, 0x01), 'RETURN': (0, 0x02), 'CRSRRIGHT': (0, 0x04),
+    'F7': (0, 0x08), 'F1': (0, 0x10), 'F3': (0, 0x20), 'F5': (0, 0x40),
+    'CRSRDOWN': (0, 0x80),
+    '3': (1, 0x01), 'W': (1, 0x02), 'A': (1, 0x04), '4': (1, 0x08),
+    'Z': (1, 0x10), 'S': (1, 0x20), 'E': (1, 0x40),
+    '5': (2, 0x01), 'R': (2, 0x02), 'D': (2, 0x04), '6': (2, 0x08),
+    'C': (2, 0x10), 'F': (2, 0x20), 'T': (2, 0x40), 'X': (2, 0x80),
+    '7': (3, 0x01), 'Y': (3, 0x02), 'G': (3, 0x04), '8': (3, 0x08),
+    'B': (3, 0x10), 'H': (3, 0x20), 'U': (3, 0x40), 'V': (3, 0x80),
+    '9': (4, 0x01), 'I': (4, 0x02), 'J': (4, 0x04), '0': (4, 0x08),
+    'M': (4, 0x10), 'K': (4, 0x20), 'O': (4, 0x40), 'N': (4, 0x80),
+    'P': (5, 0x02), 'L': (5, 0x04),
+    'SPACE': (7, 0x10), 'Q': (7, 0x40), 'RUNSTOP': (7, 0x80),
+}
+
 # Screen code -> ASCII, enough to read a result line back.
 def screen_to_ascii(c):
     if c == 0x20:
@@ -86,7 +112,7 @@ def screen_to_ascii(c):
 
 class Machine:
     def __init__(self, calibrated=True, stop_after=4, frame_log=False,
-                 ppm_frames=None):
+                 ppm_frames=None, key_script=None):
         self.mem = bytearray(65536)
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
@@ -97,6 +123,8 @@ class Machine:
         self.frame_log = frame_log
         self.ppm_frames = ppm_frames or {}
         self.frame = 0
+        self.cia_pra = 0xFF
+        self.key_script = list(key_script or [])
 
     # Straight RAM, used by the model's DMA: a blob fetch sees memory, not
     # the IO2 window, and never re-enters the register file.
@@ -109,11 +137,33 @@ class Machine:
     def read(self, addr):
         if 0xDF00 <= addr <= 0xDFFF:
             return self.gpu.read_reg(addr - IO2)
+        if addr == 0xDC01:
+            return self.keyboard()
+        if addr == 0xDC00:
+            return self.cia_pra
         if addr == 0xFFE1:
             return 0x60                     # RTS -- intercepted below
         return self.mem[addr]
 
+    def keyboard(self):
+        # Both halves of the matrix are active low: a column is selected by
+        # a ZERO in $dc00 and a pressed key answers with a ZERO row bit.
+        rows = 0xFF
+        for name in self.keys_down():
+            col, bit = KEY_MATRIX[name]
+            if not (self.cia_pra & (1 << col)):
+                rows &= ~bit
+        return rows & 0xFF
+
+    def keys_down(self):
+        for name, first, last in self.key_script:
+            if first <= self.frame <= last:
+                yield name
+
     def write(self, addr, val):
+        if addr == 0xDC00:
+            self.cia_pra = val & 0xFF
+            return
         if 0xDF00 <= addr <= 0xDFFF:
             # A page flip is the frame boundary, and it is the only one a
             # demo tells us about. Sample on the way in, while the page that
@@ -256,6 +306,16 @@ def main(argv):
     frame_log = '--frame-log' in opts
     ppm_frames = {}
     demo = '--demo' in opts
+    key_script = []
+    for o in opts:
+        if o.startswith('--key='):
+            name, span = o.split('=', 1)[1].split(':', 1)
+            first, last = (span.split('-', 1) + [span])[:2]
+            name = name.upper()
+            if name not in KEY_MATRIX:
+                print("unknown key: %s" % name)
+                return 2
+            key_script.append((name, int(first), int(last)))
     for o in opts:
         if o.startswith('--stop-after='):
             stop_after = int(o.split('=')[1])
@@ -270,7 +330,8 @@ def main(argv):
             ppm = o.split('=', 1)[1]
 
     m = Machine(calibrated=calibrated, stop_after=stop_after,
-                frame_log=frame_log, ppm_frames=ppm_frames)
+                frame_log=frame_log, ppm_frames=ppm_frames,
+                key_script=key_script)
     addr, size = m.load_prg(args[0])
     # A BASIC stub sits at $0801; the code itself starts at $0810.
     start = 0x0810

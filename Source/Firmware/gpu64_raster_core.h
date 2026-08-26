@@ -81,6 +81,13 @@
 					// thing is painted over everything
 #define GPU64_RASTER_THING_FLATLIT 0x08	// the record's light unchanged, with
 					// no darkening by distance
+#define GPU64_RASTER_THING_DIRECTIONAL 0x10 // the thing has eight views. Byte
+					// 13 is the direction it FACES (0 =
+					// +x, 256 to the circle) and the id in
+					// byte 10 is the first of eight
+					// consecutive ones; gpu64 picks the
+					// view from where the camera stands.
+					// Milestone 11.
 
 // DRAW_THINGS batch flags (ARG8), beside GPU64_RASTER_BATCH_CHECKSUM. The
 // camera is a property of the batch and not of a record: a frame's things all
@@ -307,6 +314,12 @@ void gpu64_rasterZReset( void );
 // nBatchFlags selects the camera: GPU64_RASTER_BATCH_CAM3D projects through
 // SET_CAMERA3D, so the same records serve a Quake game with a real pitch.
 // Without it the batch goes through SET_CAMERA, unchanged from milestone 8d.
+//
+// GPU64_RASTER_THING_DIRECTIONAL turns a record into an eight-view sprite:
+// view n covers the arc where the camera stands at the thing's facing angle
+// plus n*45 degrees, give or take 22.5, so view 0 is the thing seen head on,
+// view 2 is its left side and view 4 is its back. The texture drawn is
+// byte 10 plus n. Milestone 11.
 void gpu64_rasterThings( const Gpu64RasterState *pState,
 			 const Gpu64RasterTarget *pTarget,
 			 const u8 *pRecs, u32 nCount, u8 nKey, u8 nBatchFlags,

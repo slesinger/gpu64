@@ -81,6 +81,12 @@ IDB	= 2
 IDC	= 3
 IDQ	= 4
 
+; The eight views of one directional thing: IDD is the first of eight
+; consecutive ids, and view v is a single texel of colour DVC+v -- so the
+; pixel read back names the view that was chosen, with no arithmetic.
+IDD	= 8
+DVC	= 1
+
 * = $0801
 	.byte $0b, $08, $0a, $00, $9e
 	.text "2064"
@@ -154,6 +160,9 @@ start
 	#uptex IDB, TEX+1, 1, 1
 	#uptex IDC, TEX+2, 1, 1
 	#uptex IDQ, TEX+4, 2, 2
+	.for i = 0, i < 8, i += 1
+	#uptex IDD+i, TEX+8+i, 1, 1
+	.next
 	#useacc
 	#check "UPLOAD TEX"
 
@@ -647,6 +656,110 @@ start
 	#useacc
 	#check "CAM2D UNCHANGED"
 
+	; ---------------------------------------------------------------
+	; R2_THING_DIR: eight views, chosen from where the camera stands.
+	;
+	; The thing sits 4.0 units along +x with the 2D camera at the
+	; origin, so the vector the firmware works with -- thing to CAMERA
+	; -- points along -x, bearing 128. View 0 is the thing looking
+	; straight at the player, which is facing 128; every 32 units of
+	; facing after that is the next view round. The facings below are
+	; deliberately mid-band, 16 units clear of either boundary, so the
+	; test says which view was picked and not how a tie was broken.
+	; ---------------------------------------------------------------
+
+	#clracc
+	ldy #0
+dirLoop
+	sty dirIdx
+	lda dirFace,y
+	sta thingD+13
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingD, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	ldy dirIdx
+	lda RB+0
+	cmp dirWant,y
+	beq +
+	jsr kitBad		; the colour IS the view that was drawn
++
+	iny
+	cpy #8
+	beq dirDone
+	jmp dirLoop		; the body is well past a branch's reach
+dirDone
+	#useacc
+	#check "THING EIGHT VIEWS"
+
+	; Without the flag the facing byte is not read at all: the same
+	; record, the same facing, and the one id is drawn from every side.
+	; This is what keeps every existing thing in every existing program
+	; working after the flag was added.
+	lda #0
+	sta thingD+12			; flags: drop R2_THING_DIR
+	lda #0
+	sta thingD+13
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingD, 1
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, DVC+0		; view 0's colour, i.e. IDD itself
+	#useacc
+	#check "THING NOT DIRECTIONAL"
+	lda #R2_THING_DIR
+	sta thingD+12
+
+	; Under CAM3D it is the 3D camera's position that decides the view,
+	; not the 2D one's. The camera moves to 4.0 units along -y looking
+	; along +y at a thing on the origin, so the bearing is now 192 and
+	; a facing of 192 -- which was view 6 a moment ago -- is view 0.
+	#r2cam3 $0000, $fc00, $0080, 64, 0, $a000
+	lda #R2_SET_CAMERA3D
+	jsr cmd2
+	lda #192
+	sta thingD3+13
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingD3, 1, R2_BATCH_CAM3D
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, DVC+0
+	#useacc
+	#check "CAM3D VIEW FRONT"
+
+	lda #96				; three eighths round from the front
+	sta thingD3+13
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2batch thingD3, 1, R2_BATCH_CAM3D
+	lda #R2_DRAW_THINGS
+	jsr cmd2
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, DVC+3
+	#useacc
+	#check "CAM3D VIEW SIDE"
+
 	jmp kitFinish
 
 ; ----------------------------------------------------------------------
@@ -669,6 +782,17 @@ buildTextures
 	sta TEX+6
 	lda #QBR
 	sta TEX+7
+
+	; The eight one-texel views, colour DVC+v.
+	ldx #0
+btLoop
+	txa
+	clc
+	adc #DVC
+	sta TEX+8,x
+	inx
+	cpx #8
+	bne btLoop
 	rts
 
 ; ----------------------------------------------------------------------
@@ -695,6 +819,21 @@ thingAd	.macro
 thingBd	.macro
 	#r2thingd $0800, $0000, $0000, $0100, $0100, IDB, 0
 	.endm
+
+; The directional thing, patched in place: the facing byte is the only
+; thing that changes from case to case, so the eight views are proved to
+; come from the facing and not from eight different records.
+thingD	#r2thingd $0400, $0000, $0000, $0100, $0100, IDD, 0, R2_THING_DIR, 0
+thingD3	#r2thingd $0000, $0000, $0000, $0100, $0100, IDD, 0, R2_THING_DIR, 0
+
+; Facing 128 is view 0 -- the thing looking back at a camera bearing 128 --
+; and each entry after it turns the thing another eighth.
+dirFace	.byte 128, 96, 64, 32, 0, 224, 192, 160
+dirWant
+	.for i = 0, i < 8, i += 1
+	.byte DVC+i
+	.next
+dirIdx	.byte 0
 
 thingA	#thingAd
 thingB	#thingBd

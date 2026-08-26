@@ -1230,7 +1230,35 @@ void gpu64_rasterSectors( const Gpu64RasterState *pState,
 // right rows and grows or shrinks the way the wall behind it does. With a
 // pitch of zero the two ends land at the same depth and the arithmetic
 // collapses, term for term, onto the 2D path above.
+//
+// Milestone 11: GPU64_RASTER_THING_DIRECTIONAL gives a thing eight views.
+// Byte 13 is the direction the thing FACES; the card is still screen-parallel,
+// but which of eight textures goes on it is chosen from where the camera
+// stands relative to that facing. A game therefore stops sending a texture id
+// that means "the monster seen from behind" and starts sending the monster's
+// own heading, which is a number it already has -- and the eight-way choice,
+// which in Doom is an angle subtraction the game engine does per thing per
+// frame, moves to the side of the bus that has the camera on it.
 // ======================================================================
+
+// Which of eight 45-degree sectors a vector points into, 0 for the sector
+// centred on +x and counting the way angles do. No arctangent: the vector is
+// rotated by the thing's facing (less half a sector, so sector 0 is centred
+// on the facing rather than starting at it) and then only the two signs and
+// one magnitude comparison remain, which is exact everywhere including on the
+// boundaries.
+static inline int octant8( s32 x, s32 y )
+{
+	if ( y >= 0 )
+	{
+		if ( x >= 0 )
+			return ( y <= x ) ? 0 : 1;
+		return ( y >= -x ) ? 2 : 3;
+	}
+	if ( x < 0 )
+		return ( -y < -x ) ? 4 : 5;
+	return ( -y > x ) ? 6 : 7;
+}
 
 void gpu64_rasterThings( const Gpu64RasterState *pState,
 			 const Gpu64RasterTarget *pTarget,
@@ -1274,6 +1302,24 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 		const u8  texid  = r[ 10 ];
 		const u8  light  = r[ 11 ];
 		const u8  flags  = r[ 12 ];
+
+		// Eight views: the id above is the first of eight consecutive
+		// ones and byte 13 is where the thing is looking. The vector
+		// used is thing -> CAMERA, so view 0 is the thing facing the
+		// player and view 4 is its back walking away.
+		u8 useTex = texid;
+		if ( flags & GPU64_RASTER_THING_DIRECTIONAL )
+		{
+			const s32 cx = bCam3 ? (s32)pState->cam3X : (s32)pState->camX;
+			const s32 cy = bCam3 ? (s32)pState->cam3Y : (s32)pState->camY;
+			const s32 dx = cx - recS16( r, 0 );
+			const s32 dy = cy - recS16( r, 2 );
+			const u8  g  = (u8)( r[ 13 ] - 16 );
+			const s32 c  = fcos( g ), sn = fsin( g );
+			const s32 fx = ( dx * c + dy * sn ) >> 8;
+			const s32 fy = ( dy * c - dx * sn ) >> 8;
+			useTex = (u8)( texid + octant8( fx, fy ) );
+		}
 
 		// The card's two ends: hBase and hTop are heights measured
 		// DOWNWARD from the eye, so a row is horizon + h*proj/depth in
@@ -1327,7 +1373,8 @@ void gpu64_rasterThings( const Gpu64RasterState *pState,
 		// A thing is always textured. There is no flat-colour form: a
 		// solid rectangle floating in a room is not a thing anybody
 		// wants, and requiring the id makes a dropped byte visible.
-		const Gpu64RasterTexture *pTex = texid ? pLookup( pCtx, texid ) : 0;
+		const Gpu64RasterTexture *pTex =
+			( texid && useTex ) ? pLookup( pCtx, useTex ) : 0;
 		if ( pTex == 0 )
 		{
 			pResult->rejected++;

@@ -41,6 +41,7 @@ from gpu64model import (Gpu64Model, FB_W, FB_H, C64_PALETTE,  # noqa: E402
 BIN = os.path.join(HERE, "rastercheck")
 MAGIC = 0x4B433252
 REC = 16
+THING_DIRECTIONAL = 0x10
 WALL2 = 32
 POLY = 16
 
@@ -196,7 +197,7 @@ def make_polys(rnd, cam3, ids):
     return verts, texinfo, nfaces, bytes(faces)
 
 
-def make_things(rnd, cx, cy, cz, ids, n):
+def make_things(rnd, cx, cy, cz, ids, n, dirbase=0):
     """A batch of thing records scattered around a camera at (cx, cy, cz).
 
     The spread is deliberately tight: things far off to the side clip away
@@ -205,15 +206,25 @@ def make_things(rnd, cx, cy, cz, ids, n):
     pitch sweeps past."""
     recs = bytearray()
     for _ in range(n):
-        recs += struct.pack("<hhhHHBBBxxx",
+        texid = rnd.choice(ids)
+        flags = rnd.randint(0, 15)
+        facing = 0
+        # Milestone 11: some records are eight-view sprites. dirbase is the
+        # first of the eight ids and byte 13 is where the thing looks.
+        if dirbase and rnd.random() < 0.4:
+            texid = dirbase
+            flags |= THING_DIRECTIONAL
+            facing = rnd.randint(0, 255)
+        recs += struct.pack("<hhhHHBBBBxx",
                             cx + rnd.randint(-0x600, 0x600),
                             cy + rnd.randint(-0x600, 0x600),
                             cz + rnd.randint(-0x400, 0x400),
                             rnd.choice([0, rnd.randint(1, 0x300)]),
                             rnd.choice([0, rnd.randint(1, 0x300)]),
-                            rnd.choice(ids),
+                            texid,
                             rnd.randint(0, 70),
-                            rnd.randint(0, 15))
+                            flags,
+                            facing)
     assert len(recs) == n * REC
     return bytes(recs)
 
@@ -245,6 +256,15 @@ def make_scenario(rnd):
     for i in range(ntex):
         texid = rnd.randint(1, 8)
         texs[texid] = make_texture(rnd, allow_npot_w=(kind == 1))
+
+    # Milestone 11: a run of eight consecutive ids, so a DIRECTIONAL thing
+    # resolves a real view whichever octant the camera ends up in. A quarter
+    # of the time the run is left unregistered, which exercises the other
+    # half of the contract -- a view that misses simply draws nothing.
+    dirbase = rnd.randint(1, 240)
+    if rnd.random() < 0.75:
+        for i in range(8):
+            texs.setdefault(dirbase + i, make_texture(rnd, False))
 
     fill = rnd.randint(0, 255)
     key = rnd.randint(0, 255)
@@ -279,7 +299,8 @@ def make_scenario(rnd):
         # already built it. kind 9 hangs a batch of things off the back of it.
         n3 = rnd.randint(0, 20) if kind == 9 else 0
         t3 = make_things(rnd, cam3["x"], cam3["y"], cam3["z"],
-                         sorted(texs) + [0, rnd.randint(9, 255)], n3)
+                         sorted(texs) + [0, rnd.randint(9, 255)], n3,
+                         dirbase)
         return dict(kind=kind, view=view, levels=levels, cmap=cmap, texs=texs,
                     fill=fill, key=key, cam=cam, sectors=sectors, cam3=cam3,
                     verts=verts, texinfo=texinfo, count=npolys,
@@ -292,7 +313,8 @@ def make_scenario(rnd):
         # thing-against-thing ordering.
         n3 = rnd.randint(0, 60)
         t3 = make_things(rnd, cam3["x"], cam3["y"], cam3["z"],
-                         sorted(texs) + [0, rnd.randint(9, 255)], n3)
+                         sorted(texs) + [0, rnd.randint(9, 255)], n3,
+                         dirbase)
         return dict(kind=8, view=view, levels=levels, cmap=cmap, texs=texs,
                     fill=fill, key=key, cam=cam, sectors=sectors, cam3=cam3,
                     verts=verts, texinfo=texinfo, count=n3, recs=t3,
@@ -365,7 +387,8 @@ def make_scenario(rnd):
     nthings = 0
     if kind == 5:
         nthings = rnd.randint(0, 20)
-        things = make_things(rnd, cam["x"], cam["y"], 0, ids, nthings)
+        things = make_things(rnd, cam["x"], cam["y"], 0, ids, nthings,
+                             dirbase)
 
     return dict(kind=kind, view=view, levels=levels, cmap=cmap, texs=texs,
                 fill=fill, key=key, cam=cam, sectors=sectors,
