@@ -51,14 +51,14 @@
 ;
 ;      Before milestone 4c the first line was 71/~900 us; the point of the
 ;      change is that it should now read single-digit microseconds, with the
-;      wait line small too (see docs/progress_tracker.md).
+;      wait line small too (see project/progress_tracker.md).
 ;
 ;      REU emulation must be selected in RAD's menu (T key -> REU), same as
 ;      every other gpu64 test PRG -- everything gpu64 does lives inside
 ;      reuUsingPolling().
 ;
 ;      Assemble with 64tass (no --nostart: the .prg needs its 2-byte load
-;      address header, see docs/progress_tracker.md milestone 2) --
+;      address header, see project/progress_tracker.md milestone 2) --
 ;      64tass gpu64_vblank_demo.a -o gpu64_vblank_demo.prg
 ;
 ;      Copyright (c) 2026 Honza Slesinger

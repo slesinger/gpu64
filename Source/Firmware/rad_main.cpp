@@ -706,7 +706,7 @@ void CRAD::Run( void )
 			resetREU();
 
 			// gpu64: the multicore feasibility spike's liveness check
-			// (docs/milestone6_3d_design.md) -- samples cores 1-3's pass
+			// (project/milestone6_3d_design.md) -- samples cores 1-3's pass
 			// counters across a known interval to prove they are alive and
 			// streaming. Compiled out with the spike itself: with
 			// GPU64_MULTICORE_STRESS_ENABLED off it can only ever print

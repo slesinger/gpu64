@@ -16,7 +16,7 @@
 #
 # Note that 64tass is invoked WITHOUT --nostart: that option strips the
 # 2-byte load address and produces a PRG that loads to the wrong place and
-# silently never runs. See docs/progress_tracker.md.
+# silently never runs. See project/progress_tracker.md.
 #
 # Usage:
 #   tools/testprg.sh              # assemble + desk-check everything

@@ -118,6 +118,7 @@ class Machine:
         self.cpu = Cpu6502(self.read, self.write)
         self.stop_polls = 0
         self.stop_after = stop_after
+        self.col7_reads = 0
         self.done = False
         self.final = None
         self.frame_log = frame_log
@@ -148,6 +149,8 @@ class Machine:
     def keyboard(self):
         # Both halves of the matrix are active low: a column is selected by
         # a ZERO in $dc00 and a pressed key answers with a ZERO row bit.
+        if not (self.cia_pra & 0x80):
+            self.col7_reads += 1
         rows = 0xFF
         for name in self.keys_down():
             col, bit = KEY_MATRIX[name]
@@ -159,6 +162,22 @@ class Machine:
         for name, first, last in self.key_script:
             if first <= self.frame <= last:
                 yield name
+        if self.stop_in_matrix():
+            yield 'RUNSTOP'
+
+    def stop_in_matrix(self):
+        # A demo that scans the matrix itself rather than asking the KERNAL
+        # -- quake does, because $ffe1 and its own sei-guarded scan disagree
+        # on hardware -- has to be able to finish here too. Once it has read
+        # column 7 more than --stop-after times, work the key the way a hand
+        # would: held down long enough to be believed, released, then held
+        # again for the "press RUN/STOP to leave" wait at the end. Counting
+        # reads and not frames matters, because that final wait flips no
+        # pages and so never advances the frame number.
+        k = self.col7_reads - self.stop_after
+        if k <= 0:
+            return False
+        return k <= 4 or k > 8
 
     def write(self, addr, val):
         if addr == 0xDC00:

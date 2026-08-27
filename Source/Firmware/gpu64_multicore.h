@@ -24,7 +24,7 @@
 #include <circle/types.h>
 
 // gpu64: multicore feasibility test matrix (2026-08-22, see
-// docs/milestone6_3d_design.md and docs/progress_tracker.md). Two
+// project/milestone6_3d_design.md and project/progress_tracker.md). Two
 // independent toggles so each hardware round isolates one variable:
 //
 //   GPU64_MULTICORE_ENABLED         -- calls CMultiCoreSupport::Initialize()
@@ -53,7 +53,7 @@
 // #define GPU64_MULTICORE_STRESS_ENABLED
 
 // gpu64: multicore feasibility spike for milestone 6 (see
-// docs/milestone6_3d_design.md's "Architecture: a second core for the
+// project/milestone6_3d_design.md's "Architecture: a second core for the
 // render loop" section) -- NOT the real render loop.
 //
 // Core 0 keeps running the existing, untouched, cycle-accurate

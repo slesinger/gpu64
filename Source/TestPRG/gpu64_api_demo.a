@@ -29,7 +29,7 @@
 ;      reuUsingPolling().
 ;
 ;      Assemble with 64tass (no --nostart: the .prg needs its 2-byte load
-;      address header, see docs/progress_tracker.md milestone 2) --
+;      address header, see project/progress_tracker.md milestone 2) --
 ;      64tass gpu64_api_demo.a -o gpu64_api_demo.prg
 ;
 ;      Copyright (c) 2026 Honza Slesinger

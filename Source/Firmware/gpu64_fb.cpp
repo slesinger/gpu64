@@ -233,8 +233,23 @@ boolean CGpu64FrameBuffer::CommitFlip( void )
 			return FALSE;
 	}
 
-	m_nDrawPage = m_nVisiblePage;
+	// The next draw page must be one the VideoCore is provably not
+	// scanning. Taking the page that was visible is not enough: the post
+	// above does not wait for the VideoCore, which changes offset at its
+	// own next vsync, so that page can stay on screen for another whole
+	// display frame. Skip both it and the one just posted -- with
+	// GPU64_FB_PAGES == 3 exactly one page is left.
+	u8 nWasVisible = m_nVisiblePage;
 	m_nVisiblePage = m_nPendingVisible;
+
+	u8 nNext = nWasVisible;
+	for ( u8 p = 0; p < GPU64_FB_PAGES; p++ )
+		if ( p != m_nVisiblePage && p != nWasVisible )
+		{
+			nNext = p;
+			break;
+		}
+	m_nDrawPage = nNext;
 	return TRUE;
 }
 

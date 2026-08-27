@@ -728,7 +728,7 @@ bcLoop
 
 ; The 16-bit sum of one record, written as the two bytes that follow it.
 ; A checksum a 6502 can afford is a plain sum, not a CRC -- see
-; docs/milestone8_raster_design.md.
+; project/milestone8_raster_design.md.
 sumBatch1
 	lda #0
 	sta kitVal16

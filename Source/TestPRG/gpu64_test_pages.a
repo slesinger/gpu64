@@ -14,11 +14,18 @@
 ;      Double buffering and vblank: SET_DRAW_PAGE, PAGE_FLIP in both its
 ;      forms, VBLANK_ARM, VBLANK_ACK and VBLANK_SYNC.
 ;
-;      Paging is checked by content, not by a status bit. The two pages are
-;      cleared to different colours and then READ_RECT is used to ask which
-;      one is currently being drawn into -- so "the flip happened" means the
-;      bytes moved, not that a register says so. A flip that updated its own
-;      bookkeeping and nothing else passes a status check and fails this.
+;      Paging is checked by content, not by a status bit. The three pages
+;      are cleared to different colours and then READ_RECT is used to ask
+;      which one is currently being drawn into -- so "the flip happened"
+;      means the bytes moved, not that a register says so. A flip that
+;      updated its own bookkeeping and nothing else passes a status check
+;      and fails this.
+;
+;      There are three pages, and a flip ROTATES them: the new draw page is
+;      the one that is neither now visible nor visible a moment ago. A
+;      posted flip does not reach the screen until the display's next
+;      vsync, so handing the just-vacated page straight back to be drawn
+;      into paints the next frame on screen as it is built.
 ;
 ;      ADAPTS TO THE DISPLAY. The frame clock is measured once at boot, and
 ;      a display gpu64 could not measure leaves every vblank feature
@@ -53,6 +60,7 @@ RB	= $3000
 
 CA	= 1				; the colour page 0 is cleared to
 CB	= 2				; ...and page 1
+CC	= 3				; ...and page 2
 
 ; Expect OK where the frame clock exists and UNSUPPORTED where it does not.
 ; A = the ERRCODE that came back.
@@ -95,7 +103,7 @@ noClock
 	#showw INFO+14, "FRAMECLOCK"
 
 ; ----------------------------------------------------------------------
-; The pages are two distinct buffers.
+; The pages are three distinct buffers.
 ;
 ; Cleared to different colours, then read back through the draw page
 ; selector: if SET_DRAW_PAGE did nothing, both reads return the same byte
@@ -125,6 +133,18 @@ noClock
 	#wantOk
 	#check "CLEAR PAGE 1"
 
+	#argb 0, 2
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#argb 0, CC
+	lda #OP_CLEAR
+	jsr cmd0
+	#wantOk
+	#check "CLEAR PAGE 2"
+
+	#argb 0, 1
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
 	jsr readOne
 	#clracc
 	#expectb RB+0, CB
@@ -151,13 +171,15 @@ noClock
 	#check "PAGES KEPT"
 
 ; ----------------------------------------------------------------------
-; The immediate flip. It swaps draw and visible, so the page a program
-; draws into after a flip is the one that was on screen before it -- which
-; is what makes SET_DRAW_PAGE a once-at-startup call rather than a per
-; frame one.
+; The immediate flip. It rotates the three pages, so the page a program
+; draws into after a flip is never one the display could still be scanning
+; out -- which is what makes SET_DRAW_PAGE a once-at-startup call rather
+; than a per frame one.
 ; ----------------------------------------------------------------------
 
-	; Draw page 1, visible page 0. After the flip: draw 0, visible 1.
+	; Draw page 1, visible page 0. After the flip: visible 1, and the
+	; draw page is 2 -- page 0 is skipped because the display may still
+	; be showing it.
 	#argb 0, 0
 	lda #OP_PAGE_FLIP
 	jsr cmd0
@@ -166,20 +188,29 @@ noClock
 
 	jsr readOne
 	#clracc
-	#expectb RB+0, CA			; page 0 is now the draw page
+	#expectb RB+0, CC			; page 2 is now the draw page
 	#useacc
-	#check "FLIP SWAPPED"
+	#check "FLIP ROTATED"
 
 	#argb 0, 0
 	lda #OP_PAGE_FLIP
 	jsr cmd0
 	jsr readOne
 	#clracc
-	#expectb RB+0, CB			; ...and back again
+	#expectb RB+0, CA			; 2 visible, 1 just was: page 0
 	#useacc
 	#check "FLIP TWICE"
 
-	; RESET_STATE puts both pages back to 0 without touching what is in
+	#argb 0, 0
+	lda #OP_PAGE_FLIP
+	jsr cmd0
+	jsr readOne
+	#clracc
+	#expectb RB+0, CB			; and round to the start again
+	#useacc
+	#check "FLIP THRICE"
+
+	; RESET_STATE puts the pages back to 0 without touching what is in
 	; them, so the draw page must now read page 0's colour.
 	lda #OP_RESET_STATE
 	jsr cmd0

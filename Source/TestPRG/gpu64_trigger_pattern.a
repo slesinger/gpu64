@@ -13,7 +13,7 @@
 ;      gpu64 uses the unused remainder of REU's IO2 window, $DF0B-$DFFF, so
 ;      it coexists with REU emulation (RAD's own, or a real 1750-compatible
 ;      REU / the Ultimate's) which only ever decodes $DF00-$DF0A -- see
-;      docs/project_description.md's "IO address space allocation" section.
+;      project/project_description.md's "IO address space allocation" section.
 ;      No data payload yet, just a single STA to arm the trigger register.
 ;
 ;      Assemble with 64tass (matches Source/Firmware/C64Side's convention) --

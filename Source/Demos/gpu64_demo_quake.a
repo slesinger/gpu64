@@ -142,6 +142,7 @@ KB_E	= $40
 KC_D	= $04
 KD_Q	= $40
 KD_SPC	= $10
+KD_STOP	= $80
 
 ; Milestone 12: the two dynamic lights. Slot 1 is the torch on the far
 ; wall, slot 0 the muzzle flash at the player's own eye. A light reaches
@@ -151,14 +152,15 @@ TORCH_X	= 8 * 256
 TORCH_Y	= 0
 TORCH_Z	= Z_RAMP
 TORCH_R	= $0500			; 5.0 world units of reach
-FLASH_R	= $0300			; 3.0
-FLASH_N	= 6			; frames a shot stays lit
+FLASH_R	= $0600			; 6.0 -- the flash has to reach the far
+				; wall of a room this size, not just the
+				; floor at his feet
+FLASH_N	= 10			; frames a shot stays lit
 
 ; Zero page. $f7-$fe is the RS232 area every gpu64 program uses.
 posX	= $f7			; the player, 8.8 world units
 posY	= $f9			; -- kept next to posX so one routine adds
 eyeZ	= $fb			;    a signed step to either of them
-sumPtr	= $fd			; only used at start-up
 
 	#basicStub
 
@@ -264,10 +266,22 @@ mtUpload
 	; so both are uploaded once and never sent again.
 	#r2verts vertTab, NVERT
 	#cmd2 R2_UPLOAD_VERTS
+	lda ERRCODE
+	sta upV
 	#r2texinfo texinfoTab, NTI
 	#cmd2 R2_UPLOAD_TEXINFO
+	lda ERRCODE
+	sta upT
 
-	jsr sumFaces
+	; And the faces themselves. This is milestone 13: the level goes to
+	; gpu64 once, here, and a frame afterwards names a range of it. The
+	; batch this replaced was 256 bytes down the bulk transfer path
+	; sixty times a second, which is the one thing that does not scale
+	; to a real level.
+	#r2world faces, NFACES
+	#cmd2 R2_UPLOAD_POLYS
+	lda ERRCODE
+	sta upP
 
 	lda #<START_X
 	sta posX
@@ -316,17 +330,18 @@ frame
 	#argb 0, SKY_COL
 	#cmd2 R2_FILL_VIEW
 
-	; 3. The level, in the order it was written down. 256 bytes, the same
-	;    ones as last frame, checksummed once at start-up and verified by
-	;    gpu64 on every arrival.
-	#r2batchp faces, NFACES, R2_BATCH_SUM
-	#cmd2 R2_DRAW_POLYS
+	; 3. The level, in the order it was written down -- and no longer
+	;    sent: it is resident, and this is ten register writes naming
+	;    all of it. Several ranges here is how a real level would do
+	;    crude visibility, one command per room.
+	#r2drawworld 0, NFACES
+	#cmd2 R2_DRAW_WORLD
 	lda ERRCODE
 	beq +
-	sta lastErr
-	inc errCnt
+	sta lastW
+	inc wErr
 	bne +
-	inc errCnt+1
+	inc wErr+1
 +
 
 	; 3b. The monsters. Screen-upright billboards in the world, in the
@@ -342,10 +357,10 @@ frame
 	#cmd2 R2_DRAW_THINGS
 	lda ERRCODE
 	beq +
-	sta lastErr
-	inc errCnt
+	sta lastT
+	inc tErr
 	bne +
-	inc errCnt+1
+	inc tErr+1
 +
 
 	#argblob 0, SPACE_C64, statBuf, 16
@@ -385,13 +400,61 @@ frame
 	jsr report
 	jsr movePlayer
 
+	; RUN/STOP off our own matrix scan, not the KERNAL's $91 flag, and
+	; only believed on two consecutive frames. $91 is maintained by the
+	; IRQ's SCNKEY, which this program's own sei-guarded column scan
+	; fights with -- that is the suspect for the idle exit to READY.
+	lda keyD
+	and #KD_STOP
+	bne frUp
+	inc stopCt
+	lda stopCt
+	cmp #2
+	bcs frDone
+	jmp frNext
+frUp
+	lda #0
+	sta stopCt
+
+	; Instrument the old path: count frames where the KERNAL claims STOP
+	; is down while our scan says it is up. If G climbs while the demo
+	; stays alive, $91 was the culprit and this is the proof.
+frNext
 	jsr dmStop
-	beq frDone
-	jmp frame
+	bne +
+	lda keyD
+	and #KD_STOP
+	beq +
+	inc ghostCt
++	jmp frame
 frDone
 	lda #0
 	sta CMD_HI
-	jsr dmHold
+	; Say so on the C64 screen before holding. An exit nobody asked for
+	; now parks here in plain sight instead of dropping to READY., so a
+	; spurious STOP and a crash no longer look the same.
+	lda #24
+	jsr dmRow
+	jsr dmText
+	.text "STOPPED  G "
+	.byte 0
+	lda ghostCt
+	jsr dmHexA
+	jsr dmText
+	.text "  RUN/STOP AGAIN TO EXIT   "
+	.byte 0
+
+	; Hold the C64 screen until RUN/STOP is released and pressed again,
+	; so returning to BASIC does not print READY. over the last line.
+-	jsr readKeys
+	lda keyD
+	and #KD_STOP
+	beq -
+-	jsr readKeys
+	lda keyD
+	and #KD_STOP
+	bne -
+	jsr $e544			; KERNAL clear screen
 	rts
 
 ; ======================================================================
@@ -607,9 +670,10 @@ slSend
 	lda eyeZ+1
 	sta ARG+6
 	#argw 7, FLASH_R
-	lda flashCt			; 6..1 -> strength 12..2, 0 -> off
-	asl a
-	sta ARG+9
+	lda flashCt			; 10..1 -> strength 40..4, 0 -> off.
+	asl a				; Forty is far past the sixteen levels
+	asl a				; the map has, and lightAdjust clamps:
+	sta ARG+9			; near the muzzle the wall goes white.
 	#cmd2 R2_SET_LIGHT
 	lda flashCt
 	beq slDone
@@ -882,8 +946,30 @@ report
 	lda #21
 	jsr dmRow
 	jsr dmText
-	.text "WASD QE MOVE F1/F3 LOOK SPC FIRE"
+	.text "WASD QE F1/F3 SPC"
 	.byte 0
+
+	; F is the frames the muzzle flash has left and D is column 7 of
+	; the keyboard matrix raw, SPACE being bit 4 and active low. The
+	; two of them say which half of a fire that does not show is at
+	; fault: D stuck at FF is the matrix read, D dropping to EF while
+	; F stays 00 is this program, F counting down while nothing on
+	; the HDMI screen changes is the light itself.
+	jsr dmText
+	.text " F "
+	.byte 0
+	lda flashCt
+	jsr dmHexA
+	jsr dmText
+	.text " D "
+	.byte 0
+	lda keyD
+	jsr dmHexA
+	jsr dmText
+	.text " G "
+	.byte 0
+	lda ghostCt
+	jsr dmHexA
 
 	lda #22
 	jsr dmRow
@@ -945,71 +1031,45 @@ report
 	lda plPitch
 	jsr dmHexA
 
+	; Which command is failing, not just that one is. W counts frames
+	; DRAW_WORLD refused and T frames DRAW_THINGS refused, each with the
+	; code it last gave; U is the three start-up uploads -- verts, texinfo
+	; and the resident face pool. A non-zero U with W climbing means the
+	; level never got there and every frame since has been asking for a
+	; range that is not resident.
 	lda #24
 	jsr dmRow
 	jsr dmText
-	.text "RUN/STOP=END  ERRS "
+	.text "W "
 	.byte 0
-	lda errCnt+1
+	lda wErr+1
 	jsr dmHexA
-	lda errCnt
+	lda wErr
+	jsr dmHexA
+	lda lastW
 	jsr dmHexA
 	jsr dmText
-	.text " LAST "
+	.text " T "
 	.byte 0
-	lda lastErr
+	lda tErr+1
+	jsr dmHexA
+	lda tErr
+	jsr dmHexA
+	lda lastT
 	jsr dmHexA
 	jsr dmText
-	.text "  ER "
+	.text " U "
+	.byte 0
+	lda upV
+	jsr dmHexA
+	lda upT
+	jsr dmHexA
+	lda upP
+	jsr dmHexA
+	jsr dmText
+	.text " ER "
 	.byte 0
 	jsr dmErr
-	rts
-
-; ======================================================================
-; The face batch's checksum, computed once because the level never
-; changes. Rule 3 in CLAUDE.md for free.
-; ======================================================================
-sumFaces
-	lda #<faces
-	sta sumPtr
-	lda #>faces
-	sta sumPtr+1
-	lda #0
-	sta tmp
-	sta tmp+1
-	ldy #0
-	ldx #>(NFACES*R2_POLY)		; whole pages first
-	beq sfTail
-sfPage
-	clc
-	lda tmp
-	adc (sumPtr),y
-	sta tmp
-	bcc +
-	inc tmp+1
-+
-	iny
-	bne sfPage
-	inc sumPtr+1
-	dex
-	bne sfPage
-sfTail
-	cpy #<(NFACES*R2_POLY)
-	beq sfDone
-	clc
-	lda tmp
-	adc (sumPtr),y
-	sta tmp
-	bcc +
-	inc tmp+1
-+
-	iny
-	bne sfTail
-sfDone
-	lda tmp
-	sta faces+NFACES*R2_POLY
-	lda tmp+1
-	sta faces+NFACES*R2_POLY+1
 	rts
 
 ; ======================================================================
@@ -1027,6 +1087,8 @@ keyA	.byte $ff		; the four matrix columns, active low
 keyB	.byte $ff
 keyC	.byte $ff
 keyD	.byte $ff
+stopCt	.byte 0		; frames RUN/STOP has been down on our own scan
+ghostCt	.byte 0		; frames the KERNAL claimed STOP and we did not
 
 ; A whole circle of sines, 256 units round, +-127. The 3D camera measures
 ; its angles the same way, so the number in plYaw indexes this table
@@ -1037,8 +1099,13 @@ sinTab
 	.next
 
 tmp	.word 0
-errCnt	.word 0
-lastErr	.byte 0
+wErr	.word 0			; frames DRAW_WORLD refused
+lastW	.byte 0
+tErr	.word 0			; frames DRAW_THINGS refused
+lastT	.byte 0
+upV	.byte 0			; ERRCODE from each of the three start-up
+upT	.byte 0			; uploads, kept rather than counted: they
+upP	.byte 0			; happen once and once is all that matters
 statBuf	.fill 16, 0
 
 ; ======================================================================

@@ -92,6 +92,7 @@ OP_GET_INFO	= $06
 OP_LOG_ENABLE	= $07
 OP_SET_BORDER	= $08
 OP_VBLANK_SYNC	= $09
+OP_GET_HEALTH	= $0a
 OP_CLEAR	= $10
 OP_SET_PIXEL	= $20
 OP_LINE		= $21
@@ -135,6 +136,7 @@ R2_UPLOAD_TEX	= $10
 R2_FREE_TEX	= $11
 R2_UPLOAD_VERTS	= $12
 R2_UPLOAD_TEXINFO = $13
+R2_UPLOAD_POLYS = $14
 R2_DRAW_COLUMNS	= $20
 R2_DRAW_SPANS	= $21
 R2_DRAW_SPRITE	= $22
@@ -142,6 +144,7 @@ R2_DRAW_WALLS	= $23
 R2_DRAW_SECTORS	= $24
 R2_DRAW_THINGS	= $25
 R2_DRAW_POLYS	= $26
+R2_DRAW_WORLD	= $27
 
 ; Record stride, both batch kinds -- a power of two so indexing record n is
 ; a shift and not a multiply.
@@ -193,6 +196,10 @@ R2_POLY_MASKED	 = $01
 R2_POLY_FLATLIT	 = $02
 R2_POLY_TWOSIDED = $04		; no backface cull: drawn from either side
 
+; Milestone 13. The resident world: faces uploaded once and drawn by range,
+; so a frame costs no bulk transfer at all. This is how many slots it has.
+R2_WORLD_MAX	 = 2048
+
 ; texid 0 in a record is not an error: it means "solid colour", the palette
 ; index being the low byte of the record's u field.
 R2_SOLID	= 0
@@ -221,7 +228,7 @@ F_NOERR		= $fe
 ; --- framebuffer geometry, as the API reference states it --------------
 FB_W		= 320
 FB_H		= 200
-FB_PAGES	= 2
+FB_PAGES	= 3
 BORDER_W	= 32
 BORDER_H	= 36
 
@@ -458,6 +465,23 @@ r2batchp .macro	addr, count, flags=0, key=0
 	#argblob 0, SPACE_C64, \addr, (\count)*R2_POLY+((\flags)&1)*2
 	#argw 6, \count
 	#argb 8, \flags
+	#argb 9, \key
+	.endm
+
+; UPLOAD_POLYS: fill part of the resident world with poly records. `first` is
+; the destination index, so a level bigger than the staging buffer arrives as
+; several commands. count = 0 with first = 0 drops the pool.
+r2world	.macro	addr, count, first=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_POLY
+	#argw 6, \count
+	#argw 8, \first
+	.endm
+
+; DRAW_WORLD: draw a range of the resident world through SET_CAMERA3D. No
+; blob at all -- this is the whole point of the resident pool.
+r2drawworld .macro first, count, key=0
+	#argw 0, \first
+	#argw 2, \count
 	#argb 9, \key
 	.endm
 

@@ -473,7 +473,7 @@ u8 gpu64_3dDispatch( u8 op )
 	// gpu64: put back what this dispatch just evicted, while the bus is still
 	// held. A DRAW_MESH walks a framebuffer, a z-buffer and the arena, which
 	// is far more than the class 0 CLEAR that was already enough to evict
-	// warmCache()'s work -- rule 4 in docs/progress_tracker.md's polling-loop
+	// warmCache()'s work -- rule 4 in project/progress_tracker.md's polling-loop
 	// timing rules, "preloaded at start-up is not durable". Doing it here
 	// rather than in the loop is rule 5, and it is what makes the cost free:
 	// it lands inside the window the C64 is already stopped for.

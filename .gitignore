@@ -13,3 +13,6 @@ tools/rastercheck/rastercheck
 tools/rastercheck/out/
 tools/rastercheck/.scenario.bin
 __pycache__/
+
+# reference copy of shareware Quake, not part of the project
+/quake/

@@ -169,6 +169,35 @@ start
 	jsr buildCols
 	#check "BUILD BATCHES"
 
+	; Every page black before the first flip. The probe only ever paints
+	; the 320x160 view, so rows 160-199 keep whatever the page held when
+	; the program started -- and with three pages in rotation that stale
+	; band is a different picture on each one, which reads on the display
+	; as a bar along the bottom flashing at twenty hertz. It is an artifact
+	; of this probe, not of the frame loop, and a probe whose own output
+	; looks like a defect is a bad instrument.
+	; ix is scratch here: both batches are built and runPhase recomputes
+	; it. ix = pages left, ix+1 = every result code ORed together, so one
+	; #check judges all six commands.
+	lda #3
+	sta ix
+	lda #0
+	sta ix+1
+prClr
+	#argb 0, 0
+	lda #OP_CLEAR
+	jsr cmd0
+	ora ix+1
+	sta ix+1
+	lda #OP_PAGE_FLIP
+	jsr cmd0
+	ora ix+1
+	sta ix+1
+	dec ix
+	bne prClr
+	ldx ix+1
+	#check "CLEAR ALL PAGES"
+
 ; ----------------------------------------------------------------------
 ; The three phases.
 ; ----------------------------------------------------------------------

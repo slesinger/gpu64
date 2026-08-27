@@ -7,7 +7,7 @@
  by tools/hostsim -- which is the point. Every pixel-level bug in the
  pipeline is findable on a PC.
 
- Formats and semantics: docs/milestone6_3d_design.md. Not restated here.
+ Formats and semantics: project/milestone6_3d_design.md. Not restated here.
 */
 #ifndef _gpu64_3d_render_h
 #define _gpu64_3d_render_h

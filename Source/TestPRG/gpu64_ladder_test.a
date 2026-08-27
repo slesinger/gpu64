@@ -86,13 +86,13 @@
 ;      The FLIP lines will read n=0 in this build: nothing flips a page any
 ;      more. That is expected, and 4b/4d already have those numbers.
 ;
-;      See docs/progress_tracker.md milestone 6a for how to read the table.
+;      See project/progress_tracker.md milestone 6a for how to read the table.
 ;
 ;      REU emulation must be selected in RAD's menu (T key -> REU), same as
 ;      every other gpu64 test PRG.
 ;
 ;      Assemble with 64tass (no --nostart: the .prg needs its 2-byte load
-;      address header, see docs/progress_tracker.md milestone 2) --
+;      address header, see project/progress_tracker.md milestone 2) --
 ;      64tass gpu64_ladder_test.a -o gpu64_ladder_test.prg
 ;
 ;      Copyright (c) 2026 Honza Slesinger

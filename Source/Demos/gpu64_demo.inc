@@ -68,6 +68,7 @@ OP_GET_INFO	= $06
 OP_LOG_ENABLE	= $07
 OP_SET_BORDER	= $08
 OP_VBLANK_SYNC	= $09
+OP_GET_HEALTH	= $0a
 OP_CLEAR	= $10
 OP_SET_PIXEL	= $20
 OP_LINE		= $21
@@ -112,6 +113,7 @@ R2_UPLOAD_TEX	= $10
 R2_FREE_TEX	= $11
 R2_UPLOAD_VERTS	= $12
 R2_UPLOAD_TEXINFO = $13
+R2_UPLOAD_POLYS	= $14
 R2_DRAW_COLUMNS	= $20
 R2_DRAW_SPANS	= $21
 R2_DRAW_SPRITE	= $22
@@ -119,6 +121,7 @@ R2_DRAW_WALLS	= $23
 R2_DRAW_SECTORS	= $24
 R2_DRAW_THINGS	= $25
 R2_DRAW_POLYS	= $26
+R2_DRAW_WORLD	= $27
 
 ; Record stride, both batch kinds -- a power of two so indexing record n is
 ; a shift and not a multiply.
@@ -545,6 +548,22 @@ r2verts	.macro	addr, count
 r2texinfo .macro addr, count
 	#argblob 0, SPACE_C64, \addr, (\count)*R2_TEXINFO
 	#argw 6, \count
+	.endm
+
+; UPLOAD_POLYS / DRAW_WORLD: the resident world. The faces go up once at
+; start-up and a frame names a range of them, so a level costs no per-frame
+; transfer at all. `first` is the destination slot, so a level bigger than
+; the staging buffer arrives in chunks; count = 0 at first = 0 drops it.
+r2world	.macro	addr, count, first=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_POLY
+	#argw 6, \count
+	#argw 8, \first
+	.endm
+
+r2drawworld .macro first, count, key=0
+	#argw 0, \first
+	#argw 2, \count
+	#argb 9, \key
 	.endm
 
 r2batchp .macro	addr, count, flags=0, key=0

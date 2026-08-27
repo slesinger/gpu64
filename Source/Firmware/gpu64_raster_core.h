@@ -10,7 +10,7 @@
  is findable on a PC.
 
  Wire formats and semantics: docs/api_design.md (class 2). Rationale:
- docs/milestone8_raster_design.md. Neither is restated here.
+ project/milestone8_raster_design.md. Neither is restated here.
 */
 #ifndef _gpu64_raster_core_h
 #define _gpu64_raster_core_h
@@ -33,13 +33,16 @@
 
 // DRAW_POLYS' face record, and the two tables it indexes. Milestone 9: a
 // convex polygon in world space, which is the primitive a wall record and a
-// sector both are special cases of -- see docs/milestone9_poly_design.md.
+// sector both are special cases of -- see project/milestone9_poly_design.md.
 #define GPU64_RASTER_POLY_BYTES		16
 #define GPU64_RASTER_VERT_BYTES		8
 #define GPU64_RASTER_TEXINFO_BYTES	16
 
 #define GPU64_RASTER_MAX_VERTS		4096
 #define GPU64_RASTER_MAX_TEXINFO	255
+// The resident world: poly records that live in gpu64 across frames, so a
+// Quake frame costs ten register writes instead of kilobytes of DMA.
+#define GPU64_RASTER_MAX_WORLD_POLYS	2048
 
 // Vertices in one face. Quake's own limit before it subdivides; the near
 // clip can add one, hence the working buffer being larger.

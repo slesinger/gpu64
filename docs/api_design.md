@@ -32,8 +32,13 @@ Class 1 (3D) is specified in
 Draw ops write to the **draw page**; the **visible page** is what the HDMI
 output shows. Both are page 0 at reset, so a program that ignores paging
 draws straight to the visible screen. `SET_DRAW_PAGE` and `PAGE_FLIP` give
-you tear-free double buffering: draw the whole frame into the back page,
-then flip.
+you tear-free buffering: draw the whole frame into the back page, then flip.
+
+There are **three** pages, not two. A deferred `PAGE_FLIP` hands the new
+offset to the display hardware and returns without waiting for it, so the
+page that was visible can stay on screen for up to one more display frame.
+The third page is what the flip gives you to draw into meanwhile; you never
+have to think about which one it is, because `PAGE_FLIP` picks it.
 
 ### Border
 
@@ -44,7 +49,7 @@ black at reset.
 
 The border is a property of the display, not of a page, so `PAGE_FLIP` never
 changes it — set it once and it stays. That also means `SET_BORDER` is
-comparatively expensive: it repaints the frame on both pages. Set it when it
+comparatively expensive: it repaints the frame on every page. Set it when it
 changes, not once per frame.
 
 Coordinates are **signed 16-bit**. Drawing ops **clip** to the 320x200
@@ -168,12 +173,13 @@ Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
 | $01 | `RESET_STATE` | 0 | — | `ERRCODE = OK`, vblank IRQ disarmed, vblank-pending cleared, draw page = visible page = 0. Leaves framebuffer contents and palette alone. |
 | $02 | `VBLANK_ARM` | 1 | `ARG0`: 0 = disarm, 1 = arm | Arms the auto-rearming vblank IRQ. Reflected in `STATUS` bit3. Arming also re-syncs the frame clock, so it costs up to one frame of halt — see [vblank](#vblank). |
 | $03 | `VBLANK_ACK` | 0 | — | Clears `STATUS` bit2 (vblank-pending). Poll-loop programs write this after seeing the bit; IRQ handlers write it on entry. |
-| $04 | `SET_DRAW_PAGE` | 1 | `ARG0`: 0 or 1 | Selects the page subsequent draw ops write to. |
+| $04 | `SET_DRAW_PAGE` | 1 | `ARG0`: 0, 1 or 2 | Selects the page subsequent draw ops write to. |
 | $05 | `PAGE_FLIP` | 1 | `ARG0`: 0 = now, 1 = at next vblank | Makes the draw page visible and the old visible page the draw page. With `ARG0 = 1` the swap happens at the next vblank and `STATUS` bit0 (busy) stays set until it lands; asking for a second deferred flip while one is still pending returns `BUSY` and changes nothing. |
 | $06 | `GET_INFO` | 6 | `ARG0-5` destination descriptor | Writes the 16-byte info block (see below) to your memory. `len` must be ≥ 16. |
 | $07 | `LOG_ENABLE` | 1 | `ARG0`: 0 = off, 1 = on | Shows or hides gpu64's on-screen log overlay. On at reset, but **the first successful command of a session hides it automatically** so firmware text does not land on your output; `LOG_ENABLE` itself is exempt, so call it whenever you actually want the log. Turning it on also prints two `FLIP` lines giving what this session's page flips cost, in microseconds. |
 | $08 | `SET_BORDER` | 1 | `ARG0`: palette index | Paints the border around the drawing surface. Black at reset. See [Border](#border). |
 | $09 | `VBLANK_SYNC` | 0 | — | Re-syncs the frame clock against a real vertical sync. Costs up to one frame of halt; occasional housekeeping for a long-running program, not a per-frame call. See [vblank](#vblank). |
+| $0A | `GET_HEALTH` | 6 | `ARG0-5` destination descriptor | Writes the 12-byte health block (see below) to your memory: the Pi's own power and temperature state. `len` must be ≥ 12. Costs a mailbox round trip to the VideoCore — about a millisecond of halt — so poll it once a second at most, never per frame. |
 
 ### Whole surface — $10–$1F
 
@@ -185,6 +191,7 @@ Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
+| $14 | `UPLOAD_POLYS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8-9` first | Loads `count` 16-byte polygon records — the same records `DRAW_POLYS` takes — into the **resident world** starting at slot `first`, so a level bigger than one transfer arrives as several commands. Max 2048 slots; `len` must equal `count * 16`, and `first + count` past 2048 is `BAD_ARGS`. `count = 0` with `first = 0` drops the pool; `count = 0` with any other `first` does nothing. Slots may be rewritten in place. The pool is dropped by `RASTER_RESET` and survives everything else, including `UPLOAD_TEX`. |
 | $20 | `SET_PIXEL` | 5 | `ARG0-1` x, `ARG2-3` y, `ARG4` colour | One pixel. |
 | $21 | `LINE` | 9 | `ARG0-1` x0, `ARG2-3` y0, `ARG4-5` x1, `ARG6-7` y1, `ARG8` colour | Line, both endpoints inclusive. |
 | $22 | `RECT` | 9 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` w, `ARG6-7` h, `ARG8` colour | 1-pixel outline; `x,y` is the top-left corner, `w`/`h` include the outline. |
@@ -217,11 +224,52 @@ Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
 | 5 | 2 | framebuffer width (320) |
 | 7 | 2 | framebuffer height (200) |
 | 9 | 1 | bits per pixel (8) |
-| 10 | 1 | number of pages (2) |
+| 10 | 1 | number of pages (3) |
 | 11 | 1 | bitmap of implemented classes: bit0 = class 0, bit1 = class 1 (3D), bit2 = class 2 (raster) |
 | 12 | 1 | border width, each side (32) |
 | 13 | 1 | border height, each side (36) |
 | 14 | 2 | measured frame period, microseconds — **0 means the frame clock never calibrated**, and every vblank feature will answer `UNSUPPORTED` |
+
+### Health block
+
+`GET_HEALTH` writes 12 bytes. The Pi is powered separately from the C64, and
+a supply that sags under load takes gpu64 down in ways that look like
+anything but a power fault. This is the Pi saying so itself.
+
+| Offset | Size | Contents |
+|---|---|---|
+| 0 | 4 | last raw throttle word read from the VideoCore |
+| 4 | 4 | every throttle word ever read, OR-ed together |
+| 8 | 2 | core temperature, tenths of a degree Celsius |
+| 10 | 2 | highest core temperature seen this session |
+
+Bits in both throttle words, low byte first:
+
+| Bit | Meaning |
+|---|---|
+| 0 | under-voltage **now** |
+| 1 | ARM frequency capped now |
+| 2 | throttled now |
+| 3 | soft temperature limit active now |
+| 16 | under-voltage **has occurred** since boot |
+| 17 | ARM frequency has been capped since boot |
+| 18 | has been throttled since boot |
+| 19 | soft temperature limit has been active since boot |
+
+Bits 16-19 are sticky in the hardware, so a once-a-second poll cannot miss
+an event however brief — which is the point: a brownout long enough to
+corrupt a transfer is far shorter than a frame.
+
+**Bit 16 set is a verdict, not a hint.** It means the supply is not
+delivering 5V under load — a power supply or cable problem, not a gpu64
+defect — and every other symptom should be read in that light until it is
+fixed.
+
+gpu64 also acts on it without being asked: the first time a `GET_HEALTH`
+sees under-voltage, the firmware paints the border **red** and leaves it
+red. That indicator is written to all three pages, so it survives a page
+flip — and it survives the C64 hanging, which is exactly the case where no
+program is left running to report anything.
 
 ## Matrix and vector ops — $80–$9F
 
@@ -329,6 +377,7 @@ once at upload rather than per pixel.
 | $24 | `DRAW_SECTORS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` **32-byte** sector-wall records — see below. `BAD_ARGS` if `SET_SECTORS` has not been sent. |
 | $25 | `DRAW_THINGS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte thing records — billboards in world space, depth-tested against the buffer `DRAW_SECTORS` or `DRAW_POLYS` filled. `ARG8` bit 1 (`BATCH_CAM3D`) projects the batch through `SET_CAMERA3D` instead of `SET_CAMERA`; with that bit set it is `BAD_ARGS` if `SET_CAMERA3D` has not been sent. See below. |
 | $26 | `DRAW_POLYS` | 10 | `ARG0-5` blob descriptor, `ARG6-7` count, `ARG8` flags, `ARG9` key | Draws `count` 16-byte polygon records — arbitrary convex polygons in world space, through `SET_CAMERA3D`, depth-tested per pixel. See below. `BAD_ARGS` if `SET_CAMERA3D` or `UPLOAD_VERTS` has not been sent. |
+| $27 | `DRAW_WORLD` | 4 | `ARG0-1` first, `ARG2-3` count, `ARG9` key | Draws polygons `first .. first+count-1` of the resident world uploaded by `UPLOAD_POLYS`. Pixel for pixel this is `DRAW_POLYS` over the same records — same clipping, texturing, lighting and depth test — but **no blob is transferred**: a frame is ten register writes however big the level is. `BAD_ARGS` if the range runs past what has been uploaded, or if `SET_CAMERA3D` or `UPLOAD_VERTS` has not been sent. `count = 0` is a no-op, not an error, so a room with nothing visible costs a command and nothing else. |
 | $22 | `DRAW_SPRITE` | 15 | `ARG0-1` x, `ARG2-3` y, `ARG4-5` w, `ARG6-7` h, `ARG8` light, `ARG9` key, `ARG10-11` clipY0, `ARG12-13` clipY1, `ARG14` flags; **`ID`** = texture id | Scales one texture into the screen rectangle `x,y,w,h`, clipped to the view **and** to the inclusive row range `clipY0..clipY1`. Flags: bit0 mask on `key`, bit1 flip horizontally. `w` or `h` of 0 draws nothing (and counts as one rejected primitive); an unknown id is `BAD_ID`. |
 
 `count = 0` is a no-op, not an error. Otherwise `len` must be exactly
@@ -788,6 +837,51 @@ asks for, and `rejected` is the counter that moves if a batch arrives
 damaged. Reading it back costs one dispatch and a 16-byte write, which is
 cheap enough to do every frame.
 
+### Level-scale visibility — forward-looking requirements
+
+Everything below is unimplemented and exists to record the gap between
+current capability (per-face and per-pixel rejection/depth-sorting) and
+what a level-scale engine needs (per-frame visibility determination):
+
+[REQUIREMENT NEEDS DETAIL DESIGN] All per-frame visibility determination —
+deciding which polygons/faces are worth drawing for the current camera —
+must run in gpu64 firmware on the RPi side, never on the 6502; the C64's
+per-frame job is limited to updating the camera and game state, not walking
+any spatial structure.
+
+[IMPLEMENTED] A persistent, whole-level polygon table — `UPLOAD_POLYS`
+($14) alongside `UPLOAD_VERTS`/`UPLOAD_TEXINFO`, drawn by range with
+`DRAW_WORLD` ($27). The level's faces are uploaded once and a frame names
+a range of them, so no face record crosses the bus after start-up. The
+range is still chosen by the C64, which is what the requirement below
+remains open about.
+
+[REQUIREMENT NEEDS DETAIL DESIGN] A precomputed, offline-baked visibility
+structure (portal graph and/or per-cell PVS bitset, built at asset-conversion
+time on the PC, the same place a BSP-to-gpu64 converter would run) needs an
+upload opcode of its own, so gpu64 has something cheap to walk instead of
+testing every face in the level against the frustum every frame.
+
+[REQUIREMENT NEEDS DETAIL DESIGN] gpu64 firmware needs to determine which
+cell/leaf the camera currently occupies from `SET_CAMERA3D`'s position each
+frame, so the C64 never has to track or send its own location within the
+level.
+
+[REQUIREMENT NEEDS DETAIL DESIGN] Full frustum culling (not just today's
+per-face backface and near-plane rejection) needs to run inside gpu64 against
+the persistent polygon table, scoped by the PVS/portal set for the camera's
+current cell.
+
+[REQUIREMENT NEEDS DETAIL DESIGN] A new batch-less draw opcode (no blob, no
+per-frame record array) is needed so a level-scale frame costs the C64 one
+fixed-size command — camera already set via `SET_CAMERA3D` — rather than a
+record array sized by how much of the level is visible.
+
+[REQUIREMENT NEEDS DETAIL DESIGN] A memory and frame-time budget for the
+persistent polygon table and visibility structure on the RPi side needs to be
+worked out against the 3A+'s actual headroom before any of the above is
+implemented.
+
 ### Class 2 error codes
 
 Class 2 adds three codes to the table below: `$08 OUT_OF_MEMORY` (the
@@ -836,9 +930,9 @@ reports a frame period of 0, `STATUS` bit2 never sets, and `VBLANK_ARM(1)`,
 The intended shape, and what
 [`gpu64_vblank_demo.a`](../Source/TestPRG/gpu64_vblank_demo.a) does:
 
-1. `SET_DRAW_PAGE` 1 once, at the start. Every `PAGE_FLIP` after that swaps
-   the pages for you, so the draw page is always the one that is not
-   visible.
+1. `SET_DRAW_PAGE` 1 once, at the start. Every `PAGE_FLIP` after that
+   rotates the pages for you, so the draw page is always one the display
+   hardware is provably not scanning out.
 2. Wait for `STATUS` bit2, then `VBLANK_ACK`.
 3. Draw the frame.
 4. `PAGE_FLIP` with `ARG0 = 1`.

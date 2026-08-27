@@ -2,7 +2,7 @@
  gpu64: the 320x200x8 framebuffer the command API draws into.
 
  This owns the HDMI display outright ("architecture A", see
- docs/milestone4_2d_api_design.md#display-architecture): one CBcmFrameBuffer
+ project/milestone4_2d_api_design.md#display-architecture): one CBcmFrameBuffer
  at 320x200, depth 8, virtual height 400, so the VideoCore gives us a real
  256-entry 24-bit palette, a real hardware page flip (SetVirtualOffset), and
  upscaling to whatever HDMI mode is attached -- none of which costs ARM time
@@ -25,7 +25,15 @@
 // any draw op, exactly like the C64's.
 #define GPU64_FB_WIDTH		320
 #define GPU64_FB_HEIGHT		200
-#define GPU64_FB_PAGES		2
+// Three, not two. A deferred flip only *posts* the new virtual offset (see
+// gpu64_flip.h); the VideoCore applies it at its own next vsync, so for up to
+// a whole display frame after CommitFlip() the previously visible page is
+// still being scanned out. With two pages that page is immediately handed
+// back as the draw page, and the next frame is painted on screen as it is
+// built -- which is exactly what made raycast show four background-only
+// frames in five. A third page gives CommitFlip() somewhere provably idle to
+// draw into.
+#define GPU64_FB_PAGES		3
 
 // gpu64: the border. The physical framebuffer is larger than the drawing
 // surface and the surface sits centred in it, so SET_BORDER can paint the

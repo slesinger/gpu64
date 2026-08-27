@@ -3,7 +3,7 @@
  full turn of the 16-bit binary angle used on the wire.
 
  GENERATED -- do not hand-edit. Regenerate with the snippet in
- docs/milestone6_3d_design.md if the resolution ever needs to change.
+ project/milestone6_3d_design.md if the resolution ever needs to change.
 
  A table rather than a call into a maths library: the firmware is
  freestanding, and 2 KB is small enough to stay L1-resident next to the 4 KB

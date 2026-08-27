@@ -16,7 +16,7 @@
 ;
 ;        1. The arena allocator is bump-only, so re-uploading to a LIVE ID
 ;           replaces the resource but does NOT reclaim the old bytes
-;           (docs/milestone6_3d_design.md, "Phase 1, as built"). This PRG
+;           (project/milestone6_3d_design.md, "Phase 1, as built"). This PRG
 ;           uploads the same 4 KB texture to the same ID over and over. If
 ;           the bytes were reclaimed the loop would never end.
 ;

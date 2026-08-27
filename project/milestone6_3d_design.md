@@ -590,65 +590,11 @@ per Architecture above), `BAD_ID` (no such resource or node), `NO_CAMERA`
 
 ### Class 1 opcode table (draft)
 
-`CMD_HI = 1`. `ARG` offsets are relative to `ARG0` ($DF11), exactly as in
-class 0, and every opcode reads exactly the byte count in its row.
-
-#### System and loop — $00-$0F
-
-| Op | Name | Bytes | Arguments | Effect |
-|---|---|---|---|---|
-| $00 | `SCENE_RESET` | 0 | — | Destroys every node, stops the loop, leaves uploaded resources alone. |
-| $01 | `SET_VIEWPORT` | 8 | x, y, w, h (16-bit each) | Places the 3D viewport in the page. `w*h*3 > GPU64_3D_BUDGET` is `OUT_OF_RANGE`; a viewport not wholly inside 320x200 is `BAD_ARGS`. |
-| $02 | `SET_PERSPECTIVE` | 6 | `ARG0-1` fov (binary angle), `ARG2-3` near, `ARG4-5` far (8.8) | Projection for the active camera. |
-| $03 | `SET_LIGHT` | 7 | `ARG0-5` direction x,y,z (8.8), `ARG6` ambient level 0-15 | The single directional light. Face shade = ambient + N.L, clamped to 0-15, indexing the colormap. |
-| $04 | `BUILD_COLORMAP` | 0 | — | Regenerates the 16-level colormap from the current palette. Needed after `PAL_LOAD`/`PAL_SET`; costs milliseconds, never call it per frame. |
-| $05 | `SET_BACKGROUND` | 1 | `ARG0` palette index | What the viewport is cleared to each frame. |
-| $06 | `LOOP_START` | 1 | `ARG0` 0 = handshake, 1 = free-running | Starts the render loop. `NO_CAMERA` if none is active. |
-| $07 | `LOOP_STOP` | 0 | — | Stops it after the current frame. |
-| $08 | `SCENE_COMMIT` | 0 | — | Publishes the shadow scene; in handshake mode also flips at vblank and releases the next frame. `RESULT` = the page the just-finished frame is in. |
-| $09 | `ARENA_STATUS` | 0 | — | `RESULT` = free resource RAM in 128 KB units. Added in phase 1; see below. |
-
-#### Resources — $10-$1F
-
-| Op | Name | Bytes | Arguments | Effect |
-|---|---|---|---|---|
-| $10 | `UPLOAD_MESH` | 12 | `ARG0-5` vertex blob, `ARG6-11` face blob | Uploads into resource RAM under the staged `ID`. Re-upload to a live ID replaces it (see Resource lifecycle). |
-| $11 | `UPLOAD_TEXTURE` | 8 | `ARG0-5` blob, `ARG6` w shift, `ARG7` h shift | Dimensions are `1 << shift`, 3..8. `len` must equal `w*h`. |
-| $12 | `FREE_RESOURCE` | 0 | — | Frees the staged `ID`. |
-
-#### Scene nodes — $20-$2F
-
-| Op | Name | Bytes | Arguments | Effect |
-|---|---|---|---|---|
-| $20 | `CREATE_OBJECT` | 2 | `ARG0-1` mesh resource ID | Creates a node instancing that mesh, under the staged node `ID`. |
-| $21 | `CREATE_CAMERA` | 0 | — | Creates a camera node under the staged `ID`. |
-| $22 | `DESTROY_NODE` | 0 | — | Destroys the staged `ID`. |
-| $23 | `SET_ACTIVE_CAMERA` | 0 | — | The staged `ID` becomes the camera the loop renders from. |
-| $24 | `SET_VISIBLE` | 1 | `ARG0` 0 or 1 | Skips the node without destroying it. |
-
-#### Transforms — $30-$3F
-
-All act on the staged node `ID`, and all write into the shadow scene.
-
-| Op | Name | Bytes | Arguments | Effect |
-|---|---|---|---|---|
-| $30 | `SET_POSITION` | 12 | x, y, z (16.16) | Absolute, world space. |
-| $31 | `SET_ORIENTATION` | 6 | yaw, pitch, roll (binary angle) | Absolute. |
-| $32 | `MOVE_LOCAL` | 6 | dx, dy, dz (8.8) | Translate along the node's own axes. |
-| $33 | `MOVE_WORLD` | 6 | dx, dy, dz (8.8) | Translate along world axes. |
-| $34 | `ROTATE_LOCAL` | 6 | dyaw, dpitch, droll (binary angle) | Compose onto the current orientation. |
-| $35 | `SET_SCALE` | 2 | s (unsigned 8.8) | Uniform. |
-| $36 | `GET_TRANSFORM` | 6 | `ARG0-5` destination descriptor | Writes 18 bytes — position (12) + orientation (6) — back to C64 RAM or REU, for collision and gameplay logic. |
-
-#### Immediate mode — $40-$4F
-
-Legal only with the loop stopped; otherwise `BUSY`.
-
-| Op | Name | Bytes | Arguments | Effect |
-|---|---|---|---|---|
-| $40 | `CLEAR_VIEWPORT` | 0 | — | Fills the viewport with the background index and clears the z-buffer. |
-| $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Returns when done. |
-| $42 | `DRAW_NODE` | 0 | — | Same, for a scene node already positioned via $30-$35 — no re-staging of a transform. |
+The opcode table, wire formats, and as-built API deltas now live in
+[docs/class1-3d-mesh-reference.md](../docs/class1-3d-mesh-reference.md) —
+this section is kept only as the design-time draft's rationale (why the
+opcode ranges are split the way they are, above), not as the source of
+truth for what a byte means. Check the docs file for the current table.
 
 ## Phase 1, as built (2026-08-24)
 
@@ -777,48 +723,15 @@ Two more rules that bind core 1 the day it renders:
   core 1's line at all. Separating the cache lines was *not* what fixed
   milestone 6a round 10 — removing core 0's read was.
 
-### Conventions the wire format did not pin down
+### Conventions and limits the wire format did not pin down
 
-- **Axes are left-handed**: +x right, +y up, +z away from the camera.
-- **Winding is clockwise as seen from outside the model.** A face is
-  front-facing when its normal points back towards the camera; the normal
-  comes from `cross(v1-v0, v2-v0)`. Get this backwards and every face of a
-  closed mesh is culled, which looks exactly like an upload that never
-  arrived — which is why `DRAW_MESH` returns a triangle count.
-- **A positive pitch tips a node's own +z towards -y**, so a camera with a
-  positive pitch looks *down*.
-- **Face blob byte 11 is padding.** The eleven meaningful bytes are
-  `i0,i1,i2, u0,v0,u1,v1,u2,v2, texid, flags`; the stride the design fixed at
-  12 is a power of two so faces do not straddle cache lines.
-- **A texcoord byte is a texel coordinate directly**, wrapped by the
-  rasteriser's mask — so 0..255 addresses a 256-wide texture exactly and tiles
-  a narrower one.
-- **Colormap level 15 is full brightness** and resolves to the identity; level
-  0 is 1/15 of the way up, not black, so a face turned fully away still reads
-  as its own colour rather than as a hole.
-- **The z-buffer holds `near/z`**, so a bigger value is nearer and an
-  untouched pixel (0) loses to every real fragment.
-
-### Limits the formats impose, discovered by using them
-
-- **`near` and `far` are 8.8, so the far plane cannot exceed 127.99 units.**
-  A scene lives at z=70, not z=700. Nothing in the design says otherwise; it
-  is simply not obvious until a demo is written. **This is a scale convention,
-  not a distance ceiling** — a scene is authored in units where the far plane
-  fits, exactly as a model is authored to fit the 8.8 vertex format's ±128.
-  Nothing about the pipeline stops a "kilometre" being one unit. What it does
-  mean is that the unit has to be chosen once, up front, for the whole scene.
-- **The z-buffer holds `near/z`, so depth precision is set entirely by
-  `near`.** A needlessly small near plane throws it away: half the buffer's
-  range is spent between `near` and `2 * near`, wherever that happens to be.
-  The instinct is to set near tiny so nothing ever clips; the cost is z
-  fighting everywhere else in the scene. Set it as far out as the closest
-  thing the camera will ever get to.
-- Rotation matrices are held internally in **1.15**, not 8.8. A matrix entry
-  quantised to 1/256 puts a rotating box's edge a whole pixel from where it
-  belongs at 320 px wide, and the error is systematic, so it reads as wobble.
-- `RESULT` after `DRAW_MESH` is the **triangle count**, saturated to a byte.
-  `UPLOAD_MESH` leaves the face count there.
+These are now written up as part of the public reference — see
+[docs/class1-3d-mesh-reference.md](../docs/class1-3d-mesh-reference.md)'s
+"Coordinate and rotation conventions" and "Depth buffer" sections for the
+axis/winding/pitch/texcoord/colormap conventions and the near-plane/z-buffer
+precision limits discovered by using the formats. Kept here only as a
+pointer, not duplicated, so there is one source of truth for what a byte
+means.
 
 ### The renderer is portable, and is tested on a PC
 

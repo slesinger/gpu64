@@ -166,7 +166,7 @@ void gpu64_flipWarm( void )
 	// mostly the cold instruction cache of the path itself -- which the
 	// ~900 us round trip used to render invisible. Warmed from the PAGE_FLIP
 	// dispatch alongside gpu64_vsyncCommitFlip(), for the same reason: the
-	// bus is already held there. See docs/progress_tracker.md's polling-loop
+	// bus is already held there. See project/progress_tracker.md's polling-loop
 	// rules.
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_flipPost, 1024 );
 	FORCE_READ_LINEARa( (void*)gpu64_flipPost, 1024, 1024 );

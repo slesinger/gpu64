@@ -53,7 +53,7 @@ void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border,
 // masked to 5 bits same as REU's own partial IO2 decode, really any of
 // $DF0B/$DF2B/$DF4B/$DF6B/$DF8B/$DFAB/$DFCB/$DFEB -- any program that scans
 // or fills across IO2, e.g. an REU-detection utility, can trip this
-// incidentally). Per docs/bus_access_design.md, screen-mirror mode and
+// incidentally). Per project/bus_access_design.md, screen-mirror mode and
 // framebuffer-API mode are mutually exclusive: once true, the periodic
 // mirror snapshot in reuUsingPolling()'s main loop stops firing.
 //
@@ -307,7 +307,7 @@ static u8 gpu64MirrorBorder = 0, gpu64MirrorBackground = 0;
 // bus takeover -- to read the default screen RAM ($0400-$07E7) and color RAM
 // ($D800-$DBE7), plus the current border/background color ($D020/$D021),
 // then hands them to CRAD::showMirror() (rad_main.cpp) for rendering.
-// Scoped per docs/bus_access_design.md: fixed default addresses only (no VIC
+// Scoped per project/bus_access_design.md: fixed default addresses only (no VIC
 // bank / $D018 detection yet -- a program that relocates its screen will
 // render wrong until that's added), standard text mode only, and gpu64's own
 // bundled character ROM copy (font_bin, see rad_main.cpp) rather than
@@ -330,6 +330,14 @@ void gpu64_mirrorSnapshot()
 	register u16 c_a;
 	register u8 x;
 
+	// gpu64: WAIT_FOR_CPU_HALFCYCLE first -- see the long note in
+	// gpu64_blobRead() below. This is called from the polling loop *after*
+	// its own top-of-loop WAIT_FOR_VIC_HALFCYCLE, so we are already inside a
+	// VIC half-cycle and a bare WAIT_FOR_VIC_HALFCYCLE falls straight
+	// through. RESTART_CYCLE_COUNTER would then anchor mid-half-cycle and
+	// TIMING_TRIGGER_DMA would already have elapsed, putting CLR_GPIO at an
+	// undefined phase.
+	WAIT_FOR_CPU_HALFCYCLE
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
@@ -376,7 +384,7 @@ void gpu64_mirrorSnapshot()
 // The commit is bracketed in a DMA hold, exactly like the command dispatch
 // and the mirror snapshot. SetVirtualOffset() is a mailbox round-trip to the
 // VideoCore whose cost nobody has measured (it was open question 1 in
-// docs/milestone4_2d_api_design.md), and this runs while the C64 is
+// project/milestone4_2d_api_design.md), and this runs while the C64 is
 // free-running through the loop -- so without the hold, a slow mailbox call
 // would silently eat the C64's next IO2 access, which is milestone 4's
 // bug #2 all over again. With the hold, the cost stops mattering for
@@ -396,6 +404,13 @@ void gpu64_vsyncCommitFlip( void )
 	register u32 g2;
 	(void)g2;
 
+	// gpu64: WAIT_FOR_CPU_HALFCYCLE first, same reason as
+	// gpu64_mirrorSnapshot() above -- the loop calls us while it is already
+	// in a VIC half-cycle, so WAIT_FOR_VIC_HALFCYCLE alone is not a sync and
+	// the bus would be taken at whatever phase the vsync test finished on.
+	// This one fires on every deferred page flip, i.e. once a frame for the
+	// whole run, which is exactly the shape of damage that accumulates.
+	WAIT_FOR_CPU_HALFCYCLE
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
@@ -416,7 +431,7 @@ void gpu64_vsyncCommitFlip( void )
 // commit path before the loop needs it. The dispatch that queues a flip is
 // the biggest instruction-cache consumer in the system and will have evicted
 // whatever warmCache() preloaded at REU start -- see the general rule in
-// docs/progress_tracker.md. Doing it here rather than at the point of use is
+// project/progress_tracker.md. Doing it here rather than at the point of use is
 // what keeps the loop's own exposure to a single short call.
 void gpu64_vsyncWarmCommit( void )
 {
@@ -602,7 +617,7 @@ static void *s_PollLoopBase = 0;
 
 // gpu64: re-warms everything the polling loop depends on and a command
 // dispatch has just evicted. Called at the end of a class 1 dispatch, with
-// the bus still held -- rule 5 in docs/progress_tracker.md's polling-loop
+// the bus still held -- rule 5 in project/progress_tracker.md's polling-loop
 // timing rules: warm from upstream, where the C64 is already stopped, never
 // at the point of use.
 //
@@ -798,7 +813,7 @@ reuEmulationMainLoop:
 				// same immediate-mode model milestone 2's test pattern and
 				// milestone 3's mirror already use on real hardware. The C64
 				// free-runs through this loop (see the "Operating modes"
-				// section of docs/project_description.md); a command that
+				// section of project/project_description.md); a command that
 				// moves a payload steals the bus for one bounded burst,
 				// proportional to a length the C64 itself chose.
 				if ( addr >= GPU64_REG_CMD_HI )
@@ -824,6 +839,14 @@ reuEmulationMainLoop:
 						// with nothing missed. Blob transfers inside the
 						// command no longer release the bus themselves --
 						// the release below is the only one.
+						// gpu64: WAIT_FOR_CPU_HALFCYCLE first, so this catches
+						// the *transition* -- see gpu64_blobRead(). We normally
+						// arrive here inside the CPU half-cycle (the loop just
+						// sampled the write), where this costs nothing, but the
+						// register decode above has no cycle budget and a slip
+						// past the falling edge would otherwise leave the bare
+						// WAIT_FOR_VIC_HALFCYCLE falling through.
+						WAIT_FOR_CPU_HALFCYCLE
 						WAIT_FOR_VIC_HALFCYCLE
 						RESTART_CYCLE_COUNTER
 						WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );

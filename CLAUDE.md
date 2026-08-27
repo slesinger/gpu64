@@ -6,7 +6,7 @@ it. `reuUsingPolling()` in `Source/Firmware/rad_reu.cpp` is the cycle-critical
 loop that samples the C64 bus on core 0; almost every hard-won rule below
 exists because something in or near that loop was violated.
 
-Read [docs/progress_tracker.md](docs/progress_tracker.md) for status and
+Read [project/progress_tracker.md](project/progress_tracker.md) for status and
 [docs/api_design.md](docs/api_design.md) for the API surface.
 
 ## The bus is not reliable — design for it
@@ -52,7 +52,15 @@ build or in code reading.
    this wrong and damage accumulates — the program survives its first commands
    and derails later.
 3. **`WAIT_FOR_VIC_HALFCYCLE` alone is not a sync.** Precede it with
-   `WAIT_FOR_CPU_HALFCYCLE`.
+   `WAIT_FOR_CPU_HALFCYCLE`. It falls straight through when the C64 is
+   *already* in the VIC half, and then the whole entry sequence degenerates:
+   `RESTART_CYCLE_COUNTER` anchors mid-half-cycle, `TIMING_TRIGGER_DMA` has
+   already elapsed, and the bus is taken at an undefined phase. So before
+   opening a hold, check which half-cycle the **call site** is in — the
+   polling loop calls into its helpers from inside the VIC half. This has now
+   been the bug twice: milestone 4 in the blob helpers, 2026-08-27 in
+   `gpu64_vsyncCommitFlip()`, which cost days of chasing a phantom power
+   fault.
 4. **"Preloaded at start-up" is not durable.** A single `CLEAR` evicts it.
    Cycle-critical code reachable from a command must warm its own i-cache at
    the point of use. Cold-fails / warm-passes is the signature.
@@ -109,8 +117,10 @@ it.
 
 ## Docs
 
+`docs/` is for the API's users; `project/` is for whoever works on gpu64.
+
 - `docs/api_design.md` — only what a developer needs to *use* the API.
-- `docs/milestone*_design.md` — rationale and as-built decisions.
-- `docs/progress_tracker.md` — status and campaign history.
+- `project/milestone*_design.md` — rationale and as-built decisions.
+- `project/progress_tracker.md` — status and campaign history.
 
 Keep them separated that way.

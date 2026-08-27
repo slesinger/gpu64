@@ -18,12 +18,12 @@ several real fixes to compile against a standards-strict toolchain (mismatched
 prototypes, pointer/int comparisons, a missing object in the Makefile, two
 missing Circle lib dependencies, an IECBuddy printer driver that isn't
 present in this repo or upstream and is now feature-gated) -- see
-[docs/hw_testing.md](hw_testing.md) for the full list and the reasoning.
+[project/hw_testing.md](hw_testing.md) for the full list and the reasoning.
 
 Debugging connection: no, not while the RAD is seated in a live C64 --
 GPIO14/15, the only UART pins on the header, are physically wired into the
 cartridge's own bus latches (see [gpio_defs.h](../Source/Firmware/gpio_defs.h)).
-[docs/hw_testing.md](hw_testing.md) lays out the two testing tiers that
+[project/hw_testing.md](hw_testing.md) lays out the two testing tiers that
 follow from that: a bare-RPi-on-the-bench tier that *can* use Circle's serial
 bootloader for a full no-SD-card edit/flash/log loop, and an on-cartridge
 tier that instead relies on a microSD extension cable (so the card never has
@@ -43,7 +43,7 @@ reserved top-left box (`GPU_OUTPUT_BOX_W` x `GPU_OUTPUT_BOX_H`, see
 `tee_device.h`) that leaves room for the on-screen debug log beside it and
 for the eventual real C64-video-passthrough image. Getting here required
 fixing two hardware bring-up bugs first -- see "Two hardware bring-up
-gotchas" in [docs/hw_testing.md](hw_testing.md): a `KERNEL_MAX_SIZE` too
+gotchas" in [project/hw_testing.md](hw_testing.md): a `KERNEL_MAX_SIZE` too
 small for RAD's real `.bss` (total silent hang, zero diagnostic output) and
 a missing `armstub=rad-prefetch.bin` in `config.txt` (unstable/garbled
 picture, looked exactly like a hardware timing fault but wasn't).
@@ -106,7 +106,7 @@ charge.
 
 Continuous cycle-by-cycle bus sniffing (the originally imagined approach)
 does not fit this hardware -- see
-[docs/bus_access_design.md](bus_access_design.md) for the full reasoning.
+[project/bus_access_design.md](bus_access_design.md) for the full reasoning.
 RAD's board only exposes the full 16-bit address through a multiplexed latch
 that is cheap to read only while the CPU is already DMA-halted, so catching
 every write to arbitrary RAM while the C64 free-runs is not feasible in
@@ -1203,7 +1203,7 @@ the observed 3-in-7 rate an independent event would have been all but certain
 to show up 192 times over, so the failure is not a property of the REU-space
 path repeated in isolation. Either it depends on the state
 `gpu64_test_blit` is in twenty commands in, or three runs in seven
-overstated a rarer event. See `docs/hw_testing.md` for what to try next.
+overstated a rarer event. See `project/hw_testing.md` for what to try next.
 
 Two readings of the evidence died on the way, both artefacts of the test data
 rather than of the firmware: "the wrong byte is always `$5C`, the page's last
@@ -1374,7 +1374,7 @@ Mature milestone 5 into a selectable **VIC-II replication mode**: full native VI
   assigned anywhere in this vendored firmware and logs as 0, so the
   Mahoney-technique lookup table always resolves to `lookup8580` regardless
   of the real chip. See the "Open item" at the end of
-  [docs/hw_testing.md](hw_testing.md) for the full writeup and next step.
+  [project/hw_testing.md](hw_testing.md) for the full writeup and next step.
 
 - **The C64's own native video (not HDMI) showed garbage** after sitting idle
   in RAD's menu for a few minutes. Not investigated, and not known to be
@@ -1456,7 +1456,42 @@ Varying floor and ceiling heights, two-sided walls and windows are not in
 this opcode -- they are section 8c, `DRAW_SECTORS`. (`DRAW_WALLS` itself was
 verified on hardware in the round that closed 8b, below.)
 
-## 8b. The raycast demo blinks on hardware -- CLOSED
+## 8b. The raycast demo blinks on hardware -- REOPENED AND ROOT-CAUSED
+
+**Root cause found 2026-08-26: the page flip handed back a page the display
+was still scanning.** The 2026-08-25 closure below was wrong -- the blink
+never went away, it was mistaken for a feature (the user reported the probe
+had "always been restless"). Milestone 12's per-pixel lighting pushed
+raycast's render past one display frame and made it unmissable: four frames
+in five showed only the floor/ceiling gradient.
+
+Nothing in the raster path was at fault, which is why every instrument read
+zero. `gpu64_probe_raster` printed `0000` on all nine counters while the
+screen flickered, because the probe reads back the buffer gpu64 *drew* into
+and those pixels were always correct. The defect is in presentation:
+
+- `gpu64_flipPost()` (milestone 4d) only *posts* the new virtual offset; the
+  VideoCore applies it at **its** next vsync, up to a whole display frame
+  later.
+- `CommitFlip()` nevertheless handed the just-vacated page straight back as
+  the draw page. With `GPU64_FB_PAGES == 2` there was no other choice.
+- So the next frame was built inside a buffer still being scanned out, and
+  `FILL_VIEW`/`cleanView()` pushes writes to DRAM immediately. The viewer
+  sees the clear, then a race between the wall columns and the raster beam.
+
+**The fix.** `GPU64_FB_PAGES` is now **3**, and `CommitFlip()` rotates to the
+page that is neither the one just posted nor the one previously visible --
+with three pages exactly one qualifies. Propagated to `gpu64model.py`,
+`SET_DRAW_PAGE`'s bound, `GET_INFO` byte 10 (now reports 3),
+`docs/api_design.md`, `gpu64_testkit.inc` and the paging tests, which now
+assert the rotation (`FLIP ROTATED`/`TWICE`/`THRICE`) instead of a two-page
+swap. Desk-green: `gpu64_test_pages` 26/26 and `gpu64_test_system` 39/39
+against the model, all ten demos simulate, rastercheck 40 scenarios clean.
+Awaiting a bench round.
+
+Cost: one extra 320x200 page, ~104 KB.
+
+### The 2026-08-25 closure (superseded)
 
 **Closed 2026-08-25.** The bench round after the instruments below were
 built came back clean: `gpu64_test_walls`, `gpu64_probe_raster` and the rest
@@ -2042,3 +2077,150 @@ wired up, and a diff is the cheap way to tell them apart.
 - Shadows of any kind. A light passes straight through a wall.
 - Distance culling of slots. Eight is few enough that scanning them all is
   cheaper than deciding not to.
+
+## 13. The resident world
+
+Milestone 9 through 12 made the polygon layer good enough to look at:
+perspective-correct, textured, z-buffered, five-plane clipped, and lit by up
+to eight moving point lights. What it was not was *scalable*. Every frame,
+`DRAW_POLYS` pulled the batch of 16-byte face records across the bus with a
+bulk transfer, because the batch is chosen by the C64. At the quake demo's
+sixteen faces that is 256 bytes a frame; a real level's worth of faces is a
+transfer the frame budget does not have, and it rides the one path this
+project already knows to be defective (`gpu64-bulk-transfer-mismatch`,
+`gpu64-reu-space-transfer-flaky`).
+
+Verts and texinfo were already resident. Faces were the one thing still
+being re-sent, and they were the biggest of the three.
+
+### The design
+
+`UPLOAD_POLYS $14` loads face records into a resident pool of 2048 slots.
+`DRAW_WORLD $27` draws a **range** of that pool. The record layout is
+unchanged -- byte for byte what `DRAW_POLYS` already takes -- so
+`gpu64_raster_core.cpp` needed **no change at all**: `opDrawWorld()` hands
+`gpu64_rasterPolys()` a pointer into the pool instead of a pointer into the
+staging buffer. Everything the pixel layer guarantees is inherited for free,
+and the differential harness keeps covering it.
+
+Three decisions worth recording:
+
+**A destination index, not an append.** `UPLOAD_POLYS` takes `first` in
+ARG8-9. A level bigger than the staging buffer arrives as several commands,
+and an individual slot can be rewritten later -- a door that changes texture
+is one 16-byte upload, not a re-send of the level. The pool's high-water
+mark only grows, so a chunked upload does not have to arrive in order.
+
+**A range, not an index list.** `DRAW_WORLD first, count` is deliberately
+the crudest possible visibility interface, because it is the one that costs
+nothing: ten register writes, no transfer, whatever the count. A 6502 that
+sorts its faces by room draws a room per command. This is the shape a real
+PVS wants -- and it means the *only* per-frame traffic left in a 3D frame is
+the camera and the light slots.
+
+**`count = 0` is OK, not an error.** A room with nothing visible must be
+free to name, or the C64 ends up doing the culling arithmetic the range was
+supposed to avoid. `count = 0` at `first = 0` is instead how the pool is
+dropped, matching how the other resource opcodes behave.
+
+Rejections are the same shape as the rest of class 2, and nothing partial is
+ever committed: a length that disagrees with the count, a `first + count`
+past 2048, a draw range past the high-water mark, or a draw before
+`SET_CAMERA3D`/`UPLOAD_VERTS`, are all `BAD_ARGS` with the pool untouched.
+
+### Verified, all on a PC
+
+- **`Source/TestPRG/gpu64_test_world.a`, new, `PASS 39 FAIL 00`** in both
+  vblank and `--no-vblank` modes. It proves only what is *new* --
+  residency across intervening commands, chunk placement by index, slot
+  overwrite, range rejection, pool drop, and that dropping the pool leaves
+  the texture arena alone -- and reuses `gpu64_test_polys.a`'s already
+  derived pixel expectations for everything the core already guarantees.
+  Both test walls cover exactly 12800 pixels on purpose, so every
+  "which face" assertion reads a pixel only one of them reaches.
+- `tools/rastercheck`: 40 scenarios, 0 disagreements (the pixel layer is
+  untouched, so this is a regression gate, not new coverage).
+- `tools/testprg.sh`: all twelve test PRGs green. `tools/demos.sh`: all ten
+  demos green.
+- **The quake demo converted**: it uploads its faces once at start-up and
+  its frame step 3 is now `#r2drawworld 0, NFACES`. `sumFaces` is deleted.
+  A 400-frame `runsim.py` run with SPACE held over frames 100-140 ends
+  `ACC 0003 REJ 0000 ERRS 0000 LAST 00` -- i.e. no face record crosses the
+  bus after start-up and the picture is the same.
+
+### Not done
+
+- No checksum on `UPLOAD_POLYS`. This is consistent with `UPLOAD_VERTS` and
+  `UPLOAD_TEXINFO`, which have none either, and it now matters *less* than
+  it did: the transfer happens once at load time, where a retry is cheap,
+  instead of sixty times a second.
+- The C64 still chooses the range. A portal/PVS graph resident on gpu64,
+  so the firmware picks the ranges from the camera, is the next step and is
+  still an open requirement in `api_design.md`.
+
+## The intermittent hang: health telemetry, then the real cause (2026-08-27)
+
+Long unattended runs of `gpu64_demo_quake` hung the C64 minutes in, with the
+VIC-II screen flooded with garbage -- a 6502 running wild over its own screen
+RAM, not a stalled one. Reseating the Pi's power cable made it go away once,
+which sent the first round of work at the power supply and produced telemetry
+that is worth keeping regardless:
+
+- **`$0A GET_HEALTH`** reports the VideoCore's throttle word and SoC
+  temperature. The throttle word's bits 16-19 are sticky since boot, so a
+  brownout that has already passed is still visible afterwards.
+- **A latched under-voltage turns the HDMI border red.** `SetBorder()` paints
+  all three pages, so the indication survives a page flip *and* a hung C64 --
+  the one channel that still works when nothing on the C64 side can report.
+- `Source/Demos/gpu64_probe_power.prg` displays both continuously.
+
+It was not the power supply. Auditing every `bDMA_OUT` site against the
+polling-loop rules found the cause.
+
+### Two DMA holds were opened from the wrong half-cycle
+
+`gpu64_mirrorSnapshot()` and `gpu64_vsyncCommitFlip()` each began their hold
+with a **bare** `WAIT_FOR_VIC_HALFCYCLE`. Both are called from the polling loop
+*after* its own top-of-loop `WAIT_FOR_VIC_HALFCYCLE` and *before* the
+`WAIT_FOR_CPU_HALFCYCLE` that re-syncs it -- so the C64 was already inside the
+VIC half-cycle and the macro, being `do { g2 = read32(...); } while
+( CPU_HALF_CYCLE );`, fell straight through. `RESTART_CYCLE_COUNTER` then
+anchored at an arbitrary point mid-half-cycle, `WAIT_UP_TO_CYCLE(
+TIMING_TRIGGER_DMA )` had already elapsed, and `CLR_GPIO( bDMA_OUT )` took the
+bus at an undefined phase -- sometimes after Phi2 had risen again.
+
+This is rule 3 violated producing rule 2's damage. `gpu64_vsyncCommitFlip()`
+runs on **every deferred page flip -- once per frame, for the whole run**,
+which is why the failure needed minutes rather than seconds to show, and why it
+looked like a hardware fault: nothing about it is visible in a build, in code
+reading, or in a short run.
+
+`gpu64_blobRead()`/`gpu64_blobWrite()` already carried the fix *and* a comment
+describing this exact failure mode. The lesson had been learned on that path in
+milestone 4 and never propagated to the other two. That precedent is what
+turned the reading from a guess into a diagnosis.
+
+**Fixed** by prefixing `WAIT_FOR_CPU_HALFCYCLE` at both sites, and defensively
+at the command dispatch as well -- that one is normally entered from the CPU
+half, where the guard costs nothing, but the register decode above it has no
+cycle budget and a slip past the falling edge would degenerate the same way.
+
+Cleared as already correct: the dispatch release, the start-up release, the
+blob helpers, and RAD's own `handle_transfer.h` (it enters straight off the
+loop's sync and releases inside `DMA_READBYTE_P3`/`DMA_WRITEBYTE_P2`, both of
+which are boundary-synced internally). The `bDMA_OUT` sites in `rad_main.cpp`
+and `rad_hijack.cpp` are menu and launcher code, not live in an REU session.
+
+### Verified
+
+`tools/testprg.sh` twelve green, `tools/demos.sh` ten green, and -- the one
+that matters -- **`gpu64_demo_quake` left running unattended on hardware no
+longer hangs.**
+
+### Still open
+
+`gpu64_mirrorSnapshot()` calls `gpu64_showMirror()` *after* releasing the bus,
+so the C64 free-runs past a long piece of work: a rule 1 exposure. Mirror mode
+only, so it cannot be behind these hangs, and moving the call inside the hold
+would lengthen the hold noticeably -- worth doing deliberately, not as a
+drive-by.

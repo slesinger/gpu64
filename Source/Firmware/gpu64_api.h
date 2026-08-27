@@ -2,7 +2,7 @@
  gpu64: the IO2 command API register file and dispatcher.
 
  Wire protocol reference (register map, opcode table, error codes):
- docs/api_design.md. Design rationale: docs/milestone4_2d_api_design.md.
+ docs/api_design.md. Design rationale: project/milestone4_2d_api_design.md.
 
  Everything here runs synchronously on core 0, called straight from
  reuUsingPolling()'s IO2 write handler in rad_reu.cpp -- the same
@@ -59,7 +59,7 @@
 // is untouched. Poll STATUS bit0 before asking for another.
 #define GPU64_ERR_BUSY			0x07
 
-// gpu64: class 1 (milestone 6). See docs/milestone6_3d_design.md.
+// gpu64: class 1 (milestone 6). See project/milestone6_3d_design.md.
 // Resource RAM exhausted.
 #define GPU64_ERR_OUT_OF_MEMORY		0x08
 // The core-0-to-core-1 ring buffer is full. Core 0 rejects rather than waits
@@ -106,7 +106,7 @@ void gpu64_apiDispatch( u8 op );
 
 // IO2 register window write/read, minus the dispatch. addr is the full
 // 8-bit IO2 offset, so the caller must NOT pass REU's 5-bit-masked version
-// -- see the decode note in docs/milestone4_2d_api_design.md.
+// -- see the decode note in project/milestone4_2d_api_design.md.
 static inline void gpu64_apiWriteReg( u8 addr, u8 data )
 {
 	if ( addr == GPU64_REG_CMD_HI )
@@ -125,7 +125,7 @@ static inline u8 gpu64_apiReadReg( u8 addr )
 {
 	// Bounds-checked by construction: this never indexes a struct with a
 	// masked address the way REU's own read handler does (see the landmine
-	// note in docs/milestone4_2d_api_design.md).
+	// note in project/milestone4_2d_api_design.md).
 	if ( addr == GPU64_REG_STATUS )
 		return gpu64Regs.status;
 	if ( addr == GPU64_REG_ERRCODE )

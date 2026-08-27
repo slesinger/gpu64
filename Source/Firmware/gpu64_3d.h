@@ -10,7 +10,7 @@
 
  gpu64 milestone 6 -- the class 1 (3D) subsystem, public interface.
 
- Wire protocol: docs/milestone6_3d_design.md. That document is the spec;
+ Wire protocol: project/milestone6_3d_design.md. That document is the spec;
  this header is the firmware side of it and deliberately does not restate
  the rationale.
 
@@ -39,7 +39,7 @@
 #define GPU64_3D_ENABLED
 
 // --- class 1 opcodes ----------------------------------------------------
-// Full table with argument layouts: docs/milestone6_3d_design.md. Only the
+// Full table with argument layouts: project/milestone6_3d_design.md. Only the
 // ones a given phase implements are dispatched; the rest are BAD_OPCODE
 // until they exist, which is what keeps a half-built class honest.
 
@@ -94,7 +94,7 @@
 void gpu64_3dInit( void );
 
 // Session reset -- called from gpu64_apiReset(), i.e. on every resetREU().
-// Per docs/milestone6_3d_design.md's Resource lifecycle section this is
+// Per project/milestone6_3d_design.md's Resource lifecycle section this is
 // where every resource of the session is freed, so RUN/STOP+RESTORE cannot
 // leave the next program running against stale IDs.
 void gpu64_3dReset( void );

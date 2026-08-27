@@ -7,7 +7,7 @@
  portable and compiled by tools/rastercheck on a PC. Keeping the two apart is
  what makes a pixel bug findable without a bench round.
 
- Reference: docs/api_design.md. Rationale: docs/milestone8_raster_design.md.
+ Reference: docs/api_design.md. Rationale: project/milestone8_raster_design.md.
 */
 #include "gpu64_raster.h"
 
@@ -79,6 +79,16 @@ static Gpu64RasterSector s_SectorsNew[ GPU64_RASTER_MAX_SECTORS ];
 static Gpu64RasterVertex  s_Verts[ GPU64_RASTER_MAX_VERTS ];
 static Gpu64RasterTexinfo s_Texinfo[ GPU64_RASTER_MAX_TEXINFO ];
 
+// The resident world. Poly records, in their wire form, kept across frames so
+// that DRAW_WORLD can name a range of them instead of shipping them again.
+// This is the bandwidth answer: a Quake level is thousands of faces and the
+// C64 cannot afford to DMA them sixty times a second -- nor should it risk
+// the bulk path's known defects once per frame when the geometry never
+// changes. Stored raw rather than parsed because gpu64_rasterPolys() reads
+// wire records directly, so DRAW_WORLD is a pointer and a count.
+static u8  s_World[ GPU64_RASTER_MAX_WORLD_POLYS * GPU64_RASTER_POLY_BYTES ];
+static u16 s_WorldPolys;
+
 // Blob staging. Static for the same reason gpu64_api.cpp's are: this runs on
 // reuUsingPolling()'s stack. One buffer is enough -- no class 2 opcode has
 // both a source and a destination blob.
@@ -142,6 +152,7 @@ void gpu64_rasterReset( void )
 	memset( s_Sectors, 0, sizeof( s_Sectors ) );
 	memset( s_Verts, 0, sizeof( s_Verts ) );
 	memset( s_Texinfo, 0, sizeof( s_Texinfo ) );
+	s_WorldPolys = 0;
 	memset( &s_LastBatch, 0, sizeof( s_LastBatch ) );
 	s_LastRequested = 0;
 }
@@ -586,7 +597,7 @@ static u8 opUploadTexinfo( void )
 
 // DRAW_POLYS. Unlike DRAW_SECTORS this does NOT clear the depth buffer: a
 // Quake frame may be several batches, and FILL_VIEW is the op that owns the
-// clear -- see docs/milestone9_poly_design.md.
+// clear -- see project/milestone9_poly_design.md.
 static u8 opDrawPolys( void )
 {
 	u32 count;
@@ -605,6 +616,71 @@ static u8 opDrawPolys( void )
 
 	gpu64_rasterPolys( &s_State, &target, s_Stage, count, sArg[ 9 ],
 			   lookupTexture, 0, &s_LastBatch );
+	cleanView();
+	return GPU64_ERR_OK;
+}
+
+// UPLOAD_POLYS. The resident world, filled in chunks: ARG8..9 is the
+// destination index, so a level larger than the 64 KB staging buffer arrives
+// as several commands and the pool grows to cover the highest one written.
+// count = 0 with first = 0 drops the pool, the same "way back" SET_SECTORS
+// and UPLOAD_VERTS both offer.
+static u8 opUploadPolys( void )
+{
+	u8 space; u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+	const u16 count = argU16( 6 );
+	const u16 first = argU16( 8 );
+
+	if ( count == 0 )
+	{
+		if ( first == 0 )
+			s_WorldPolys = 0;
+		return GPU64_ERR_OK;
+	}
+	if ( (u32)first + count > GPU64_RASTER_MAX_WORLD_POLYS )
+		return GPU64_ERR_BAD_ARGS;
+	if ( len != (u32)count * GPU64_RASTER_POLY_BYTES )
+		return GPU64_ERR_BAD_ARGS;
+
+	const u8 res = gpu64_blobRead( space, addr, len, s_Stage );
+	if ( res != GPU64_ERR_OK )
+		return res;
+
+	memcpy( s_World + (u32)first * GPU64_RASTER_POLY_BYTES, s_Stage, len );
+	if ( first + count > s_WorldPolys )
+		s_WorldPolys = (u16)( first + count );
+	return GPU64_ERR_OK;
+}
+
+// DRAW_WORLD. DRAW_POLYS over a range of the resident pool: ARG0..1 first,
+// ARG2..3 count, ARG9 the mask key -- ten register writes and no blob at all,
+// which is the whole point. The 6502 does its own visibility work by choosing
+// ranges, so a level laid out room by room can be drawn a room at a time.
+static u8 opDrawWorld( void )
+{
+	const u16 first = argU16( 0 );
+	const u16 count = argU16( 2 );
+
+	s_LastRequested = count;
+	memset( &s_LastBatch, 0, sizeof( s_LastBatch ) );
+
+	if ( count == 0 )
+		return GPU64_ERR_OK;			// no-op, not an error
+	if ( (u32)first + count > s_WorldPolys )
+		return GPU64_ERR_BAD_ARGS;
+	if ( s_State.cam3Proj == 0 )
+		return GPU64_ERR_BAD_ARGS;	// SET_CAMERA3D was never sent
+	if ( s_State.pVerts == 0 )
+		return GPU64_ERR_BAD_ARGS;	// UPLOAD_VERTS was never sent
+
+	Gpu64RasterTarget target;
+	if ( !makeTarget( &target ) )
+		return GPU64_ERR_UNSUPPORTED;
+
+	gpu64_rasterPolys( &s_State, &target,
+			   s_World + (u32)first * GPU64_RASTER_POLY_BYTES,
+			   count, sArg[ 9 ], lookupTexture, 0, &s_LastBatch );
 	cleanView();
 	return GPU64_ERR_OK;
 }
@@ -715,6 +791,7 @@ u8 gpu64_rasterDispatch( u8 op )
 	case GPU64_RASTER_OP_FREE_TEXTURE:	res = opFreeTexture(); break;
 	case GPU64_RASTER_OP_UPLOAD_VERTS:	res = opUploadVerts(); break;
 	case GPU64_RASTER_OP_UPLOAD_TEXINFO:	res = opUploadTexinfo(); break;
+	case GPU64_RASTER_OP_UPLOAD_POLYS:	res = opUploadPolys(); break;
 
 	case GPU64_RASTER_OP_DRAW_COLUMNS:	res = opDrawColumns(); break;
 	case GPU64_RASTER_OP_DRAW_SPANS:	res = opDrawSpans(); break;
@@ -723,6 +800,7 @@ u8 gpu64_rasterDispatch( u8 op )
 	case GPU64_RASTER_OP_DRAW_SECTORS:	res = opDrawSectors(); break;
 	case GPU64_RASTER_OP_DRAW_THINGS:	res = opDrawThings(); break;
 	case GPU64_RASTER_OP_DRAW_POLYS:	res = opDrawPolys(); break;
+	case GPU64_RASTER_OP_DRAW_WORLD:	res = opDrawWorld(); break;
 
 	default:
 		res = GPU64_ERR_BAD_OPCODE;

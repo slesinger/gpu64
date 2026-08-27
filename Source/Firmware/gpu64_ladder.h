@@ -30,7 +30,7 @@
 // out corrupt the C64's own VIC-II output, while multicore *bring-up* alone
 // does not. That leaves milestone 6's actual question open -- the render
 // loop does not need flat-out bandwidth, it needs *some*, and nobody knows
-// how much is safe. See docs/milestone6_3d_design.md: "find the actual
+// how much is safe. See project/milestone6_3d_design.md: "find the actual
 // contention threshold (a load ladder ... working up rather than starting
 // from a deliberately worst-case synthetic stress)".
 //
@@ -48,7 +48,7 @@
 // LEFT ON deliberately, unlike gpu64_multicore.h's toggles: this exists for
 // one bench round and the image that round needs is the one tools/build.sh
 // produces by default. **Comment it back out once the ladder result is
-// recorded in docs/progress_tracker.md.** It forces multicore bring-up on
+// recorded in project/progress_tracker.md.** It forces multicore bring-up on
 // (rad_main.h) whatever gpu64_multicore.h's own toggles say, it widens
 // reuUsingPolling()'s instruction-cache preload window (below), and it puts
 // measurement code inside that loop -- a diagnostic build, never a shipping

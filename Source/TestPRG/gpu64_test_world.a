@@ -1,0 +1,552 @@
+;
+;      gpu64 API conformance -- class 2 milestone 13: the resident world.
+;
+;      WHAT THIS IS FOR
+;
+;      DRAW_POLYS ships its face records through the bulk transfer path on
+;      every call. For a cube that is nothing; for a Quake level it is
+;      kilobytes a frame, sixty times a second, down a path CLAUDE.md's
+;      rule 3 says may lose bytes. But a level does not change: only the
+;      camera does. UPLOAD_POLYS puts the faces in gpu64 once and
+;      DRAW_WORLD names a range of them, so a frame costs ten register
+;      writes and no DMA at all.
+;
+;      The pixels are DRAW_POLYS' pixels -- the same core function over the
+;      same records -- and tools/rastercheck already proves those. What
+;      only hardware can show is the part that is new: that a record
+;      uploaded in one command is still the same record several commands
+;      later, that a chunked upload lands where its index said, and that a
+;      range past the end of the pool is refused rather than read.
+;
+;      THE GEOMETRY is gpu64_test_polys.a's, unchanged, so the expected
+;      numbers are that program's and were derived there:
+;
+;        camera at the origin, yaw 0, pitch 0, projection 160 px, so
+;        column = 160 - y*160/x and row = 100 - z*160/x.
+;
+;        far  wall, verts 0..3, x = 4.0: columns  80..239, rows  60..139
+;        near wall, verts 8..11, x = 2.0: columns 120..199, rows  20..179
+;
+;      Both are 12800 pixels, which is deliberate: the pixel count cannot
+;      tell them apart, so every assertion that says WHICH face was drawn
+;      has to read the framebuffer where only one of them reaches.
+;
+;      THE POOL is filled in three separate commands -- face 0, then face
+;      1, then face 2 -- because that is how a level bigger than the
+;      staging buffer must arrive, and an UPLOAD_POLYS that ignored its
+;      destination index would pass a single-chunk test and fail here.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+STATS	= $3300				; RASTER_STATS reads back here
+RB	= $3380				; READ_RECT reads back here
+TEX	= $3400			        ; the texture is built here
+
+BG	= 0				; the colour the page is cleared to
+WFAR	= 7				; the far wall
+WNEAR	= 5				; the near wall
+TEXBASE	= 20				; texel( u, v ) = TEXBASE + u*4 + v
+
+IDT	= 1				; the texture id
+TI	= 1				; the texinfo id
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 13 - RESIDENT WORLD"
+
+	#poison RB, 16, $aa
+	#argblob 0, SPACE_C64, RB, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "GET INFO"
+
+	#clracc
+	lda RB+11
+	and #$04
+	bne +
+	jsr kitBad
++
+	#useacc
+	#check "CLASS 2 BIT"
+
+	#argb 0, BG
+	lda #OP_CLEAR
+	jsr cmd0
+
+	lda #R2_RESET
+	jsr cmd2
+	#wantOk
+	#check "RESET"
+
+	#argw 0, 0
+	#argw 2, 0
+	#argw 4, 320
+	#argw 6, 200
+	lda #R2_SET_VIEW
+	jsr cmd2
+	#argblob 0, SPACE_C64, 0, 0
+	#argb 6, 0
+	lda #R2_SET_COLORMAP
+	jsr cmd2
+	#wantOk
+	#check "WORLD SETUP"
+
+	; ---------------------------------------------------------------
+	; RESET emptied the pool, so there is no face 0 to draw. Naming
+	; one has to be an error: the alternative is reading whatever the
+	; previous program left in the array.
+	; ---------------------------------------------------------------
+
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD EMPTY POOL"
+
+	; ---------------------------------------------------------------
+	; The level tables. Verts and texinfo are resident already; the
+	; faces are what milestone 13 adds.
+	; ---------------------------------------------------------------
+
+	#r2verts vertTab, NVERT
+	lda #R2_UPLOAD_VERTS
+	jsr cmd2
+	#wantOk
+	#check "UPLOAD VERTS"
+
+	#r2texinfo texinfoTab, NTI
+	lda #R2_UPLOAD_TEXINFO
+	jsr cmd2
+	#wantOk
+	#check "UPLOAD TEXINFO"
+
+	; A length that disagrees with the count is the only evidence an
+	; upload gets that the transfer lost bytes -- CLAUDE.md rule 3. It
+	; must reject, and it must not have written anything first.
+	#argblob 0, SPACE_C64, polyFar, 2*R2_POLY
+	#argw 6, 1
+	#argw 8, 0
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD BAD LEN"
+
+	; And the pool is still empty after that, not one face long.
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD BAD LEN CLEAN"
+
+	; A range that would end past the last slot of the pool is refused
+	; before anything is allocated.
+	#r2world polyFar, 1, R2_WORLD_MAX
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD PAST MAX"
+
+	; ---------------------------------------------------------------
+	; The three faces, one command each, each naming its own slot.
+	; ---------------------------------------------------------------
+
+	#r2world polyFar, 1, 0
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#wantOk
+	#check "UPLOAD POLYS 0"
+
+	#r2world polyNear, 1, 1
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#wantOk
+	#check "UPLOAD POLYS 1"
+
+	#r2world polyTex, 1, 2
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#wantOk
+	#check "UPLOAD POLYS 2"
+
+	; ---------------------------------------------------------------
+	; There is still no camera. A batch cannot be projected without
+	; one, and saying so once beats rejecting every face in it.
+	; ---------------------------------------------------------------
+
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD NO CAMERA"
+
+	#r2cam3 0, 0, 0, 0, 0, $a000
+	lda #R2_SET_CAMERA3D
+	jsr cmd2
+	#wantOk
+	#check "SET CAMERA3D"
+
+	jsr buildTexture
+	#clracc
+	#uptex IDT, TEX, 4, 4
+	#useacc
+	#check "UPLOAD TEX"
+
+	; ---------------------------------------------------------------
+	; Face 0 alone. Same pixels, same edges as DRAW_POLYS draws from a
+	; batch -- and no batch was sent.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantOk
+	#check "DRAW WORLD"
+
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 1		; accepted
+	#expectw STATS+4, 0		; rejected
+	#expectw STATS+6, 1		; requested
+	#expectw STATS+8, 12800		; pixels
+	#useacc
+	#check "WORLD STATS"
+
+	#stgRead RB, 78, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; x=78
+	#expectb RB+1, BG		; x=79
+	#expectb RB+2, WFAR		; x=80, first column
+	#expectb RB+3, WFAR
+	#useacc
+	#check "WORLD LEFT EDGE"
+
+	#stgRead RB, 238, 100, 4, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WFAR
+	#expectb RB+1, WFAR		; x=239, last column
+	#expectb RB+2, BG
+	#expectb RB+3, BG
+	#useacc
+	#check "WORLD RIGHT EDGE"
+
+	; ---------------------------------------------------------------
+	; Face 1 alone -- the chunk that was uploaded second. It is the
+	; near wall, and the two places it reaches that the far wall does
+	; not are what say the index was honoured rather than ignored.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 1, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantOk
+	#stgRead RB, 160, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WNEAR		; row 30: only the near wall is here
+	#useacc
+	#check "WORLD FACE 1"
+
+	#stgRead RB, 100, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; column 100: the far wall's, empty
+	#useacc
+	#check "WORLD FACE 1 ONLY"
+
+	; ---------------------------------------------------------------
+	; Both faces as one range, which is what a frame actually does.
+	; The depth buffer decides, exactly as it does for DRAW_POLYS.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 0, 2
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantOk
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 2		; both accepted
+	#expectw STATS+4, 0
+	#expectw STATS+6, 2
+	#useacc
+	#check "WORLD RANGE STATS"
+
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WNEAR		; the near wall owns the centre
+	#useacc
+	#check "WORLD DEPTH NEAR"
+
+	#stgRead RB, 100, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WFAR		; outside its columns, the far one
+	#useacc
+	#check "WORLD DEPTH FAR"
+
+	; ---------------------------------------------------------------
+	; RESIDENCE. The point of the whole milestone: nothing has been
+	; uploaded since, several commands have run, and face 0 still
+	; draws what it drew. A pool that were really the staging buffer
+	; under another name would have been overwritten by the texture
+	; upload and the reads above long before here.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 1
+	#expectw STATS+8, 12800
+	#useacc
+	#check "WORLD STILL THERE"
+
+	#stgRead RB, 160, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, BG		; and it is still the FAR wall
+	#useacc
+	#check "WORLD STILL FACE 0"
+
+	; ---------------------------------------------------------------
+	; The range checks. One past the end of what was uploaded is an
+	; error even though every slot up to it is real, and a count of
+	; zero is a no-op rather than an error -- a room with nothing
+	; visible in it must not fail the frame.
+	; ---------------------------------------------------------------
+
+	#r2drawworld 2, 2
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD RANGE END"
+
+	#r2drawworld 3, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD RANGE PAST"
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 0, 0
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantOk
+	#argblob 0, SPACE_C64, STATS, 16
+	lda #R2_STATS
+	jsr cmd2
+	#clracc
+	#expectw STATS+2, 0
+	#expectw STATS+6, 0
+	#expectw STATS+8, 0
+	#useacc
+	#check "WORLD EMPTY RANGE"
+
+	; ---------------------------------------------------------------
+	; Face 2 is textured, and reads the resident texinfo table and the
+	; texture arena. Four texels across, each a different byte, so a
+	; sample names exactly which one was read: a face record that had
+	; been truncated on its way into the pool would lose its texinfo
+	; and texture ids and draw flat.
+	; ---------------------------------------------------------------
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 2, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantOk
+	#check "DRAW WORLD TEX"
+
+	#stgRead RB, 90, 70, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, TEXBASE+2*4+3	; u=2 v=3
+	#useacc
+	#check "WORLD TEXEL 2 3"
+
+	#stgRead RB, 220, 120, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, TEXBASE+1*4+0	; u=1 v=0
+	#useacc
+	#check "WORLD TEXEL 1 0"
+
+	; ---------------------------------------------------------------
+	; Overwriting one slot in place. A level that streams rooms in and
+	; out reuses slots, and slot 0 must become the near wall without
+	; disturbing slots 1 and 2.
+	; ---------------------------------------------------------------
+
+	#r2world polyNear, 1, 0
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#wantOk
+	#check "WORLD OVERWRITE"
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#stgRead RB, 160, 30, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, WNEAR		; slot 0 is the near wall now
+	#useacc
+	#check "WORLD SLOT REPLACED"
+
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 2, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#stgRead RB, 90, 70, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, TEXBASE+2*4+3	; slot 2 untouched by that write
+	#useacc
+	#check "WORLD NEIGHBOUR OK"
+
+	; ---------------------------------------------------------------
+	; The way back. count = 0 at first = 0 drops the pool, the same
+	; escape UPLOAD_VERTS and SET_SECTORS give, so a game can change
+	; level without a RESET taking the textures with it.
+	; ---------------------------------------------------------------
+
+	#r2world 0, 0, 0
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#wantOk
+	#check "WORLD DROP"
+
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#wantErr ERR_BAD_ARGS
+	#check "WORLD DROPPED"
+
+	; And the arena survived it: the texture is still there, which is
+	; what makes dropping the pool cheaper than RESET.
+	#r2world polyTex, 1, 0
+	lda #R2_UPLOAD_POLYS
+	jsr cmd2
+	#argb 0, BG
+	lda #R2_FILL_VIEW
+	jsr cmd2
+	#r2drawworld 0, 1
+	lda #R2_DRAW_WORLD
+	jsr cmd2
+	#stgRead RB, 90, 70, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	#clracc
+	#expectb RB+0, TEXBASE+2*4+3
+	#useacc
+	#check "WORLD TEX SURVIVED"
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+; The texture, built at run time so the file carries no blob.
+; Column-major: texel( u, v ) is at [ u * h + v ].
+; ----------------------------------------------------------------------
+buildTexture
+	ldx #0
+-	txa
+	clc
+	adc #TEXBASE
+	sta TEX,x
+	inx
+	cpx #16
+	bne -
+	rts
+
+; ----------------------------------------------------------------------
+; The level. gpu64_test_polys.a's, so the expected pixels are that
+; program's -- what differs is only how the faces get to gpu64.
+; ----------------------------------------------------------------------
+
+vertTab
+	; 0..3 -- the far wall at x = 4.0, wound clockwise on screen
+	#r2vertd $0400, $0200, $0100
+	#r2vertd $0400, $fe00, $0100
+	#r2vertd $0400, $fe00, $ff00
+	#r2vertd $0400, $0200, $ff00
+	; 4..7 -- the same four the other way round: the back of it
+	#r2vertd $0400, $0200, $ff00
+	#r2vertd $0400, $fe00, $ff00
+	#r2vertd $0400, $fe00, $0100
+	#r2vertd $0400, $0200, $0100
+	; 8..11 -- the near wall at x = 2.0
+	#r2vertd $0200, $0080, $0100
+	#r2vertd $0200, $ff80, $0100
+	#r2vertd $0200, $ff80, $ff00
+	#r2vertd $0200, $0080, $ff00
+NVERT	= 12
+
+; s = -y, t = -z, both in texels.
+texinfoTab
+	#r2texinfod $0000, $ff00, $0000, $0000,  $0000, $0000, $ff00, $0000
+NTI	= 1
+
+polyFar	 #r2polyd 0, 4, 0, 0, WFAR, 0
+polyNear #r2polyd 8, 4, 0, 0, WNEAR, 0
+polyTex	 #r2polyd 0, 4, TI, IDT, 0, 0
+
+	.include "gpu64_testkit_rt.inc"

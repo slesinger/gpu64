@@ -850,15 +850,32 @@ report
 	jsr dmHexA
 	lda badCnt
 	jsr dmHexA
+	; A and R are the accepted/rejected counts from the FIRST bad frame,
+	; latched by countBad. Row 22's copy is a live snapshot and is
+	; unreadable while the screen is misbehaving; this one holds still.
 	jsr dmText
-	.text "  ERRS "
+	.text " A "
+	.byte 0
+	lda badAcc+1
+	jsr dmHexA
+	lda badAcc
+	jsr dmHexA
+	jsr dmText
+	.text " R "
+	.byte 0
+	lda badRej+1
+	jsr dmHexA
+	lda badRej
+	jsr dmHexA
+	jsr dmText
+	.text " E "
 	.byte 0
 	lda errCnt+1
 	jsr dmHexA
 	lda errCnt
 	jsr dmHexA
 	jsr dmText
-	.text "  LAST "
+	.text " L "
 	.byte 0
 	lda lastErr
 	jsr dmHexA
@@ -885,6 +902,20 @@ countBad
 	ora statBuf+5
 	beq cbDone
 cbBad
+	; Latch the first one. What ACC and REJ were on a frame that went
+	; wrong is the whole question; after that they are just noise.
+	lda badCnt
+	ora badCnt+1
+	bne cbCount
+	lda statBuf+2
+	sta badAcc
+	lda statBuf+3
+	sta badAcc+1
+	lda statBuf+4
+	sta badRej
+	lda statBuf+5
+	sta badRej+1
+cbCount
 	inc badCnt
 	bne cbDone
 	inc badCnt+1
@@ -915,6 +946,8 @@ bobT	.byte 0
 sprY	.byte 0
 frameLo	.byte 0
 badCnt	.word 0
+badAcc	.word 0
+badRej	.word 0
 errCnt	.word 0
 lastErr	.byte 0
 recTmpl	.fill 16, 0

@@ -1,6 +1,6 @@
 /*
  gpu64 milestone 6 -- the ring buffer both cores talk through, and core 1's
- drain loop. See gpu64_3d.h and docs/milestone6_3d_design.md.
+ drain loop. See gpu64_3d.h and project/milestone6_3d_design.md.
 
  What core 1 does today is count. The renderer that phase 1 built runs on
  core 0, synchronously, inside the dispatch window where the C64 is already

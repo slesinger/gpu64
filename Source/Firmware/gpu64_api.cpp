@@ -10,6 +10,7 @@
 #include "gpu64_3d.h"
 #include "gpu64_raster.h"
 #include <circle/util.h>
+#include <circle/bcmpropertytags.h>
 
 // gpu64: set once a program actually drives the API, which stops the
 // milestone 3 screen mirror (the two modes are mutually exclusive). Declared
@@ -55,7 +56,7 @@ void gpu64_apiReset( void )
 	gpu64_vsyncResetState();
 
 	// Class 1's session state goes the same way: ring emptied, every
-	// uploaded resource freed. See docs/milestone6_3d_design.md's Resource
+	// uploaded resource freed. See project/milestone6_3d_design.md's Resource
 	// lifecycle -- without this a RUN/STOP+RESTORE leaks the whole arena and
 	// the next program starts against stale IDs.
 #ifdef GPU64_3D_ENABLED
@@ -304,6 +305,81 @@ void gpu64_ladderDumpNow( void )
 #endif
 }
 
+// --- health telemetry ---------------------------------------------------
+// Power and thermal state, read from the VideoCore. The bench has twice shown
+// a failure that looks exactly like a brownout -- mis-sampled IO2 writes, a
+// torn RAD menu on entry, and finally a 6502 running wild over its own screen
+// RAM -- and reseating the power cable made it go away once. That is a
+// coincidence with a plausible story, not evidence, so this makes the Pi say
+// for itself whether its supply ever sagged.
+//
+// GET_THROTTLED's bits 16-19 are sticky since boot, so a once-a-second poll
+// cannot miss an event however brief it was. The cost is a mailbox round trip
+// -- the same order as the blocking page flip milestone 4d removed -- so this
+// is a housekeeping call, never a per-frame one.
+struct GPU64HEALTH
+{
+	u32	throttled;		// last raw GET_THROTTLED word
+	u32	sticky;			// OR of every word ever read
+	u16	tempC10;		// last core temperature, tenths of a degree
+	u16	tempMax10;		// highest seen
+	u16	samples;
+	u8	flagged;		// border already recoloured for an event
+};
+static GPU64HEALTH s_Health = { 0, 0, 0, 0, 0, 0 };
+
+// GET_THROTTLED bits. The low four are "right now", the high four latch.
+// C64 palette index 2, red -- deliberately not a colour any demo sets.
+#define GPU64_HEALTH_BORDER_ALARM	2
+
+#define GPU64_THR_UNDERVOLT_NOW		0x00000001
+#define GPU64_THR_UNDERVOLT_EVER	0x00010000
+
+struct TPropertyTagThrottled
+{
+	TPropertyTag	Tag;
+	u32		nValue;
+}
+PACKED;
+
+static void readHealth( void )
+{
+	// bEarlyUse = TRUE skips the spinlock. Core 0 is the only caller and the
+	// multicore rules forbid core 1 from touching MMIO at all, so there is
+	// nothing to serialise against.
+	CBcmPropertyTags Tags( TRUE );
+
+	TPropertyTagThrottled Thr;
+	if ( Tags.GetTag( PROPTAG_GET_THROTTLED, &Thr, sizeof Thr, 0 ) )
+	{
+		s_Health.throttled = Thr.nValue;
+		s_Health.sticky |= Thr.nValue;
+	}
+
+	TPropertyTagTemperature Temp;
+	Temp.nTemperatureId = TEMPERATURE_ID;
+	if ( Tags.GetTag( PROPTAG_GET_TEMPERATURE, &Temp, sizeof Temp, 4 ) )
+	{
+		s_Health.tempC10 = (u16)( Temp.nValue / 100 );
+		if ( s_Health.tempC10 > s_Health.tempMax10 )
+			s_Health.tempMax10 = s_Health.tempC10;
+	}
+
+	s_Health.samples++;
+
+	// A brownout tends to take the C64 down with it, and a hung C64 cannot
+	// read a register or print a status line. The HDMI border can say it
+	// without the C64's help and goes on saying it after everything else has
+	// stopped: red the moment the VideoCore admits to an under-voltage.
+	if ( !s_Health.flagged
+	     && ( s_Health.sticky & ( GPU64_THR_UNDERVOLT_NOW | GPU64_THR_UNDERVOLT_EVER ) ) )
+	{
+		s_Health.flagged = 1;
+		if ( g_pGpu64FB )
+			g_pGpu64FB->SetBorder( GPU64_HEALTH_BORDER_ALARM );
+	}
+}
+
 static u8 doSystem( u8 op )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
@@ -355,7 +431,7 @@ static u8 doSystem( u8 op )
 		return GPU64_ERR_OK;
 
 	case 0x04:					// SET_DRAW_PAGE
-		if ( sArg[ 0 ] > 1 )
+		if ( sArg[ 0 ] >= GPU64_FB_PAGES )
 			return GPU64_ERR_BAD_ARGS;
 		if ( pFB ) pFB->SetDrawPage( sArg[ 0 ] );
 		return GPU64_ERR_OK;
@@ -428,6 +504,32 @@ static u8 doSystem( u8 op )
 		info[ 14 ] = (u8)( gpu64Vsync.periodUs & 0xff );
 		info[ 15 ] = (u8)( ( gpu64Vsync.periodUs >> 8 ) & 0xff );
 		return gpu64_blobWrite( space, addr, 16, info );
+	}
+
+	case 0x0A:					// GET_HEALTH
+	{
+		u8 space; u32 addr, len;
+		argBlob( 0, &space, &addr, &len );
+		if ( len < 12 )
+			return GPU64_ERR_BAD_ARGS;
+
+		readHealth();
+
+		u8 h[ 12 ];
+		memset( h, 0, sizeof h );
+		h[ 0 ] = (u8)( s_Health.throttled & 0xff );
+		h[ 1 ] = (u8)( ( s_Health.throttled >> 8 ) & 0xff );
+		h[ 2 ] = (u8)( ( s_Health.throttled >> 16 ) & 0xff );
+		h[ 3 ] = (u8)( ( s_Health.throttled >> 24 ) & 0xff );
+		h[ 4 ] = (u8)( s_Health.sticky & 0xff );
+		h[ 5 ] = (u8)( ( s_Health.sticky >> 8 ) & 0xff );
+		h[ 6 ] = (u8)( ( s_Health.sticky >> 16 ) & 0xff );
+		h[ 7 ] = (u8)( ( s_Health.sticky >> 24 ) & 0xff );
+		h[ 8 ] = (u8)( s_Health.tempC10 & 0xff );
+		h[ 9 ] = (u8)( s_Health.tempC10 >> 8 );
+		h[ 10 ] = (u8)( s_Health.tempMax10 & 0xff );
+		h[ 11 ] = (u8)( s_Health.tempMax10 >> 8 );
+		return gpu64_blobWrite( space, addr, 12, h );
 	}
 
 	case 0x08:					// SET_BORDER
@@ -867,7 +969,7 @@ void gpu64_apiDispatch( u8 op )
 	if ( sCmdHi == 1 )
 	{
 		// Class 1 does not execute here -- it stages a command and hands it
-		// to core 1 (docs/milestone6_3d_design.md, Architecture). What comes
+		// to core 1 (project/milestone6_3d_design.md, Architecture). What comes
 		// back is the *acceptance* result, not the command's outcome: a
 		// class 1 OK means core 1 has the command, and STATUS bit4 or RESULT
 		// is what says it finished. That is the whole point of the split.
@@ -880,7 +982,7 @@ void gpu64_apiDispatch( u8 op )
 		// Class 2 executes here and now, on core 0, exactly like a class 0
 		// draw op -- the C64 is halted for the dispatch, so there is nothing
 		// for another core to overlap with. See
-		// docs/milestone8_raster_design.md.
+		// project/milestone8_raster_design.md.
 		res = gpu64_rasterDispatch( op );
 	} else
 #endif

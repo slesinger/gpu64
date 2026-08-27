@@ -192,10 +192,10 @@ start
 ; Opcode and class validation.
 ; ----------------------------------------------------------------------
 
-	lda #$0a				; gap between VBLANK_SYNC and CLEAR
+	lda #$0b				; gap between GET_HEALTH and CLEAR
 	jsr cmd0
 	#wantErr ERR_BAD_OPCODE
-	#check "BAD OP 0A"
+	#check "BAD OP 0B"
 
 	lda #$6f				; gap between READ_RECT and the math set
 	jsr cmd0
@@ -284,8 +284,15 @@ start
 	#argb 0, 2
 	lda #OP_SET_DRAW_PAGE
 	jsr cmd0
-	#wantErr ERR_BAD_ARGS
+	#wantOk
 	#check "DRAWPAGE 2"
+
+	; One past the last page. There are three now, not two.
+	#argb 0, 3
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#wantErr ERR_BAD_ARGS
+	#check "DRAWPAGE 3"
 
 	#argb 0, 1
 	lda #OP_LOG_ENABLE

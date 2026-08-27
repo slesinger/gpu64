@@ -106,7 +106,7 @@ boolean gpu64_3dRingPush( u8 op );
 
 // --- the resource arena -------------------------------------------------
 //
-// A bump allocator over one static block, per docs/milestone6_3d_design.md's
+// A bump allocator over one static block, per project/milestone6_3d_design.md's
 // Resource lifecycle: explicit free only, no automatic eviction, and the
 // whole thing is reclaimed on resetREU(). Phase 0 only brings it up; phase 1
 // is what actually allocates out of it.

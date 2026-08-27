@@ -84,7 +84,7 @@ RESULT   = $df21
 OP_PAGE_FLIP     = $05
 OP_PAL_LOAD      = $31
 
-; class 1 -- docs/milestone6_3d_design.md
+; class 1 -- project/milestone6_3d_design.md
 OP_SET_VIEWPORT    = $01
 OP_SET_PERSPECTIVE = $02
 OP_SET_LIGHT       = $03

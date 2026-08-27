@@ -16,7 +16,7 @@ the on-screen log overlay, cache behaviour, and anything about timing beyond
 import math
 import struct
 
-FB_W, FB_H, FB_PAGES = 320, 200, 2
+FB_W, FB_H, FB_PAGES = 320, 200, 3
 BORDER_W, BORDER_H = 32, 36
 
 # The palette a reset gpu64 comes up with (Source/Firmware/gpu64_fb.cpp):
@@ -58,6 +58,7 @@ RASTER_VERT_BYTES = 8
 RASTER_TEXINFO_BYTES = 16
 RASTER_MAX_VERTS = 4096
 RASTER_MAX_TEXINFO = 255
+RASTER_MAX_WORLD_POLYS = 2048
 RASTER_MAX_POLY_VERTS = 16
 RASTER_MAX_LIGHTS = 8
 RASTER_LIGHT_SHIFT = 40
@@ -209,6 +210,7 @@ class Gpu64Model:
         self.pages = [bytearray(FB_W * FB_H) for _ in range(FB_PAGES)]
         self.draw_page = 0
         self.visible_page = 0
+        self.pending_visible = 0
         self.border = 0
         self.palette = bytearray(256 * 3)
         for i, rgb in enumerate(C64_PALETTE):
@@ -216,6 +218,7 @@ class Gpu64Model:
         self.palette[255 * 3:256 * 3] = b'\xff\xff\xff'
         self.log_enabled = True
         self.api_active = False
+        self.health_samples = 0
 
         # --- class 2 (raster) -----------------------------------------
         # ids are 1..255; each entry is (w, h, texels) with texels stored
@@ -234,6 +237,10 @@ class Gpu64Model:
         self.rcam3 = dict(x=0, y=0, z=0, yaw=0, pitch=0, proj=0, flags=0)
         self.rverts = []
         self.rtexinfo = []
+        # Milestone 13's resident world: poly records in wire form, kept
+        # across frames so DRAW_WORLD is ten register writes and no DMA.
+        self.rworld = bytearray()
+        self.rworldn = 0
         # Milestone 12's dynamic point lights: eight slots, each either None
         # (off) or (x, y, z, r2, fall).
         self.rlights = [None] * RASTER_MAX_LIGHTS
@@ -266,8 +273,24 @@ class Gpu64Model:
             self.status |= ST_VB_PEND
             if self.flip_pending:
                 self.flip_pending = False
-                self.draw_page, self.visible_page = self.visible_page, self.draw_page
+                self._commit_flip()
                 self.status &= ~ST_BUSY
+
+    def _commit_flip(self):
+        """The page rotation CGpu64FrameBuffer::CommitFlip() performs.
+
+        The new draw page is the one that is neither the page just made
+        visible nor the page that was visible before it: a posted flip does
+        not take effect until the display hardware's next vsync, so the old
+        visible page is still being scanned out for up to a frame."""
+        was_visible = self.visible_page
+        self.visible_page = self.pending_visible
+        for p in range(FB_PAGES):
+            if p != self.visible_page and p != was_visible:
+                self.draw_page = p
+                break
+        else:
+            self.draw_page = was_visible
 
     # --- the REU controller ------------------------------------------
     # Only enough of a 1764 to move a block: the suite uses it to get bytes
@@ -458,7 +481,7 @@ class Gpu64Model:
             self.status = 0
             self.vb_armed = False
             self.flip_pending = False
-            self.draw_page = self.visible_page = 0
+            self.draw_page = self.visible_page = self.pending_visible = 0
             return ERR_OK
         if op == 0x02:                                  # VBLANK_ARM
             if a[0] > 1:
@@ -476,7 +499,7 @@ class Gpu64Model:
             self.status &= ~ST_VB_PEND
             return ERR_OK
         if op == 0x04:                                  # SET_DRAW_PAGE
-            if a[0] > 1:
+            if a[0] >= FB_PAGES:
                 return ERR_BAD_ARGS
             self.draw_page = a[0]
             return ERR_OK
@@ -488,10 +511,12 @@ class Gpu64Model:
                     return ERR_UNSUPPORTED
                 if self.flip_pending:
                     return ERR_BUSY
+                self.pending_visible = self.draw_page
                 self.flip_pending = True
                 self.status |= ST_BUSY
                 return ERR_OK
-            self.draw_page, self.visible_page = self.visible_page, self.draw_page
+            self.pending_visible = self.draw_page
+            self._commit_flip()
             return ERR_OK
         if op == 0x06:                                  # GET_INFO
             space, addr, length = self.a_blob(0)
@@ -526,6 +551,19 @@ class Gpu64Model:
             if self.flip_pending:
                 return ERR_BUSY
             return ERR_OK
+        if op == 0x0A:                                  # GET_HEALTH
+            # A healthy Pi on a PC: no throttling ever, a plausible
+            # temperature. The model cannot know the real thing -- what it
+            # checks is that a program reads the block correctly.
+            space, addr, length = self.a_blob(0)
+            if length < 12:
+                return ERR_BAD_ARGS
+            h = bytearray(12)
+            self.health_samples += 1
+            t = 452                                     # 45.2 C
+            h[8], h[9] = t & 0xFF, t >> 8
+            h[10], h[11] = t & 0xFF, t >> 8
+            return self.blob_write(space, addr, h)
         if op == 0x10:                                  # CLEAR
             self.rect_fill(0, 0, FB_W, FB_H, a[0])
             return ERR_OK
@@ -859,6 +897,8 @@ class Gpu64Model:
             self.rcam3 = dict(x=0, y=0, z=0, yaw=0, pitch=0, proj=0, flags=0)
             self.rverts = []
             self.rtexinfo = []
+            self.rworld = bytearray()
+            self.rworldn = 0
             self.rlights = [None] * RASTER_MAX_LIGHTS
             # The depth buffer's lifecycle matches the firmware's: RESET
             # makes it empty again, so a program that sends things but no
@@ -1075,6 +1115,44 @@ class Gpu64Model:
                 tuple(s16(data[i * 16 + 2 * k] | (data[i * 16 + 2 * k + 1] << 8))
                       for k in range(8))
                 for i in range(count)]
+            return ERR_OK
+
+        if op == 0x14:                                  # UPLOAD_POLYS
+            space, addr, length = self.a_blob(0)
+            count = self.a_u16(6)
+            first = self.a_u16(8)
+            if count == 0:
+                if first == 0:
+                    self.rworld = bytearray()
+                    self.rworldn = 0
+                return ERR_OK
+            if first + count > RASTER_MAX_WORLD_POLYS:
+                return ERR_BAD_ARGS
+            if length != count * RASTER_POLY_BYTES:
+                return ERR_BAD_ARGS
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            end = (first + count) * RASTER_POLY_BYTES
+            if len(self.rworld) < end:
+                self.rworld.extend(bytes(end - len(self.rworld)))
+            self.rworld[first * RASTER_POLY_BYTES:end] = data
+            self.rworldn = max(self.rworldn, first + count)
+            return ERR_OK
+
+        if op == 0x27:                                  # DRAW_WORLD
+            first = self.a_u16(0)
+            count = self.a_u16(2)
+            self.rrequested = count
+            self.rbatch = [0, 0, 0]
+            if count == 0:
+                return ERR_OK
+            if first + count > self.rworldn:
+                return ERR_BAD_ARGS
+            if self.rcam3['proj'] == 0 or not self.rverts:
+                return ERR_BAD_ARGS
+            self.r_polys(bytes(self.rworld[first * RASTER_POLY_BYTES:]),
+                         count, a[9])
             return ERR_OK
 
         if op == 0x26:                                  # DRAW_POLYS
@@ -1738,7 +1816,7 @@ class Gpu64Model:
     # ------------------------------------------------------------------
     # DRAW_POLYS -- milestone 9's polygon layer.
     #
-    # Written from docs/api_design.md and docs/milestone9_poly_design.md,
+    # Written from docs/api_design.md and project/milestone9_poly_design.md,
     # not from gpu64_raster_core.cpp. Every division goes through idiv() and
     # every shift is arithmetic, because the two implementations have to
     # agree on a truncation, not merely on a picture.

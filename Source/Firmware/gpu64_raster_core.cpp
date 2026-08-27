@@ -1582,7 +1582,7 @@ u16 gpu64_rasterChecksum( const u8 *p, u32 nLen )
 //
 // A convex polygon in world space, arbitrarily oriented: the primitive both
 // a wall record and a sector's flats are special cases of. Rationale is in
-// docs/milestone9_poly_design.md; what matters here is the arithmetic.
+// project/milestone9_poly_design.md; what matters here is the arithmetic.
 //
 // The pipeline per face is: gather from the vertex pool, transform to view
 // space, clip against five planes, project, backface-cull, scan-convert.
