@@ -323,7 +323,7 @@ static u8 gpu64MirrorBorder = 0, gpu64MirrorBackground = 0;
 // inside reuUsingPolling() but isn't covered by that function's own preload
 // window.
 __attribute__( ( optimize( "align-functions=256" ) ) )
-__attribute__( ( section( "section_polling" ) ) )
+__attribute__( ( section( ".text.section_polling" ) ) )
 void gpu64_mirrorSnapshot()
 {
 	register u32 g2;
@@ -396,7 +396,7 @@ void gpu64_mirrorSnapshot()
 // be the unprotected delay it is meant to prevent. Same __attribute__ pair
 // as gpu64_mirrorSnapshot() above.
 __attribute__( ( optimize( "align-functions=256" ) ) )
-__attribute__( ( section( "section_polling" ) ) )
+__attribute__( ( section( ".text.section_polling" ) ) )
 void gpu64_vsyncCommitFlip( void )
 {
 	// The WAIT_FOR_*_HALFCYCLE macros sample the GPIO bank into a variable
@@ -477,7 +477,7 @@ static inline void gpu64_warmBuffer( const u8 *p, u32 len )
 // Same __attribute__s and the same cache-preload requirement as
 // gpu64_mirrorSnapshot() -- see warmCache() in rad_main.cpp.
 __attribute__( ( optimize( "align-functions=256" ) ) )
-__attribute__( ( section( "section_polling" ) ) )
+__attribute__( ( section( ".text.section_polling" ) ) )
 u8 gpu64_blobRead( u8 space, u32 addr, u32 len, u8 *pDst )
 {
 	if ( len == 0 )
@@ -547,7 +547,7 @@ u8 gpu64_blobRead( u8 space, u32 addr, u32 len, u8 *pDst )
 }
 
 __attribute__( ( optimize( "align-functions=256" ) ) )
-__attribute__( ( section( "section_polling" ) ) )
+__attribute__( ( section( ".text.section_polling" ) ) )
 u8 gpu64_blobWrite( u8 space, u32 addr, u32 len, const u8 *pSrc )
 {
 	if ( len == 0 )
@@ -646,9 +646,30 @@ void gpu64_apiWarmPollingLoop( void )
 	FORCE_READ_LINEAR32a( &gpu64Vsync, sizeof( GPU64VSYNC ), sizeof( GPU64VSYNC ) * 8 );
 }
 
+// gpu64: this and the other four functions sharing the ".text.section_polling"
+// section (gpu64_mirrorSnapshot, gpu64_vsyncCommitFlip, gpu64_blobRead,
+// gpu64_blobWrite, below) are grouped together deliberately -- see each
+// site's own comment for why. The ".text." prefix is load-bearing, not
+// cosmetic: circle.ld (external/, gitignored, not ours to edit) places
+// *(.text*) before it sets _etext, and translationtable64.cpp's MMU setup
+// marks every 64KB page whose base is >= _etext execute-never (PXN). A bare
+// section name -- what this used to be -- is an orphan section ld places
+// *after* .text, i.e. entirely past _etext, so every function in it lived on
+// borrowed time: fine as long as the whole group fit in the last 64KB page
+// shared with the rest of .text, a silent crash the moment growth elsewhere
+// in the image pushed reuUsingPolling's tail across the next page boundary.
+// That is exactly what stage 14 did: two harmless-looking Stage-14 builds
+// (12 opcodes, no DRAW_NODE) fit; the two that also linked DRAW_NODE did
+// not, and the ~2KB tail of this function that landed past the boundary
+// faulted on fetch -- IO2 unserviced, floating bus reads, dead RAD menu,
+// power-cycle required. Diagnosed 2026-08-29 by hardware bisection down to
+// DRAW_NODE, then confirmed by reading _etext and section_polling's
+// placement out of the ELF with nm/readelf, not by guessing. The ".text."
+// prefix makes this function part of .text by construction, so it is always
+// on the PXN=0 side of _etext regardless of image size.
 #if 1
 __attribute__( ( optimize( "align-functions=256" ) ) )
-__attribute__( ( section( "section_polling" ) ) )
+__attribute__( ( section( ".text.section_polling" ) ) )
 u8 reuUsingPolling( int step )
 {
 	register u32 g2 = bBUTTON, g3;

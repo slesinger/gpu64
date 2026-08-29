@@ -12,6 +12,7 @@
  Usage: ./hostsim [outdir]
 */
 #include "gpu64_3d_render.h"
+#include "gpu64_3d_scene.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -441,6 +442,130 @@ int main( int argc, char **argv )
 		snprintf( path, sizeof( path ), "%s/prgpreview.ppm", pOutDir );
 		writePPM( path, &state );
 		printf( "PRG preview: %u tris, checksum %08x\n", n, checksum() );
+	}
+
+	// --- the scene graph: stage 14 ---------------------------------------
+	// Exercises every opcode in the vertical slice (CREATE_OBJECT/CAMERA,
+	// SET_POSITION/ORIENTATION, MOVE_LOCAL/WORLD, ROTATE_LOCAL, SET_SCALE,
+	// SET_ACTIVE_CAMERA, SET_VISIBLE, DESTROY_NODE, GET_TRANSFORM) plus the
+	// DRAW_NODE draw path -- gpu64_3d_class1.cpp's opDrawNode() does exactly
+	// this sequence (resolve node, check visible, resolve mesh via the ID the
+	// node carries, call gpu64_3dDrawMesh() with the node's own pos/rot/scale)
+	// except for the resource-ID lookup, which needs the C64 bus and so has
+	// no counterpart here -- `mesh` stands in for whatever CREATE_OBJECT's
+	// meshId would have resolved to.
+	{
+		int failures = 0;
+#define CHECK( label, got, want ) \
+		do { if ( (got) != (want) ) { \
+			fprintf( stderr, "hostsim: SCENE %s: got %02x, want %02x\n", \
+				 label, (unsigned)(got), (unsigned)(want) ); \
+			failures++; \
+		} } while ( 0 )
+
+		Gpu64_3dScene scene;
+		gpu64_3dSceneReset( &scene );
+
+		const u16 kObjId = 1, kCamId = 2;
+
+		CHECK( "CREATE_OBJECT", gpu64_3dSceneCreateObject( &scene, kObjId, 42 ), GPU64_3D_OK );
+		CHECK( "CREATE_CAMERA", gpu64_3dSceneCreateCamera( &scene, kCamId ), GPU64_3D_OK );
+
+		Gpu64_3dVec objPos; objPos.x = 0; objPos.y = 0; objPos.z = 70 * GPU64_FX16_ONE;
+		CHECK( "SET_POSITION(obj)", gpu64_3dSceneSetPosition( &scene, kObjId, &objPos ), GPU64_3D_OK );
+		CHECK( "SET_ORIENTATION(obj)",
+		       gpu64_3dSceneSetOrientation( &scene, kObjId, (u16)( 65536 / 8 ), 0, 0 ), GPU64_3D_OK );
+
+		// MOVE_LOCAL walks along the node's own +z, which SET_ORIENTATION
+		// just turned 45 degrees off the world +z -- so this must not land on
+		// the world-z-only path MOVE_WORLD would take.
+		CHECK( "MOVE_LOCAL", gpu64_3dSceneMoveLocal( &scene, kObjId, 0, 0, 5 * GPU64_FX16_ONE ), GPU64_3D_OK );
+		CHECK( "MOVE_WORLD", gpu64_3dSceneMoveWorld( &scene, kObjId, 2 * GPU64_FX16_ONE, 0, 0 ), GPU64_3D_OK );
+		CHECK( "ROTATE_LOCAL",
+		       gpu64_3dSceneRotateLocal( &scene, kObjId, (u16)( 65536 / 16 ), 0, 0 ), GPU64_3D_OK );
+		CHECK( "SET_SCALE", gpu64_3dSceneSetScale( &scene, kObjId, (u16)( 1.25 * GPU64_FX8_ONE ) ), GPU64_3D_OK );
+		CHECK( "SET_SCALE(0)", gpu64_3dSceneSetScale( &scene, kObjId, 0 ), GPU64_3D_BAD_ARGS );
+
+		// Camera raised and tilted down -- same pose setCamera() above has
+		// been using by hand, now driven through CREATE_CAMERA + the
+		// transform opcodes instead.
+		Gpu64_3dVec camPos; camPos.x = 0; camPos.y = 26 * GPU64_FX16_ONE; camPos.z = 0;
+		CHECK( "SET_POSITION(cam)", gpu64_3dSceneSetPosition( &scene, kCamId, &camPos ), GPU64_3D_OK );
+		CHECK( "SET_ORIENTATION(cam)",
+		       gpu64_3dSceneSetOrientation( &scene, kCamId, 0, (u16)( 65536 / 24 ), 0 ), GPU64_3D_OK );
+		CHECK( "SET_ACTIVE_CAMERA", gpu64_3dSceneSetActiveCamera( &scene, kCamId ), GPU64_3D_OK );
+		CHECK( "SET_ACTIVE_CAMERA(bad id)", gpu64_3dSceneSetActiveCamera( &scene, 999 ), GPU64_3D_BAD_ID );
+
+		gpu64_3dSceneApplyCamera( &scene, &state );
+		if ( !state.bHaveCamera )
+		{
+			fprintf( stderr, "hostsim: SCENE ApplyCamera left bHaveCamera FALSE\n" );
+			failures++;
+		}
+
+		Gpu64_3dVec gotPos; u16 gotYaw, gotPitch, gotRoll;
+		CHECK( "GET_TRANSFORM", gpu64_3dSceneGetTransform( &scene, kObjId, &gotPos, &gotYaw, &gotPitch, &gotRoll ),
+		       GPU64_3D_OK );
+		// yaw was set to 65536/8 then advanced by ROTATE_LOCAL's 65536/16 --
+		// GET_TRANSFORM must read back the accumulated angle, not the one
+		// SET_ORIENTATION last wrote.
+		CHECK( "GET_TRANSFORM yaw", gotYaw, (u16)( 65536 / 8 + 65536 / 16 ) );
+
+		Gpu64_3dNode *pObj = gpu64_3dSceneFind( &scene, kObjId, GPU64_3D_NODE_OBJECT );
+		if ( pObj == 0 )
+		{
+			fprintf( stderr, "hostsim: SCENE lost the object node\n" );
+			failures++;
+		}
+		else
+		{
+			gpu64_3dClearViewport( &state, &target );
+			const unsigned n = gpu64_3dDrawMesh( &state, &target, &scratch, &mesh,
+							     &pObj->pos, &pObj->rot, pObj->scale, lookupTex, &tt );
+			snprintf( path, sizeof( path ), "%s/scenegraph.ppm", pOutDir );
+			writePPM( path, &state );
+			printf( "scene graph test: %u tris, checksum %08x\n", n, checksum() );
+
+			// SET_VISIBLE(0) must be honoured by the DRAW_NODE path -- here,
+			// by whatever reads pObj->visible the way opDrawNode() does.
+			CHECK( "SET_VISIBLE(0)", gpu64_3dSceneSetVisible( &scene, kObjId, FALSE ), GPU64_3D_OK );
+			if ( pObj->visible )
+			{
+				fprintf( stderr, "hostsim: SCENE SET_VISIBLE(0) left the node visible\n" );
+				failures++;
+			}
+		}
+
+		// Destroying the active camera must clear bHaveActiveCamera, not
+		// leave a dangling ID a later CREATE_OBJECT could silently inherit --
+		// see gpu64_3dSceneDestroyNode()'s own comment.
+		CHECK( "DESTROY_NODE(cam)", gpu64_3dSceneDestroyNode( &scene, kCamId ), GPU64_3D_OK );
+		gpu64_3dSceneApplyCamera( &scene, &state );
+		if ( state.bHaveCamera )
+		{
+			fprintf( stderr, "hostsim: SCENE ApplyCamera kept a camera after DESTROY_NODE\n" );
+			failures++;
+		}
+		CHECK( "DESTROY_NODE(already gone)", gpu64_3dSceneDestroyNode( &scene, kCamId ), GPU64_3D_BAD_ID );
+
+		// The 257th node must be refused: GPU64_3D_MAX_NODES is the design
+		// doc's own "256 object instances" limit, and nothing upstream of
+		// gpu64_3dSceneCreateObject() enforces it -- this is the only test of
+		// that ceiling that exists anywhere in the pipeline.
+		gpu64_3dSceneReset( &scene );
+		u8 fillRes = GPU64_3D_OK;
+		for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
+			fillRes = gpu64_3dSceneCreateObject( &scene, (u16)i, 0 );
+		CHECK( "fill to capacity", fillRes, GPU64_3D_OK );
+		CHECK( "one past capacity", gpu64_3dSceneCreateObject( &scene, 0xffff, 0 ), GPU64_3D_OUT_OF_MEMORY );
+
+#undef CHECK
+		if ( failures )
+		{
+			fprintf( stderr, "hostsim: %d scene graph check(s) failed\n", failures );
+			return 1;
+		}
+		printf( "scene graph: all checks passed\n" );
 	}
 
 	printf( "PPMs written to %s/\n", pOutDir );

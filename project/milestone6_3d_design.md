@@ -39,6 +39,20 @@ Three consequences bind on everything below:
 
 ## Philosophy
 
+- **This is "OpenGL for the C64," not a Doom/Quake clone-in-a-box.**
+  (Decided 2026-08-28, superseding the framing below where it reads
+  narrower than that.) Doom-style column casting and Quake-style polygon
+  worlds — class 2 and class 1's early demos — were illustrative targets
+  used to pressure-test the design, not the scope. The API this document
+  and [class1-3d-mesh-reference.md](../docs/class1-3d-mesh-reference.md)
+  describe — retained GPU-side resources, a scene graph the C64 moves
+  nodes in, an autonomous render loop, textured triangles with a real
+  z-buffer — is meant to be general enough for whatever a C64 program
+  wants to put on the HDMI screen in three dimensions, not scoped to
+  first-person shooters. Class 2 is deprecated (frozen, not removed) in
+  favour of this layer; see the note at the top of api_design.md's class 2
+  section. Staging for the work this implies is
+  [project/gap_filling_plan.md](gap_filling_plan.md).
 - **Resources live and stay GPU-side.** A texture or mesh, once uploaded,
   is identified by an ID the GPU owns; it does not need to keep occupying
   C64 RAM, and later rendering commands reference it by ID with no further
@@ -48,6 +62,15 @@ Three consequences bind on everything below:
   update it in real time; the actual per-frame rendering and HDMI scanout
   run on the RPi on their own schedule, decoupled from whatever the C64 is
   doing. The C64 is not blocked waiting for frames to render.
+- **Per-frame, the C64 only ever does two things**: write per-object
+  updates (a `SET_POSITION`/`MOVE_LOCAL`/`SET_LIGHT`-shaped command for
+  each thing that actually changed, straight into the shadow scene — no
+  bulk delta blob, no diffing) and then fire `SCENE_COMMIT`, which is
+  fire-and-forget from the C64's point of view: it publishes the shadow
+  scene, and the C64 moves on without waiting for the frame to render. In
+  handshake mode the *next* commit is gated on `STATUS` bit4 (frame-ready),
+  which is the poll-to-confirm half of the contract — at most one frame is
+  ever in flight.
 
 This does **not** mean the C64 is ever DMA-halted for longer than a single
 bounded burst — see [project_description.md](project_description.md#operating-modes).
@@ -401,9 +424,20 @@ traffic textures add on top, and which no HSR scheme avoids.
 
     GPU64_3D_BUDGET = 196608     /* w * h * 3, provisional */
 
-`SET_VIEWPORT` rejects anything past that with `OUT_OF_RANGE`. The number
-is provisional until ladder round 7 finds the actual edge; it leaves ~64 KB
-of L2 for texels and for core 0's own preload schedule.
+`SET_VIEWPORT` rejects anything past that with `OUT_OF_RANGE`. **This
+number's original rationale is stale and wrong — corrected 2026-08-28.**
+It was written as an L2-capacity budget ("leaves ~64 KB of L2 for texels");
+the settled ladder answer (see "The real risk: store bursts, not
+core-count and not the L2" above) proved working-set size and L2 residency
+are not the axis at all — a working set far larger than L2 costs nothing
+by itself, only unbroken store-burst length does, and the rasteriser
+already respects that limit via `gpu64_3d_span.h`'s chunking, independent
+of viewport size. `GPU64_3D_BUDGET` therefore has no load-bearing
+justification left; it survives only as an arbitrary, generous cap chosen
+before the real constraint was known. It is not urgent to revisit — no
+class-1 program has asked for a bigger viewport — but a future change to
+it should be sized against actual demand, not against this stale
+rationale.
 
 Painter's algorithm was considered and rejected: it saves the 80 KB of z
 but breaks on interpenetrating geometry, and it saves the wrong resource —
@@ -751,11 +785,16 @@ artefact. Finding that on hardware would have cost a bench session.
 ## Open questions
 
 
-1. Core-split feasibility (see Architecture above) — ladder round 7's edge
-   is the number `GPU64_3D_BUDGET` is provisionally guessing at. Nothing in
-   the API above is invalidated by a lower edge; the viewport just gets
-   smaller, and the rasteriser's region argument is what makes tiling
-   available if it gets much lower.
+1. ~~Core-split feasibility~~ **Closed 2026-08-23** (see "The real risk:
+   store bursts, not core-count and not the L2" above): the edge is a
+   7-line/448-byte unbroken store burst (8 lines/512 bytes if
+   cache-resident), design to 256 bytes (4 lines), and rate/working-set/L2
+   residency are all non-axes. Nothing in the API above is invalidated —
+   the rasteriser's existing region-argument and span-chunking machinery
+   (`gpu64_3d_span.h`) is exactly what a burst-length limit needs, and nothing
+   about viewport *size* is constrained by it. What is still open is
+   *using* the answer: the render loop has not yet moved to core 1 — see
+   [gap_filling_plan.md](gap_filling_plan.md) for that staging.
 2. Whether the scene graph ever needs **hierarchy** (a turret parented to a
    tank). Deliberately not designed — `SET_PARENT` is a one-opcode addition
    later, and composing parent transforms every frame is work core 1 does

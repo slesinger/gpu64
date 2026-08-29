@@ -1,41 +1,59 @@
 # Class 1 — 3D mesh reference
 
 This is what a byte means for `CMD_HI = 1`, gpu64's retained/immediate-mode
-3D mesh pipeline: textured, affine-mapped triangles, flat-lit per face. It
-is a smaller, more literal pipeline than the class 2 raster layer — one
-mesh, one draw call, one triangle rasteriser with a real z-buffer — and it
-is the one to reach for when your geometry is not wall/floor/ceiling shaped
-(vehicles, characters, arbitrary props, a CAD part, a cockpit).
+3D mesh pipeline: textured, affine-mapped triangles, flat-lit per face,
+over a real z-buffer. **This is gpu64's general-purpose 3D layer — the
+"OpenGL for the C64" one** — not a pipeline scoped to any one game genre;
+a Doom/Quake-style first-person renderer is one thing it can draw, not
+what it's for. It supersedes [class 2](api_design.md#class-2-opcodes--the-raster-layer)
+(deprecated, frozen but still working) as gpu64's forward path for 3D.
 
 See also: [project/milestone6_3d_design.md](../project/milestone6_3d_design.md)
 for the architecture rationale (why a second core, why a generated colormap
-instead of RGB, the store-burst budget) and the phase-1 build history.
+instead of RGB, the store-burst budget) and the phase-1 build history, and
+[project/gap_filling_plan.md](../project/gap_filling_plan.md) for what is
+staged next to close the gap between this section and "Status" below.
 
-## Status: phase 1, immediate mode only
+## Status: retained scene graph, no autonomous loop yet
 
 **Read this before the opcode table below — it changes what several rows
 actually do today.**
 
 The design targets a retained scene graph rendered autonomously by a second
-core, with the C64 only ever moving nodes and committing frames. What is
-built (phase 1, 2026-08-24) is smaller:
+core, with the C64 only ever moving nodes and committing frames. As of
+stage 14 (2026-08-29), the scene graph itself is built and live; the
+autonomous loop is not:
 
-- The renderer executes **synchronously on core 0**, inside the same
-  DMA-halt window as any class 0 draw op — not on a second core.
-- `LOOP_START` and `SCENE_COMMIT` ($06, $08) answer **`UNSUPPORTED`**.
-- Every scene-node and transform opcode, **$20-$36**, answers **`BAD_OPCODE`**.
-- Only the System/loop opcodes that don't depend on the loop ($00-$05,
-  $09), the Resources opcodes ($10-$12), and Immediate mode ($40-$42) are
-  live.
-- `ARENA_STATUS` ($09) exists in phase 1 and was not in the original design
-  sketch — see below.
+- The renderer, including `DRAW_NODE`, executes **synchronously on core 0**,
+  inside the same DMA-halt window as any class 0 draw op — not on a second
+  core. Node state (position, orientation, scale, visibility) is retained
+  across commands; drawing it is still an explicit per-frame call.
+- `LOOP_START` and `SCENE_COMMIT` ($06, $08) answer **`UNSUPPORTED`** — the
+  autonomous loop and shadow-scene double-buffering are not built yet.
+- Scene-node and transform opcodes, **$20-$24 and $30-$36**, are **live**:
+  a node created with `CREATE_OBJECT`/`CREATE_CAMERA` persists in a 256-node
+  table until `DESTROY_NODE` or a session reset, and `DRAW_NODE` ($42) draws
+  it using whatever the transform opcodes last set — no re-staging a
+  position/orientation/scale on every draw the way `DRAW_MESH` needs.
+- `ARENA_STATUS` ($09) exists and was not in the original design sketch —
+  see below.
 
-In other words: **today, a class 1 program uploads meshes and textures,
-then calls `DRAW_MESH` or `DRAW_NODE`-equivalent immediate draws directly,
-once per object, every frame, with no scene graph and no autonomous loop.**
-That is a real and useful pipeline — it is how the shipped demos work — but
-size your expectations from this section, not from the opcode table's
-column headers.
+In other words: **today, a class 1 program can either call `DRAW_MESH`
+directly (transform argument staged fresh every call, nothing retained), or
+build persistent nodes once with `CREATE_OBJECT`/`CREATE_CAMERA` and move
+them with `SET_POSITION`/`MOVE_LOCAL`/`SET_VISIBLE`/etc. before calling
+`DRAW_NODE` — but there is still no autonomous loop:** every frame's draws
+are explicit calls from the C64, each one halting it for the duration, same
+as `DRAW_MESH`.
+
+Once the loop is live (staged in
+[project/gap_filling_plan.md](../project/gap_filling_plan.md)), a
+program's per-frame work collapses further: one small command per object
+that actually moved this frame, then `SCENE_COMMIT` — a single
+fire-and-forget trigger that publishes the frame and returns immediately;
+the C64 never blocks waiting for the render, and finds out the next frame
+is ready by polling `STATUS` bit4 rather than by waiting on the command
+itself.
 
 ## Opcode table
 
@@ -65,40 +83,43 @@ class 0, and every opcode reads exactly the byte count in its row.
 | $11 | `UPLOAD_TEXTURE` | 8 | `ARG0-5` blob descriptor, `ARG6` w shift, `ARG7` h shift | Dimensions are `1 << shift`, 3..8 (8 to 256 px, power of two). `len` must equal `w*h`; anything else is `BAD_ARGS`. |
 | $12 | `FREE_RESOURCE` | 0 | — | Frees the staged `ID`'s table slot. In phase 1 this does not reclaim arena bytes — see Resource lifecycle. |
 
-### Scene nodes — $20-$2F (design only — `BAD_OPCODE` in phase 1)
+### Scene nodes — $20-$2F
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
-| $20 | `CREATE_OBJECT` | 2 | `ARG0-1` mesh resource ID | Creates a node instancing that mesh, under the staged node `ID`. |
-| $21 | `CREATE_CAMERA` | 0 | — | Creates a camera node under the staged `ID`. |
-| $22 | `DESTROY_NODE` | 0 | — | Destroys the staged `ID`. |
-| $23 | `SET_ACTIVE_CAMERA` | 0 | — | The staged `ID` becomes the camera the loop renders from. |
-| $24 | `SET_VISIBLE` | 1 | `ARG0` 0 or 1 | Skips the node without destroying it. |
+| $20 | `CREATE_OBJECT` | 2 | `ARG0-1` mesh resource ID | Creates a node instancing that mesh, under the staged node `ID`. Re-creating over a live `ID` replaces it — same convention as the resource table's re-upload. `OUT_OF_MEMORY` if the 256-node table is full. |
+| $21 | `CREATE_CAMERA` | 0 | — | Creates a camera node under the staged `ID`. Same replace-on-live-ID and `OUT_OF_MEMORY` behaviour as `CREATE_OBJECT`. |
+| $22 | `DESTROY_NODE` | 0 | — | Destroys the staged `ID`. `BAD_ID` if it does not exist. Destroying the active camera clears it — a later node reusing that same numeric `ID` is not silently treated as the camera again. |
+| $23 | `SET_ACTIVE_CAMERA` | 0 | — | The staged `ID` becomes the camera `DRAW_NODE` and the loop render from. `BAD_ID` unless it names a live camera node. |
+| $24 | `SET_VISIBLE` | 1 | `ARG0` 0 or 1 | Skips the node without destroying it. Any other `ARG0` value is `BAD_ARGS`. |
 
-### Transforms — $30-$3F (design only — `BAD_OPCODE` in phase 1)
+### Transforms — $30-$3F
 
-All act on the staged node `ID`, and all write into the shadow scene.
+All act on the staged node `ID` (object or camera — both carry a
+position/orientation), and all write into the retained node table, not a
+shadow copy — an immediate-mode `DRAW_NODE` sees the change on its very next
+call.
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
 | $30 | `SET_POSITION` | 12 | x, y, z (16.16) | Absolute, world space. |
-| $31 | `SET_ORIENTATION` | 6 | yaw, pitch, roll (binary angle) | Absolute. |
-| $32 | `MOVE_LOCAL` | 6 | dx, dy, dz (8.8) | Translate along the node's own axes. |
-| $33 | `MOVE_WORLD` | 6 | dx, dy, dz (8.8) | Translate along world axes. |
-| $34 | `ROTATE_LOCAL` | 6 | dyaw, dpitch, droll (binary angle) | Compose onto the current orientation. |
-| $35 | `SET_SCALE` | 2 | s (unsigned 8.8) | Uniform. |
-| $36 | `GET_TRANSFORM` | 6 | `ARG0-5` destination descriptor | Writes 18 bytes — position (12) + orientation (6) — back to C64 RAM or REU, for collision and gameplay logic. |
+| $31 | `SET_ORIENTATION` | 6 | yaw, pitch, roll (binary angle) | Absolute — replaces, does not compose with, whatever was there. |
+| $32 | `MOVE_LOCAL` | 6 | dx, dy, dz (8.8) | Translate along the node's own axes, i.e. the delta is rotated by the node's current orientation before being added — "forward 1.5" means forward for *this* node, however it's currently facing. |
+| $33 | `MOVE_WORLD` | 6 | dx, dy, dz (8.8) | Translate along world axes — added directly, no rotation. |
+| $34 | `ROTATE_LOCAL` | 6 | dyaw, dpitch, droll (binary angle) | Added to the current yaw/pitch/roll independently, each wrapping mod 65536 — "add a turn rate and let it wrap", same as any other binary-angle field. |
+| $35 | `SET_SCALE` | 2 | s (unsigned 8.8) | Uniform. Zero is `BAD_ARGS` — same rejection `DRAW_MESH` makes at draw time, caught here instead so the opcode that caused it is the one that fails. |
+| $36 | `GET_TRANSFORM` | 6 | `ARG0-5` destination descriptor | Writes 18 bytes — position (12, s32 16.16 x/y/z) + yaw/pitch/roll (6, u16 each), all little-endian — back to C64 RAM or REU, for collision and gameplay logic. Reads back the accumulated angles, including anything `ROTATE_LOCAL` has added since the last `SET_ORIENTATION`. Destination `len < 18` is `BAD_ARGS`. |
 
-### Immediate mode — $40-$4F (live in phase 1)
+### Immediate mode — $40-$4F
 
-Legal only with the loop stopped — which in phase 1 means always, since the
-loop cannot be started. Otherwise `BUSY`.
+Legal only with the loop stopped — which today means always, since the loop
+cannot be started. Otherwise `BUSY`.
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
 | $40 | `CLEAR_VIEWPORT` | 0 | — | Fills the viewport with the background index and clears the z-buffer. Call this once per frame before drawing — nothing else clears the z-buffer for you (see Depth buffer below). |
-| $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Runs synchronously on core 0 and returns when done. `RESULT` = triangle count drawn, saturated to a byte — **a mesh that draws 0 triangles and a winding-order mistake that culls every face look identical**, so check `RESULT` after your first upload of any new mesh. |
-| $42 | `DRAW_NODE` | 0 | — | Same, for a scene node already positioned via $30-$35 — no re-staging of a transform. Depends on the scene-node opcodes and so is not usable until phase 2. |
+| $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Runs synchronously on core 0 and returns when done. Ignores the scene graph entirely — draws in world space unless a camera has been applied by a preceding `DRAW_NODE` call this session (`SET_PERSPECTIVE`'s projection still applies either way). `RESULT` = triangle count drawn, saturated to a byte — **a mesh that draws 0 triangles and a winding-order mistake that culls every face look identical**, so check `RESULT` after your first upload of any new mesh. |
+| $42 | `DRAW_NODE` | 0 | — | Draws the staged object node `ID` using its retained position/orientation/scale — no re-staging a transform, unlike `DRAW_MESH`. Applies the active camera (if any) fresh on every call, so moving the camera between two `DRAW_NODE`s in one frame is seen by both. `BAD_ID` if the staged `ID` is not a live object node (a camera `ID` included). An invisible node (`SET_VISIBLE 0`) is skipped silently: `RESULT` = 0, `ERRCODE` = `OK`, same "0 is informative, not an error" convention `DRAW_MESH` uses for full culling. |
 
 ## Mesh format
 
@@ -143,7 +164,7 @@ Notes that affect how you author or export a mesh:
 |---|---|---|
 | Vertices per mesh | 256 | the 1-byte face index |
 | Meshes and textures resident | thousands | flat 16-bit resource ID space, 512 MB resource RAM (32 MB in the phase-1 arena) |
-| Object instances in the scene | 256 | the scene table (design only, not live in phase 1) |
+| Object instances in the scene | 256 | the scene table |
 
 ## Texture format
 
@@ -237,13 +258,13 @@ Class 1 adds one readable byte beyond the class 0 register set:
 
 | Address | Name | Dir | Purpose |
 |---|---|---|---|
-| $DF21 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT` (design only), allocated ID from a future `CREATE_*`, triangle count from `DRAW_MESH`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. |
+| $DF21 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT` (design only), triangle count from `DRAW_MESH`/`DRAW_NODE`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. `CREATE_OBJECT`/`CREATE_CAMERA` don't allocate an ID and so don't set `RESULT` — node IDs are chosen by the C64 side, same as resource IDs. |
 
 and one `STATUS` bit:
 
 | Bit | Meaning |
 |---|---|
-| 4 | frame-ready — the loop has finished a frame and is waiting for `SCENE_COMMIT` (handshake mode only; not reachable in phase 1, since the loop cannot start). |
+| 4 | frame-ready — the loop has finished a frame and is waiting for `SCENE_COMMIT` (handshake mode only; not reachable yet, since the loop cannot start). |
 
 New `ERRCODE` values this class adds: `OUT_OF_MEMORY` (resource RAM
 exhausted), `QUEUE_FULL` (the core-0/core-1 command ring is full), `BAD_ID`

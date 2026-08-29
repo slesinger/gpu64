@@ -13,7 +13,15 @@ Why the protocol looks the way it does is in
 [milestone4_2d_api_design.md](milestone4_2d_api_design.md); status and
 hardware test results are in [progress_tracker.md](progress_tracker.md).
 Class 1 (3D) is specified in
-[milestone6_3d_design.md](milestone6_3d_design.md).
+[class1-3d-mesh-reference.md](class1-3d-mesh-reference.md); the retained
+scene graph, autonomous render loop and per-frame commit it targets — the
+thing this whole API is converging on being "OpenGL for the C64" — is
+[milestone6_3d_design.md](../project/milestone6_3d_design.md)'s subject,
+staged in [gap_filling_plan.md](../project/gap_filling_plan.md).
+
+Class 2 (below) is **deprecated in favour of class 1's retained scene
+graph** — it still works and its own opcode table is unchanged, but new
+work should target class 1. See the note at the top of that section.
 
 ---
 
@@ -319,6 +327,21 @@ Everything not listed above — including $A0–$FF — is undefined: writing it
 sets `ERRCODE = BAD_OPCODE` and does nothing else.
 
 ## Class 2 opcodes — the raster layer
+
+**Deprecated (2026-08-28), frozen, not removed.** Class 2 was gpu64's
+first 3D-shaped layer — a per-frame, C64-driven batch of column/span/wall/
+polygon records, rebuilt and re-sent every frame. Class 1's retained scene
+graph (see [class1-3d-mesh-reference.md](class1-3d-mesh-reference.md) and
+its [gap-filling plan](../project/gap_filling_plan.md)) is the forward
+path: resources live GPU-side, the scene persists across frames, and the
+C64's per-frame job shrinks to one fire-and-forget commit plus whichever
+few objects actually moved. Class 2 is not going away — the opcodes below
+keep working, the demos that use them keep working, and it stays the right
+choice for genuinely 2.5D column-cast rendering (`DRAW_COLUMNS`/
+`DRAW_WALLS`/`DRAW_SECTORS` have no class-1 equivalent and none is
+planned). But it gets no new capability: the "Level-scale visibility"
+wishlist below is superseded by class 1's gap-filling plan, not by
+anything in this class.
 
 Set `CMD_HI = 2`. This is the column/span/sprite layer a first-person
 renderer needs: instead of one command per shape, you fill an array of
@@ -837,11 +860,20 @@ asks for, and `rejected` is the counter that moves if a batch arrives
 damaged. Reading it back costs one dispatch and a 16-byte write, which is
 cheap enough to do every frame.
 
-### Level-scale visibility — forward-looking requirements
+### Level-scale visibility — superseded by class 1
 
-Everything below is unimplemented and exists to record the gap between
-current capability (per-face and per-pixel rejection/depth-sorting) and
-what a level-scale engine needs (per-frame visibility determination):
+**This subsection is frozen, not actionable.** It records the gap between
+class 2's per-frame batch model and what a level-scale engine needs, as it
+stood before the 2026-08-28 decision to make class 1's retained scene graph
+gpu64's forward path (see the deprecation note at the top of this class,
+and [project/gap_filling_plan.md](../project/gap_filling_plan.md)). A
+persistent world, GPU-side visibility determination and a per-frame cost
+that doesn't scale with level size are exactly what class 1's scene graph
+and autonomous render loop are designed to give every class-1 program by
+construction, not as a class-2-specific extension — so none of the items
+below are planned to be built here. Kept for the historical record and
+because `UPLOAD_POLYS`/`DRAW_WORLD` (marked `[IMPLEMENTED]` below) remain
+live, working class-2 opcodes.
 
 [REQUIREMENT NEEDS DETAIL DESIGN] All per-frame visibility determination —
 deciding which polygons/faces are worth drawing for the current camera —

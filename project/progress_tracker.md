@@ -2224,3 +2224,193 @@ so the C64 free-runs past a long piece of work: a rule 1 exposure. Mirror mode
 only, so it cannot be behind these hangs, and moving the call inside the hold
 would lengthen the hold noticeably -- worth doing deliberately, not as a
 drive-by.
+
+## 14. The scene graph and transforms, on core 0 (2026-08-29)
+
+**Status: done, verified on hardware 2026-08-29.**
+
+`gap_filling_plan.md`'s Stage 14, taken out of turn ahead of core 1
+(now Stage 15): `CREATE_OBJECT`/`CREATE_CAMERA`/`DESTROY_NODE`/
+`SET_ACTIVE_CAMERA`/`SET_VISIBLE` ($20-$24), the seven transform opcodes
+($30-$36), and `DRAW_NODE` ($42) are real, replacing `BAD_OPCODE`. All of it
+runs synchronous-on-core-0, the same execution model `DRAW_MESH` already
+uses -- one DMA-halt window, one framebuffer owner, no ring-buffer
+involvement. `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT` are untouched and still
+`UNSUPPORTED`; a node's transform is live the instant the opcode that set it
+returns, and a program still calls `DRAW_NODE` once per object per frame
+itself. What changes is the size of what crosses the bus to do it: a
+transform update to a resident node, not `DRAW_MESH`'s full pose every call.
+
+New files: `gpu64_3d_scene.h`/`.cpp` hold the portable scene table (256
+nodes, `Gpu64_3dNode`: type, visibility, mesh id, position, three
+independent absolute-angle fields with a cached rotation matrix rebuilt on
+every orientation change, scale) and camera application
+(`gpu64_3dSceneApplyCamera()`, called fresh on every `DRAW_NODE`, not
+cached). `gpu64_3d_class1.cpp` stays a thin IO2 wrapper over it, the same
+division phase 1 already used for the resource table.
+
+Conventions worth recording:
+
+- **Node creation over a live id replaces it**, same rule `resSlot()`
+  already used for resources.
+- **`DESTROY_NODE` on the active camera clears `bHaveActiveCamera`**, so a
+  later `CREATE_OBJECT` that reuses the freed id does not silently inherit
+  camera status.
+- **`DRAW_NODE` on an invisible node is not an error.** `RESULT=0`,
+  `ERRCODE=OK` -- `SET_VISIBLE(0)` parks a node without destroying it, the
+  same "zero triangles is informative, not an error" precedent `DRAW_MESH`
+  already set for full culling.
+- **`MOVE_LOCAL` rotates its delta by the node's cached rotation** before
+  adding to position; `MOVE_WORLD` adds directly. `ROTATE_LOCAL` is plain
+  wrapping addition onto the live angle, not onto whatever `SET_ORIENTATION`
+  last wrote -- checked directly (see below).
+
+### The three open questions, resolved
+
+`milestone6_3d_design.md` left three questions for this stage to settle.
+All three turned out to already be answered by code that predates it:
+
+1. **Hierarchy (`SET_PARENT`)** -- not built. Per the plan's own criterion
+   ("build it only if a real scene wants a turret-on-a-tank"), no scene has
+   asked for it yet. Deliberately deferred, not forgotten.
+2. **Clipping strategy** -- already Sutherland-Hodgman against the single
+   near plane (`clipNear()` in `gpu64_3d_render.cpp`), with the viewport
+   rect left to the rasteriser's scissor. This is the doc's own leaning and
+   has been live since the polygon layer (milestone 9); nothing about the
+   scene graph changes it.
+3. **Bounding-sphere source** -- already computed at `UPLOAD_MESH`
+   (`gpu64_3dBuildMesh()` fills `pMesh->centre`/`radius`), and already used
+   for a whole-object near/far reject before per-vertex work starts. Also
+   predates this stage. The lean the plan wrote down is what the code
+   already does.
+
+### Verified, on a PC
+
+- **`tools/hostsim`**: a scene-graph exercise (create two objects and a
+  camera, position/orient/move/rotate/scale them, apply the camera, draw)
+  appended to `main()`. `scene graph test: 6 tris, checksum a28132da` /
+  `scene graph: all checks passed`, rendered to `out/scenegraph.ppm` and
+  visually confirmed (a lit, textured box from an elevated camera angle, no
+  corruption). Checks include: `SET_SCALE(0)` returns `BAD_ARGS`;
+  destroying the active camera clears `bHaveActiveCamera` (`ApplyCamera`
+  reverts to `bHaveCamera=FALSE` afterwards); the 256th `CREATE_OBJECT`
+  succeeds and the 257th returns `OUT_OF_MEMORY`; `GET_TRANSFORM` after a
+  `SET_ORIENTATION` followed by a `ROTATE_LOCAL` reads back the *sum*, not
+  just the last `SET_ORIENTATION` value -- proof `ROTATE_LOCAL` composes
+  onto live state.
+- **Full firmware cross-build** (`tools/build.sh`, `aarch64-none-elf-*`
+  toolchain) compiles the new/changed files against the real Circle/RAD
+  headers, not just in isolation. Zero warnings attributable to this stage.
+- **`Source/TestPRG/gpu64_3d_scene_test.a`**, new, assembles clean
+  (`64tass --cbm-prg`, no warnings). `gpu64_3d_arena_test.a`-style: fills
+  the 256-node table one `CREATE_OBJECT` at a time until the 257th returns
+  `OUT_OF_MEMORY`, then checks that creating over a still-live id replaces
+  it in place even while the table is full, that `DESTROY_NODE` reclaims
+  exactly one slot for a later create, that the table refuses again one
+  node past that, and that `DESTROY_NODE`/`SET_VISIBLE`/`SET_SCALE` return
+  `BAD_ID`/`BAD_ARGS` where the design says they must. Self-verdicting,
+  screen-readable, one-shot like its precedent -- not run yet, see below.
+
+### Not done / still open
+
+- **No several-hundred-frame sim run.** The plan's verification text calls
+  for one, but `tools/prgsim` (the only frame-driven PC model this project
+  has) explicitly does not model class 1 -- `gpu64model.py`: "class 1 is
+  not modelled", and any `CMD_HI=1` write there answers `BAD_CLASS`
+  regardless of opcode. There is no tooling gap to close cheaply here: class
+  0 and class 2 get a Python reference model because they have one; class 1
+  gets `tools/hostsim` instead, which is a native pixel-correctness check,
+  not a many-frame C64-side soak. `gpu64_3d_scene_test.a` is a one-shot
+  exhaustion test in the same spirit as `gpu64_3d_arena_test.a`, not a demo,
+  so a frame count does not obviously apply to it either -- flagging this
+  rather than quietly declaring the plan's checklist satisfied.
+- **Docs updated** (`docs/class1-3d-mesh-reference.md`): scene node and
+  transform opcodes now describe real behaviour instead of "design only --
+  `BAD_OPCODE` in phase 1"; `DRAW_MESH`/`DRAW_NODE` rows, the object-instance
+  limits row, and the `RESULT`/status-bit descriptions updated to match.
+  `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT` and `FREE_RESOURCE`'s
+  non-reclaiming arena text are untouched -- still accurate.
+
+### Verified, on hardware (2026-08-29)
+
+`gpu64_3d_scene_test.prg` and `gpu64_3d_arena_test.prg` both green on real
+RAD hardware, RAD menu reachable afterward with no power-cycle needed. Got
+there in four rounds -- the first three chased a phantom.
+
+### The hardware regression: a linker/MMU page-boundary defect, not a bug in DRAW_NODE
+
+Round 0 (all 13 new opcodes live) shipped garbage `ERRCODE`s above the
+highest defined value ($0B) -- $20, $99, $66 -- and left the RAD menu
+unreachable, needing a power-cycle to recover. Worse, *after* the
+power-cycle, `gpu64_3d_arena_test.prg` -- untouched by this stage, using
+only milestone-6 opcodes -- failed too. That combination (a fresh failure
+in old, previously-green code, only after the new build had run) was the
+first real clue, in hindsight; at the time it read as two bugs.
+
+Source-level `#if 0` bisection narrowed it to `DRAW_NODE` by elimination
+over two more rounds: everything new *except* `DRAW_NODE` was clean; only
+`DRAW_NODE` reintroduced the failure. That pointed at
+`gpu64_3dSceneApplyCamera()`, the one code path able to drive
+`gpu64_3dDrawMesh()`'s camera-relative transform with real values, and a
+self-warm fix was built and shipped for round 3 on that theory (CLAUDE.md
+rule 4 -- cold i-cache at a cycle-critical point of use). **It did not
+work.** Same signature, arena_test now worse.
+
+Asked for a second opinion (Opus) rather than guess a fourth time. It read
+`gpu64_3d_scene_test.a`'s own header comment and opcode list first, and
+found the round-2/3 premise was never true: **the test never issues
+`DRAW_NODE` at all** -- it only exercises `CREATE_OBJECT`/`DESTROY_NODE`/
+`SET_VISIBLE`/`SET_SCALE`. The entire camera/transform investigation was
+chasing a code path the failing program never calls.
+
+The real defect, found by reading the linked ELF's section layout rather
+than the C++ source: the five cycle-critical functions in `rad_reu.cpp`
+(`reuUsingPolling` and the four it's grouped with) carried a bare
+`__attribute__((section("section_polling")))`. `external/Circle/circle.ld`
+(vendored, gitignored, not ours to edit) only routes names starting with
+`.text` into the `.text` output section before it sets `_etext`; a bare
+name is orphan-placed by the linker *after* `.text`, i.e. potentially past
+`_etext`. `translationtable64.cpp` marks every 64KB page at or above
+`_etext` execute-never (PXN) at the MMU level.
+
+This was a **latent, pre-existing defect** -- `section_polling` has always
+sat above `_etext` -- harmless only because the whole 5-function group
+happened to fit inside the same 64KB page as the rest of `.text`. Stage
+14's growth pushed `reuUsingPolling`'s tail -- the actual C64-bus GPIO
+code -- 2120 bytes across the next page boundary, into execute-never
+territory, in round 0's and round 3's builds specifically (round 1 and
+round 2's smaller images landed only 72 bytes over, still inside the same
+page). Confirmed independently against the actual built ELF with
+`aarch64-none-elf-nm`/`readelf`, not taken on the agent's word: `_etext =
+0xcdf18`, `section_polling` at `0xce000`, `reuUsingPolling` spanning to
+`0xd0848`, 2120 bytes past the `0xd0000` page boundary in the failing
+build. That fully explains every symptom -- an instruction-fetch fault
+inside the function driving the C64 bus reads as a floating/garbage bus
+from the C64 side, kills the RAD menu, and needs a power-cycle -- and
+explains why the bisection kept implicating `DRAW_NODE`: linking it in was
+simply what tipped that particular build over the boundary, unrelated to
+what its code does.
+
+**Fixed** by renaming the section attribute at all five sites in
+`rad_reu.cpp` from `"section_polling"` to `".text.section_polling"`, so
+`circle.ld`'s existing `*(.text*)` wildcard places the group inside
+`.text`, before `_etext`, by construction -- durable against future image
+growth, and no edit needed to the vendored linker script. Verified at the
+desk before spending a fourth hardware round: `section_polling` no longer
+exists as a separate output section post-fix, and `reuUsingPolling` (now
+at `0x86800`-`0x88248`) sits over 160KB inside `.text`'s new end
+(`_etext = 0xd0718`). Round 4 (this fix, all 13 opcodes live) is the
+green hardware run above.
+
+The round-3 self-warm in `opDrawNode()` was left in place -- rule 4 is a
+real, separate concern this codebase has been bitten by more than once,
+and the path is new enough on hardware to be worth not gambling on -- but
+its `FORCE_READ_LINEARa` accumulator was corrected from `65536` (the
+boot-time `warmCache()` idiom, copied into the wrong context) to `1024*2`
+(the in-dispatch idiom `gpu64_blobRead`/`gpu64_blobWrite` already use),
+since the wrong value was needlessly extending the DMA-held window ~32x
+whenever `DRAW_NODE` runs for real.
+
+**Not yet done:** a build-time assertion that no executable byte lands on
+a page at or above `_etext`, to catch any future recurrence of this exact
+class of defect before it reaches hardware. Worth doing; not blocking.

@@ -21,8 +21,10 @@
 */
 #include "gpu64_3d_internals.h"
 #include "gpu64_3d_render.h"
+#include "gpu64_3d_scene.h"
 #include "gpu64_api.h"
 #include "gpu64_fb.h"
+#include "lowlevel_arm64.h"
 #include <circle/util.h>
 
 #ifdef GPU64_3D_ENABLED
@@ -72,6 +74,11 @@ static Gpu64_3dState	s_State;
 static Gpu64_3dResource	s_Res[ GPU64_3D_MAX_RESOURCES ];
 static Gpu64_3dScratch	s_Scratch;
 
+// The scene graph -- stage 14. Nodes reference meshes by ID; resolving that
+// ID to a Gpu64_3dResource stays here rather than in gpu64_3d_scene.cpp, for
+// the reason given at the top of gpu64_3d_scene.h.
+static Gpu64_3dScene	s_Scene;
+
 // The z-buffer, sized for the largest viewport SET_VIEWPORT will accept.
 // Static rather than out of the arena so a program cannot exhaust resource
 // RAM and then find it cannot draw.
@@ -94,6 +101,12 @@ static inline u16 argU16( unsigned i )
 static inline s16 argS16( unsigned i )
 {
 	return (s16)argU16( i );
+}
+
+static inline s32 argS32( unsigned i )
+{
+	return (s32)( (u32)sArg[ i ] | ( (u32)sArg[ i + 1 ] << 8 ) |
+		       ( (u32)sArg[ i + 2 ] << 16 ) | ( (u32)sArg[ i + 3 ] << 24 ) );
 }
 
 static inline void argBlob( unsigned i, u8 *pSpace, u32 *pAddr, u32 *pLen )
@@ -163,6 +176,7 @@ void gpu64_3dInit( void )
 	memset( s_Res, 0, sizeof( s_Res ) );
 	gpu64_3dArenaReset();
 	gpu64_3dStateDefaults( &s_State );
+	gpu64_3dSceneReset( &s_Scene );
 }
 
 void gpu64_3dReset( void )
@@ -181,6 +195,11 @@ void gpu64_3dReset( void )
 	memset( s_Res, 0, sizeof( s_Res ) );
 	gpu64_3dArenaReset();
 	gpu64_3dStateDefaults( &s_State );
+
+	// Every node of the session goes with it too, same rule and same
+	// reason as the resource table above: RUN/STOP+RESTORE must not leave
+	// the next program looking at a dead program's scene.
+	gpu64_3dSceneReset( &s_Scene );
 
 	memset( &gpu64_3dHost, 0, sizeof( gpu64_3dHost ) );
 }
@@ -395,6 +414,184 @@ static u8 opDrawMesh( void )
 	return GPU64_ERR_OK;
 }
 
+// --- the scene graph ($20-$24, $30-$36, $42) -----------------------------
+//
+// Thin IO2 wrappers, same shape throughout: unpack ARG into the units
+// gpu64_3d_scene.h wants, call the portable function, translate its
+// GPU64_3D_* code to the GPU64_ERR_* one the C64 side already knows (they
+// share numeric values for BAD_ID/BAD_ARGS/OUT_OF_MEMORY/OK by construction,
+// so the "translation" is the identity -- spelled out anyway so a future
+// divergence between the two enums fails to compile instead of miscoding).
+
+static u8 opCreateObject( void )
+{
+	return gpu64_3dSceneCreateObject( &s_Scene, stagedId(), argU16( 0 ) );
+}
+
+static u8 opCreateCamera( void )
+{
+	return gpu64_3dSceneCreateCamera( &s_Scene, stagedId() );
+}
+
+static u8 opDestroyNode( void )
+{
+	return gpu64_3dSceneDestroyNode( &s_Scene, stagedId() );
+}
+
+static u8 opSetActiveCamera( void )
+{
+	return gpu64_3dSceneSetActiveCamera( &s_Scene, stagedId() );
+}
+
+static u8 opSetVisible( void )
+{
+	if ( sArg[ 0 ] > 1 )
+		return GPU64_ERR_BAD_ARGS;
+	return gpu64_3dSceneSetVisible( &s_Scene, stagedId(), sArg[ 0 ] != 0 );
+}
+
+static u8 opSetPosition( void )
+{
+	Gpu64_3dVec pos;
+	pos.x = argS32( 0 );		// wire is already 16.16 -- SET_POSITION places
+	pos.y = argS32( 4 );		// a node anywhere in a 65536-unit world, unlike
+	pos.z = argS32( 8 );		// DRAW_MESH's 8.8 immediate-mode offset.
+	return gpu64_3dSceneSetPosition( &s_Scene, stagedId(), &pos );
+}
+
+static u8 opSetOrientation( void )
+{
+	return gpu64_3dSceneSetOrientation( &s_Scene, stagedId(),
+					     argU16( 0 ), argU16( 2 ), argU16( 4 ) );
+}
+
+static u8 opMoveLocal( void )
+{
+	return gpu64_3dSceneMoveLocal( &s_Scene, stagedId(),
+					(s32)argS16( 0 ) << 8,		// 8.8 -> 16.16
+					(s32)argS16( 2 ) << 8,
+					(s32)argS16( 4 ) << 8 );
+}
+
+static u8 opMoveWorld( void )
+{
+	return gpu64_3dSceneMoveWorld( &s_Scene, stagedId(),
+					(s32)argS16( 0 ) << 8,
+					(s32)argS16( 2 ) << 8,
+					(s32)argS16( 4 ) << 8 );
+}
+
+static u8 opRotateLocal( void )
+{
+	return gpu64_3dSceneRotateLocal( &s_Scene, stagedId(),
+					  argU16( 0 ), argU16( 2 ), argU16( 4 ) );
+}
+
+static u8 opSetScale( void )
+{
+	return gpu64_3dSceneSetScale( &s_Scene, stagedId(), argU16( 0 ) );
+}
+
+static u8 opGetTransform( void )
+{
+	u8  space;
+	u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+	if ( len < 18 )
+		return GPU64_ERR_BAD_ARGS;
+
+	Gpu64_3dVec pos;
+	u16 yaw, pitch, roll;
+	const u8 res = gpu64_3dSceneGetTransform( &s_Scene, stagedId(), &pos, &yaw, &pitch, &roll );
+	if ( res != GPU64_ERR_OK )
+		return res;
+
+	// Position (s32 16.16 x/y/z) then yaw/pitch/roll (u16 each), little-endian
+	// throughout -- the same byte order every other multi-byte field on this
+	// bus uses. 18 bytes, matching the wire format's own accounting.
+	u8 buf[ 18 ];
+	buf[ 0 ] = (u8)( pos.x );        buf[ 1 ] = (u8)( pos.x >> 8 );
+	buf[ 2 ] = (u8)( pos.x >> 16 );  buf[ 3 ] = (u8)( pos.x >> 24 );
+	buf[ 4 ] = (u8)( pos.y );        buf[ 5 ] = (u8)( pos.y >> 8 );
+	buf[ 6 ] = (u8)( pos.y >> 16 );  buf[ 7 ] = (u8)( pos.y >> 24 );
+	buf[ 8 ] = (u8)( pos.z );        buf[ 9 ] = (u8)( pos.z >> 8 );
+	buf[ 10 ] = (u8)( pos.z >> 16 ); buf[ 11 ] = (u8)( pos.z >> 24 );
+	buf[ 12 ] = (u8)( yaw );         buf[ 13 ] = (u8)( yaw >> 8 );
+	buf[ 14 ] = (u8)( pitch );       buf[ 15 ] = (u8)( pitch >> 8 );
+	buf[ 16 ] = (u8)( roll );        buf[ 17 ] = (u8)( roll >> 8 );
+
+	return gpu64_blobWrite( space, addr, 18, buf );
+}
+
+static u8 opDrawNode( void )
+{
+	// gpu64: self-warm, rule 4 in CLAUDE.md -- "cycle-critical code reachable
+	// from a command must warm its own i-cache at the point of use." Unlike
+	// DRAW_MESH's path (opDrawMesh -> gpu64_3dDrawMesh -> the rasteriser),
+	// which has been dispatched, and therefore self-warmed by execution,
+	// continuously since milestone 6, this function and the two scene-graph
+	// calls below it are new in Stage 14 and on a cold boot are guaranteed
+	// never to have executed before their first DRAW_NODE. warmCache() at
+	// boot (rad_main.cpp) does not cover them -- it only preloads the
+	// polling loop and the other functions the loop calls directly -- and
+	// gpu64_apiWarmPollingLoop() (gpu64_3dDispatch(), below) re-warms only
+	// after a dispatch, too late to help this one. Same in-dispatch idiom as
+	// gpu64_blobRead()/gpu64_blobWrite() in rad_reu.cpp -- acc == size, one
+	// linear pass, not warmCache()'s boot-time acc=65536 (that one pays for
+	// itself once at start-up; this one runs every dispatch with the bus
+	// held, so it should cost exactly what it needs to and no more).
+	// gpu64_3dDrawMesh() itself is deliberately not repeated here -- it is
+	// already covered by DRAW_MESH's own history of use.
+	//
+	// This was not, on its own, what actually caused the Stage-14 hardware
+	// regression -- that turned out to be reuUsingPolling() itself landing
+	// on an execute-never MMU page once DRAW_NODE's code pushed the image
+	// past a 64KB boundary (fixed at each ".text.section_polling" site in
+	// rad_reu.cpp, 2026-08-29). It stays because rule 4 is a real, separate
+	// concern this codebase has been bitten by more than once, and this path
+	// is new enough on hardware to be worth not gambling on.
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)opDrawNode, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)opDrawNode, 1024 * 2, 1024 * 2 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneFind, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_3dSceneFind, 1024 * 2, 1024 * 2 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneApplyCamera, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_3dSceneApplyCamera, 1024 * 2, 1024 * 2 );
+
+	Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, stagedId(), GPU64_3D_NODE_OBJECT );
+	if ( pN == 0 )
+		return GPU64_ERR_BAD_ID;
+
+	if ( !pN->visible )
+	{
+		// Not an error -- SET_VISIBLE(0) is how a program parks a node
+		// without destroying it, exactly like DRAW_MESH's own "every face
+		// culled" result below.
+		gpu64Regs.result = 0;
+		return GPU64_ERR_OK;
+	}
+
+	const Gpu64_3dResource *pR = resFind( pN->meshId, GPU64_3D_RES_MESH );
+	if ( pR == 0 )
+		return GPU64_ERR_BAD_ID;
+
+	Gpu64_3dTarget target;
+	if ( !makeTarget( &target ) )
+		return GPU64_ERR_UNSUPPORTED;
+
+	// The active camera, if any, is applied fresh on every DRAW_NODE: a
+	// program that moves the camera between two DRAW_NODE calls in the same
+	// frame must see both nodes drawn from where the camera is *now*, not
+	// from wherever it was at some earlier SET_ACTIVE_CAMERA.
+	gpu64_3dSceneApplyCamera( &s_Scene, &s_State );
+
+	const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
+					     &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
+	cleanViewport();
+
+	gpu64Regs.result = (u8)( n > 255 ? 255 : n );
+	return GPU64_ERR_OK;
+}
+
 // --- dispatch -----------------------------------------------------------
 
 static u8 execute( u8 op )
@@ -402,10 +599,11 @@ static u8 execute( u8 op )
 	switch ( op )
 	{
 	case GPU64_3D_OP_SCENE_RESET:
-		// Nodes and the loop are phase 2 and phase 4; what exists to reset
-		// today is the render state. Resources deliberately survive, per the
-		// opcode's own definition.
+		// "Destroys every node, stops the loop, leaves uploaded resources
+		// alone" -- docs/class1-3d-mesh-reference.md. The loop is phase 4
+		// and does not exist yet; nodes and render state do.
 		gpu64_3dStateDefaults( &s_State );
+		gpu64_3dSceneReset( &s_Scene );
 		return GPU64_ERR_OK;
 
 	case GPU64_3D_OP_SET_VIEWPORT:		return opSetViewport();
@@ -439,21 +637,33 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_UPLOAD_TEXTURE:	return opUploadTexture();
 	case GPU64_3D_OP_FREE_RESOURCE:		return opFreeResource();
 
+	case GPU64_3D_OP_CREATE_OBJECT:		return opCreateObject();
+	case GPU64_3D_OP_CREATE_CAMERA:		return opCreateCamera();
+	case GPU64_3D_OP_DESTROY_NODE:		return opDestroyNode();
+	case GPU64_3D_OP_SET_ACTIVE_CAMERA:	return opSetActiveCamera();
+	case GPU64_3D_OP_SET_VISIBLE:		return opSetVisible();
+
+	case GPU64_3D_OP_SET_POSITION:		return opSetPosition();
+	case GPU64_3D_OP_SET_ORIENTATION:	return opSetOrientation();
+	case GPU64_3D_OP_MOVE_LOCAL:		return opMoveLocal();
+	case GPU64_3D_OP_MOVE_WORLD:		return opMoveWorld();
+	case GPU64_3D_OP_ROTATE_LOCAL:		return opRotateLocal();
+	case GPU64_3D_OP_SET_SCALE:		return opSetScale();
+	case GPU64_3D_OP_GET_TRANSFORM:		return opGetTransform();
+
 	case GPU64_3D_OP_CLEAR_VIEWPORT:	return opClearViewport();
 	case GPU64_3D_OP_DRAW_MESH:		return opDrawMesh();
+	case GPU64_3D_OP_DRAW_NODE:		return opDrawNode();
 
 	case GPU64_3D_OP_LOOP_START:
 	case GPU64_3D_OP_SCENE_COMMIT:
-		// Both belong to the retained scene and the autonomous loop, which is
-		// phase 4. UNSUPPORTED rather than BAD_OPCODE: the opcode is real and
-		// this build cannot do it, which is a different thing for a program
-		// to branch on than an opcode that does not exist.
+		// Both belong to the autonomous loop, which is phase 4. UNSUPPORTED
+		// rather than BAD_OPCODE: the opcode is real and this build cannot do
+		// it, which is a different thing for a program to branch on than an
+		// opcode that does not exist.
 		return GPU64_ERR_UNSUPPORTED;
 	}
 
-	// Scene nodes and transforms ($20-$36) are phase 2 and land here. A class
-	// that silently accepts what it cannot do is worse than one that rejects
-	// it -- the C64 side gets no signal and debugs the wrong layer.
 	return GPU64_ERR_BAD_OPCODE;
 }
 
