@@ -269,4 +269,7 @@ and one `STATUS` bit:
 New `ERRCODE` values this class adds: `OUT_OF_MEMORY` (resource RAM
 exhausted), `QUEUE_FULL` (the core-0/core-1 command ring is full), `BAD_ID`
 (no such resource or node), `NO_CAMERA` (a render was asked for with no
-active camera). See [error-codes.md](error-codes.md) for the shared table.
+active camera), `WORKER_TIMEOUT` (a `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE`
+did not come back from core 1 in a generous worst-case window — designed to
+be unreachable in normal operation). See [error-codes.md](error-codes.md) for
+the shared table.

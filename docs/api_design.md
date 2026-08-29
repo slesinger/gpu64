@@ -992,6 +992,7 @@ simply `ERRCODE != OK`.
 | $07 | `BUSY` | A vblank-deferred `PAGE_FLIP` is still waiting for its frame boundary. The pending flip is untouched; poll `STATUS` bit0 and retry. |
 | $08 | `OUT_OF_MEMORY` | A resource upload had nowhere to go — in class 2, the texture arena is full. Free something and retry. |
 | $0A | `BAD_ID` | A resource id that is 0, past the end of its table, or not currently live. |
+| $0C | `WORKER_TIMEOUT` | A class 1 render op (`CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE`) did not complete in a generous worst-case window. Designed to be unreachable in normal operation — see [class1-3d-mesh-reference.md](class1-3d-mesh-reference.md). |
 
 A failed dispatch does nothing: no drawing, no data fetch, no state change.
 

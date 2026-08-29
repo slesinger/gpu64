@@ -2,12 +2,22 @@
  gpu64 milestone 6 -- the ring buffer both cores talk through, and core 1's
  drain loop. See gpu64_3d.h and project/milestone6_3d_design.md.
 
- What core 1 does today is count. The renderer that phase 1 built runs on
- core 0, synchronously, inside the dispatch window where the C64 is already
- DMA-halted -- exactly like every class 0 draw op (gpu64_3d_class1.cpp says
- why). So this file is not yet the render loop; it is the instrument that
- keeps the cross-core path under real command traffic, so the timing question
- milestone 6a opened stays measurable while the pipeline is built.
+ Through Stage 14, what core 1 did was count: every class 1 opcode ran
+ synchronously on core 0, inside the dispatch window where the C64 is already
+ DMA-halted, and the ring only kept the cross-core path under real command
+ traffic so the timing question milestone 6a opened stayed measurable while
+ the pipeline was built.
+
+ Stage 15a (project/gap_filling_plan.md) gives execute() below a real job for
+ three opcodes: CLEAR_VIEWPORT, DRAW_MESH and DRAW_NODE now run for real on
+ core 1, via gpu64_3dExecuteRender() (gpu64_3d_class1.cpp, which still owns
+ all the session state this needs and cannot export). gpu64_3dDispatch()
+ stalls the whole dispatch on the ring fully draining before it returns --
+ 15a's zero-concurrency window -- so there is still exactly one owner of the
+ framebuffer and the z-buffer at any instant, just relocated from "core 0,
+ always" to "core 1, while core 0 waits". Every other class 1 opcode is
+ unchanged: pushed for the ring's own counters, then still executed
+ synchronously on core 0.
 */
 #include "gpu64_3d_internals.h"
 #include "gpu64_api.h"
@@ -78,15 +88,34 @@ static void enableEventStream( void )
 	asm volatile( "ISB" );
 }
 
-// Records one drained command. Core 1 executes nothing today -- see the file
-// header -- so this is deliberately not a switch: every opcode is legal here,
-// because core 0 has already validated and executed it. A switch would have
-// to be kept in step with core 0's for no gain, and the day core 1 does take
-// over the render loop it wants a fresh one written against that phase's
-// opcode set, not this one inherited.
-static void execute( const Gpu64_3dCmd *pCmd )
+// Records one drained command, and, for the three render opcodes, actually
+// executes it. pCmd is non-const now: gpu64_3dExecuteRender() writes its
+// result back into the slot for gpu64_3dDispatch() to read once its drain
+// wait succeeds.
+//
+// Every opcode besides the three render ones is still legal here with no
+// handler, because core 0 still executes them synchronously, itself, before
+// this drain loop ever sees them go by -- this function's count is the only
+// trace they leave on core 1. That is why unknownOp below is not a fault
+// counter: it is expected to climb continuously, on every non-render class 1
+// command, and gpu64_3dReport() (gpu64_3d_class1.cpp) does not treat it as
+// one.
+static void execute( Gpu64_3dCmd *pCmd )
 {
 	gpu64_3dWorkerStats.lastOp = pCmd->op;
+
+	switch ( pCmd->op )
+	{
+	case GPU64_3D_OP_CLEAR_VIEWPORT:
+	case GPU64_3D_OP_DRAW_MESH:
+	case GPU64_3D_OP_DRAW_NODE:
+		gpu64_3dExecuteRender( pCmd );
+		break;
+
+	default:
+		gpu64_3dWorkerStats.unknownOp++;
+		break;
+	}
 }
 
 void gpu64_3dWorker( void )
@@ -117,6 +146,13 @@ void gpu64_3dWorker( void )
 			execute( &gpu64_3dRing.slot[ tail ] );
 
 			tail = ( tail + 1 ) & GPU64_3D_RING_MASK;
+
+			// For the three render ops, execute() just wrote pCmd->err/result
+			// into the slot gpu64_3dDispatch() is stalled waiting to read back
+			// (waitForDrain(), gpu64_3d_class1.cpp). Those writes must be
+			// visible before the tail that tells core 0 to go read them --
+			// pairs with the DMB core 0 issues after observing tail == head.
+			asm volatile( "DMB ISH" ::: "memory" );
 
 			// Publishing the tail per command rather than per batch keeps a
 			// producer that is filling the ring from stalling on a consumer

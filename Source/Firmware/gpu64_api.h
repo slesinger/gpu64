@@ -70,6 +70,17 @@
 // A render was asked for with no active camera.
 #define GPU64_ERR_NO_CAMERA		0x0B
 
+// gpu64: Stage 15a. gpu64_3dDispatch() pushes a validated CLEAR_VIEWPORT /
+// DRAW_MESH / DRAW_NODE onto the core-0/core-1 ring and then waits for core 1
+// to drain it (see gpu64_3d_class1.cpp's waitForDrain()); this is what it
+// returns if the backstop timeout fires first. It is not a validation
+// failure -- the command already passed precheck, the same checks that used
+// to produce BAD_ID/BAD_ARGS/UNSUPPORTED for these opcodes -- it means core 1
+// did not finish in a generous multiple of any real draw's worst case, i.e.
+// core 1 is wedged. Designed to be unreachable in normal operation; see
+// project/gap_filling_plan.md's Stage 15 section.
+#define GPU64_ERR_WORKER_TIMEOUT	0x0C
+
 // --- blob descriptor spaces --------------------------------------------
 #define GPU64_SPACE_C64			0
 #define GPU64_SPACE_REU			1

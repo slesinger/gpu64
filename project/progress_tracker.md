@@ -2414,3 +2414,79 @@ whenever `DRAW_NODE` runs for real.
 **Not yet done:** a build-time assertion that no executable byte lands on
 a page at or above `_etext`, to catch any future recurrence of this exact
 class of defect before it reaches hardware. Worth doing; not blocking.
+
+## 15a. Core 1 actually renders -- plumbing, zero concurrency (2026-08-29)
+
+**Status: done, verified on hardware 2026-08-29.**
+
+`gap_filling_plan.md`'s Stage 15a: `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE`
+move from core-0-synchronous execution to core 1, driven off the ring buffer
+phase 1 already fed but core 1 only ever counted. `gpu64_3dDispatch()` stalls
+on the ring fully draining (`tail == head`) before returning for any of the
+three, so exactly one command is ever in flight -- the zero-concurrency
+window the round is named for, deliberately relocating "one owner of the
+framebuffer/z-buffer at any instant" from "core 0, always" to "core 1, while
+core 0 waits" rather than removing the guarantee.
+
+This is the round that resolved the design tension recorded in memory
+[[gpu64-multicore-rule-scoped-to-polling-loop]]: CLAUDE.md's "core 0 must
+never read a line core 1 writes" turned out to be milestone 6a's finding
+about `reuUsingPolling()`'s per-C64-cycle loop specifically, not all core-0
+code, so no new mailbox was needed -- `gpu64_3dDispatch()` just waits on the
+ring's own `tail`, which the worker already publishes after each command.
+CLAUDE.md's Multicore section and `gap_filling_plan.md`'s Stage 15 section
+were reworded to say so explicitly, in commit `f85b789`.
+
+Three things fixed in this round, all found by an Opus review reading the
+real code before any of it was written, then independently re-verified:
+
+- **`cleanViewport()` chunked.** Was one unchunked `CleanRows()` call over
+  the whole viewport -- free while core 0 held the bus for the whole draw,
+  not once core 1 owns it. Now one `CleanRows()` + one `GPU64_3D_YIELD()`
+  per row, the same 256-byte/7-line budget `gpu64_3d_span.h` already
+  measured for the rasteriser.
+- **Push-after-validate, not before.** `gpu64_3dDispatch()` used to push a
+  render op onto the ring and only then validate it -- harmless while core 1
+  merely counted, wrong the moment it executes unconditionally (its own
+  comment says so). Split into `precheckClearViewport()`/`precheckDrawMesh()`/
+  `precheckDrawNode()`, run on core 0 before the ring ever sees the command;
+  a validation failure, or a parked (`SET_VISIBLE 0`) `DRAW_NODE`, now never
+  touches the ring at all.
+- **A missing acquire/release pairing**, caught during implementation, not
+  by the review: core 1's `gpu64_3dExecuteRender()` writes `err`/`result`
+  into the ring slot, and `gpu64_3dDispatch()` reads them back after its
+  drain wait succeeds -- that read needs its own `DMB ISH`, paired with one
+  added between the write-back and the `tail` publish in
+  `gpu64_3dWorker()`. Without it, `tail == head` alone does not guarantee
+  core 0 sees the slot's new contents, ARM's memory model being weak enough
+  to let the load reorder ahead of the store it looks like it followed.
+
+`GPU64_ERR_WORKER_TIMEOUT` ($0C) is the backstop: `waitForDrain()` spins core
+0 on `gpu64_3dRing.tail` (a DRAM location, not an MMIO register -- the
+direction "never poll MMIO from another core" never applied to) with a
+`CNTVCT_EL0`/`CNTFRQ_EL0` timeout of 50ms, generous against any real draw
+this arena's 32MB size limit allows. Designed to be unreachable; a wedged
+core 1 reports instead of hanging the C64 forever.
+
+Per-core L1 instruction caches meant the DRAW_NODE self-warm block from
+milestone 14's `opDrawNode()` had to move to `gpu64_3dExecuteRender()`
+verbatim rather than just get called from there -- a warm that ran on core 0
+has no effect on core 1's separate silicon. `DRAW_MESH` got its own explicit
+self-warm for the same reason: its old "kept warm by continuous use since
+milestone 6" premise was core-0 usage history that does not carry over.
+
+Verification: a full firmware build (`tools/build.sh`) links clean, no
+warnings, across all four edited files. `tools/hostsim` was not run for this
+round -- it only links the portable math/raster/scene files, none of which
+changed; the files this round touched (`gpu64_3d_class1.cpp`,
+`gpu64_3d_core1.cpp`) aren't in its source list, so a clean build was the
+relevant host-side check, not the PPM oracle. Deployed to the RAD card and
+run on hardware 2026-08-29: several hundred frames of a scene-graph PRG, C64
+stayed alive throughout, user-confirmed good -- the actual dual-core
+behavior this round changes has now been exercised for real, not just
+built. Docs updated: `GPU64_ERR_WORKER_TIMEOUT` added to `api_design.md`'s
+ERRCODE table and `class1-3d-mesh-reference.md`'s ERRCODE sentence.
+
+**Not yet done:** Stage 15b (narrowing the stall to real observation points,
+so a frame of `DRAW_NODE` calls actually overlaps with the C64 free-running
+-- the real contention regime this round deliberately excluded).

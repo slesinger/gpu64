@@ -35,7 +35,18 @@ struct Gpu64_3dCmd
 	u16	id;			// the staged ID at the moment of dispatch
 	u32	aux;			// phase 1: arena offset of a pulled blob
 	u32	auxLen;
-	u32	pad;
+
+	// Stage 15a: the readback half of the slot. Core 1's
+	// gpu64_3dExecuteRender() (gpu64_3d_class1.cpp) writes these for
+	// CLEAR_VIEWPORT/DRAW_MESH/DRAW_NODE; gpu64_3dDispatch() reads them back
+	// after its drain wait succeeds, under the same DMB pairing that already
+	// protects head/tail (see gpu64_3dWorker(), gpu64_3d_core1.cpp). Carved
+	// out of the field this replaces (a u32 pad, never used) so the struct
+	// stays 32 bytes.
+	u8	err;			// GPU64_ERR_*
+	u8	result;			// RESULT byte
+	u16	pad;			// still unused
+
 	u8	arg[ 16 ];
 };
 
@@ -82,7 +93,11 @@ struct Gpu64_3dWorkerStats
 {
 	volatile u32	consumed;	// commands drained off the ring
 	volatile u32	lastOp;		// most recent opcode core 1 saw
-	volatile u32	unknownOp;	// opcodes core 1 has no handler for yet
+	// Stage 15a: every class 1 opcode besides the three render ones -- core 1
+	// still has no handler for them because core 0 still executes them
+	// synchronously itself. Expected to climb continuously; not a fault
+	// counter (see gpu64_3d_core1.cpp's execute()).
+	volatile u32	unknownOp;
 	volatile u32	wakeups;	// times the drain loop found work
 	u32		pad[ 12 ];
 } __attribute__(( aligned( 64 ) ));
@@ -103,6 +118,17 @@ extern Gpu64_3dHostStats gpu64_3dHost;
 // Core 0 side, implemented in gpu64_3d_core1.cpp next to the worker it pairs
 // with. FALSE means the ring is full, which is GPU64_ERR_QUEUE_FULL.
 boolean gpu64_3dRingPush( u8 op );
+
+// Core 1 side (Stage 15a): the real CLEAR_VIEWPORT / DRAW_MESH / DRAW_NODE
+// execution, called from gpu64_3d_core1.cpp's execute() for those three
+// opcodes only. Implemented in gpu64_3d_class1.cpp, next to the session state
+// and resource table it needs and cannot export -- this declaration is the
+// only crossing. pCmd is the ring slot itself (gpu64_3dWorker() passes
+// &gpu64_3dRing.slot[tail]); the function writes pCmd->err and, for
+// DRAW_MESH/DRAW_NODE, pCmd->result, and never touches gpu64Regs -- core 0
+// stays the sole writer of the C64-visible register file, copying pCmd's
+// fields across itself once its drain wait succeeds.
+void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd );
 
 // --- the resource arena -------------------------------------------------
 //

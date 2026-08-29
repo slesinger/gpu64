@@ -1,20 +1,26 @@
 /*
- gpu64 milestone 6 -- class 1 on core 0: session state, the resource table,
- and the opcode dispatcher.
+ gpu64 milestone 6 -- class 1: session state, the resource table, and the
+ opcode dispatcher. Through Stage 14 every class 1 opcode, render ops
+ included, ran synchronously on core 0. Stage 15a (project/gap_filling_plan.md)
+ moves the three render ops -- CLEAR_VIEWPORT, DRAW_MESH, DRAW_NODE -- onto
+ core 1, via the ring gpu64_3d_core1.cpp owns; everything else here is
+ unchanged and still runs on core 0.
 
- Why core 0, when the design's architecture section puts the renderer on core
- 1: because immediate mode is the bring-up path, and immediate mode has no
- cross-core state by construction. DRAW_MESH is specified to return when the
- mesh is drawn and to be illegal while the render loop runs -- so there is
- exactly one owner of the framebuffer and the z-buffer at any instant, and
- running it here makes that owner core 0, inside the dispatch window where the
- C64 is already DMA-halted. That is precisely the model every class 0 draw op
- already uses, and it means the entire pipeline can be brought up on hardware
- with the cross-core question still open.
+ DRAW_MESH is specified to return when the mesh is drawn and to be illegal
+ while the render loop runs -- so there is exactly one owner of the
+ framebuffer and the z-buffer at any instant. Stage 15a keeps that true by
+ having gpu64_3dDispatch() stall on the ring fully draining before it returns
+ for a render op: a zero-concurrency window, just relocated from "core 0,
+ always" to "core 1, while core 0 waits" -- see gpu64_3dDispatch() below and
+ gpu64-multicore-rule-scoped-to-polling-loop (memory) for why that stall is
+ legal from core 0 despite the "never poll MMIO from another core" rule.
 
- The ring is still fed -- every accepted class 1 command is pushed to it and
- counted by core 1 (gpu64_3d_core1.cpp) -- so the cross-core path stays under
- real traffic while that question is settled.
+ gpu64_3dExecuteRender(), below, is the core-1 half of the three render ops --
+ called from gpu64_3d_core1.cpp's execute(), it lives here because it needs
+ the session state and resource table this file owns and does not export.
+ Every other class 1 opcode is still pushed to the ring purely for its own
+ counters (gpu64_3d_core1.cpp's unknownOp), then executed synchronously here
+ on core 0, exactly as before Stage 15a.
 
  Nothing here is portable; the pipeline it drives (gpu64_3d_render.h) is, and
  is exercised on a PC by tools/hostsim.
@@ -22,6 +28,7 @@
 #include "gpu64_3d_internals.h"
 #include "gpu64_3d_render.h"
 #include "gpu64_3d_scene.h"
+#include "gpu64_3d_span.h"
 #include "gpu64_api.h"
 #include "gpu64_fb.h"
 #include "lowlevel_arm64.h"
@@ -222,11 +229,28 @@ static boolean makeTarget( Gpu64_3dTarget *pTarget )
 // nothing drawn is visible until the rows are cleaned -- same rule every
 // class 0 draw op follows. Only the viewport is cleaned: the rest of the page
 // belongs to the C64's HUD and was cleaned when the C64 drew it.
+//
+// Stage 15a: this now runs on core 1 (gpu64_3dExecuteRender(), below), not
+// inside a dispatch that holds the C64's bus -- so the CLAUDE.md multicore
+// burst cap applies to it for the first time. Before 15a a viewport's worth
+// of rows was safe as one unchunked CleanDataCacheRange because core 0 owned
+// the whole draw and the C64 was DMA-halted throughout; now it is core 1's
+// own store burst, subject to the same 256-byte/7-line yield discipline as
+// the rasteriser (gpu64_3d_span.h). One CleanRows() + one GPU64_3D_YIELD()
+// per row, same as that header's own comment: "one yield per scanline...
+// falls out of the geometry."
 static void cleanViewport( void )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
-	if ( pFB )
-		pFB->CleanRows( pFB->GetDrawPage(), s_State.vpY, s_State.vpY + s_State.vpH );
+	if ( pFB == 0 )
+		return;
+
+	const u8 page = pFB->GetDrawPage();
+	for ( u16 y = s_State.vpY; y < s_State.vpY + s_State.vpH; y++ )
+	{
+		pFB->CleanRows( page, y, y + 1 );
+		GPU64_3D_YIELD();
+	}
 }
 
 // --- opcodes ------------------------------------------------------------
@@ -368,49 +392,33 @@ static u8 opFreeResource( void )
 	return GPU64_ERR_OK;
 }
 
-static u8 opClearViewport( void )
-{
-	Gpu64_3dTarget target;
-	if ( !makeTarget( &target ) )
-		return GPU64_ERR_UNSUPPORTED;
+// --- Stage 15a: core-0-side prechecks for the three render opcodes ------
+//
+// gpu64_3dDispatch() (below) calls exactly one of these before it pushes a
+// render opcode onto the ring. Everything that used to make opClearViewport/
+// opDrawMesh/opDrawNode fail outright -- a bad resource id, a bad arg, no
+// framebuffer -- must still be caught here, on core 0, before the command is
+// ever queued: once it is on the ring core 1 runs it unconditionally (its own
+// comment in gpu64_3d_core1.cpp says so), so a validation failure that
+// reached the ring would either have to be invented a second failure path for
+// or would silently execute on bad input. See gpu64-multicore-rule-scoped-to-
+// polling-loop (memory) for why this split exists.
 
-	gpu64_3dClearViewport( &s_State, &target );
-	cleanViewport();
+static u8 precheckClearViewport( void )
+{
+	if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
+		return GPU64_ERR_UNSUPPORTED;
 	return GPU64_ERR_OK;
 }
 
-static u8 opDrawMesh( void )
+static u8 precheckDrawMesh( void )
 {
-	const Gpu64_3dResource *pR = resFind( stagedId(), GPU64_3D_RES_MESH );
-	if ( pR == 0 )
+	if ( resFind( stagedId(), GPU64_3D_RES_MESH ) == 0 )
 		return GPU64_ERR_BAD_ID;
-
-	Gpu64_3dTarget target;
-	if ( !makeTarget( &target ) )
+	if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
 		return GPU64_ERR_UNSUPPORTED;
-
-	Gpu64_3dVec pos;
-	pos.x = (s32)argS16( 0 ) << 8;			// 8.8 -> 16.16
-	pos.y = (s32)argS16( 2 ) << 8;
-	pos.z = (s32)argS16( 4 ) << 8;
-
-	Gpu64_3dMat rot;
-	gpu64_3dMatFromEuler( &rot, argU16( 6 ), argU16( 8 ), argU16( 10 ) );
-
-	u16 scale = argU16( 12 );
-	if ( scale == 0 )
+	if ( argU16( 12 ) == 0 )				// scale
 		return GPU64_ERR_BAD_ARGS;
-
-	const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
-					     &pos, &rot, scale, lookupTexture, 0 );
-	cleanViewport();
-
-	// RESULT is the triangle count, saturated to a byte. It is the difference
-	// between "the mesh was drawn and you are looking at the wrong part of
-	// the screen" and "every face was culled", which a blank viewport cannot
-	// tell you -- and on this hardware that distinction is otherwise a trip
-	// to the bench.
-	gpu64Regs.result = (u8)( n > 255 ? 255 : n );
 	return GPU64_ERR_OK;
 }
 
@@ -523,39 +531,15 @@ static u8 opGetTransform( void )
 	return gpu64_blobWrite( space, addr, 18, buf );
 }
 
-static u8 opDrawNode( void )
+// pNeedsDraw is set FALSE for a parked (SET_VISIBLE(0)) node: that is not an
+// error -- it is DRAW_NODE's equivalent of DRAW_MESH's "every face culled"
+// result -- but it means gpu64_3dDispatch() must not push anything onto the
+// ring for it. RESULT is written here, directly, on core 0, for exactly that
+// case; every other path through DRAW_NODE gets its RESULT from core 1's
+// gpu64_3dExecuteRender() after the ring drains.
+static u8 precheckDrawNode( boolean *pNeedsDraw )
 {
-	// gpu64: self-warm, rule 4 in CLAUDE.md -- "cycle-critical code reachable
-	// from a command must warm its own i-cache at the point of use." Unlike
-	// DRAW_MESH's path (opDrawMesh -> gpu64_3dDrawMesh -> the rasteriser),
-	// which has been dispatched, and therefore self-warmed by execution,
-	// continuously since milestone 6, this function and the two scene-graph
-	// calls below it are new in Stage 14 and on a cold boot are guaranteed
-	// never to have executed before their first DRAW_NODE. warmCache() at
-	// boot (rad_main.cpp) does not cover them -- it only preloads the
-	// polling loop and the other functions the loop calls directly -- and
-	// gpu64_apiWarmPollingLoop() (gpu64_3dDispatch(), below) re-warms only
-	// after a dispatch, too late to help this one. Same in-dispatch idiom as
-	// gpu64_blobRead()/gpu64_blobWrite() in rad_reu.cpp -- acc == size, one
-	// linear pass, not warmCache()'s boot-time acc=65536 (that one pays for
-	// itself once at start-up; this one runs every dispatch with the bus
-	// held, so it should cost exactly what it needs to and no more).
-	// gpu64_3dDrawMesh() itself is deliberately not repeated here -- it is
-	// already covered by DRAW_MESH's own history of use.
-	//
-	// This was not, on its own, what actually caused the Stage-14 hardware
-	// regression -- that turned out to be reuUsingPolling() itself landing
-	// on an execute-never MMU page once DRAW_NODE's code pushed the image
-	// past a 64KB boundary (fixed at each ".text.section_polling" site in
-	// rad_reu.cpp, 2026-08-29). It stays because rule 4 is a real, separate
-	// concern this codebase has been bitten by more than once, and this path
-	// is new enough on hardware to be worth not gambling on.
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)opDrawNode, 1024 * 2 );
-	FORCE_READ_LINEARa( (void*)opDrawNode, 1024 * 2, 1024 * 2 );
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneFind, 1024 * 2 );
-	FORCE_READ_LINEARa( (void*)gpu64_3dSceneFind, 1024 * 2, 1024 * 2 );
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneApplyCamera, 1024 * 2 );
-	FORCE_READ_LINEARa( (void*)gpu64_3dSceneApplyCamera, 1024 * 2, 1024 * 2 );
+	*pNeedsDraw = FALSE;
 
 	Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, stagedId(), GPU64_3D_NODE_OBJECT );
 	if ( pN == 0 )
@@ -563,33 +547,137 @@ static u8 opDrawNode( void )
 
 	if ( !pN->visible )
 	{
-		// Not an error -- SET_VISIBLE(0) is how a program parks a node
-		// without destroying it, exactly like DRAW_MESH's own "every face
-		// culled" result below.
 		gpu64Regs.result = 0;
 		return GPU64_ERR_OK;
 	}
 
-	const Gpu64_3dResource *pR = resFind( pN->meshId, GPU64_3D_RES_MESH );
-	if ( pR == 0 )
+	if ( resFind( pN->meshId, GPU64_3D_RES_MESH ) == 0 )
 		return GPU64_ERR_BAD_ID;
-
-	Gpu64_3dTarget target;
-	if ( !makeTarget( &target ) )
+	if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
 		return GPU64_ERR_UNSUPPORTED;
 
-	// The active camera, if any, is applied fresh on every DRAW_NODE: a
-	// program that moves the camera between two DRAW_NODE calls in the same
-	// frame must see both nodes drawn from where the camera is *now*, not
-	// from wherever it was at some earlier SET_ACTIVE_CAMERA.
-	gpu64_3dSceneApplyCamera( &s_Scene, &s_State );
-
-	const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
-					     &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
-	cleanViewport();
-
-	gpu64Regs.result = (u8)( n > 255 ? 255 : n );
+	*pNeedsDraw = TRUE;
 	return GPU64_ERR_OK;
+}
+
+// --- Stage 15a: core-1-side execution for the three render opcodes ------
+//
+// Called from gpu64_3d_core1.cpp's execute() -- core 1, not core 0 -- for
+// CLEAR_VIEWPORT, DRAW_MESH and DRAW_NODE only, and only after the matching
+// precheck*() above has already proved the command legal. pCmd is the ring
+// slot itself; this writes pCmd->err and, for the two draws, pCmd->result,
+// and never touches gpu64Regs -- core 0 remains the sole writer of the
+// C64-visible register file, copying pCmd's fields across itself once its
+// drain wait (waitForDrain(), below) succeeds.
+//
+// The self-warm blocks below are DRAW_NODE's own, moved here verbatim from
+// the old opDrawNode() (CLAUDE.md rule 4): core 1 has its own, separate L1
+// instruction cache, so a warm that ran on core 0 has no effect here, and
+// this function is new enough on core 1 -- it has never executed before its
+// first post-15a DRAW_NODE -- to need the same self-warm opDrawNode() did.
+// DRAW_MESH's warm is new for the same reason: before 15a, opDrawMesh() had
+// been kept warm by continuous use on core 0 since milestone 6, but that
+// history is core-0 silicon and does not carry over to core 1's cache.
+void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
+{
+	Gpu64_3dTarget target;
+
+	switch ( pCmd->op )
+	{
+	case GPU64_3D_OP_CLEAR_VIEWPORT:
+		if ( !makeTarget( &target ) )
+		{
+			// precheckClearViewport() already proved this can't happen.
+			pCmd->err = GPU64_ERR_UNSUPPORTED;
+			return;
+		}
+		gpu64_3dClearViewport( &s_State, &target );
+		cleanViewport();
+		pCmd->err = GPU64_ERR_OK;
+		return;
+
+	case GPU64_3D_OP_DRAW_MESH:
+	{
+		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dExecuteRender, 1024 * 2 );
+		FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRender, 1024 * 2, 1024 * 2 );
+
+		const Gpu64_3dResource *pR = resFind( pCmd->id, GPU64_3D_RES_MESH );
+		if ( pR == 0 || !makeTarget( &target ) )
+		{
+			// precheckDrawMesh() already proved this can't happen.
+			pCmd->err = GPU64_ERR_BAD_ID;
+			return;
+		}
+
+		Gpu64_3dVec pos;
+		pos.x = (s32)(s16)( pCmd->arg[ 0 ] | ( pCmd->arg[ 1 ] << 8 ) ) << 8;	// 8.8 -> 16.16
+		pos.y = (s32)(s16)( pCmd->arg[ 2 ] | ( pCmd->arg[ 3 ] << 8 ) ) << 8;
+		pos.z = (s32)(s16)( pCmd->arg[ 4 ] | ( pCmd->arg[ 5 ] << 8 ) ) << 8;
+
+		Gpu64_3dMat rot;
+		const u16 yaw   = (u16)( pCmd->arg[ 6 ]  | ( pCmd->arg[ 7 ]  << 8 ) );
+		const u16 pitch = (u16)( pCmd->arg[ 8 ]  | ( pCmd->arg[ 9 ]  << 8 ) );
+		const u16 roll  = (u16)( pCmd->arg[ 10 ] | ( pCmd->arg[ 11 ] << 8 ) );
+		gpu64_3dMatFromEuler( &rot, yaw, pitch, roll );
+
+		const u16 scale = (u16)( pCmd->arg[ 12 ] | ( pCmd->arg[ 13 ] << 8 ) );
+
+		const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
+						     &pos, &rot, scale, lookupTexture, 0 );
+		cleanViewport();
+
+		// RESULT is the triangle count, saturated to a byte -- see the
+		// original opDrawMesh() comment this replaces: it is the difference
+		// between "drawn, wrong part of the screen" and "every face culled".
+		pCmd->result = (u8)( n > 255 ? 255 : n );
+		pCmd->err = GPU64_ERR_OK;
+		return;
+	}
+
+	case GPU64_3D_OP_DRAW_NODE:
+	{
+		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dExecuteRender, 1024 * 2 );
+		FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRender, 1024 * 2, 1024 * 2 );
+		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneFind, 1024 * 2 );
+		FORCE_READ_LINEARa( (void*)gpu64_3dSceneFind, 1024 * 2, 1024 * 2 );
+		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneApplyCamera, 1024 * 2 );
+		FORCE_READ_LINEARa( (void*)gpu64_3dSceneApplyCamera, 1024 * 2, 1024 * 2 );
+
+		// Re-resolved by id rather than carried as a pointer from precheck:
+		// precheck ran on core 0 before the push, this runs on core 1 after
+		// the drain, and nothing about the node or the resource table is
+		// locked between the two -- re-finding both here is what makes that
+		// safe rather than merely convenient.
+		Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, pCmd->id, GPU64_3D_NODE_OBJECT );
+		const Gpu64_3dResource *pR = pN ? resFind( pN->meshId, GPU64_3D_RES_MESH ) : 0;
+		if ( pN == 0 || pR == 0 || !makeTarget( &target ) )
+		{
+			// precheckDrawNode() already proved this can't happen.
+			pCmd->err = GPU64_ERR_BAD_ID;
+			return;
+		}
+
+		// The active camera, if any, is applied fresh on every DRAW_NODE: a
+		// program that moves the camera between two DRAW_NODE calls in the
+		// same frame must see both nodes drawn from where the camera is
+		// *now*, not from wherever it was at some earlier SET_ACTIVE_CAMERA.
+		gpu64_3dSceneApplyCamera( &s_Scene, &s_State );
+
+		const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
+						     &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
+		cleanViewport();
+
+		pCmd->result = (u8)( n > 255 ? 255 : n );
+		pCmd->err = GPU64_ERR_OK;
+		return;
+	}
+
+	default:
+		// Unreachable: gpu64_3dDispatch() only ever pushes the three render
+		// ops above onto the ring for gpu64_3dExecuteRender() to see.
+		pCmd->err = GPU64_ERR_BAD_OPCODE;
+		return;
+	}
 }
 
 // --- dispatch -----------------------------------------------------------
@@ -651,9 +739,12 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_SET_SCALE:		return opSetScale();
 	case GPU64_3D_OP_GET_TRANSFORM:		return opGetTransform();
 
-	case GPU64_3D_OP_CLEAR_VIEWPORT:	return opClearViewport();
-	case GPU64_3D_OP_DRAW_MESH:		return opDrawMesh();
-	case GPU64_3D_OP_DRAW_NODE:		return opDrawNode();
+	// CLEAR_VIEWPORT, DRAW_MESH and DRAW_NODE are not handled here as of
+	// Stage 15a: gpu64_3dDispatch() intercepts all three before execute() is
+	// ever called, running a precheck*() on core 0 and, once that passes,
+	// pushing them to run on core 1 (gpu64_3dExecuteRender()). They fall
+	// through to BAD_OPCODE below if execute() is ever reached with one,
+	// which should not happen.
 
 	case GPU64_3D_OP_LOOP_START:
 	case GPU64_3D_OP_SCENE_COMMIT:
@@ -667,18 +758,126 @@ static u8 execute( u8 op )
 	return GPU64_ERR_BAD_OPCODE;
 }
 
+static boolean isRenderOp( u8 op )
+{
+	return op == GPU64_3D_OP_CLEAR_VIEWPORT
+	    || op == GPU64_3D_OP_DRAW_MESH
+	    || op == GPU64_3D_OP_DRAW_NODE;
+}
+
+// Generous on purpose: this is a backstop against a wedged core 1, not a
+// tuned budget -- see project/gap_filling_plan.md's Stage 15 section. 50ms is
+// a large multiple of any real draw this arena's size limit allows, and the
+// cost of guessing too high is a slightly later ERRCODE on a build that was
+// already broken; the cost of guessing too low is a spurious WORKER_TIMEOUT
+// on a slow-but-fine frame.
+#define GPU64_3D_DRAIN_TIMEOUT_US	50000
+
+// Spins core 0 until the ring drains to head, or the timeout backstop fires.
+// This is not the MMIO poll CLAUDE.md's multicore section forbids from a
+// second core -- gpu64_3dRing.tail is a DRAM location, not a VideoCore
+// peripheral register, and this runs on core 0 itself, watching core 1, which
+// is the direction that rule never applied to. CNTVCT_EL0/CNTFRQ_EL0 rather
+// than the BCM system timer for the same reason gpu64_ladder.cpp uses them:
+// the only clock safe to read off core 0's own silicon.
+static boolean waitForDrain( u32 head )
+{
+	u64 freq;
+	asm volatile( "MRS %0, CNTFRQ_EL0" : "=r" (freq) );
+	const u64 timeoutTicks = ( freq / 1000000ULL ) * GPU64_3D_DRAIN_TIMEOUT_US;
+
+	u64 start;
+	asm volatile( "MRS %0, CNTVCT_EL0" : "=r" (start) );
+
+	while ( gpu64_3dRing.tail != head )
+	{
+		asm volatile( "YIELD" );
+
+		u64 now;
+		asm volatile( "MRS %0, CNTVCT_EL0" : "=r" (now) );
+		if ( now - start > timeoutTicks )
+			return gpu64_3dRing.tail == head;	// one last look before giving up
+	}
+	return TRUE;
+}
+
 u8 gpu64_3dDispatch( u8 op )
 {
-	// The ring is fed first, and a full ring refuses the command outright:
-	// the design's rule is that a failed dispatch does nothing, so a command
-	// must not execute and then be reported as rejected.
-	if ( !gpu64_3dRingPush( op ) )
-	{
-		gpu64_3dHost.rejected++;
-		return GPU64_ERR_QUEUE_FULL;
-	}
+	u8 res;
 
-	const u8 res = execute( op );
+	// gpu64_3dHost.pushed is documented as "commands accepted onto the ring"
+	// (gpu64_3d_internals.h). Before Stage 15a that was every non-QUEUE_FULL
+	// dispatch, because every accepted op was pushed unconditionally, before
+	// validation. Hazard #2's fix (project/gap_filling_plan.md, Stage 15)
+	// means a render op that fails its precheck, or a parked DRAW_NODE that
+	// needs no draw, now never touches the ring at all -- didPush tracks
+	// that exactly, so the counter keeps meaning what its comment says.
+	boolean didPush = FALSE;
+
+	if ( isRenderOp( op ) )
+	{
+		// Stage 15a: precheck on core 0 before the command ever reaches the
+		// ring -- see the precheck*() comment above for why this order
+		// matters now that core 1 actually executes what it drains, instead
+		// of only counting it.
+		boolean needsDraw = TRUE;
+
+		if ( op == GPU64_3D_OP_CLEAR_VIEWPORT )
+			res = precheckClearViewport();
+		else if ( op == GPU64_3D_OP_DRAW_MESH )
+			res = precheckDrawMesh();
+		else
+			res = precheckDrawNode( &needsDraw );
+
+		if ( res == GPU64_ERR_OK && needsDraw )
+		{
+			const u32 slot = gpu64_3dRing.head;
+
+			if ( !gpu64_3dRingPush( op ) )
+			{
+				gpu64_3dHost.rejected++;
+				return GPU64_ERR_QUEUE_FULL;
+			}
+			didPush = TRUE;
+
+			if ( !waitForDrain( gpu64_3dRing.head ) )
+			{
+				res = GPU64_ERR_WORKER_TIMEOUT;
+			}
+			else
+			{
+				// Pairs with the DMB gpu64_3dWorker() issues (gpu64_3d_core1.cpp)
+				// after execute() writes err/result and before it publishes tail
+				// -- without this, having observed tail == head does not by
+				// itself guarantee this core sees the slot's new contents.
+				asm volatile( "DMB ISH" ::: "memory" );
+
+				const Gpu64_3dCmd *pSlot = &gpu64_3dRing.slot[ slot ];
+				res = pSlot->err;
+
+				// Not for CLEAR_VIEWPORT: that opcode never touched RESULT
+				// before Stage 15a either, and copying pSlot->result here
+				// would leak whatever stale value a previous DRAW_MESH/
+				// DRAW_NODE left in this slot.
+				if ( op != GPU64_3D_OP_CLEAR_VIEWPORT )
+					gpu64Regs.result = pSlot->result;
+			}
+		}
+	}
+	else
+	{
+		// The ring is fed first, and a full ring refuses the command
+		// outright: the design's rule is that a failed dispatch does
+		// nothing, so a command must not execute and then be reported as
+		// rejected.
+		if ( !gpu64_3dRingPush( op ) )
+		{
+			gpu64_3dHost.rejected++;
+			return GPU64_ERR_QUEUE_FULL;
+		}
+		didPush = TRUE;
+		res = execute( op );
+	}
 
 	// gpu64: put back what this dispatch just evicted, while the bus is still
 	// held. A DRAW_MESH walks a framebuffer, a z-buffer and the arena, which
@@ -696,7 +895,7 @@ u8 gpu64_3dDispatch( u8 op )
 
 	if ( res == GPU64_ERR_BAD_OPCODE )
 		gpu64_3dHost.badOpcode++;
-	else
+	else if ( didPush )
 		gpu64_3dHost.pushed++;
 
 	return res;
