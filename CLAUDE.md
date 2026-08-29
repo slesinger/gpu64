@@ -86,9 +86,17 @@ it.
   working-set size, L2 capacity and duty cycle are all non-constraints.
 - **Never poll an MMIO register from another core** — any MMIO spin breaks core
   0's bus timing. Use `CNTVCT_EL0`, not the BCM system timer.
-- **Core 0 must never read a cache line another core writes.** Separate cache
-  lines are not sufficient; removing the read is what produced a zero noise
-  floor.
+- **Inside `reuUsingPolling()` and anything it reaches with the bus still
+  free-running, core 0 must never read a cache line another core writes.**
+  Separate cache lines are not sufficient; removing the read is what produced
+  a zero noise floor. This is a statement about that loop's per-C64-cycle
+  deadline, not a general memory-model rule — 6a's own instrument only ever
+  measured loop-pass elongation there. Code that runs with the C64 DMA-halted
+  (a command dispatch, the log path) has no such deadline and already reads
+  core-1-written state safely in shipped, hardware-verified form
+  (`logGpu64_3dStats()` in `gpu64_api.cpp`, the ring's own cached-tail
+  fallback). Conflating the two cost a full design round on Stage 15 — see
+  `project/gap_filling_plan.md`'s Stage 15 section.
 - `STNP` and `DC ZVA` were both tried as escapes and both fail.
 
 ## Testing

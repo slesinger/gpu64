@@ -188,29 +188,75 @@ Scope:
 ### Stage 15 — core 1 actually renders (bring-up, immediate mode only)
 
 Get the render loop running on core 1 at all, now that there's a settled
-node/transform API to run it against. Scope deliberately narrow:
+node/transform API to run it against. Scope deliberately narrow.
 
-- Move `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE`'s existing logic from
-  core-0-synchronous execution to core 1, driven by draining the ring
-  buffer that phase 1 already feeds (today core 1 counts entries but
-  executes nothing).
-- Still no `LOOP_START`/`SCENE_COMMIT` — immediate mode stays immediate
-  mode, just executed off-core. `DRAW_MESH`/`DRAW_NODE` still return when
-  the draw is done; the difference is which core did the work.
-- This is where the store-burst rule (milestone6_3d_design.md, "The real
-  risk: store bursts, not core-count and not the L2") goes from a `DSB`
-  protecting nothing to load-bearing for the first time. `gpu64_3d_span.h`'s
-  chunking already exists and is already sized to 256 bytes (4 lines);
-  this stage is what actually exercises it against a live C64.
+**Completion signal, settled 2026-08-29 (Opus review, cross-checked against
+the actual source — see progress_tracker.md's "## 14." regression writeup for
+the review methodology this follows):** an earlier draft of this stage said
+both "`DRAW_MESH`/`DRAW_NODE` still return when the draw is done" *and* "this
+stage is what actually exercises [the store-burst rule] against a live C64" —
+those two cannot both hold if core 0 waits for the draw with the bus held,
+because a bus-held wait leaves nothing free-running for the store bursts to
+contend against. The fix is not a new mailbox — CLAUDE.md's "core 0 must never
+read a line core 1 writes" is milestone 6a's finding about
+`reuUsingPolling()`'s per-C64-cycle hot loop specifically (its own instrument
+only ever measured loop-pass elongation there), not an unconditional rule
+about all core-0 code. Dispatch already runs with the C64 DMA-halted and no
+per-cycle deadline, and shipped code already reads core-1-written state from
+there (`logGpu64_3dStats()`, gpu64_api.cpp — reads `gpu64_3dWorkerStats` every
+`LOG_ENABLE(1)`, hardware-verified since milestone 6). So: `gpu64_3dDispatch()`
+reads `gpu64_3dRing.tail` (bus held) and waits for it to catch `head` — no new
+signal, the worker already publishes `tail` *after* each command executes, so
+`tail == head` is already an exact completion signal. See
+`gpu64_3d_internals.h`'s `Gpu64_3dRing` comment for why the read itself is
+cheap enough not to matter at dispatch time.
+
+Split into two rounds so a core-1 rendering bug and a bus-timing bug fail in
+different bench passes rather than the same one:
+
+- **15a — plumbing, zero concurrency.** Move `CLEAR_VIEWPORT`/`DRAW_MESH`/
+  `DRAW_NODE`'s existing logic from core-0-synchronous execution to core 1,
+  driven by draining the ring buffer that phase 1 already feeds (today core 1
+  counts entries but executes nothing). Stall on drain at the top of *every*
+  dispatch, so the concurrency window is nil and only rendering correctness is
+  under test. Two known fixes belong in this round, both found reading the
+  real code, not hypothetical:
+  - `cleanViewport()`'s call into `CGpu64FrameBuffer::CleanRows()` is one
+    unchunked `CleanDataCacheRange` over the whole viewport (~1000 back-to-back
+    cache ops, no yield) — free today because core 0 holds the bus for the
+    whole draw; needs chunking to the same 256-byte/yield budget as the
+    rasteriser before 15b puts it under contention. 6a's one data point on
+    bulk cache-maintenance ops (`DC ZVA`) was "actively worse," not a hatch.
+  - `gpu64_3dDispatch()` currently pushes onto the ring *before* validating/
+    executing, so a `BAD_OPCODE`/`UNSUPPORTED` entry can already sit in the
+    ring — harmless while core 1 only counts (its `execute()` skips a switch
+    "because core 0 has already validated"), but that premise inverts the
+    moment core 1 actually executes. Swap the order.
+- **15b — narrow the stall, arm the positive control.** Stall only at
+  observation points (page flip/vsync commit, class 0 framebuffer ops, ring
+  full) rather than every dispatch, so a full frame of `DRAW_NODE` calls
+  actually queues and overlaps while the C64 free-runs — the real contention
+  regime. This is where the store-burst rule (milestone6_3d_design.md, "The
+  real risk: store bursts, not core-count and not the L2") goes from a `DSB`
+  protecting nothing to load-bearing for the first time; `gpu64_3d_span.h`'s
+  chunking already exists and is already sized to 256 bytes (4 lines).
+  Ring entries snapshot `gpu64Regs.arg` but not `s_State` (viewport/camera/
+  light) or node transforms read at execute time, so a `SET_LIGHT` issued
+  between push and deferred execute would change what a queued draw sees —
+  sequence the state opcodes through the ring too, not just draws.
 - Verification: the load ladder's positive control (a real REU round-trip
   running underneath core 1's render traffic) plus the existing hostsim
   reference PPMs as the pixel-correctness oracle — a core-1 rendering bug
-  and a bus-timing bug must not be diagnosed as the same symptom.
+  and a bus-timing bug must not be diagnosed as the same symptom. **No
+  hardware ladder campaign needed** — the store-burst budget is already
+  measured (6a); this stage exercises it, it doesn't re-derive it.
 - Carries forward untouched: never poll MMIO from core 1 (the current
-  worker already parks on `WFE` against the generic timer, satisfying
-  this); core 0 must never read a line core 1 writes (the ring's
-  cached-tail design already satisfies this — don't add a new mailbox that
-  breaks it).
+  worker already parks on `WFE` against the generic timer, satisfying this).
+- `QUEUE_FULL` becomes reachable for the first time once draws take real
+  time. Prefer waiting for a slot with the bus held over rejecting —
+  `GPU64_ERR_QUEUE_FULL`'s rationale in gpu64_api.h is about the *polling
+  loop's* predictability, which a dispatch-time wait doesn't touch — but keep
+  a timeout backstop so a wedged core 1 reports rather than hangs.
 
 ### Stage 16 — the commit protocol
 
