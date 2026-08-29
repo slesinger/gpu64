@@ -14,27 +14,37 @@ instead of RGB, the store-burst budget) and the phase-1 build history, and
 [project/gap_filling_plan.md](../project/gap_filling_plan.md) for what is
 staged next to close the gap between this section and "Status" below.
 
-## Status: retained scene graph, no autonomous loop yet
+## Status: retained scene graph, real core-1 overlap, no autonomous loop yet
 
 **Read this before the opcode table below — it changes what several rows
 actually do today.**
 
 The design targets a retained scene graph rendered autonomously by a second
 core, with the C64 only ever moving nodes and committing frames. As of
-stage 14 (2026-08-29), the scene graph itself is built and live; the
-autonomous loop is not:
+stage 15b (2026-08-29), the scene graph is built and live, and the renderer
+runs for real on core 1 with the C64 overlapping it; the autonomous loop
+itself is not built:
 
-- The renderer, including `DRAW_NODE`, executes **synchronously on core 0**,
-  inside the same DMA-halt window as any class 0 draw op — not on a second
-  core. Node state (position, orientation, scale, visibility) is retained
-  across commands; drawing it is still an explicit per-frame call.
+- `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` run on **core 1**, not core 0 —
+  `gpu64_3dDispatch()` queues the draw and returns without waiting for it to
+  finish, so the C64 is free to issue its next command while core 1 is still
+  rasterising. `RESULT`/`ERRCODE` for these three catch up to the draw's own
+  outcome at the next observation point rather than at return time — see
+  "Deferred RESULT" below, it changes how you read them back. Node state
+  (position, orientation, scale, visibility) is retained across commands;
+  drawing it is still an explicit per-frame call.
 - `LOOP_START` and `SCENE_COMMIT` ($06, $08) answer **`UNSUPPORTED`** — the
-  autonomous loop and shadow-scene double-buffering are not built yet.
+  autonomous loop and shadow-scene double-buffering are not built yet. What
+  stage 15b adds is overlap *within* the explicit-call model, not the
+  handshake/free-running loop the design describes for $06/$08.
 - Scene-node and transform opcodes, **$20-$24 and $30-$36**, are **live**:
   a node created with `CREATE_OBJECT`/`CREATE_CAMERA` persists in a 256-node
   table until `DESTROY_NODE` or a session reset, and `DRAW_NODE` ($42) draws
   it using whatever the transform opcodes last set — no re-staging a
-  position/orientation/scale on every draw the way `DRAW_MESH` needs.
+  position/orientation/scale on every draw the way `DRAW_MESH` needs. Every
+  opcode in these ranges runs synchronously on core 0 as before, but as of
+  15b each one first waits for any render it queued to finish draining on
+  core 1 — it is about to mutate state that render also reads.
 - `ARENA_STATUS` ($09) exists and was not in the original design sketch —
   see below.
 
@@ -43,8 +53,11 @@ directly (transform argument staged fresh every call, nothing retained), or
 build persistent nodes once with `CREATE_OBJECT`/`CREATE_CAMERA` and move
 them with `SET_POSITION`/`MOVE_LOCAL`/`SET_VISIBLE`/etc. before calling
 `DRAW_NODE` — but there is still no autonomous loop:** every frame's draws
-are explicit calls from the C64, each one halting it for the duration, same
-as `DRAW_MESH`.
+are explicit calls from the C64. Unlike through stage 15a, those calls no
+longer each halt the C64 for their own full duration — a `DRAW_NODE` queues
+and returns, and only something that actually needs the draw finished (the
+next state-mutating opcode, a page flip, a class 0 framebuffer op) pays the
+wait.
 
 Once the loop is live (staged in
 [project/gap_filling_plan.md](../project/gap_filling_plan.md)), a
@@ -118,8 +131,50 @@ cannot be started. Otherwise `BUSY`.
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
 | $40 | `CLEAR_VIEWPORT` | 0 | — | Fills the viewport with the background index and clears the z-buffer. Call this once per frame before drawing — nothing else clears the z-buffer for you (see Depth buffer below). |
-| $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Runs synchronously on core 0 and returns when done. Ignores the scene graph entirely — draws in world space unless a camera has been applied by a preceding `DRAW_NODE` call this session (`SET_PERSPECTIVE`'s projection still applies either way). `RESULT` = triangle count drawn, saturated to a byte — **a mesh that draws 0 triangles and a winding-order mistake that culls every face look identical**, so check `RESULT` after your first upload of any new mesh. |
-| $42 | `DRAW_NODE` | 0 | — | Draws the staged object node `ID` using its retained position/orientation/scale — no re-staging a transform, unlike `DRAW_MESH`. Applies the active camera (if any) fresh on every call, so moving the camera between two `DRAW_NODE`s in one frame is seen by both. `BAD_ID` if the staged `ID` is not a live object node (a camera `ID` included). An invisible node (`SET_VISIBLE 0`) is skipped silently: `RESULT` = 0, `ERRCODE` = `OK`, same "0 is informative, not an error" convention `DRAW_MESH` uses for full culling. |
+| $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Queues on core 1 and returns immediately — see "Deferred RESULT" below for what that means for reading the outcome back. Ignores the scene graph entirely — draws in world space unless a camera has been applied by a preceding `DRAW_NODE` call this session (`SET_PERSPECTIVE`'s projection still applies either way). `RESULT` = triangle count drawn, saturated to a byte — **a mesh that draws 0 triangles and a winding-order mistake that culls every face look identical**, so check `RESULT` after your first upload of any new mesh. |
+| $42 | `DRAW_NODE` | 0 | — | Draws the staged object node `ID` using its retained position/orientation/scale — no re-staging a transform, unlike `DRAW_MESH`. Queues on core 1 and returns immediately, same as `DRAW_MESH` — see "Deferred RESULT" below. Applies the active camera (if any) fresh on every call, so moving the camera between two `DRAW_NODE`s in one frame is seen by both — "every call" means every call as actually run on core 1, in the order queued, not the order a deferred `RESULT` is later read. `BAD_ID` if the staged `ID` is not a live object node (a camera `ID` included) — this much is still checked on core 0 before the call returns, since it can be. An invisible node (`SET_VISIBLE 0`) is skipped silently: `RESULT` = 0, `ERRCODE` = `OK`, same "0 is informative, not an error" convention `DRAW_MESH` uses for full culling. |
+
+### Deferred RESULT
+
+As of stage 15b (2026-08-29), `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` queue
+onto core 1 and return without waiting for their own draw to finish — that
+overlap, not a stall on every one, is the point: a frame of `DRAW_NODE` calls
+now queues and runs while the C64 goes on to its next command instead of
+halting for each one in turn. The trade is that `ERRCODE` on return only
+reflects what core 0 could check before queuing (a bad `ID`, no active
+camera, an argument out of range) — never the draw's own outcome — and
+`RESULT` is **not** updated to that draw's triangle count at return time.
+
+`RESULT` is valid **as of the last observation point** instead: it catches up
+to the most recently queued `DRAW_MESH`/`DRAW_NODE` the next time anything
+forces the ring to finish draining, which happens automatically and often —
+every other class 1 opcode does it before it runs (they mutate state a queued
+draw also reads), and so does a `PAGE_FLIP`/`VBLANK_SYNC` and any class 0
+opcode that touches the framebuffer. In practice this means: **the debugging
+workflow "check `RESULT` after your first upload of any new mesh" still
+works exactly as written** — issue the `DRAW_MESH`, then issue essentially
+any other command (a `SET_*`, a class 0 `CLEAR`, a `PAGE_FLIP`) and read
+`RESULT` — no dedicated "wait" opcode is needed because ordinary programs
+already call something else next. Two things to not use for this: another
+`DRAW_MESH`/`DRAW_NODE` does **not** reliably flush the previous one's
+`RESULT` — the render ops only drain when the ring is full, not on every
+call, so back-to-back draws can leave the first one's `RESULT` unread for
+longer than one call; and an opcode that defines its own `RESULT`
+(`ARENA_STATUS`, `UPLOAD_MESH`) overwrites the just-flushed value with its
+own the instant it runs, so it never actually surfaces the draw's triangle
+count even though it does force the wait. A program with truly nothing else
+to issue should use `NOP` ($00, class 0) instead: it is genuinely
+side-effect-free and forces the same wait — see `gpu64_3dSync()`'s comment
+in `gpu64_3d.h`.
+
+A queued-but-not-yet-drained ring is also why `QUEUE_FULL` is reachable for
+`CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` far less often than it used to be:
+pushing against a full ring waits (bus held) for core 1 to make room rather
+than rejecting outright, with `WORKER_TIMEOUT` as the backstop against a
+wedged core 1 — see the `ERRCODE` table below. A genuinely full ring only
+still rejects outright for the other class 1 opcodes, which is the design's
+"a failed dispatch does nothing" rule doing its job on a command with no
+useful way to wait.
 
 ## Mesh format
 
@@ -258,7 +313,7 @@ Class 1 adds one readable byte beyond the class 0 register set:
 
 | Address | Name | Dir | Purpose |
 |---|---|---|---|
-| $DF21 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT` (design only), triangle count from `DRAW_MESH`/`DRAW_NODE`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. `CREATE_OBJECT`/`CREATE_CAMERA` don't allocate an ID and so don't set `RESULT` — node IDs are chosen by the C64 side, same as resource IDs. |
+| $DF21 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT` (design only), triangle count from `DRAW_MESH`/`DRAW_NODE`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. `CREATE_OBJECT`/`CREATE_CAMERA` don't allocate an ID and so don't set `RESULT` — node IDs are chosen by the C64 side, same as resource IDs. As of stage 15b, `DRAW_MESH`/`DRAW_NODE`'s `RESULT` is deferred — see "Deferred RESULT" above for when it actually becomes valid. |
 
 and one `STATUS` bit:
 
@@ -267,9 +322,16 @@ and one `STATUS` bit:
 | 4 | frame-ready — the loop has finished a frame and is waiting for `SCENE_COMMIT` (handshake mode only; not reachable yet, since the loop cannot start). |
 
 New `ERRCODE` values this class adds: `OUT_OF_MEMORY` (resource RAM
-exhausted), `QUEUE_FULL` (the core-0/core-1 command ring is full), `BAD_ID`
-(no such resource or node), `NO_CAMERA` (a render was asked for with no
-active camera), `WORKER_TIMEOUT` (a `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE`
-did not come back from core 1 in a generous worst-case window — designed to
-be unreachable in normal operation). See [error-codes.md](error-codes.md) for
-the shared table.
+exhausted), `QUEUE_FULL` (the ring was full and the opcode was one of the
+ones that still rejects outright rather than waiting — see "Deferred RESULT"
+above), `BAD_ID` (no such resource or node), `NO_CAMERA` (a render was asked
+for with no active camera), `WORKER_TIMEOUT` (core 0 gave up waiting on core
+1 in a generous worst-case window — designed to be unreachable in normal
+operation). As of stage 15b this has two distinct triggers, not one: a
+`CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` pushed against a full ring waiting
+for space to open up, or any other class 1 opcode (including the drain
+inside a session reset, i.e. RUN/STOP+RESTORE) waiting for a previously
+queued render to finish before it mutates the state that render reads. Both
+mean the same thing at the hardware level — core 1 did not drain the ring in
+time — just reached from two different call sites. See
+[error-codes.md](error-codes.md) for the shared table.

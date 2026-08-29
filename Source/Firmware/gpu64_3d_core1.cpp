@@ -8,16 +8,24 @@
  traffic so the timing question milestone 6a opened stayed measurable while
  the pipeline was built.
 
- Stage 15a (project/gap_filling_plan.md) gives execute() below a real job for
- three opcodes: CLEAR_VIEWPORT, DRAW_MESH and DRAW_NODE now run for real on
- core 1, via gpu64_3dExecuteRender() (gpu64_3d_class1.cpp, which still owns
- all the session state this needs and cannot export). gpu64_3dDispatch()
- stalls the whole dispatch on the ring fully draining before it returns --
- 15a's zero-concurrency window -- so there is still exactly one owner of the
- framebuffer and the z-buffer at any instant, just relocated from "core 0,
- always" to "core 1, while core 0 waits". Every other class 1 opcode is
- unchanged: pushed for the ring's own counters, then still executed
- synchronously on core 0.
+ Stage 15a (project/gap_filling_plan.md) gave execute() below a real job for
+ three opcodes: CLEAR_VIEWPORT, DRAW_MESH and DRAW_NODE run for real on core
+ 1, via gpu64_3dExecuteRender() (gpu64_3d_class1.cpp, which still owns all
+ the session state this needs and cannot export). 15a stalled the whole
+ dispatch on the ring fully draining before it returned, for every one of
+ the three -- a deliberate zero-concurrency window so there was exactly one
+ owner of the framebuffer and the z-buffer at any instant, just relocated
+ from "core 0, always" to "core 1, while core 0 waits".
+
+ Stage 15b (same plan doc) narrows that stall to real observation points --
+ page flip/vsync commit, a class 0 framebuffer op, a full ring -- instead of
+ every dispatch, so a frame of DRAW_NODE calls actually queues and overlaps
+ the C64 free-running instead of stalling on each one. This file's own job
+ does not change: it still just drains the ring and, for the three render
+ ops, calls gpu64_3dExecuteRender(). What changed is on the other side, in
+ gpu64_3dDispatch() (gpu64_3d_class1.cpp) -- see the comment above
+ drainAndFlush() there for what an observation point is and why every other
+ class 1 opcode now drains the ring *before* running, not just after.
 */
 #include "gpu64_3d_internals.h"
 #include "gpu64_api.h"
@@ -90,16 +98,18 @@ static void enableEventStream( void )
 
 // Records one drained command, and, for the three render opcodes, actually
 // executes it. pCmd is non-const now: gpu64_3dExecuteRender() writes its
-// result back into the slot for gpu64_3dDispatch() to read once its drain
-// wait succeeds.
+// result back into the slot for a later drainAndFlush() (gpu64_3d_class1.cpp)
+// to read.
 //
 // Every opcode besides the three render ones is still legal here with no
-// handler, because core 0 still executes them synchronously, itself, before
-// this drain loop ever sees them go by -- this function's count is the only
-// trace they leave on core 1. That is why unknownOp below is not a fault
-// counter: it is expected to climb continuously, on every non-render class 1
-// command, and gpu64_3dReport() (gpu64_3d_class1.cpp) does not treat it as
-// one.
+// handler: core 0 still executes all of those itself, synchronously, but as
+// of Stage 15b it does so *after* this drain loop has seen the entry go by,
+// not before -- gpu64_3dDispatch() pushes, then drains to here, then calls
+// its own execute(u8) (gpu64_3d_class1.cpp). This function's count is the
+// only trace any of them leaves on core 1. That is why unknownOp below is
+// not a fault counter: it is expected to climb continuously, on every
+// non-render class 1 command, and gpu64_3dReport() (gpu64_3d_class1.cpp)
+// does not treat it as one.
 static void execute( Gpu64_3dCmd *pCmd )
 {
 	gpu64_3dWorkerStats.lastOp = pCmd->op;

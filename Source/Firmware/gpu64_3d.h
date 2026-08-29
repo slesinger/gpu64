@@ -101,13 +101,41 @@ void gpu64_3dReset( void );
 
 // Executes one class 1 command from core 0, exactly as doSystem()/doDraw()
 // do for class 0: returns a GPU64_ERR_* code, having already pushed
-// whatever core 1 needs to do onto the ring. Never blocks -- a full ring is
-// GPU64_ERR_QUEUE_FULL, per the design's rule that core 0's
-// cycle-predictability outranks any command's completion.
+// whatever core 1 needs to do onto the ring.
+//
+// Through Stage 15a this never blocked beyond a full ring (GPU64_ERR_QUEUE_
+// FULL). Stage 15b (project/gap_filling_plan.md) changes that: CLEAR_
+// VIEWPORT/DRAW_MESH/DRAW_NODE now push and return without waiting for their
+// own draw, but every *other* class 1 opcode drains the ring before it runs
+// (it is about to mutate state a still-queued render also reads), and a
+// render pushed against a full ring waits, bus held, for space rather than
+// rejecting outright -- see gpu64_3dSync()'s comment for what that means for
+// RESULT/ERRCODE timing on the two draws. GPU64_ERR_QUEUE_FULL survives only
+// for the pathological case both of those still refuse: a non-render op
+// pushed against a full ring, which the design's "a failed dispatch does
+// nothing" rule still answers by rejecting rather than waiting.
 u8 gpu64_3dDispatch( u8 op );
 
 // Core 1's entry point, called from CGpu64MultiCore::Run(). Never returns.
 void gpu64_3dWorker( void );
+
+// Stage 15b's observation-point hook for gpu64_api.cpp: waits for the ring
+// to fully drain, publishing the most recently queued CLEAR_VIEWPORT/
+// DRAW_MESH/DRAW_NODE's RESULT to gpu64Regs once it is known complete.
+// Returns FALSE only on the drain timeout backstop (a wedged core 1).
+//
+// Call this before anything that would otherwise race a render this file has
+// queued but not yet run on core 1: a page flip/vsync commit, or a class 0
+// opcode that reads or writes the framebuffer. (Every non-render class 1
+// opcode already does the equivalent internally, via its own dispatch --
+// callers here do not need to call this before *those*.)
+//
+// This is also how a program gets a DRAW_MESH/DRAW_NODE's own RESULT (the
+// triangle count) back on demand: RESULT is valid as of the last observation
+// point, not the instant dispatch returns, so issuing any op that reaches
+// this -- including just the next DRAW_NODE -- and then reading RESULT gets
+// it. See docs/class1-3d-mesh-reference.md's "Deferred RESULT" note.
+boolean gpu64_3dSync( void );
 
 // Formats the subsystem's counters for the on-screen log (bring-up aid,
 // phase 0's only output). Returns the end pointer.

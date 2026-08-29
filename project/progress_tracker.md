@@ -2487,6 +2487,116 @@ behavior this round changes has now been exercised for real, not just
 built. Docs updated: `GPU64_ERR_WORKER_TIMEOUT` added to `api_design.md`'s
 ERRCODE table and `class1-3d-mesh-reference.md`'s ERRCODE sentence.
 
-**Not yet done:** Stage 15b (narrowing the stall to real observation points,
-so a frame of `DRAW_NODE` calls actually overlaps with the C64 free-running
--- the real contention regime this round deliberately excluded).
+**Not yet done at the time this section was written:** Stage 15b (narrowing
+the stall to real observation points, so a frame of `DRAW_NODE` calls
+actually overlaps with the C64 free-running -- the real contention regime
+this round deliberately excluded). See the next section.
+
+## 15b. Narrowing the stall to observation points -- real overlap (2026-08-29)
+
+**Status: done, verified on hardware 2026-08-29.**
+
+`gap_filling_plan.md`'s Stage 15b: replace 15a's "every render dispatch
+drains the whole ring before returning" with stalling only where core 0 is
+about to do something that would actually race a still-queued render on
+core 1. `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` now push onto the ring and
+return immediately; nothing waits for the draw itself except backpressure
+from a full ring. So a frame's worth of `DRAW_NODE` calls actually queues
+and runs on core 1 while the C64 goes on to its next command, instead of
+halting once per draw as 15a did on purpose.
+
+The abstraction this round introduces is the **observation point**: any
+place core 0 is about to touch state a queued-but-undrained render also
+reads must drain first. Four kinds, all now implemented:
+
+- **Every other class 1 opcode** (the ~17 that aren't one of the three
+  render ops) drains before it runs -- they mutate `s_State`/`s_Scene`/
+  `s_Res`, which `gpu64_3dExecuteRender()` reads on core 1. One call site in
+  `gpu64_3dDispatch()`'s non-render branch, ahead of `execute(op)`, covers
+  all of them -- deliberately not per-opcode and not by moving any of them to
+  core 1, since both were checked to produce identical observable ordering
+  to this with far more new surface area (new core-1 handlers, new
+  cache-warm bookkeeping per CLAUDE.md's rule 4/5).
+- **`gpu64_3dReset()`** (the RUN/STOP+RESTORE path) drains first, best
+  effort. Its old comment justified slamming `tail = head` without draining
+  by "the C64 is halted, nothing new can arrive" -- true but no longer
+  sufficient once core 1 can be mid-`gpu64_3dExecuteRender()` on a command
+  queued *before* RESTORE was pressed, racing the reset's own `memset`/
+  `gpu64_3dArenaReset()`. The drain's return value is ignored and the reset
+  proceeds regardless -- a session reset must always recover the session,
+  even against a wedged core 1.
+- **`gpu64_api.cpp`'s `doSystem()`**: `RESET_STATE`, `SET_DRAW_PAGE`, and
+  both branches of `PAGE_FLIP` (armed and immediate) drain first.
+  `SET_DRAW_PAGE` specifically closes a hazard `makeTarget()`
+  (`gpu64_3d_class1.cpp`) has always had latently: it reads
+  `pFB->GetDrawPage()` when core 1 actually *executes* a queued render, not
+  when it was pushed, so a `SET_DRAW_PAGE` landing between push and execute
+  would have misdirected the draw.
+- **`gpu64_api.cpp`'s `doDraw()`**: one drain at the top of the function,
+  ahead of its `switch`, covers every class 0 framebuffer opcode
+  (`CLEAR`/`SET_PIXEL`/`LINE`/`RECT`/`RECT_FILL`/`PAL_SET`/`PAL_LOAD`/
+  `BLIT`/`BLIT_KEYED`/`READ_RECT`) with one call rather than one per case.
+
+All four are `gpu64_3dSync()` (`gpu64_3d.h`), which is also the mechanism a
+program uses to force the wait on demand and read back a deferred
+`DRAW_MESH`/`DRAW_NODE` `RESULT` -- see `class1-3d-mesh-reference.md`'s
+"Deferred RESULT" section for what changed for callers and why `NOP` ($00,
+class 0) is the documented on-demand sync primitive (added there this round:
+it was already side-effect-free and now also calls `gpu64_3dSync()`).
+`ARENA_STATUS` was considered for that role first and rejected -- it defines
+its own `RESULT`, so it clobbers the just-flushed triangle count with its own
+free-arena value the instant it runs, which would have made the documented
+workflow silently wrong.
+
+The flush mechanism: `s_LastRenderSlot`/`s_LastRenderPending`, set whenever
+`gpu64_3dDispatch()` pushes one of the three render ops, read back by
+`drainAndFlush()` (the static function `gpu64_3dSync()` wraps) once the
+drain confirms that slot has actually executed -- `CLEAR_VIEWPORT` is
+excluded from the copy since it defines no `RESULT`.
+
+Backpressure: a render op pushed against a full ring now calls
+`drainAndFlush()` and retries the push once, rather than answering
+`QUEUE_FULL` outright -- `GPU64_ERR_WORKER_TIMEOUT` from the drain is the
+existing 15a backstop against a wedged core 1. `QUEUE_FULL` still applies
+outright, unchanged, to a non-render class 1 opcode pushed against a full
+ring -- the design's "a failed dispatch does nothing" rule, which has no
+useful way to wait for a command whose whole point is to run synchronously
+on core 0 right after.
+
+`gpu64_3d_core1.cpp` (core 1's own drain loop and `execute(Gpu64_3dCmd*)`)
+needed no functional change -- confirmed byte-for-byte compatible with 15b;
+only its design-history comment was updated. All the stall/observation-point
+logic lives on the core-0 side, in `gpu64_3d_class1.cpp`.
+
+Verification: `tools/build.sh` links clean across all four edited files
+(`gpu64_3d_class1.cpp`, `gpu64_3d.h`, `gpu64_3d_core1.cpp`, `gpu64_api.cpp`),
+no new warnings. No PC-side simulator exists for dual-core overlap timing
+(same limitation 15a noted); this round's own correctness claims -- the
+observation-point coverage, the retry-on-QUEUE_FULL path, the deferred-flush
+bookkeeping -- were checked by re-reading the real code, the same review
+discipline that caught 15a's three defects, not by a build-time proxy for
+concurrency. Docs updated: `class1-3d-mesh-reference.md` (Status section,
+opcode table rows for `DRAW_MESH`/`DRAW_NODE`, new "Deferred RESULT"
+section, `RESULT` register row, `WORKER_TIMEOUT` description) and
+`api_design.md`'s `WORKER_TIMEOUT` row.
+
+Deployed to the RAD card and run on hardware 2026-08-29 (build id
+`37bfa72a-dirty src:1e76a6d7`): `gpu64_demo_quake.prg` -- the workload that
+actually exercises the change, since it issues `DRAW_NODE` continuously
+while the camera moves, so it is the one that now genuinely overlaps core
+0/core 1 instead of stalling per-draw -- ran several hundred frames with the
+C64 staying alive throughout and correct geometry/lighting/camera, no sign
+of a render seeing state from underneath a missing observation point.
+`gpu64_3d_scene_test.prg`, the same PRG that verified 15a, was also re-run
+as a direct regression baseline and stayed good. User-confirmed both tests
+"all good." The load ladder's positive control (real store-burst
+contention underneath render traffic) was not run -- per the plan's own
+"no hardware ladder campaign needed," 6a already measured the store-burst
+budget and this stage exercises it rather than re-deriving it, and neither
+test above showed anything that would call for it.
+
+**Not yet done:** a fresh look at whether the observation-point set above is
+complete now that real concurrency is possible and has been exercised for
+real -- 15a's zero-concurrency model made several of these races
+unreachable in practice, and two demo/test PRGs are not exhaustive coverage
+of every state-opcode/render-op interleaving the API allows.

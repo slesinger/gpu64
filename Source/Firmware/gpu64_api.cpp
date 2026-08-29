@@ -387,11 +387,27 @@ static u8 doSystem( u8 op )
 	switch ( op )
 	{
 	case 0x00:					// NOP
+		// Stage 15b: NOP is otherwise genuinely side-effect-free, which
+		// makes it the natural "force a sync" primitive for a program that
+		// wants a queued CLEAR_VIEWPORT/DRAW_MESH/DRAW_NODE's own RESULT
+		// right now and has nothing else to issue -- see gpu64_3dSync()'s
+		// comment and docs/class1-3d-mesh-reference.md's "Deferred RESULT"
+		// note. Unlike ARENA_STATUS or UPLOAD_MESH, NOP has no RESULT
+		// contract of its own to clobber the flushed value with.
+#ifdef GPU64_3D_ENABLED
+		gpu64_3dSync();
+#endif
 		return GPU64_ERR_OK;
 
 	case 0x01:					// RESET_STATE
 		sStatus = 0;
 		gpu64_vsyncResetState();
+		// Stage 15b observation point: ResetPages() touches every page's
+		// content, which a class 1 render still queued (not yet run on
+		// core 1) also targets -- see gpu64_3dSync()'s comment.
+#ifdef GPU64_3D_ENABLED
+		gpu64_3dSync();
+#endif
 		if ( pFB ) pFB->ResetPages();
 		return GPU64_ERR_OK;
 
@@ -433,6 +449,15 @@ static u8 doSystem( u8 op )
 	case 0x04:					// SET_DRAW_PAGE
 		if ( sArg[ 0 ] >= GPU64_FB_PAGES )
 			return GPU64_ERR_BAD_ARGS;
+		// Stage 15b observation point: a class 1 render queued before this
+		// call targets whatever page GetDrawPage() reads when core 1
+		// actually runs it (gpu64_3d_class1.cpp's makeTarget()), which is
+		// execute time, not push time. Draining first means that read
+		// always sees the page that was current when the draw was issued,
+		// never one changed out from under it -- see gpu64_3dSync().
+#ifdef GPU64_3D_ENABLED
+		gpu64_3dSync();
+#endif
 		if ( pFB ) pFB->SetDrawPage( sArg[ 0 ] );
 		return GPU64_ERR_OK;
 
@@ -451,6 +476,16 @@ static u8 doSystem( u8 op )
 			// boundary. The C64 polls STATUS bit0 to know when.
 			if ( gpu64Vsync.flipPending )
 				return GPU64_ERR_BUSY;
+			// Stage 15b observation point: a class 1 render queued before
+			// this call is still drawing into the current draw page: if
+			// the flip armed here fires before that draw actually runs on
+			// core 1, the presented page is missing it. Draining first
+			// means the page this arms to present is always exactly what
+			// had been drawn to it as of this dispatch -- see
+			// gpu64_3dSync().
+#ifdef GPU64_3D_ENABLED
+			gpu64_3dSync();
+#endif
 			// Everything expensive about a flip happens now, while the C64
 			// is halted for this dispatch anyway; the loop is then left
 			// with only the SetVirtualOffset to do at the boundary.
@@ -463,6 +498,11 @@ static u8 doSystem( u8 op )
 			sStatus |= GPU64_STATUS_BUSY;
 			return GPU64_ERR_OK;
 		}
+		// Same observation point as the armed branch above, for the
+		// immediate flip.
+#ifdef GPU64_3D_ENABLED
+		gpu64_3dSync();
+#endif
 		pFB->Flip();
 		return GPU64_ERR_OK;
 
@@ -565,6 +605,16 @@ static u8 doDraw( u8 op )
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
 	if ( pFB == 0 )
 		return GPU64_ERR_UNSUPPORTED;
+
+	// Stage 15b observation point: every op below reads or writes the
+	// current draw page's pixels directly, the same page a queued-but-not-
+	// yet-run class 1 render also targets. One drain here, rather than one
+	// per opcode, both fixes the race and keeps a program's CLEAR-then-
+	// DRAW_NODE-then-RECT (or the reverse) in the order it issued them --
+	// see gpu64_3dSync().
+#ifdef GPU64_3D_ENABLED
+	gpu64_3dSync();
+#endif
 
 	switch ( op )
 	{

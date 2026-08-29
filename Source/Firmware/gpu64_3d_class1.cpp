@@ -175,6 +175,14 @@ static const Gpu64_3dTexture *lookupTexture( void *, u16 nId )
 
 // --- lifecycle ----------------------------------------------------------
 
+// Forward declaration: gpu64_3dReset(), directly below, needs Stage 15b's
+// drain-before-mutate defined much further down (it comes after every
+// opXxx() this file dispatches to, by design -- see the comment above its
+// definition). Everything else in this file still relies on definition
+// order rather than a declarations block; this is the one call that reaches
+// backward across it.
+static boolean drainAndFlush( void );
+
 void gpu64_3dInit( void )
 {
 	memset( &gpu64_3dRing, 0, sizeof( gpu64_3dRing ) );
@@ -188,11 +196,29 @@ void gpu64_3dInit( void )
 
 void gpu64_3dReset( void )
 {
-	// A session reset has to leave the ring empty, and only core 0 can say
-	// so: core 1 is mid-drain and would happily execute commands belonging to
-	// the program that just died. Moving the tail forward from core 0 is the
-	// one place that rule is broken, and it is safe precisely because the C64
-	// is halted and no new command can arrive while it happens.
+	// Stage 15b made this drain load-bearing rather than cosmetic: before
+	// 15b every dispatch already drained the ring, so by the time a RESTORE
+	// could reach here core 1 was always parked and idle. Now a render can
+	// still be queued, or actually mid-execute on core 1, when RESTORE is
+	// pressed -- and gpu64_3dExecuteRender() reads and writes exactly the
+	// s_Res/s_State/s_Scene/s_Scratch/s_Depth structures this function is
+	// about to reset. Draining first makes that impossible instead of
+	// merely unlikely. The C64 being halted for this call still rules out a
+	// *new* command arriving mid-reset -- that half of the old comment's
+	// reasoning stands -- it just no longer covers one core 1 was already
+	// working on when the halt began.
+	//
+	// Best-effort: if core 1 is genuinely wedged (the GPU64_3D_DRAIN_TIMEOUT_US
+	// backstop), a RUN/STOP+RESTORE still has to recover the session rather
+	// than leave the whole subsystem dead, so the reset proceeds regardless
+	// of drainAndFlush()'s result -- there is no worse outcome available
+	// from a void function with no caller to report a timeout to.
+	drainAndFlush();
+
+	// Only core 0 gets to say a new session's ring starts empty. Redundant
+	// with the drain above whenever it succeeded (tail already == head by
+	// then), kept as the statement of intent for the timeout case, where it
+	// is the only thing that still moves the ring forward.
 	gpu64_3dRing.tail = gpu64_3dRing.head;
 	gpu64_3dRing.tailCache = gpu64_3dRing.head;
 
@@ -801,6 +827,79 @@ static boolean waitForDrain( u32 head )
 	return TRUE;
 }
 
+// --- Stage 15b: observation points ---------------------------------------
+//
+// Under 15a every dispatch drained the ring before returning, so the ring
+// never held more than one entry and "wait for the ring to empty" and "wait
+// for this op's own completion" were the same thing. 15b lets CLEAR_VIEWPORT/
+// DRAW_MESH/DRAW_NODE queue and return without waiting (below), which is the
+// whole point -- a frame of DRAW_NODE calls now overlaps the C64 free-running
+// instead of stalling on every one -- but it breaks that equivalence, and
+// with it docs/class1-3d-mesh-reference.md's old "RESULT is valid the instant
+// dispatch returns" contract for those three opcodes.
+//
+// What replaces it: RESULT is valid as of the last *observation point* --
+// anywhere this file or gpu64_api.cpp forces the ring to fully drain before
+// going on to do something that would otherwise race a still-in-flight
+// render. That is every non-render class 1 opcode below (they mutate
+// s_State/s_Scene/s_Res, which a queued render also reads), plus, from
+// gpu64_api.cpp, a page flip/vsync commit and any class 0 opcode that touches
+// the framebuffer -- see gpu64_3dSync() at the bottom of this section. A
+// program that wants a DRAW_NODE's own RESULT right now (the debugging
+// workflow docs/class1-3d-mesh-reference.md calls out: "check RESULT after
+// your first upload of any new mesh") gets it by issuing any one of those as
+// the next call and then reading RESULT -- it does not need a dedicated
+// "sync" opcode, because ordinary programs already do this constantly.
+//
+// s_LastRenderSlot/s_LastRenderPending are core-0-private bookkeeping: which
+// ring slot the most recently pushed render op landed in, and whether it has
+// been flushed to gpu64Regs.result yet. Nothing on core 1 reads either.
+static u32     s_LastRenderSlot;
+static boolean s_LastRenderPending;
+
+// Waits for the ring to fully drain, then -- if a render op was pushed since
+// the last flush -- copies its RESULT across, exactly as gpu64_3dDispatch()
+// used to do inline for every DRAW_MESH/DRAW_NODE before 15b. Returns FALSE
+// only on the GPU64_3D_DRAIN_TIMEOUT_US backstop (a wedged core 1).
+static boolean drainAndFlush( void )
+{
+	if ( !waitForDrain( gpu64_3dRing.head ) )
+		return FALSE;
+
+	// Pairs with the DMB gpu64_3dWorker() issues (gpu64_3d_core1.cpp) after
+	// execute() writes err/result and before it publishes tail -- without
+	// this, having observed tail == head does not by itself guarantee this
+	// core sees the slot's new contents.
+	asm volatile( "DMB ISH" ::: "memory" );
+
+	if ( s_LastRenderPending )
+	{
+		const Gpu64_3dCmd *pSlot = &gpu64_3dRing.slot[ s_LastRenderSlot ];
+
+		// Not for CLEAR_VIEWPORT: that opcode never touched RESULT before
+		// Stage 15a either, and copying pSlot->result here would leak
+		// whatever stale value a previous DRAW_MESH/DRAW_NODE left in this
+		// slot (slots are a ring, reused, not per-opcode storage).
+		if ( pSlot->op != GPU64_3D_OP_CLEAR_VIEWPORT )
+			gpu64Regs.result = pSlot->result;
+		s_LastRenderPending = FALSE;
+	}
+	return TRUE;
+}
+
+// gpu64_api.cpp's observation-point hook: a page flip/vsync commit or a
+// class 0 opcode that touches the framebuffer must not run ahead of a
+// render this file has queued but not yet executed on core 1 -- see the
+// comment above drainAndFlush(). A no-op (returns TRUE immediately) whenever
+// GPU64_3D_ENABLED is off, so callers do not need their own #ifdef for the
+// common case; they still need one around the call itself, the same as
+// every other gpu64_3d.h entry point, because this whole file is compiled
+// out with the toggle.
+boolean gpu64_3dSync( void )
+{
+	return drainAndFlush();
+}
+
 u8 gpu64_3dDispatch( u8 op )
 {
 	u8 res;
@@ -831,36 +930,56 @@ u8 gpu64_3dDispatch( u8 op )
 
 		if ( res == GPU64_ERR_OK && needsDraw )
 		{
-			const u32 slot = gpu64_3dRing.head;
+			u32 slot = gpu64_3dRing.head;
 
 			if ( !gpu64_3dRingPush( op ) )
 			{
-				gpu64_3dHost.rejected++;
-				return GPU64_ERR_QUEUE_FULL;
-			}
-			didPush = TRUE;
-
-			if ( !waitForDrain( gpu64_3dRing.head ) )
-			{
-				res = GPU64_ERR_WORKER_TIMEOUT;
+				// QUEUE_FULL backpressure (Stage 15b): wait for the ring to
+				// fully drain, bus held, rather than reject outright -- a
+				// C64 program drawing faster than core 1 renders should see
+				// its draws queue, not fail. gap_filling_plan.md's Stage 15b
+				// QUEUE_FULL note prefers this to an outright reject, with
+				// GPU64_3D_DRAIN_TIMEOUT_US as the backstop against a
+				// wedged core 1. A ring that has just fully drained cannot
+				// immediately be full again -- core 0 is the only producer,
+				// and it is not doing anything else meanwhile -- so the
+				// retried push below is not itself allowed to fail.
+				if ( !drainAndFlush() )
+				{
+					gpu64_3dHost.rejected++;
+					res = GPU64_ERR_WORKER_TIMEOUT;
+				}
+				else
+				{
+					slot = gpu64_3dRing.head;
+					if ( gpu64_3dRingPush( op ) )
+					{
+						didPush = TRUE;
+					}
+					else
+					{
+						// Unreachable in practice -- a ring that just fully
+						// drained cannot be full again one push later, core
+						// 0 being the only producer -- but fail safely
+						// rather than assume it.
+						gpu64_3dHost.rejected++;
+						res = GPU64_ERR_QUEUE_FULL;
+					}
+				}
 			}
 			else
 			{
-				// Pairs with the DMB gpu64_3dWorker() issues (gpu64_3d_core1.cpp)
-				// after execute() writes err/result and before it publishes tail
-				// -- without this, having observed tail == head does not by
-				// itself guarantee this core sees the slot's new contents.
-				asm volatile( "DMB ISH" ::: "memory" );
+				didPush = TRUE;
+			}
 
-				const Gpu64_3dCmd *pSlot = &gpu64_3dRing.slot[ slot ];
-				res = pSlot->err;
-
-				// Not for CLEAR_VIEWPORT: that opcode never touched RESULT
-				// before Stage 15a either, and copying pSlot->result here
-				// would leak whatever stale value a previous DRAW_MESH/
-				// DRAW_NODE left in this slot.
-				if ( op != GPU64_3D_OP_CLEAR_VIEWPORT )
-					gpu64Regs.result = pSlot->result;
+			if ( didPush )
+			{
+				// Stage 15b: push and return -- this draw's own completion
+				// is not waited for here. RESULT/ERRCODE for *this specific
+				// call* become valid at the next observation point; see the
+				// comment above drainAndFlush().
+				s_LastRenderSlot = slot;
+				s_LastRenderPending = TRUE;
 			}
 		}
 	}
@@ -876,6 +995,22 @@ u8 gpu64_3dDispatch( u8 op )
 			return GPU64_ERR_QUEUE_FULL;
 		}
 		didPush = TRUE;
+
+		// Stage 15b: execute(), below, is about to mutate s_State/s_Scene/
+		// s_Res synchronously on core 0 -- and a render queued earlier, not
+		// yet executed, reads exactly that state on core 1. Draining first
+		// turns this from a race into an observation point: a draw issued
+		// before this dispatch always sees the state that was live when
+		// *it* was issued, and this dispatch's own mutation is only visible
+		// to draws issued after it returns. This has the same ordering
+		// effect as literally sequencing every one of these ~15 opcodes
+		// through the ring the way the three render ops are, without adding
+		// a second, core-1-side execution path for opcodes that still only
+		// ever run on core 0 -- gap_filling_plan.md's Stage 15b "sequence
+		// the state opcodes through the ring too" note.
+		if ( !drainAndFlush() )
+			return GPU64_ERR_WORKER_TIMEOUT;
+
 		res = execute( op );
 	}
 
