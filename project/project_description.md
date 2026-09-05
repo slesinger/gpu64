@@ -40,4 +40,12 @@ Decision: **leave IO1 untouched entirely** (reserved, unused by gpu64) and **giv
 
 **Open question to verify empirically**: this relies on the Ultimate's (and any real REU's) IO2 decode being a true partial decode of $DF00–$DF0A only, not a full-256-byte mirror of those registers. Real 17xx REUs and the Ultimate's REU are expected to behave this way (1750-compatible), but it should be confirmed on hardware — probe $DF0B+ from a test PRG while the Ultimate's REU is active — before the protocol design leans on it.
 
+**gpu64's actual register addresses within $DF0B–$DFFF are moving**: the
+current $DF0B–$DF21 layout collides with the Ultimate's Command Interface
+(UCI), which optionally maps $DF1B–$DF1F — see
+[uci_register_remap_design.md](uci_register_remap_design.md) for the
+collision, the decision (shift the whole block to $DF20–$DF36), and the
+migration checklist. Not yet implemented; docs/api_design.md still reflects
+the old addresses until it lands.
+
 Within $DF0B–$DFFF, register layout is TBD as the API is designed (see progress tracker) — likely a small command/status register set plus a data-latch or DMA-style bulk path for pixel/vertex data, rather than one byte per operation.

@@ -5,7 +5,7 @@
 # For each Source/TestPRG/gpu64_test_*.a:
 #   1. assemble it with 64tass into the matching .prg
 #   2. run it under tools/prgsim against a reference model of the API built
-#      from docs/api_design.md, and require VERDICT PASS
+#      from docs/README.md and the files it indexes, and require VERDICT PASS
 #
 # Step 2 is the point. A test that encodes a misreading of the reference
 # fails here, on a PC, in a second -- rather than at the bench, where the

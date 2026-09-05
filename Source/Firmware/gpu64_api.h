@@ -30,6 +30,20 @@
 // opcode and undefined for opcodes that define none.
 #define GPU64_REG_RESULT	0x21
 
+// gpu64: reliability-protocol detector-only build (project/reliability_protocol_design.md,
+// "Recommended next step"). SEQ is write-only, C64-chosen, cycled $01-$FE
+// (never $00 or $FF); SEQACK is read-only and is set to the most recently
+// *dispatched* SEQ, so a C64-side compare against the value it just wrote
+// catches a dropped CMD_LO the same way a dropped ARG write would silently
+// go unnoticed today. No retry logic yet -- see the design doc. Provisional
+// addresses: these sit in the currently-reserved tail of the un-remapped
+// $DF0B-$DF21 block, ahead of the planned UCI remap
+// (project/uci_register_remap_design.md) -- acceptable here only because
+// this pair is throwaway diagnostic instrumentation, not the shipped
+// protocol, which will land after the remap at $DF37+.
+#define GPU64_REG_SEQ		0x22
+#define GPU64_REG_SEQACK	0x23
+
 #define GPU64_ARG_COUNT		16
 
 // --- STATUS bits --------------------------------------------------------
@@ -104,6 +118,8 @@ struct GPU64REGS
 	u8	id[ 2 ];
 	u8	result;			// class 1, read-only from the C64
 	u8	arg[ GPU64_ARG_COUNT ];
+	u8	seq;			// last SEQ value written (detector-only)
+	u8	seqAck;			// SEQ of the last command actually dispatched
 };
 
 extern GPU64REGS gpu64Regs;
@@ -128,6 +144,8 @@ static inline void gpu64_apiWriteReg( u8 addr, u8 data )
 		gpu64Regs.id[ 1 ] = data;
 	else if ( addr >= GPU64_REG_ARG0 && addr <= GPU64_REG_ARG15 )
 		gpu64Regs.arg[ addr - GPU64_REG_ARG0 ] = data;
+	else if ( addr == GPU64_REG_SEQ )
+		gpu64Regs.seq = data;
 	// Everything else in $DF21-$DFFF is reserved: writes are ignored.
 	// (CMD_LO never reaches here -- the caller dispatches it directly.)
 }
@@ -143,6 +161,8 @@ static inline u8 gpu64_apiReadReg( u8 addr )
 		return gpu64Regs.err;
 	if ( addr == GPU64_REG_RESULT )
 		return gpu64Regs.result;
+	if ( addr == GPU64_REG_SEQACK )
+		return gpu64Regs.seqAck;
 	return 0xFF;
 }
 

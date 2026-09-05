@@ -5,7 +5,7 @@ gpu64 rastercheck -- differential test of the class 2 raster core.
 Renders the same randomised scenarios twice: once through the firmware's
 Source/Firmware/gpu64_raster_core.cpp (compiled natively by the Makefile
 here) and once through the reference model in tools/prgsim/gpu64model.py,
-which was written from docs/api_design.md rather than from the firmware.
+which was written from docs/class2-raster-reference.md rather than from the firmware.
 Then it compares all 64000 pixels and the accepted/rejected/pixels counters.
 
 A disagreement is a real finding either way round: either the firmware does

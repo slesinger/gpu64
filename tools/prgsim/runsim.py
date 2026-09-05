@@ -8,7 +8,8 @@ the C64 screen it produced.
 Exit status is 0 only if the program reached its summary line and that line
 says VERDICT PASS, so this drops straight into a build script.
 
-What this is for: the suite asserts what docs/api_design.md specifies. Run
+What this is for: the suite asserts what docs/README.md and the files it
+indexes specify. Run
 here, a failure means the TEST is wrong -- the model is built from the same
 document. Run on hardware, a failure means the FIRMWARE is wrong. Getting
 the first kind out of the way on a PC is the whole point, because bench time

@@ -31,6 +31,7 @@
 #include "gpu64_3d_span.h"
 #include "gpu64_api.h"
 #include "gpu64_fb.h"
+#include "gpu64_vsync.h"
 #include "lowlevel_arm64.h"
 #include <circle/util.h>
 
@@ -85,6 +86,43 @@ static Gpu64_3dScratch	s_Scratch;
 // ID to a Gpu64_3dResource stays here rather than in gpu64_3d_scene.cpp, for
 // the reason given at the top of gpu64_3d_scene.h.
 static Gpu64_3dScene	s_Scene;
+
+// --- Stage 16: the autonomous loop and its shadow copy -------------------
+//
+// s_Scene/s_State are what GPU64_3D_OP_RENDER_SCENE reads on core 1 -- see
+// gpu64_3dExecuteRenderScene() below. Once LOOP_START has queued a frame,
+// mutating either directly from a C64 command would race that read exactly
+// the way Stage 15b's drain-before-mutate exists to prevent for immediate
+// mode. The design doc's answer is a shadow copy: while the loop runs,
+// isShadowRedirectable() opcodes write s_ShadowScene/s_ShadowState instead,
+// and SCENE_COMMIT is the only thing that ever copies shadow -> live, which
+// it does only after gpu64_3dDispatch()'s own unconditional drain (SCENE_
+// COMMIT is not itself shadow-redirectable) has already proven the in-flight
+// render finished. No new synchronisation primitive: this reuses drain-
+// before-mutate for the one write that still needs it, and removes the
+// drain for everything else, which is the whole point -- SET_POSITION during
+// the loop must not stall behind a frame it can no longer race.
+static Gpu64_3dScene	s_ShadowScene;
+static Gpu64_3dState	s_ShadowState;
+
+static boolean s_LoopRunning;
+
+// Bookkeeping for the one frame the autonomous loop may have in flight --
+// same shape as s_LastRenderSlot/s_LastRenderPending below, deliberately
+// separate from them: those track a C64-visible DRAW_MESH/DRAW_NODE RESULT,
+// this tracks STATUS bit4 (GPU64_STATUS_FRAME_READY) and the page number
+// that goes with it, which is a different C64-visible contract. s_LoopFrame-
+// Target is the ring's *head* value read right after RENDER_SCENE was
+// pushed -- i.e. the tail value that means "this slot has been consumed".
+// tail is a *masked* ring index, not a monotonic counter, and an unrelated
+// ring push can drain past s_LoopFrameTarget without ever being observed
+// sitting exactly on it -- so pollLoopFrame() below tests "has tail reached
+// or passed target" with modular distance rather than equality. (Contrast
+// waitForDrain(), which may test equality: there core 1 stops exactly at the
+// head core 0 just published and cannot overshoot it.)
+static u32     s_LoopFrameSlot;	// ring slot pushLoopFrame() put RENDER_SCENE in
+static u32     s_LoopFrameTarget;
+static boolean s_LoopFramePending;
 
 // The z-buffer, sized for the largest viewport SET_VIEWPORT will accept.
 // Static rather than out of the arena so a program cannot exhaust resource
@@ -173,6 +211,58 @@ static const Gpu64_3dTexture *lookupTexture( void *, u16 nId )
 	return pR ? &pR->tex : 0;
 }
 
+// --- Stage 16: shadow redirection ----------------------------------------
+//
+// Every op*() below that mutates the scene graph or the per-frame render
+// state goes through one of these two instead of touching s_Scene/s_State
+// directly, so the same handler body works whether or not the loop is
+// running -- see the comment above s_ShadowScene/s_ShadowState.
+static inline Gpu64_3dScene *sceneTarget( void )
+{
+	return s_LoopRunning ? &s_ShadowScene : &s_Scene;
+}
+
+static inline Gpu64_3dState *stateTargetForEdit( void )
+{
+	return s_LoopRunning ? &s_ShadowState : &s_State;
+}
+
+// Whitelist of opcodes gpu64_3dDispatch() may skip the pre-execute drain for
+// while the loop runs -- exactly those whose handler writes only through
+// sceneTarget()/stateTargetForEdit() above, never s_Scene/s_State directly,
+// and never the resource table (resource ops keep draining unconditionally:
+// they are not part of the design doc's per-frame dynamic state, and
+// gpu64_3dExecuteRenderScene() reads resources by ID through the same
+// s_Res[] this file already serialises against the C64 the ordinary way).
+// SCENE_COMMIT and SCENE_RESET are deliberately absent -- both need the
+// drain themselves, for different reasons covered at their own call sites.
+static boolean isShadowRedirectable( u8 op )
+{
+	switch ( op )
+	{
+	case GPU64_3D_OP_SET_VIEWPORT:
+	case GPU64_3D_OP_SET_PERSPECTIVE:
+	case GPU64_3D_OP_SET_LIGHT:
+	case GPU64_3D_OP_BUILD_COLORMAP:
+	case GPU64_3D_OP_SET_BACKGROUND:
+	case GPU64_3D_OP_CREATE_OBJECT:
+	case GPU64_3D_OP_CREATE_CAMERA:
+	case GPU64_3D_OP_DESTROY_NODE:
+	case GPU64_3D_OP_SET_ACTIVE_CAMERA:
+	case GPU64_3D_OP_SET_VISIBLE:
+	case GPU64_3D_OP_SET_POSITION:
+	case GPU64_3D_OP_SET_ORIENTATION:
+	case GPU64_3D_OP_MOVE_LOCAL:
+	case GPU64_3D_OP_MOVE_WORLD:
+	case GPU64_3D_OP_ROTATE_LOCAL:
+	case GPU64_3D_OP_SET_SCALE:
+	case GPU64_3D_OP_GET_TRANSFORM:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
 // --- lifecycle ----------------------------------------------------------
 
 // Forward declaration: gpu64_3dReset(), directly below, needs Stage 15b's
@@ -180,8 +270,11 @@ static const Gpu64_3dTexture *lookupTexture( void *, u16 nId )
 // opXxx() this file dispatches to, by design -- see the comment above its
 // definition). Everything else in this file still relies on definition
 // order rather than a declarations block; this is the one call that reaches
-// backward across it.
+// backward across it. pollLoopFrame() is Stage 16's non-blocking counterpart
+// -- same forward-reference reason.
 static boolean drainAndFlush( void );
+static void    pollLoopFrame( void );
+static boolean pushLoopFrame( void );
 
 void gpu64_3dInit( void )
 {
@@ -192,6 +285,10 @@ void gpu64_3dInit( void )
 	gpu64_3dArenaReset();
 	gpu64_3dStateDefaults( &s_State );
 	gpu64_3dSceneReset( &s_Scene );
+	gpu64_3dStateDefaults( &s_ShadowState );
+	gpu64_3dSceneReset( &s_ShadowScene );
+	s_LoopRunning = FALSE;
+	s_LoopFramePending = FALSE;
 }
 
 void gpu64_3dReset( void )
@@ -234,18 +331,41 @@ void gpu64_3dReset( void )
 	// the next program looking at a dead program's scene.
 	gpu64_3dSceneReset( &s_Scene );
 
+	// Stage 16: a RUN/STOP+RESTORE must not leave the autonomous loop
+	// running against a session that no longer exists -- the drain above
+	// already proved core 1 is idle (or the timeout backstop already
+	// decided to proceed regardless), so it is safe to declare the loop
+	// stopped and its shadow copy gone here.
+	s_LoopRunning = FALSE;
+	s_LoopFramePending = FALSE;
+	gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
+	gpu64_3dStateDefaults( &s_ShadowState );
+	gpu64_3dSceneReset( &s_ShadowScene );
+
 	memset( &gpu64_3dHost, 0, sizeof( gpu64_3dHost ) );
 }
 
 // --- the draw target ----------------------------------------------------
 
-static boolean makeTarget( Gpu64_3dTarget *pTarget )
+// The draw page as core 0 sees it right now. Every ring push goes through
+// this: it is the one place the draw page is read for a command, so a queued
+// render's target is fixed at push time and cannot move under it afterwards.
+static u8 currentDrawPage( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	return ( pFB != 0 && pFB->IsInitialized() ) ? pFB->GetDrawPage() : 0;
+}
+
+// nPage comes from the ring slot core 0 stamped at push time (Gpu64_3dCmd::page),
+// never from GetDrawPage(): this runs on core 1, and the draw page is core 0's
+// to advance. See that field's comment for what reading it here used to cost.
+static boolean makeTarget( Gpu64_3dTarget *pTarget, u8 nPage )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
 	if ( pFB == 0 || !pFB->IsInitialized() )
 		return FALSE;
 
-	pTarget->pPixels = pFB->PageBuffer( pFB->GetDrawPage() );
+	pTarget->pPixels = pFB->PageBuffer( nPage );
 	pTarget->pitch   = pFB->GetPitch();
 	pTarget->pDepth  = s_Depth;
 	return pTarget->pPixels != 0;
@@ -265,16 +385,23 @@ static boolean makeTarget( Gpu64_3dTarget *pTarget )
 // the rasteriser (gpu64_3d_span.h). One CleanRows() + one GPU64_3D_YIELD()
 // per row, same as that header's own comment: "one yield per scanline...
 // falls out of the geometry."
-static void cleanViewport( void )
+//
+// Stage 16 (Finding 2): the page is the caller's, taken from the same ring
+// slot makeTarget() drew through, so the rows cleaned are always the rows just
+// written. This used to re-read GetDrawPage() -- a second, independent read
+// that could disagree with the first one across a page hand-over, cleaning the
+// new page's rows while the pixels sat unflushed on the old one. That is
+// tearing that sticks: the display keeps scanning stale DRAM for a page whose
+// cache lines were never written back.
+static void cleanViewport( u8 nPage )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
 	if ( pFB == 0 )
 		return;
 
-	const u8 page = pFB->GetDrawPage();
 	for ( u16 y = s_State.vpY; y < s_State.vpY + s_State.vpH; y++ )
 	{
-		pFB->CleanRows( page, y, y + 1 );
+		pFB->CleanRows( nPage, y, y + 1 );
 		GPU64_3D_YIELD();
 	}
 }
@@ -292,15 +419,17 @@ static u8 opSetViewport( void )
 	if ( (u32)w * h * 3 > GPU64_3D_BUDGET )
 		return GPU64_ERR_OUT_OF_RANGE;
 
-	s_State.vpX = x;
-	s_State.vpY = y;
-	s_State.vpW = w;
-	s_State.vpH = h;
+	Gpu64_3dState *pState = stateTargetForEdit();
+
+	pState->vpX = x;
+	pState->vpY = y;
+	pState->vpW = w;
+	pState->vpH = h;
 
 	// The focal length is derived from the fov and the viewport width, so a
 	// viewport change re-derives it. Not doing so is a subtle one: the scene
 	// keeps rendering and quietly has the wrong field of view.
-	s_State.focal = gpu64_3dFocalFromFov( s_State.fov, w );
+	pState->focal = gpu64_3dFocalFromFov( pState->fov, w );
 	return GPU64_ERR_OK;
 }
 
@@ -313,14 +442,16 @@ static u8 opSetPerspective( void )
 	if ( near <= 0 || far <= near )
 		return GPU64_ERR_BAD_ARGS;
 
-	const s32 focal = gpu64_3dFocalFromFov( fov, s_State.vpW );
+	Gpu64_3dState *pState = stateTargetForEdit();
+
+	const s32 focal = gpu64_3dFocalFromFov( fov, pState->vpW );
 	if ( focal <= 0 )
 		return GPU64_ERR_BAD_ARGS;
 
-	s_State.fov   = fov;
-	s_State.focal = focal;
-	s_State.nearZ = near;
-	s_State.farZ  = far;
+	pState->fov   = fov;
+	pState->focal = focal;
+	pState->nearZ = near;
+	pState->farZ  = far;
 	return GPU64_ERR_OK;
 }
 
@@ -329,10 +460,12 @@ static u8 opSetLight( void )
 	if ( sArg[ 6 ] > 15 )
 		return GPU64_ERR_BAD_ARGS;
 
-	if ( !gpu64_3dNormalise( s_State.lightDir, argS16( 0 ), argS16( 2 ), argS16( 4 ) ) )
+	Gpu64_3dState *pState = stateTargetForEdit();
+
+	if ( !gpu64_3dNormalise( pState->lightDir, argS16( 0 ), argS16( 2 ), argS16( 4 ) ) )
 		return GPU64_ERR_BAD_ARGS;		// a zero-length direction
 
-	s_State.ambient = sArg[ 6 ];
+	pState->ambient = sArg[ 6 ];
 	return GPU64_ERR_OK;
 }
 
@@ -342,7 +475,7 @@ static u8 opBuildColormap( void )
 	if ( pFB == 0 )
 		return GPU64_ERR_UNSUPPORTED;
 
-	gpu64_3dBuildColormap( &s_State, pFB->GetPaletteRGB() );
+	gpu64_3dBuildColormap( stateTargetForEdit(), pFB->GetPaletteRGB() );
 	return GPU64_ERR_OK;
 }
 
@@ -430,8 +563,17 @@ static u8 opFreeResource( void )
 // or would silently execute on bad input. See gpu64-multicore-rule-scoped-to-
 // polling-loop (memory) for why this split exists.
 
+// Stage 16: "immediate mode requires the loop stopped" (design doc) --
+// CLEAR_VIEWPORT/DRAW_MESH/DRAW_NODE would read/write s_State/s_Scene/the
+// framebuffer's draw page directly, exactly what GPU64_3D_OP_RENDER_SCENE is
+// doing on core 1 while the loop runs. BUSY, not UNSUPPORTED: this is a
+// legal opcode temporarily refused, the same distinction GPU64_ERR_BUSY
+// already carries for a PAGE_FLIP against a still-pending one.
+
 static u8 precheckClearViewport( void )
 {
+	if ( s_LoopRunning )
+		return GPU64_ERR_BUSY;
 	if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
 		return GPU64_ERR_UNSUPPORTED;
 	return GPU64_ERR_OK;
@@ -439,6 +581,8 @@ static u8 precheckClearViewport( void )
 
 static u8 precheckDrawMesh( void )
 {
+	if ( s_LoopRunning )
+		return GPU64_ERR_BUSY;
 	if ( resFind( stagedId(), GPU64_3D_RES_MESH ) == 0 )
 		return GPU64_ERR_BAD_ID;
 	if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
@@ -459,29 +603,29 @@ static u8 precheckDrawMesh( void )
 
 static u8 opCreateObject( void )
 {
-	return gpu64_3dSceneCreateObject( &s_Scene, stagedId(), argU16( 0 ) );
+	return gpu64_3dSceneCreateObject( sceneTarget(), stagedId(), argU16( 0 ) );
 }
 
 static u8 opCreateCamera( void )
 {
-	return gpu64_3dSceneCreateCamera( &s_Scene, stagedId() );
+	return gpu64_3dSceneCreateCamera( sceneTarget(), stagedId() );
 }
 
 static u8 opDestroyNode( void )
 {
-	return gpu64_3dSceneDestroyNode( &s_Scene, stagedId() );
+	return gpu64_3dSceneDestroyNode( sceneTarget(), stagedId() );
 }
 
 static u8 opSetActiveCamera( void )
 {
-	return gpu64_3dSceneSetActiveCamera( &s_Scene, stagedId() );
+	return gpu64_3dSceneSetActiveCamera( sceneTarget(), stagedId() );
 }
 
 static u8 opSetVisible( void )
 {
 	if ( sArg[ 0 ] > 1 )
 		return GPU64_ERR_BAD_ARGS;
-	return gpu64_3dSceneSetVisible( &s_Scene, stagedId(), sArg[ 0 ] != 0 );
+	return gpu64_3dSceneSetVisible( sceneTarget(), stagedId(), sArg[ 0 ] != 0 );
 }
 
 static u8 opSetPosition( void )
@@ -490,18 +634,18 @@ static u8 opSetPosition( void )
 	pos.x = argS32( 0 );		// wire is already 16.16 -- SET_POSITION places
 	pos.y = argS32( 4 );		// a node anywhere in a 65536-unit world, unlike
 	pos.z = argS32( 8 );		// DRAW_MESH's 8.8 immediate-mode offset.
-	return gpu64_3dSceneSetPosition( &s_Scene, stagedId(), &pos );
+	return gpu64_3dSceneSetPosition( sceneTarget(), stagedId(), &pos );
 }
 
 static u8 opSetOrientation( void )
 {
-	return gpu64_3dSceneSetOrientation( &s_Scene, stagedId(),
+	return gpu64_3dSceneSetOrientation( sceneTarget(), stagedId(),
 					     argU16( 0 ), argU16( 2 ), argU16( 4 ) );
 }
 
 static u8 opMoveLocal( void )
 {
-	return gpu64_3dSceneMoveLocal( &s_Scene, stagedId(),
+	return gpu64_3dSceneMoveLocal( sceneTarget(), stagedId(),
 					(s32)argS16( 0 ) << 8,		// 8.8 -> 16.16
 					(s32)argS16( 2 ) << 8,
 					(s32)argS16( 4 ) << 8 );
@@ -509,7 +653,7 @@ static u8 opMoveLocal( void )
 
 static u8 opMoveWorld( void )
 {
-	return gpu64_3dSceneMoveWorld( &s_Scene, stagedId(),
+	return gpu64_3dSceneMoveWorld( sceneTarget(), stagedId(),
 					(s32)argS16( 0 ) << 8,
 					(s32)argS16( 2 ) << 8,
 					(s32)argS16( 4 ) << 8 );
@@ -517,13 +661,13 @@ static u8 opMoveWorld( void )
 
 static u8 opRotateLocal( void )
 {
-	return gpu64_3dSceneRotateLocal( &s_Scene, stagedId(),
+	return gpu64_3dSceneRotateLocal( sceneTarget(), stagedId(),
 					  argU16( 0 ), argU16( 2 ), argU16( 4 ) );
 }
 
 static u8 opSetScale( void )
 {
-	return gpu64_3dSceneSetScale( &s_Scene, stagedId(), argU16( 0 ) );
+	return gpu64_3dSceneSetScale( sceneTarget(), stagedId(), argU16( 0 ) );
 }
 
 static u8 opGetTransform( void )
@@ -536,7 +680,7 @@ static u8 opGetTransform( void )
 
 	Gpu64_3dVec pos;
 	u16 yaw, pitch, roll;
-	const u8 res = gpu64_3dSceneGetTransform( &s_Scene, stagedId(), &pos, &yaw, &pitch, &roll );
+	const u8 res = gpu64_3dSceneGetTransform( sceneTarget(), stagedId(), &pos, &yaw, &pitch, &roll );
 	if ( res != GPU64_ERR_OK )
 		return res;
 
@@ -566,6 +710,9 @@ static u8 opGetTransform( void )
 static u8 precheckDrawNode( boolean *pNeedsDraw )
 {
 	*pNeedsDraw = FALSE;
+
+	if ( s_LoopRunning )
+		return GPU64_ERR_BUSY;
 
 	Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, stagedId(), GPU64_3D_NODE_OBJECT );
 	if ( pN == 0 )
@@ -611,14 +758,14 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 	switch ( pCmd->op )
 	{
 	case GPU64_3D_OP_CLEAR_VIEWPORT:
-		if ( !makeTarget( &target ) )
+		if ( !makeTarget( &target, pCmd->page ) )
 		{
 			// precheckClearViewport() already proved this can't happen.
 			pCmd->err = GPU64_ERR_UNSUPPORTED;
 			return;
 		}
 		gpu64_3dClearViewport( &s_State, &target );
-		cleanViewport();
+		cleanViewport( pCmd->page );
 		pCmd->err = GPU64_ERR_OK;
 		return;
 
@@ -628,7 +775,7 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 		FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRender, 1024 * 2, 1024 * 2 );
 
 		const Gpu64_3dResource *pR = resFind( pCmd->id, GPU64_3D_RES_MESH );
-		if ( pR == 0 || !makeTarget( &target ) )
+		if ( pR == 0 || !makeTarget( &target, pCmd->page ) )
 		{
 			// precheckDrawMesh() already proved this can't happen.
 			pCmd->err = GPU64_ERR_BAD_ID;
@@ -650,7 +797,7 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 
 		const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
 						     &pos, &rot, scale, lookupTexture, 0 );
-		cleanViewport();
+		cleanViewport( pCmd->page );
 
 		// RESULT is the triangle count, saturated to a byte -- see the
 		// original opDrawMesh() comment this replaces: it is the difference
@@ -676,7 +823,7 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 		// safe rather than merely convenient.
 		Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, pCmd->id, GPU64_3D_NODE_OBJECT );
 		const Gpu64_3dResource *pR = pN ? resFind( pN->meshId, GPU64_3D_RES_MESH ) : 0;
-		if ( pN == 0 || pR == 0 || !makeTarget( &target ) )
+		if ( pN == 0 || pR == 0 || !makeTarget( &target, pCmd->page ) )
 		{
 			// precheckDrawNode() already proved this can't happen.
 			pCmd->err = GPU64_ERR_BAD_ID;
@@ -691,7 +838,7 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 
 		const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
 						     &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
-		cleanViewport();
+		cleanViewport( pCmd->page );
 
 		pCmd->result = (u8)( n > 255 ? 255 : n );
 		pCmd->err = GPU64_ERR_OK;
@@ -706,6 +853,77 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 	}
 }
 
+// --- Stage 16: core-1-side execution for the autonomous loop's own frame -
+//
+// One whole frame: clear the viewport, apply the active camera once, then
+// draw every visible OBJECT node in scene order. Same contract as
+// gpu64_3dExecuteRender() above -- writes pCmd->err/pCmd->result, never
+// touches gpu64Regs. Reads s_Scene/s_State directly, exactly as DRAW_NODE
+// does, which stays safe for the same reason DRAW_NODE was: at most one
+// GPU64_3D_OP_RENDER_SCENE is ever in flight (LOOP_START/SCENE_COMMIT never
+// push a second one before the first has drained -- see pollLoopFrame()),
+// and the shadow copy is what stops a C64 mutator from racing this read
+// while this frame is in flight (see s_ShadowScene/s_ShadowState above).
+//
+// A mesh a live node points at that no longer resolves (freed out from
+// under it) is skipped, not a failure -- one bad node must not blank an
+// otherwise-good autonomous frame the way it would a single explicit
+// DRAW_NODE, which the C64 can see failed and retry.
+void gpu64_3dExecuteRenderScene( Gpu64_3dCmd *pCmd )
+{
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dExecuteRenderScene, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRenderScene, 1024 * 2, 1024 * 2 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneApplyCamera, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_3dSceneApplyCamera, 1024 * 2, 1024 * 2 );
+
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	Gpu64_3dTarget target;
+	if ( pFB == 0 || !makeTarget( &target, pCmd->page ) )
+	{
+		// LOOP_START already proved a framebuffer exists before it ever
+		// pushed this op.
+		pCmd->err = GPU64_ERR_UNSUPPORTED;
+		return;
+	}
+
+	gpu64_3dClearViewport( &s_State, &target );
+
+	// Fresh every frame, same rule DRAW_NODE's own comment gives: a program
+	// that moves the camera between two commits must see the next frame
+	// rendered from where the camera is now.
+	gpu64_3dSceneApplyCamera( &s_Scene, &s_State );
+
+	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
+	{
+		const Gpu64_3dNode *pN = &s_Scene.node[ i ];
+		if ( pN->type != GPU64_3D_NODE_OBJECT || !pN->visible )
+			continue;
+
+		const Gpu64_3dResource *pR = resFind( pN->meshId, GPU64_3D_RES_MESH );
+		if ( pR == 0 )
+			continue;
+
+		gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
+				   &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
+
+		// Store-burst discipline (CLAUDE.md multicore rules): gpu64_3d_span.h's
+		// own yield covers the rasteriser's inner loop, but a scene of many
+		// small meshes can otherwise chain draw after draw with no yield
+		// between them at all. One here per node closes that gap.
+		GPU64_3D_YIELD();
+	}
+
+	cleanViewport( pCmd->page );
+
+	// The page this frame was actually rendered into, which is what the C64
+	// reads back as RESULT after SCENE_COMMIT. Not GetDrawPage(): by the time
+	// this line runs, core 0 may have advanced the draw page for the *next*
+	// frame, and answering with that one told the C64 the wrong page had been
+	// drawn (Finding 2).
+	pCmd->result = pCmd->page;
+	pCmd->err = GPU64_ERR_OK;
+}
+
 // --- dispatch -----------------------------------------------------------
 
 static u8 execute( u8 op )
@@ -714,10 +932,19 @@ static u8 execute( u8 op )
 	{
 	case GPU64_3D_OP_SCENE_RESET:
 		// "Destroys every node, stops the loop, leaves uploaded resources
-		// alone" -- docs/class1-3d-mesh-reference.md. The loop is phase 4
-		// and does not exist yet; nodes and render state do.
+		// alone" -- docs/class1-3d-mesh-reference.md. Stage 16: the loop
+		// now exists, so this must actually stop it and drop its shadow
+		// copy, not just the live session -- otherwise a RESET followed
+		// by a fresh LOOP_START would seed the new loop's shadow from a
+		// stale one instead of from the session gpu64_3dStateDefaults()/
+		// gpu64_3dSceneReset() just produced.
 		gpu64_3dStateDefaults( &s_State );
 		gpu64_3dSceneReset( &s_Scene );
+		s_LoopRunning = FALSE;
+		s_LoopFramePending = FALSE;
+		gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
+		gpu64_3dStateDefaults( &s_ShadowState );
+		gpu64_3dSceneReset( &s_ShadowScene );
 		return GPU64_ERR_OK;
 
 	case GPU64_3D_OP_SET_VIEWPORT:		return opSetViewport();
@@ -726,7 +953,7 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_BUILD_COLORMAP:	return opBuildColormap();
 
 	case GPU64_3D_OP_SET_BACKGROUND:
-		s_State.background = sArg[ 0 ];
+		stateTargetForEdit()->background = sArg[ 0 ];
 		return GPU64_ERR_OK;
 
 	case GPU64_3D_OP_ARENA_STATUS:
@@ -742,9 +969,16 @@ static u8 execute( u8 op )
 	}
 
 	case GPU64_3D_OP_LOOP_STOP:
-		// No loop runs yet, so stopping one always succeeds. Answering
-		// BAD_OPCODE instead would make a correctly-written program fail at
-		// its teardown.
+		// Always succeeds, even against a loop that was not running --
+		// answering an error instead would make a correctly written
+		// program's teardown call fail. Deliberately leaves
+		// s_LoopFramePending alone: a frame already queued when LOOP_STOP
+		// arrives still finishes on core 1 regardless (there is no
+		// ring-cancel primitive, and letting it finish is cheaper than
+		// building one just to discard the result), and a later
+		// pollLoopFrame() still harvests it -- harmlessly, since nothing
+		// reads GPU64_STATUS_FRAME_READY once the loop is not running.
+		s_LoopRunning = FALSE;
 		return GPU64_ERR_OK;
 
 	case GPU64_3D_OP_UPLOAD_MESH:		return opUploadMesh();
@@ -773,12 +1007,93 @@ static u8 execute( u8 op )
 	// which should not happen.
 
 	case GPU64_3D_OP_LOOP_START:
+	{
+		if ( s_LoopRunning )
+			return GPU64_ERR_BUSY;
+		// ARG[0] selects the mode: 0 is handshake (SCENE_COMMIT-driven,
+		// what this build implements), 1 is free-running vsync-driven,
+		// which is Stage 18 -- see project/gap_filling_plan.md. Answering
+		// UNSUPPORTED for mode 1 rather than silently treating it as mode
+		// 0 keeps a program written against a future firmware from
+		// running the wrong protocol against an old one without noticing.
+		if ( sArg[ 0 ] != 0 )
+			return GPU64_ERR_UNSUPPORTED;
+		if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
+			return GPU64_ERR_UNSUPPORTED;
+		// Enforced here, once, at the moment a render is actually asked
+		// for -- not per frame inside gpu64_3dExecuteRenderScene(), which
+		// (like gpu64_3dSceneApplyCamera() it calls) has no precedent
+		// anywhere else in this file for failing a render outright over a
+		// missing camera; it falls back to the identity view instead. A
+		// camera destroyed mid-loop by a later, shadow-redirected
+		// DESTROY_NODE is deliberately not re-checked per commit for the
+		// same reason.
+		if ( !s_Scene.bHaveActiveCamera )
+			return GPU64_ERR_NO_CAMERA;
+
+		// The shadow starts as a copy of the live session: the loop's
+		// first frame, and every isShadowRedirectable() edit up to the
+		// first SCENE_COMMIT, must still see whatever the C64 already set
+		// up before LOOP_START.
+		s_ShadowScene = s_Scene;
+		s_ShadowState = s_State;
+
+		gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
+
+		if ( !pushLoopFrame() )
+			return GPU64_ERR_QUEUE_FULL;
+
+		s_LoopRunning = TRUE;
+		return GPU64_ERR_OK;
+	}
+
 	case GPU64_3D_OP_SCENE_COMMIT:
-		// Both belong to the autonomous loop, which is phase 4. UNSUPPORTED
-		// rather than BAD_OPCODE: the opcode is real and this build cannot do
-		// it, which is a different thing for a program to branch on than an
-		// opcode that does not exist.
-		return GPU64_ERR_UNSUPPORTED;
+	{
+		if ( !s_LoopRunning )
+			return GPU64_ERR_UNSUPPORTED;
+
+		// gpu64_3dDispatch()'s generic branch already drained the ring
+		// unconditionally before calling execute() -- SCENE_COMMIT is
+		// deliberately absent from isShadowRedirectable() -- so the frame
+		// pushLoopFrame() queued last time is guaranteed finished by now.
+		// That drain does not itself harvest RESULT/FRAME_READY, only
+		// pollLoopFrame() does, so call it explicitly rather than assume
+		// an earlier, incidental call already did.
+		pollLoopFrame();
+		if ( !( gpu64Regs.status & GPU64_STATUS_FRAME_READY ) )
+			// Should not happen given the drain above; kept as a
+			// stated precondition rather than an assumption.
+			return GPU64_ERR_BUSY;
+
+		// Same armed-branch pattern as PAGE_FLIP (gpu64_api.cpp's
+		// doSystem()) -- SCENE_COMMIT's flip is the same flip, just
+		// driven by the loop instead of by the C64 calling PAGE_FLIP
+		// itself.
+		if ( !gpu64Vsync.calibrated )
+			return GPU64_ERR_UNSUPPORTED;
+		if ( gpu64Vsync.flipPending )
+			return GPU64_ERR_BUSY;
+		CGpu64FrameBuffer *pFB = g_pGpu64FB;
+		if ( pFB == 0 )
+			return GPU64_ERR_UNSUPPORTED;
+
+		// Publish: everything isShadowRedirectable() redirected since
+		// LOOP_START (or the last commit) becomes what the *next* frame
+		// renders from.
+		s_Scene = s_ShadowScene;
+		s_State = s_ShadowState;
+
+		pFB->PrepareFlip();
+		gpu64_vsyncWarmCommit();
+		gpu64Vsync.flipPending = 1;
+		gpu64Regs.status |= GPU64_STATUS_BUSY;
+		gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
+
+		if ( !pushLoopFrame() )
+			return GPU64_ERR_QUEUE_FULL;
+
+		return GPU64_ERR_OK;
+	}
 	}
 
 	return GPU64_ERR_BAD_OPCODE;
@@ -897,12 +1212,102 @@ static boolean drainAndFlush( void )
 // out with the toggle.
 boolean gpu64_3dSync( void )
 {
+	pollLoopFrame();
 	return drainAndFlush();
+}
+
+// --- Stage 16: the autonomous loop's own frame handoff --------------------
+//
+// pushLoopFrame() and pollLoopFrame() are drainAndFlush()'s counterparts for
+// GPU64_3D_OP_RENDER_SCENE: the same slot/target bookkeeping
+// s_LastRenderSlot/s_LastRenderPending use for DRAW_MESH/DRAW_NODE, kept
+// separate (as s_LoopFrameSlot/s_LoopFrameTarget/s_LoopFramePending) because
+// they gate a different C64-visible contract -- GPU64_STATUS_FRAME_READY and
+// RESULT-as-"the page SCENE_COMMIT just rendered", not a triangle count.
+
+// Pushes one GPU64_3D_OP_RENDER_SCENE and arms pollLoopFrame() to notice when
+// it finishes. Called from LOOP_START and from SCENE_COMMIT's armed branch,
+// each exactly once, always with s_LoopFramePending already FALSE by
+// construction -- LOOP_START only runs when the loop was not running, and
+// SCENE_COMMIT only reaches this call after pollLoopFrame() has just cleared
+// it -- so the ring never carries more than one RENDER_SCENE at a time,
+// matching gpu64_3dExecuteRenderScene()'s own "at most one in flight"
+// comment. FALSE only on QUEUE_FULL, which the caller reports as such -- the
+// ring being full of C64-issued traffic at the exact instant the loop wants
+// to queue its own frame is a real, reportable condition, not swallowed.
+static boolean pushLoopFrame( void )
+{
+	const u32 slot = gpu64_3dRing.head;
+	// The page is decided here, on core 0, with the C64 halted for this
+	// dispatch -- and, at SCENE_COMMIT's call site, *after* PrepareFlip() has
+	// already handed the draw page over. That ordering is the fix for
+	// Finding 2: the page this frame renders into is by construction neither
+	// the one on screen nor the one queued to replace it.
+	if ( !gpu64_3dRingPush( GPU64_3D_OP_RENDER_SCENE, currentDrawPage() ) )
+		return FALSE;
+	s_LoopFrameSlot = slot;
+	s_LoopFrameTarget = gpu64_3dRing.head;
+	s_LoopFramePending = TRUE;
+	return TRUE;
+}
+
+// The non-blocking counterpart to drainAndFlush(): one modular-distance test
+// against the ring's tail, cheap enough to call from every dispatch (gpu64_3dDispatch()'s
+// own top, below, and gpu64_3dSync() above) without turning every command the
+// C64 sends while the loop runs into a drain -- the whole point of Stage 16's
+// shadow redirection. Never blocks, never spins. Harvests the just-finished
+// frame's page number into gpu64Regs.result and raises
+// GPU64_STATUS_FRAME_READY the moment core 1 publishes tail == target; does
+// not consult pCmd->err the same way drainAndFlush() does not for its render
+// ops -- LOOP_START/SCENE_COMMIT already validated the framebuffer exists
+// before ever pushing, so gpu64_3dExecuteRenderScene() has nothing left to
+// fail on.
+static void pollLoopFrame( void )
+{
+	if ( !s_LoopFramePending )
+		return;
+
+	// gpu64_3dRing.tail is a masked ring index (wraps mod
+	// GPU64_3D_RING_ENTRIES), not a monotonic counter -- so an exact
+	// equality test against s_LoopFrameTarget is not safe. A drain
+	// triggered by an *unrelated* ring push (a second LOOP_START while one
+	// is already running is exactly this test suite's own step 6, "LOOP_START
+	// again while running" -- gpu64_3dDispatch()'s non-render branch pushes
+	// that op onto the ring and drains unconditionally, before execute()
+	// ever gets to reject it with BUSY) can walk tail straight past
+	// s_LoopFrameTarget without ever landing on it exactly, orphaning
+	// s_LoopFramePending forever: SCENE_COMMIT then answers BUSY on every
+	// subsequent call (line ~1040 below), and the render the C64 last
+	// queued never gets harvested, freezing the HDMI side while the C64
+	// program keeps running. Test "has tail reached or passed target" in
+	// modular space instead -- safe because real per-dispatch progress is a
+	// handful of slots, nowhere near the half-ring wraparound ambiguity
+	// point.
+	u32 distance = ( gpu64_3dRing.tail - s_LoopFrameTarget ) & GPU64_3D_RING_MASK;
+	if ( distance >= GPU64_3D_RING_ENTRIES / 2 )
+		return;
+
+	// Pairs with the DMB gpu64_3dWorker() issues (gpu64_3d_core1.cpp) after
+	// execute() writes err/result and before it publishes tail -- same
+	// pairing drainAndFlush() relies on above.
+	asm volatile( "DMB ISH" ::: "memory" );
+
+	const Gpu64_3dCmd *pSlot = &gpu64_3dRing.slot[ s_LoopFrameSlot ];
+	gpu64Regs.result = pSlot->result;
+	gpu64Regs.status |= GPU64_STATUS_FRAME_READY;
+	s_LoopFramePending = FALSE;
 }
 
 u8 gpu64_3dDispatch( u8 op )
 {
 	u8 res;
+
+	// Stage 16: pump the autonomous loop's handoff forward on every single
+	// dispatch, not just SCENE_COMMIT -- a program polling STATUS between
+	// SCENE_COMMIT calls must see GPU64_STATUS_FRAME_READY as soon as core 1
+	// actually finishes, not only once it happens to issue a SCENE_COMMIT.
+	// Cheap: see pollLoopFrame()'s own comment for why this never blocks.
+	pollLoopFrame();
 
 	// gpu64_3dHost.pushed is documented as "commands accepted onto the ring"
 	// (gpu64_3d_internals.h). Before Stage 15a that was every non-QUEUE_FULL
@@ -932,7 +1337,7 @@ u8 gpu64_3dDispatch( u8 op )
 		{
 			u32 slot = gpu64_3dRing.head;
 
-			if ( !gpu64_3dRingPush( op ) )
+			if ( !gpu64_3dRingPush( op, currentDrawPage() ) )
 			{
 				// QUEUE_FULL backpressure (Stage 15b): wait for the ring to
 				// fully drain, bus held, rather than reject outright -- a
@@ -952,7 +1357,7 @@ u8 gpu64_3dDispatch( u8 op )
 				else
 				{
 					slot = gpu64_3dRing.head;
-					if ( gpu64_3dRingPush( op ) )
+					if ( gpu64_3dRingPush( op, currentDrawPage() ) )
 					{
 						didPush = TRUE;
 					}
@@ -989,7 +1394,7 @@ u8 gpu64_3dDispatch( u8 op )
 		// outright: the design's rule is that a failed dispatch does
 		// nothing, so a command must not execute and then be reported as
 		// rejected.
-		if ( !gpu64_3dRingPush( op ) )
+		if ( !gpu64_3dRingPush( op, currentDrawPage() ) )
 		{
 			gpu64_3dHost.rejected++;
 			return GPU64_ERR_QUEUE_FULL;
@@ -1008,8 +1413,21 @@ u8 gpu64_3dDispatch( u8 op )
 		// a second, core-1-side execution path for opcodes that still only
 		// ever run on core 0 -- gap_filling_plan.md's Stage 15b "sequence
 		// the state opcodes through the ring too" note.
-		if ( !drainAndFlush() )
-			return GPU64_ERR_WORKER_TIMEOUT;
+		//
+		// Stage 16: while the autonomous loop runs, an isShadowRedirectable()
+		// opcode's handler writes only s_ShadowScene/s_ShadowState (see
+		// sceneTarget()/stateTargetForEdit()), never s_Scene/s_State/s_Res --
+		// exactly the state GPU64_3D_OP_RENDER_SCENE reads on core 1 -- so it
+		// no longer races a frame the loop has queued, and the drain is not
+		// needed for it. This is what actually delivers the loop's promised
+		// concurrency: without this, every SET_POSITION issued while the loop
+		// runs would still stall behind whatever frame core 1 is mid-render,
+		// exactly the cost the shadow copy exists to remove.
+		if ( !( s_LoopRunning && isShadowRedirectable( op ) ) )
+		{
+			if ( !drainAndFlush() )
+				return GPU64_ERR_WORKER_TIMEOUT;
+		}
 
 		res = execute( op );
 	}

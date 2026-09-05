@@ -315,6 +315,20 @@ haveClock
 	jsr kitWantSet
 	#check "BUSY SET"
 
+	; The draw page hands over when the flip is ARMED, not when it lands.
+	; Page 0 is drawn and visible here, so arming queues page 0 and the
+	; draw page must already be page 1 -- while the flip is still pending.
+	; The alternative (hand over at the frame boundary) would leave a
+	; program drawing into the page it just asked to be displayed, for up
+	; to a whole frame; that is what made a class 1 autonomous frame paint
+	; onto the screen as it was being scanned. See project/progress_tracker.md,
+	; Stage 16 Finding 2.
+	jsr readOne
+	#clracc
+	#expectb RB+0, CB
+	#useacc
+	#check "DEFER ROTATES"
+
 	; A second deferred flip while the first is pending. The rule being
 	; tested is not only that it is refused, but that it changes nothing:
 	; the queued flip still lands, which the wait below proves.
@@ -326,6 +340,15 @@ haveClock
 
 	jsr waitNotBusy
 	#check "FLIP LANDS"
+
+	; ...and landing does not move the draw page a second time. The commit
+	; half only publishes what was queued; if it rotated as well, a frame
+	; drawn between the arm and the boundary would be thrown away.
+	jsr readOne
+	#clracc
+	#expectb RB+0, CB
+	#useacc
+	#check "LAND KEEPS PAGE"
 
 	; An immediate flip is always available, clock or no clock -- it is the
 	; documented fallback for a display that never calibrated.

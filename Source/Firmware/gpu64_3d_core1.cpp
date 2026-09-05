@@ -41,7 +41,7 @@ Gpu64_3dHostStats   gpu64_3dHost;
 // waits, per the design's QUEUE_FULL rule. Core 0 side; it lives here rather
 // than next to the dispatcher because the barrier below only makes sense read
 // against the worker at the bottom of this file.
-boolean gpu64_3dRingPush( u8 op )
+boolean gpu64_3dRingPush( u8 op, u8 nPage )
 {
 	const u32 head = gpu64_3dRing.head;
 	const u32 next = ( head + 1 ) & GPU64_3D_RING_MASK;
@@ -62,6 +62,9 @@ boolean gpu64_3dRingPush( u8 op )
 	pSlot->id     = (u16)( gpu64Regs.id[ 0 ] | ( gpu64Regs.id[ 1 ] << 8 ) );
 	pSlot->aux    = 0;
 	pSlot->auxLen = 0;
+	// Read once, here, on core 0 -- the whole point of the field. See
+	// Gpu64_3dCmd::page (gpu64_3d_internals.h).
+	pSlot->page   = nPage;
 	memcpy( pSlot->arg, gpu64Regs.arg, GPU64_ARG_COUNT );
 
 	// The slot must be visible before the head that advertises it. Without
@@ -96,20 +99,22 @@ static void enableEventStream( void )
 	asm volatile( "ISB" );
 }
 
-// Records one drained command, and, for the three render opcodes, actually
-// executes it. pCmd is non-const now: gpu64_3dExecuteRender() writes its
-// result back into the slot for a later drainAndFlush() (gpu64_3d_class1.cpp)
-// to read.
+// Records one drained command, and, for the render opcodes, actually
+// executes it. pCmd is non-const now: gpu64_3dExecuteRender()/
+// gpu64_3dExecuteRenderScene() write their result back into the slot for a
+// later drainAndFlush() or pollLoopFrame() (both gpu64_3d_class1.cpp) to
+// read.
 //
-// Every opcode besides the three render ones is still legal here with no
-// handler: core 0 still executes all of those itself, synchronously, but as
-// of Stage 15b it does so *after* this drain loop has seen the entry go by,
-// not before -- gpu64_3dDispatch() pushes, then drains to here, then calls
-// its own execute(u8) (gpu64_3d_class1.cpp). This function's count is the
-// only trace any of them leaves on core 1. That is why unknownOp below is
-// not a fault counter: it is expected to climb continuously, on every
-// non-render class 1 command, and gpu64_3dReport() (gpu64_3d_class1.cpp)
-// does not treat it as one.
+// Every opcode besides those is still legal here with no handler: core 0
+// still executes all of those itself, synchronously, but as of Stage 15b it
+// does so *after* this drain loop has seen the entry go by, not before --
+// gpu64_3dDispatch() pushes, then drains to here, then calls its own
+// execute(u8) (gpu64_3d_class1.cpp). This function's count is the only trace
+// any of them leaves on core 1. That is why unknownOp below is not a fault
+// counter: it is expected to climb continuously, on every non-render class 1
+// command, and gpu64_3dReport() (gpu64_3d_class1.cpp) does not treat it as
+// one. GPU64_3D_OP_RENDER_SCENE is Stage 16's fourth real handler here --
+// see its own case below and gpu64_3d_internals.h for what it is.
 static void execute( Gpu64_3dCmd *pCmd )
 {
 	gpu64_3dWorkerStats.lastOp = pCmd->op;
@@ -120,6 +125,13 @@ static void execute( Gpu64_3dCmd *pCmd )
 	case GPU64_3D_OP_DRAW_MESH:
 	case GPU64_3D_OP_DRAW_NODE:
 		gpu64_3dExecuteRender( pCmd );
+		break;
+
+	// Stage 16: the autonomous loop's one synthetic op -- see its
+	// definition in gpu64_3d_internals.h. Never arrives here except via
+	// gpu64_3dDispatch()'s own LOOP_START/SCENE_COMMIT handlers.
+	case GPU64_3D_OP_RENDER_SCENE:
+		gpu64_3dExecuteRenderScene( pCmd );
 		break;
 
 	default:

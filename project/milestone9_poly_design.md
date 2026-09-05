@@ -75,27 +75,9 @@ sector renderer can afford, and `SET_CAMERA3D`'s `pitch` is a rotation.
 
 ## Conventions this pins down
 
-The 2.5D layer never had to name a world *z* axis, because heights were a
-separate scalar. The polygon layer does.
-
-- **World is right-handed-ish and Doom-shaped**: `x`,`y` are the ground
-  plane, exactly as the wall and thing records use them, and **`z` is up**,
-  measured the same way the sector table's absolute floor heights are. A
-  thing standing on a sector floor at 0 and a polygon vertex at z = 0 are at
-  the same height, so the two layers compose.
-- **Yaw 0 looks along +x**, 256 to the circle — `camAng`'s convention,
-  unchanged.
-- **Pitch is positive looking up**, same units. It is a real rotation about
-  the view's right axis, applied after yaw, so the horizon bends the way it
-  should when you look at a floor edge-on rather than sliding as a shear does.
-- **Front-facing is clockwise on screen** after projection, y downwards. That
-  is the same convention `DRAW_WALLS` states as "drawn only from the side
-  that projects it left to right": extrude such a wall upward and wind the
-  quad top-left, top-right, bottom-right, bottom-left and it is clockwise.
-  So a level ported from sector walls to polygons keeps its winding.
-- Everything is 8.8 signed, so the world is **±127.99 units** across with a
-  resolution of 1/256. Scale a level to fit it — the same limit `DRAW_WALLS`
-  has documented since milestone 8a.
+The axis, winding and fixed-point conventions this milestone settled are
+developer-facing API material now, not rationale — see
+[docs/class2-raster-reference.md](../docs/class2-raster-reference.md#conventions).
 
 ## The rasteriser, and what it deliberately does not do
 
@@ -149,12 +131,9 @@ already documented it as "the op a frame starts with". A frame that skips
 
 ## Limits, and where they came from
 
-| Limit | Value | Why |
-|---|---|---|
-| vertices in the pool | 4096 | 32 KB of static store; a Quake start map is ~1200 |
-| texinfos | 255 | one byte in a face record |
-| vertices per face | 16 | Quake's own limit before it subdivides; the near clip can add one, so the working buffer is 20 |
-| faces per batch | 4096 | the 65536-byte staging buffer at 16 bytes a record |
+The limit values and their rationale are now in
+[docs/class2-raster-reference.md](../docs/class2-raster-reference.md#limits),
+alongside the rest of class 2's limits table.
 
 ## Not in this milestone
 

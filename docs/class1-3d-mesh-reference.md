@@ -5,7 +5,7 @@ This is what a byte means for `CMD_HI = 1`, gpu64's retained/immediate-mode
 over a real z-buffer. **This is gpu64's general-purpose 3D layer — the
 "OpenGL for the C64" one** — not a pipeline scoped to any one game genre;
 a Doom/Quake-style first-person renderer is one thing it can draw, not
-what it's for. It supersedes [class 2](api_design.md#class-2-opcodes--the-raster-layer)
+what it's for. It supersedes [class 2](class2-raster-reference.md)
 (deprecated, frozen but still working) as gpu64's forward path for 3D.
 
 See also: [project/milestone6_3d_design.md](../project/milestone6_3d_design.md)
@@ -14,16 +14,14 @@ instead of RGB, the store-burst budget) and the phase-1 build history, and
 [project/gap_filling_plan.md](../project/gap_filling_plan.md) for what is
 staged next to close the gap between this section and "Status" below.
 
-## Status: retained scene graph, real core-1 overlap, no autonomous loop yet
+## Status: retained scene graph, real core-1 overlap, handshake loop live
 
 **Read this before the opcode table below — it changes what several rows
 actually do today.**
 
 The design targets a retained scene graph rendered autonomously by a second
 core, with the C64 only ever moving nodes and committing frames. As of
-stage 15b (2026-08-29), the scene graph is built and live, and the renderer
-runs for real on core 1 with the C64 overlapping it; the autonomous loop
-itself is not built:
+stage 16 (2026-08-29), that is live for **handshake mode**:
 
 - `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` run on **core 1**, not core 0 —
   `gpu64_3dDispatch()` queues the draw and returns without waiting for it to
@@ -32,41 +30,43 @@ itself is not built:
   outcome at the next observation point rather than at return time — see
   "Deferred RESULT" below, it changes how you read them back. Node state
   (position, orientation, scale, visibility) is retained across commands;
-  drawing it is still an explicit per-frame call.
-- `LOOP_START` and `SCENE_COMMIT` ($06, $08) answer **`UNSUPPORTED`** — the
-  autonomous loop and shadow-scene double-buffering are not built yet. What
-  stage 15b adds is overlap *within* the explicit-call model, not the
-  handshake/free-running loop the design describes for $06/$08.
+  drawing it is still an explicit per-frame call. **These three are refused
+  with `BUSY` while the autonomous loop is running** — see "Frame lifecycle"
+  below for why, and use `DRAW_NODE`'s scene-graph siblings instead.
+- `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT` ($06-$08) are **live in handshake
+  mode** (`LOOP_START`'s `ARG0` = 0). Free-running mode (`ARG0` = 1,
+  vsync-driven rather than `SCENE_COMMIT`-driven) still answers
+  `UNSUPPORTED` — staged next in
+  [project/gap_filling_plan.md](../project/gap_filling_plan.md).
 - Scene-node and transform opcodes, **$20-$24 and $30-$36**, are **live**:
   a node created with `CREATE_OBJECT`/`CREATE_CAMERA` persists in a 256-node
   table until `DESTROY_NODE` or a session reset, and `DRAW_NODE` ($42) draws
   it using whatever the transform opcodes last set — no re-staging a
   position/orientation/scale on every draw the way `DRAW_MESH` needs. Every
-  opcode in these ranges runs synchronously on core 0 as before, but as of
-  15b each one first waits for any render it queued to finish draining on
-  core 1 — it is about to mutate state that render also reads.
+  opcode in these ranges runs synchronously on core 0, but as of 15b each one
+  first waits for any *immediate-mode* render it queued to finish draining on
+  core 1 — it is about to mutate state that render also reads. **While the
+  autonomous loop is running, these same opcodes instead write a shadow copy
+  and return without waiting at all** — see "Frame lifecycle" below; the
+  drain-before-mutate behaviour just described is what still happens when the
+  loop is not running.
 - `ARENA_STATUS` ($09) exists and was not in the original design sketch —
   see below.
 
-In other words: **today, a class 1 program can either call `DRAW_MESH`
-directly (transform argument staged fresh every call, nothing retained), or
-build persistent nodes once with `CREATE_OBJECT`/`CREATE_CAMERA` and move
-them with `SET_POSITION`/`MOVE_LOCAL`/`SET_VISIBLE`/etc. before calling
-`DRAW_NODE` — but there is still no autonomous loop:** every frame's draws
-are explicit calls from the C64. Unlike through stage 15a, those calls no
-longer each halt the C64 for their own full duration — a `DRAW_NODE` queues
-and returns, and only something that actually needs the draw finished (the
-next state-mutating opcode, a page flip, a class 0 framebuffer op) pays the
-wait.
-
-Once the loop is live (staged in
-[project/gap_filling_plan.md](../project/gap_filling_plan.md)), a
-program's per-frame work collapses further: one small command per object
-that actually moved this frame, then `SCENE_COMMIT` — a single
-fire-and-forget trigger that publishes the frame and returns immediately;
-the C64 never blocks waiting for the render, and finds out the next frame
-is ready by polling `STATUS` bit4 rather than by waiting on the command
-itself.
+In other words: **a class 1 program has two ways to drive a frame.**
+Immediate mode calls `DRAW_MESH` directly (transform staged fresh every
+call), or builds persistent nodes with `CREATE_OBJECT`/`CREATE_CAMERA` and
+draws them explicitly with `DRAW_NODE` — every frame's draws are calls the
+C64 makes itself, each one queuing on core 1 and returning without waiting
+for its own draw to finish (something that actually needs the draw finished
+— the next state-mutating opcode, a page flip, a class 0 framebuffer op —
+pays that wait). The autonomous loop (`LOOP_START`/`SCENE_COMMIT`) instead
+has core 1 render the whole scene every frame on its own: the C64's
+per-frame work collapses to one small command per object that actually moved
+this frame, then `SCENE_COMMIT` — a fire-and-forget trigger that publishes
+those edits and returns immediately, never blocking on the render itself; it
+finds out the next frame is ready by polling `STATUS` bit4. See "Frame
+lifecycle" below for the full protocol.
 
 ## Opcode table
 
@@ -83,9 +83,9 @@ class 0, and every opcode reads exactly the byte count in its row.
 | $03 | `SET_LIGHT` | 7 | `ARG0-5` direction x,y,z (8.8), `ARG6` ambient level 0-15 | The single directional light. Face shade = ambient + N.L, clamped to 0-15, indexing the colormap. |
 | $04 | `BUILD_COLORMAP` | 0 | — | Regenerates the 16-level colormap from the current palette. Needed after a palette change; costs milliseconds — never call it per frame. |
 | $05 | `SET_BACKGROUND` | 1 | `ARG0` palette index | What the viewport is cleared to. |
-| $06 | `LOOP_START` | 1 | `ARG0` 0 = handshake, 1 = free-running | **`UNSUPPORTED` in phase 1.** Design: starts the autonomous render loop; `NO_CAMERA` if no camera is active. |
-| $07 | `LOOP_STOP` | 0 | — | **`UNSUPPORTED` in phase 1.** Design: stops the loop after the current frame. |
-| $08 | `SCENE_COMMIT` | 0 | — | **`UNSUPPORTED` in phase 1.** Design: publishes the shadow scene; in handshake mode also flips at vblank and releases the next frame. `RESULT` = the page the just-finished frame is in. |
+| $06 | `LOOP_START` | 1 | `ARG0` 0 = handshake, 1 = free-running | Starts the autonomous render loop. `ARG0` must be 0 — free-running is `UNSUPPORTED`, staged next. `BUSY` if the loop is already running; `NO_CAMERA` if no camera is active at the moment of the call (checked once, here — not re-checked per frame after). Queues the loop's first frame and returns immediately; see "Frame lifecycle". |
+| $07 | `LOOP_STOP` | 0 | — | Stops the loop. Always answers `OK`, even if no loop was running — a teardown call must not fail. A frame already queued when this arrives still finishes on core 1; it is discarded, not cancelled. |
+| $08 | `SCENE_COMMIT` | 0 | — | Publishes every shadow-redirected edit made since `LOOP_START`/the last commit, arms the next vblank flip the same way `PAGE_FLIP` does, and queues the loop's next frame. `RESULT` = the page the just-finished frame is in — the same page the flip this call just armed is about to show. `UNSUPPORTED` if the loop is not running or the flip subsystem is not calibrated yet; `BUSY` if a `PAGE_FLIP` is already pending. See "Frame lifecycle". |
 | $09 | `ARENA_STATUS` | 0 | — | `RESULT` = free resource RAM in 128 KB units (0..256 for the 32 MB phase-1 arena). Not in the original design; added because "you get `OUT_OF_MEMORY` eventually" is truthful and undebuggable without it. |
 
 ### Resources — $10-$1F
@@ -175,6 +175,57 @@ wedged core 1 — see the `ERRCODE` table below. A genuinely full ring only
 still rejects outright for the other class 1 opcodes, which is the design's
 "a failed dispatch does nothing" rule doing its job on a command with no
 useful way to wait.
+
+## Frame lifecycle
+
+The autonomous loop (handshake mode, `LOOP_START ARG0=0`, live as of
+stage 16) is the model the whole class 1 design has been building toward:
+core 1 renders a whole frame — clear, every visible `OBJECT` node under the
+active camera, in scene order — on its own, every commit, instead of the C64
+issuing each draw itself.
+
+**Starting it.** `LOOP_START` snapshots the live scene/render state into a
+shadow copy and queues the first frame. From that point on, every opcode
+that would normally mutate the live scene graph or per-frame render state
+(`SET_VIEWPORT`/`SET_PERSPECTIVE`/`SET_LIGHT`/`BUILD_COLORMAP`/
+`SET_BACKGROUND`, every $20-$24/$30-$36 scene-node opcode) instead writes the
+**shadow** copy and returns immediately, without waiting on the ring at
+all — that's what makes moving ten objects between two commits cheap: none
+of those ten calls can race the frame core 1 is currently rendering, because
+neither one touches what the other reads. `CLEAR_VIEWPORT`/`DRAW_MESH`/
+`DRAW_NODE` (immediate mode) are refused with `BUSY` for as long as the loop
+runs — they read/write the live scene/framebuffer directly, exactly what the
+loop's own render is doing on core 1 at the same time.
+
+**Each frame.** Move whatever needs to move with the ordinary scene-node
+opcodes, then call `SCENE_COMMIT`. It publishes every shadow edit since the
+last commit into the live scene (what the *next* frame renders from), arms
+a page flip the same way `PAGE_FLIP` does (so the *just-finished* frame
+actually reaches the screen), and queues the next frame on core 1 — all
+without the C64 waiting for that next frame to actually finish rendering.
+`RESULT` after `SCENE_COMMIT` returns is the page the frame just flipped to
+was rendered into.
+
+**Polling for the next one.** `STATUS` bit4 (`GPU64_STATUS_FRAME_READY`)
+goes high the moment core 1 finishes a frame — checked on every dispatch, not
+only when `SCENE_COMMIT` happens to run, so a program that polls `STATUS`
+between commits sees it as soon as it's true. A `SCENE_COMMIT` issued before
+the previous frame is actually ready answers `BUSY` rather than committing
+against a still-in-flight render — in practice this should not happen, since
+`SCENE_COMMIT` itself already waits for the previous frame to drain before
+it does anything else, but it is checked rather than assumed.
+
+**Stopping it.** `LOOP_STOP` always succeeds. A frame already queued when it
+arrives still finishes on core 1 — there is no way to cancel a frame in
+flight — but nothing further reads its result once the loop is stopped.
+`SCENE_RESET` also stops the loop (and drops the shadow copy) as part of
+destroying every node, per its own row above.
+
+**What free-running mode (`LOOP_START ARG0=1`) will add**, once built: the
+same loop driven by vblank instead of by `SCENE_COMMIT` — the C64 never
+calls anything per frame at all, it just edits the shadow state whenever it
+likes and the loop picks up whatever was last written each vsync. Not yet
+implemented; `ARG0=1` is `UNSUPPORTED`.
 
 ## Mesh format
 
@@ -313,13 +364,13 @@ Class 1 adds one readable byte beyond the class 0 register set:
 
 | Address | Name | Dir | Purpose |
 |---|---|---|---|
-| $DF21 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT` (design only), triangle count from `DRAW_MESH`/`DRAW_NODE`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. `CREATE_OBJECT`/`CREATE_CAMERA` don't allocate an ID and so don't set `RESULT` — node IDs are chosen by the C64 side, same as resource IDs. As of stage 15b, `DRAW_MESH`/`DRAW_NODE`'s `RESULT` is deferred — see "Deferred RESULT" above for when it actually becomes valid. |
+| $DF21 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT`, triangle count from `DRAW_MESH`/`DRAW_NODE`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. `CREATE_OBJECT`/`CREATE_CAMERA` don't allocate an ID and so don't set `RESULT` — node IDs are chosen by the C64 side, same as resource IDs. As of stage 15b, `DRAW_MESH`/`DRAW_NODE`'s `RESULT` is deferred — see "Deferred RESULT" above for when it actually becomes valid. |
 
 and one `STATUS` bit:
 
 | Bit | Meaning |
 |---|---|
-| 4 | frame-ready — the loop has finished a frame and is waiting for `SCENE_COMMIT` (handshake mode only; not reachable yet, since the loop cannot start). |
+| 4 | frame-ready — the loop has finished a frame and is waiting for `SCENE_COMMIT` (handshake mode only). Polled at the top of every dispatch, so it goes high as soon as core 1 finishes, not only when `SCENE_COMMIT` itself runs. |
 
 New `ERRCODE` values this class adds: `OUT_OF_MEMORY` (resource RAM
 exhausted), `QUEUE_FULL` (the ring was full and the opcode was one of the

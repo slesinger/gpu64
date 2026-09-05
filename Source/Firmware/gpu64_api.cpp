@@ -29,6 +29,8 @@ GPU64REGS gpu64Regs = { 0, 0, GPU64_ERR_OK, { 0, 0 }, 0, { 0 } };
 #define sId		gpu64Regs.id
 #define sResult	gpu64Regs.result
 #define sArg	gpu64Regs.arg
+#define sSeq	gpu64Regs.seq
+#define sSeqAck	gpu64Regs.seqAck
 
 // gpu64: payload staging. Static rather than stack-local -- these are far too
 // big for reuUsingPolling()'s stack, and the dispatcher is called from inside
@@ -51,6 +53,7 @@ void gpu64_apiReset( void )
 	sResult = 0;
 	for ( unsigned i = 0; i < GPU64_ARG_COUNT; i++ )
 		sArg[ i ] = 0;
+	sSeq = sSeqAck = 0;
 	// The frame clock's calibration survives -- it describes the display,
 	// not the session -- but nothing else about the vblank state does.
 	gpu64_vsyncResetState();
@@ -449,12 +452,15 @@ static u8 doSystem( u8 op )
 	case 0x04:					// SET_DRAW_PAGE
 		if ( sArg[ 0 ] >= GPU64_FB_PAGES )
 			return GPU64_ERR_BAD_ARGS;
-		// Stage 15b observation point: a class 1 render queued before this
-		// call targets whatever page GetDrawPage() reads when core 1
-		// actually runs it (gpu64_3d_class1.cpp's makeTarget()), which is
-		// execute time, not push time. Draining first means that read
-		// always sees the page that was current when the draw was issued,
-		// never one changed out from under it -- see gpu64_3dSync().
+		// Stage 15b observation point. A queued class 1 render now carries
+		// its own target page in its ring slot (Gpu64_3dCmd::page), stamped
+		// when it was pushed, so this call can no longer redirect a draw
+		// that was already issued -- that hazard is closed by construction.
+		// The drain stays because the *other* half of the observation-point
+		// contract still holds: RESULT/ERRCODE for a render pushed before
+		// this call become valid only at a drain, and a program that changes
+		// the draw page expects everything it drew for the old one to have
+		// landed first. See gpu64_3dSync().
 #ifdef GPU64_3D_ENABLED
 		gpu64_3dSync();
 #endif
@@ -1005,6 +1011,17 @@ static u8 doMath( u8 op )
 
 void gpu64_apiDispatch( u8 op )
 {
+	// gpu64: reliability-protocol detector-only build (project/reliability_protocol_design.md).
+	// Publish the SEQ this dispatch is acting on unconditionally, before
+	// anything can early-return -- the C64 side wrote SEQ (and, ordering
+	// permitting, its args) before CMD_LO, so whatever value sits in
+	// gpu64Regs.seq right now is the one this dispatch belongs to. This is
+	// only a detector: it does not retry and does not change dispatch
+	// behaviour, it just gives the C64 something reliable-by-construction to
+	// compare its own SEQ against (SEQACK is read-only, so a mismatch can
+	// only mean the CMD_LO/ARG/SEQ write sequence was not what the C64 sent).
+	sSeqAck = sSeq;
+
 	// gpu64: finish any page flip still in flight before anything else runs
 	// (gpu64_flip.h). Two reasons, and both are correctness, not tidiness:
 	// this command may draw into a page the VideoCore has not yet stopped

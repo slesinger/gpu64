@@ -257,7 +257,13 @@
 	#define GPU64_POLL_IPL_WINDOW	0x2000
 	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 8 )
 #else
-	#define GPU64_POLL_IPL_WINDOW	0x1a00
+	// 0x1a00 measured 120-176B under the function's actual size across
+	// several rounds (see [[gpu64-poll-loop-exceeds-ipl-window]]) -- recorded
+	// as real but benign, since widening it previously changed nothing on
+	// hardware. Bumped to 0x1c00 for margin while touching this file for the
+	// Stage 16 loop-freeze fix (unrelated bug); re-measure with the nm -S
+	// command above after any further change to reuUsingPolling().
+	#define GPU64_POLL_IPL_WINDOW	0x1c00
 	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 7 )
 #endif
 

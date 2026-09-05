@@ -2600,3 +2600,266 @@ complete now that real concurrency is possible and has been exercised for
 real -- 15a's zero-concurrency model made several of these races
 unreachable in practice, and two demo/test PRGs are not exhaustive coverage
 of every state-opcode/render-op interleaving the API allows.
+
+## 16. The commit protocol -- handshake-mode autonomous loop (2026-08-29)
+
+**Status: build-verified 2026-08-29; first hardware run 2026-08-30 found
+three defects -- see 16a below, which supersedes this section's "not yet
+run on hardware" caveat.**
+
+`gap_filling_plan.md`'s Stage 16, scoped to handshake mode only (`LOOP_START`
+`ARG0`=0) per the plan's own deferral of free-running/vsync-driven mode to
+Stage 18. `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT` ($06-$08) go from
+`UNSUPPORTED` stubs to a real protocol: core 1 renders a whole frame --
+clear, every visible `OBJECT` node under the active camera, in scene order
+-- autonomously, once per `SCENE_COMMIT`, instead of the C64 issuing each
+draw itself.
+
+The governing design decision (an `AskUserQuestion` answered
+"Dispatch-refreshed" in an earlier round) stays binding: `gpu64Regs` remains
+core-0-exclusive-write; the frame-done signal is harvested only from
+dispatch-time code (bus DMA-halted, no per-cycle deadline), never from
+inside `reuUsingPolling()`'s hot loop -- see
+[[gpu64-multicore-rule-scoped-to-polling-loop]].
+
+**What's new, all in `gpu64_3d_class1.cpp`:**
+
+- `gpu64_3dExecuteRenderScene()` -- core 1's handler for the new synthetic
+  opcode `GPU64_3D_OP_RENDER_SCENE` (`gpu64_3d_internals.h`; high bit set,
+  never sent over the wire, pushed only by this file's own
+  `pushLoopFrame()`). Clears the viewport, applies the active camera, walks
+  every `OBJECT` node in the *live* scene, draws the visible ones, and
+  writes `pCmd->result` = the page it rendered into -- same slot-writeback
+  contract `gpu64_3dExecuteRender()` already established in 15a.
+- `pushLoopFrame()`/`pollLoopFrame()` -- Stage 16's own counterpart to
+  15b's `drainAndFlush()`/`s_LastRenderSlot`, tracking a different
+  contract (`GPU64_STATUS_FRAME_READY` + `RESULT`-as-page-number, not a
+  triangle count) via separate statics. `pushLoopFrame()` pushes one
+  `RENDER_SCENE`; `pollLoopFrame()` is non-blocking -- a single tail
+  equality test, no spin -- and is now called from three places: the top
+  of `gpu64_3dDispatch()`, the top of `gpu64_3dSync()` (so every existing
+  observation point also pumps it), and explicitly inside `SCENE_COMMIT`
+  before it checks `FRAME_READY`.
+- **`LOOP_START`**: refuses `ARG0`=1 (`UNSUPPORTED`, staged for 18),
+  `BUSY` if already running, `NO_CAMERA` if `!s_Scene.bHaveActiveCamera` --
+  checked exactly once, here, not re-checked per frame inside
+  `gpu64_3dExecuteRenderScene()` (consistent with
+  `gpu64_3dSceneApplyCamera()`'s existing graceful no-camera fallback, and
+  with no precedent elsewhere in the file for a hard per-frame render
+  failure; a camera destroyed mid-loop by a later shadow-redirected
+  `DESTROY_NODE` is deliberately not re-checked per commit either). Copies
+  `s_Scene`/`s_State` into the shadow pair, queues the first frame.
+- **`SCENE_COMMIT`**: polls the outstanding frame, publishes the shadow
+  copy into the live scene/state, arms a page flip via the same
+  armed-branch pattern `PAGE_FLIP` uses in `gpu64_api.cpp`'s `doSystem()`,
+  queues the next frame. `RESULT` = the page the just-finished frame
+  rendered into. `UNSUPPORTED` if the loop isn't running or the flip
+  subsystem isn't calibrated; `BUSY` if a flip or a not-yet-ready frame is
+  still outstanding.
+- **`LOOP_STOP`**: always succeeds; a frame already queued still finishes
+  on core 1 (nothing cancels it), but nothing further reads its result.
+- **The shadow-redirect mechanism** (from an earlier round, extended here):
+  while `s_LoopRunning`, the ~17 state/scene-graph opcodes on
+  `isShadowRedirectable()`'s whitelist write `s_ShadowScene`/`s_ShadowState`
+  instead of the live pair and return immediately -- no ring wait -- since
+  neither the shadow write nor the live-scene render on core 1 touches what
+  the other reads. `SCENE_COMMIT`/`SCENE_RESET` stay off the whitelist;
+  both need the drain themselves. `SCENE_RESET` was also fixed this round
+  to stop the loop and drop the shadow copy as part of tearing down every
+  node -- previously it did neither, which would have left a dangling
+  `s_LoopRunning` across a reset. `SET_BACKGROUND` had a latent bug fixed
+  in the same pass: it wrote `s_State` directly rather than going through
+  `stateTargetForEdit()`, so a background change during the loop would have
+  landed on the live copy instead of the shadow one.
+- **The concurrency this stage actually delivers**: `gpu64_3dDispatch()`'s
+  generic (non-render) branch used to drain the ring unconditionally before
+  every opcode. It now skips that drain when the opcode is both
+  shadow-redirectable and the loop is running, since those writes no longer
+  race anything. A `SET_POSITION` issued while the loop runs no longer
+  stalls behind a frame core 1 is mid-rendering -- this is the payoff of
+  the whole design, not just a stub filled in.
+
+**Verification:** `tools/build.sh` links clean (`kernel8.img`, 397464
+bytes, build id `35d6545e-dirty src:0c308668`), no warnings from either
+edited file. No PC-side simulator exists for this -- same limitation 15a/15b
+noted, `tools/hostsim` does not link `gpu64_3d_class1.cpp`/
+`gpu64_3d_core1.cpp` -- so correctness rests on re-reading the real code
+against the design, the same discipline that caught 15a's three defects and
+15b's `SCENE_RESET`/`SET_BACKGROUND` bugs above. **Not yet exercised on
+hardware** -- this class of change has no PC-side coverage and a hardware
+run needs to be user-initiated ("bench time is scarce").
+
+Docs updated: `class1-3d-mesh-reference.md` -- Status section, opcode table
+rows for `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT`, new "Frame lifecycle"
+section, `RESULT` register row (dropped "design only"), `STATUS` bit 4 row
+(dropped "not reachable yet"). `api_design.md` not touched this round --
+nothing in it referenced these three opcodes' phase-1 status to begin with.
+
+**Not yet done:** free-running/vsync-driven mode (`ARG0`=1, Stage 18); a
+fresh look at whether the shadow-redirect whitelist and the observation-point
+set both still hold once handshake-mode concurrency is exercised for real on
+hardware, the same caveat 15b left open for its own observation points.
+
+## 16a. Stage 16 meets the bench: three defects and an instrument (2026-08-30 .. 2026-09-05)
+
+**Status: three fixes in, all PC-verified, none of them yet re-run on
+hardware. The bench trip that produced them is the only hardware data so
+far.**
+
+The first hardware run of `gpu64_loop_test.a` (2026-08-30) did not get as
+far as testing the commit protocol. It found three separate things, in the
+order they had to be peeled off:
+
+**Defect 1 -- one cold mailbox call disabled a whole feature.**
+Every `SCENE_COMMIT` in the session answered `UNSUPPORTED`, from the first
+one. Cause: `gpu64_vsyncCalibrate()` ran once at boot, its first
+`WaitForVerticalSync()` failed, and nothing ever retried -- so
+`gpu64Vsync.calibrated` stayed 0 for the rest of the power-on session.
+That had always been survivable before, because `PAGE_FLIP(ARG0=0)` falls
+back to an immediate flip; `SCENE_COMMIT` is the first opcode with **no**
+fallback path, which is what turned a soft boot-time failure into a dead
+feature. Fix in `gpu64_vsync.cpp`: `calibrateOnce()` split out,
+`gpu64_vsyncCalibrate()` retries it up to `GPU64_VSYNC_CAL_ATTEMPTS` (5)
+times. A monitor still locking sync right after power-on is the plausible
+first-attempt failure, and a failed attempt costs one cheap failed mailbox
+call, not a full 0.5s timed pass. **The lesson worth keeping is the shape,
+not the retry**: a subsystem that has always had a fallback acquires a
+hard dependency the moment a new opcode requires it, and nothing in the
+build flags that.
+
+**Defect 2 (Finding 1) -- the loop froze but the C64 didn't.**
+Once calibration held, the HDMI picture stopped advancing while the C64
+program kept running and `SCENE_COMMIT` answered `BUSY` forever after.
+Cause, in `pollLoopFrame()`: it tested `gpu64_3dRing.tail ==
+s_LoopFrameTarget`, but `tail` is a *masked* ring index, not a monotonic
+counter. Any unrelated push that drains the ring can walk `tail` straight
+past the target without ever landing on it -- and this test suite triggers
+exactly that itself, in step 6 ("`LOOP_START` again while running": the
+non-render branch pushes that op and drains unconditionally, *before*
+`execute()` gets to reject it with `BUSY`). One overshoot orphans
+`s_LoopFramePending` permanently. Fixed to a modular
+"has tail reached or passed target" distance test, safe because real
+per-dispatch progress is a handful of slots and the ambiguity point is half
+a ring away. `waitForDrain()` may keep its equality test -- there core 1
+stops exactly on the head core 0 just published and cannot overshoot -- and
+the comment now says so, because the two look identical and are not.
+
+**Defect 3 (Finding 2) -- the framebuffer draw-page race.**
+Found by reading, not on the bench, while working out how Finding 2 could
+also produce a frozen or torn picture. The flip is split
+([[gpu64-milestone4d-flip-mailbox-split]]): `PrepareFlip()` runs during a
+bus-held dispatch, `CommitFlip()` runs from the polling loop at the next
+vsync boundary -- up to a whole frame later. The draw page used to rotate
+in `CommitFlip()`. Core 1 called `GetDrawPage()` at render time, so any
+frame core 1 started in the window between arming a flip and the boundary
+read the *old* draw page -- the page that is about to become visible. In
+15a/15b that window was closed by construction (every render was drained
+before the flip); Stage 16's whole point is that it isn't any more.
+
+The fix (user's choice between two shapes -- **"page carried in the ring
+slot"**, over the smaller "one local read on core 1", because it removes
+the bug class rather than the instance):
+
+- `PrepareFlip()` hands the draw page over immediately -- it picks the
+  next page from the same exclusion set `CommitFlip()` used to, so the
+  rotation *sequence* is unchanged and only its timing moved earlier.
+  `CommitFlip()` keeps just `m_nVisiblePage = m_nPendingVisible`.
+- `Gpu64_3dCmd` gained a `u8 page` field (the struct is still exactly 32
+  bytes -- checked, not assumed). `gpu64_3dRingPush()` takes the page and
+  stamps the slot **before** the `DMB ISH` that publishes `head`, so it
+  travels under the barrier that already orders every other slot field.
+- Core 1 no longer calls `GetDrawPage()` at all: `makeTarget()` and
+  `cleanViewport()` take a page, every call site passes `pCmd->page`, and
+  `gpu64_3dExecuteRenderScene()` reports `pCmd->result = pCmd->page`. The
+  page a frame renders into is now decided once, on core 0, at push time.
+
+`tools/prgsim/gpu64model.py` mirrors the same split (`_prepare_flip()`
+advances the draw page, `_commit_flip()` only publishes), so the class 0
+oracle and the firmware still agree on paging.
+
+**The instrument: SEQ/SEQACK drop detection (detector only, no retry).**
+Independent of all three defects, and built because "the bus is not
+reliable" ([[gpu64-io2-sampling-reliability]]) is the first thing to rule
+out whenever a run shows one inexplicable glitch. `GPU64_REG_SEQ` ($DF22,
+write-only) and `GPU64_REG_SEQACK` ($DF23, read-only) let the C64 write a
+cycling tag before a command and read back the tag of the command actually
+dispatched; a mismatch means a write the bus-watch loop never sampled.
+`gpu64_loop_test.a` counts those into its `MISSED` row. This is
+throwaway diagnostic instrumentation, not the shipped protocol -- the real
+one lands after the UCI remap at $DF37+
+(`project/uci_register_remap_design.md`), and these two addresses sit in
+the tail of the un-remapped block on purpose. Design:
+`project/reliability_protocol_design.md`.
+
+**The diagnostics the bench trip proved were missing (D1-D4).**
+The run that found defect 1 produced almost no usable information: the
+program needed an operator keypress to stop, so a run nobody was watching
+produced no verdict at all, and a derail was indistinguishable from a hang.
+`gpu64_loop_test.a` now carries four instruments, all of which cost
+nothing when the run is healthy:
+
+- **D1, auto-stop** after `AUTO_STOP_FRAMES` (600) commits, so the POST
+  checks and the verdict always run whether or not anyone is at the
+  keyboard. RUN/STOP still ends it early.
+- **D2, a PHASE trace** -- one letter per stage reached (`SCAPV`, or
+  `SCKPV` when the animation is skipped). If the program stops short,
+  that row says where.
+- **D3, an ALIVE spinner plus a stage byte** advanced once per animation
+  frame and bracketing the ROTATE/COMMIT dispatches ($10/$11/$20/$21/$30).
+  A frozen spinner means the *C64* stopped; a turning spinner with a frozen
+  HDMI picture means it did not -- which is precisely the distinction
+  defect 2 turned on.
+- **D4, BRK and NMI traps** installed over CBINV/NMINV, printing the trap
+  kind and the return address. BRK unwinds to the saved entry SP and falls
+  into the post-check path, so a derailed run still prints LOOP_STOP,
+  the POST results and a verdict instead of looking like a hang; NMI
+  saves and restores everything `printAt` touches and `rti`s.
+
+Plus `FRAME nnnn/mmmm` (attempted vs OK -- a run where every commit is
+refused used to look like a healthy one) and a sticky `FIRST ERR xx @ nnnn`
+(the last-error row alone is erased by a single good frame afterwards).
+The verdict now fails on any trap, and requires at least one OK frame when
+the animation actually ran; the commit loop tolerates `BUSY` and only
+checks RESULT/STATUS on accepted commits.
+
+`gpu64_test_pages.a` gained two assertions pinning the new paging
+semantics from the C64 side: after arming a deferred flip the draw page
+must **already** have rotated (`DEFER ROTATES`), and landing must **not**
+rotate it a second time (`LAND KEEPS PAGE`). The first was checked to be
+non-vacuous by temporarily reverting the model to rotate-in-commit -- it
+fails, `PASS 27 FAIL 01`. The second passes either way (an arithmetic
+coincidence of the 3-page cycle) and is kept as documentation.
+
+**Verification.** `tools/build.sh` links clean (`kernel8.img`, 397464
+bytes, build id `35d6545e-dirty src:a902079d`). `tools/testprg.sh`: 12/12
+ok, including the two new `pages` assertions. `tools/hostsim` cannot reach
+any of this (its `SRCS` omits `gpu64_3d_class1.cpp`/`gpu64_3d_core1.cpp`/
+`gpu64_fb.cpp`) and `runsim.py` does not model class 1 at all, so the F1
+change is covered on the PC only through the class 0 paging oracle above;
+the core-1 half rests on reading, as 15a/15b's did. D1-D4 were desk-checked
+under `runsim.py` in four runs -- baseline, a forced-animation variant
+(`FRAME 0258/0000`, i.e. exactly 600, so D1 counts right), and synthetic
+BRK and NMI variants whose reported trap PCs matched the listing's return
+addresses exactly, confirming the `$0105,x`/`$0106,x` stack arithmetic
+against the real KERNAL entry sequences at `$FF48`/`$FE43`. (`runsim.py`'s
+6502 core treats `BRK` as halt and never dispatches through CBINV, hence
+the synthetic variants.) A headless VICE run of the real PRG then confirmed
+the whole boot/report/exit path on real silicon: `PHASE SCKPV`, no trap,
+and `READY.` landing cleanly below the report -- i.e. the traps were
+uninstalled and BASIC got its vectors back.
+
+**Docs.** The draw-page handover is user-visible (a `READ_RECT` right
+after arming a deferred flip now reads the new page), so it is documented
+rather than left as an implementation detail: `class0-2d-reference.md`'s
+`PAGE_FLIP` row gained its missing `ARG0` entirely -- the split-out file
+had dropped the deferred branch that `api_design.md` always documented --
+and `vblank-and-animation.md` gained a "The deferred flip, and when the
+draw page moves" section plus a correction to the calibration-failed
+paragraph, which claimed `PAGE_FLIP` was unaffected when in fact
+`ARG0 = 1` answers `UNSUPPORTED` there.
+
+**Open, and the reason the next bench trip matters.** None of the three
+fixes has been seen on hardware. The run that goes out should be read in
+this order: PHASE first (did it get through), then ALIVE (is the C64 alive
+at all), then FRAME's two numbers, then MISSED -- and only then the
+per-check error rows.

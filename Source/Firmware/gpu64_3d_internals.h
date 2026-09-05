@@ -45,7 +45,23 @@ struct Gpu64_3dCmd
 	// stays 32 bytes.
 	u8	err;			// GPU64_ERR_*
 	u8	result;			// RESULT byte
-	u16	pad;			// still unused
+
+	// Stage 16 (Finding 2): which framebuffer page this command draws into.
+	// The *input* counterpart of err/result -- core 0 stamps it at push time
+	// (gpu64_3dRingPush(), before the barrier that publishes the slot) and
+	// core 1 only ever reads it.
+	//
+	// It exists because core 1 must not call GetDrawPage() itself. The draw
+	// page is core 0's state, and between an autonomous frame's push and its
+	// execution core 0 can advance it (PrepareFlip(), from the next
+	// SCENE_COMMIT) -- so a core-1 read could straddle a page hand-over and
+	// come back with two different answers within one render, cleaning the
+	// cache for rows on a page it never drew. Reading it once on core 0,
+	// with the C64 halted for the dispatch, makes that structurally
+	// impossible instead of merely unlikely.
+	u8	page;
+
+	u8	pad;			// still unused
 
 	u8	arg[ 16 ];
 };
@@ -84,6 +100,14 @@ struct Gpu64_3dRing
 
 extern Gpu64_3dRing gpu64_3dRing;
 
+// Stage 16: a synthetic op, never sent over the wire (every real wire opcode
+// is <= 0x42 -- see gpu64_3d.h's table). gpu64_3dDispatch() pushes this onto
+// the ring itself, from LOOP_START's and SCENE_COMMIT's own handlers, to ask
+// core 1 for one autonomous frame; the C64 never spells it. High bit set so
+// a stray match against a real opcode is structurally impossible rather than
+// merely unlikely.
+#define GPU64_3D_OP_RENDER_SCENE	0x80
+
 // --- phase 0 counters ---------------------------------------------------
 //
 // The only output phase 0 has. Core 1 writes these and core 0 reads them
@@ -117,7 +141,10 @@ extern Gpu64_3dHostStats gpu64_3dHost;
 
 // Core 0 side, implemented in gpu64_3d_core1.cpp next to the worker it pairs
 // with. FALSE means the ring is full, which is GPU64_ERR_QUEUE_FULL.
-boolean gpu64_3dRingPush( u8 op );
+// nPage is the framebuffer page the command is to draw into -- see
+// Gpu64_3dCmd::page above; ignored by the opcodes that draw nothing, which
+// pass whatever the draw page happens to be rather than a special value.
+boolean gpu64_3dRingPush( u8 op, u8 nPage );
 
 // Core 1 side (Stage 15a): the real CLEAR_VIEWPORT / DRAW_MESH / DRAW_NODE
 // execution, called from gpu64_3d_core1.cpp's execute() for those three
@@ -129,6 +156,13 @@ boolean gpu64_3dRingPush( u8 op );
 // stays the sole writer of the C64-visible register file, copying pCmd's
 // fields across itself once its drain wait succeeds.
 void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd );
+
+// Core 1 side (Stage 16): renders one whole autonomous-loop frame -- clear,
+// every visible OBJECT node under the active camera, in scene order -- for
+// GPU64_3D_OP_RENDER_SCENE only. Same contract as gpu64_3dExecuteRender():
+// writes pCmd->err and pCmd->result (the page rendered into), never touches
+// gpu64Regs. Implemented in gpu64_3d_class1.cpp next to gpu64_3dExecuteRender().
+void gpu64_3dExecuteRenderScene( Gpu64_3dCmd *pCmd );
 
 // --- the resource arena -------------------------------------------------
 //

@@ -4,7 +4,7 @@
  tools/prgsim/gpu64model.py.
 
  The two were written from opposite ends: the core is the firmware, the model
- is a reading of docs/api_design.md. Neither is authoritative on its own, and
+ is a reading of docs/class2-raster-reference.md. Neither is authoritative on its own, and
  every place they disagree is either a firmware bug or a document that does
  not say what the firmware does. Both are worth finding, and both are worth
  finding here rather than at the bench -- see CLAUDE.md on bench time.

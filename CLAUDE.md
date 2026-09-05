@@ -7,7 +7,7 @@ loop that samples the C64 bus on core 0; almost every hard-won rule below
 exists because something in or near that loop was violated.
 
 Read [project/progress_tracker.md](project/progress_tracker.md) for status and
-[docs/api_design.md](docs/api_design.md) for the API surface.
+[docs/README.md](docs/README.md) for the API surface.
 
 ## The bus is not reliable — design for it
 
@@ -127,7 +127,8 @@ it.
 
 `docs/` is for the API's users; `project/` is for whoever works on gpu64.
 
-- `docs/api_design.md` — only what a developer needs to *use* the API.
+- `docs/README.md` and the files it indexes — only what a developer needs
+  to *use* the API, split one file per class/topic.
 - `project/milestone*_design.md` — rationale and as-built decisions.
 - `project/progress_tracker.md` — status and campaign history.
 

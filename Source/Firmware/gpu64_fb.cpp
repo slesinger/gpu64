@@ -211,6 +211,34 @@ void CGpu64FrameBuffer::PrepareFlip( void )
 	// while holding the C64 halted, the better.
 	DrawLogOverlay( m_nPendingVisible );
 	CleanPage( m_nPendingVisible );
+
+	// The draw page hands over *here*, not in CommitFlip(). It used to
+	// advance only once the flip actually committed at the vsync boundary,
+	// which was harmless while every draw ran inside the same bus-held
+	// dispatch that called PrepareFlip() -- the polling loop cannot run
+	// CommitFlip() while it is halted, so nothing could observe the gap.
+	//
+	// Stage 16 broke that: SCENE_COMMIT queues core 1's next frame
+	// immediately after this call and returns, so core 1 draws during the
+	// window that ends at the *next* vsync. With the advance left in
+	// CommitFlip() every autonomous frame was painted into the page this
+	// call just queued for display, which then went visible mid-render --
+	// stale, torn output that looked like a freeze (Finding 2, see
+	// project/progress_tracker.md's Stage 16 section).
+	//
+	// The page picked is the same one CommitFlip() used to pick, chosen from
+	// the same two exclusions and therefore just as safe: not the page still
+	// on screen (m_nVisiblePage -- the post below does not wait for the
+	// VideoCore, so it keeps being scanned until the VideoCore's own next
+	// vsync) and not the one just queued (m_nPendingVisible). With
+	// GPU64_FB_PAGES == 3 exactly one page is left, and it is provably idle.
+	m_nDrawPage = m_nVisiblePage;			// only if the loop below finds nothing
+	for ( u8 p = 0; p < GPU64_FB_PAGES; p++ )
+		if ( p != m_nVisiblePage && p != m_nPendingVisible )
+		{
+			m_nDrawPage = p;
+			break;
+		}
 }
 
 boolean CGpu64FrameBuffer::CommitFlip( void )
@@ -233,23 +261,13 @@ boolean CGpu64FrameBuffer::CommitFlip( void )
 			return FALSE;
 	}
 
-	// The next draw page must be one the VideoCore is provably not
-	// scanning. Taking the page that was visible is not enough: the post
-	// above does not wait for the VideoCore, which changes offset at its
-	// own next vsync, so that page can stay on screen for another whole
-	// display frame. Skip both it and the one just posted -- with
-	// GPU64_FB_PAGES == 3 exactly one page is left.
-	u8 nWasVisible = m_nVisiblePage;
+	// The draw page is deliberately *not* chosen here any more -- PrepareFlip()
+	// already advanced it, from the same two exclusions this used to apply
+	// (the page still being scanned and the page just posted), so that core 1
+	// has a stable target for the whole frame it renders between the two
+	// halves of a deferred flip. See PrepareFlip()'s comment. All that is
+	// left here is publishing which page the post above made current.
 	m_nVisiblePage = m_nPendingVisible;
-
-	u8 nNext = nWasVisible;
-	for ( u8 p = 0; p < GPU64_FB_PAGES; p++ )
-		if ( p != m_nVisiblePage && p != nWasVisible )
-		{
-			nNext = p;
-			break;
-		}
-	m_nDrawPage = nNext;
 	return TRUE;
 }
 

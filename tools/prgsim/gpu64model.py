@@ -1,6 +1,6 @@
 """
 A reference model of the gpu64 class 0 command API, written from
-docs/api_design.md rather than from the firmware.
+docs/README.md and the files it indexes, rather than from the firmware.
 
 That direction matters. The point of this file is to be a second opinion:
 the conformance suite is checked against what the reference SAYS, so a test
@@ -44,7 +44,7 @@ ERR_OUT_OF_MEMORY = 0x08
 ERR_QUEUE_FULL = 0x09
 ERR_BAD_ID = 0x0A
 
-# Class 2 -- the raster layer (docs/api_design.md, "Class 2 opcodes").
+# Class 2 -- the raster layer (docs/class2-raster-reference.md, "Class 2 opcodes").
 RASTER_REC_BYTES = 16
 RASTER_WALL2_BYTES = 32
 RASTER_SEC_BYTES = 8
@@ -145,7 +145,7 @@ def fix_sat(v):
 
 
 # When true, round the way Source/Firmware/gpu64_api.cpp's fixWrite()
-# actually does rather than the way docs/api_design.md specifies, so a run
+# actually does rather than the way docs/class0-2d-reference.md specifies, so a run
 # can predict exactly which suite lines a given firmware will fail. See
 # runsim.py --firmware-rounding.
 FIRMWARE_ROUNDING = [False]
@@ -163,7 +163,7 @@ ALIAS_DROP = [[]]
 
 def fix_write_product(buf, i, acc):
     """Bring a 16.16 accumulator back to 8.8, rounded half away from zero and
-    saturated -- the contract docs/api_design.md states for the $8x set."""
+    saturated -- the contract docs/class0-2d-reference.md states for the $8x set."""
     if FIRMWARE_ROUNDING[0]:
         # acc += +-128 then an arithmetic shift right. The shift floors, so
         # for a negative accumulator the bias is applied twice and every
@@ -276,21 +276,34 @@ class Gpu64Model:
                 self._commit_flip()
                 self.status &= ~ST_BUSY
 
-    def _commit_flip(self):
-        """The page rotation CGpu64FrameBuffer::CommitFlip() performs.
+    def _prepare_flip(self):
+        """The half of a flip CGpu64FrameBuffer::PrepareFlip() performs.
 
-        The new draw page is the one that is neither the page just made
-        visible nor the page that was visible before it: a posted flip does
-        not take effect until the display hardware's next vsync, so the old
-        visible page is still being scanned out for up to a frame."""
-        was_visible = self.visible_page
-        self.visible_page = self.pending_visible
+        Queues the current draw page for display and hands the draw page over
+        immediately -- to the page that is neither still being scanned out
+        (visible_page: a posted flip does not take effect until the display
+        hardware's own next vsync, so the old page can stay up for another
+        frame) nor the one just queued.
+
+        The hand-over is here, not in _commit_flip(), because a class 1
+        autonomous frame starts rendering as soon as SCENE_COMMIT returns and
+        must not be aimed at the page about to go on screen -- Stage 16's
+        Finding 2, see project/progress_tracker.md."""
+        self.pending_visible = self.draw_page
+        # The C carries a defensive `m_nDrawPage = m_nVisiblePage` default
+        # ahead of this loop, for the case where the two exclusions cover
+        # every page. With FB_PAGES == 3 that is unreachable on both sides,
+        # so it is left out here rather than mirrored -- but if FB_PAGES ever
+        # changes, change it in both places or the oracle stops agreeing.
         for p in range(FB_PAGES):
-            if p != self.visible_page and p != was_visible:
+            if p != self.visible_page and p != self.pending_visible:
                 self.draw_page = p
                 break
-        else:
-            self.draw_page = was_visible
+
+    def _commit_flip(self):
+        """The other half: what actually goes on screen. The draw page was
+        already advanced by _prepare_flip()."""
+        self.visible_page = self.pending_visible
 
     # --- the REU controller ------------------------------------------
     # Only enough of a 1764 to move a block: the suite uses it to get bytes
@@ -511,11 +524,11 @@ class Gpu64Model:
                     return ERR_UNSUPPORTED
                 if self.flip_pending:
                     return ERR_BUSY
-                self.pending_visible = self.draw_page
+                self._prepare_flip()
                 self.flip_pending = True
                 self.status |= ST_BUSY
                 return ERR_OK
-            self.pending_visible = self.draw_page
+            self._prepare_flip()
             self._commit_flip()
             return ERR_OK
         if op == 0x06:                                  # GET_INFO
@@ -833,7 +846,7 @@ class Gpu64Model:
     # ==================================================================
     # Class 2 -- the raster layer
     #
-    # Written from docs/api_design.md's class 2 section, not from
+    # Written from docs/class2-raster-reference.md, not from
     # Source/Firmware/gpu64_raster_core.cpp. Where this and the firmware
     # disagree, one of them is wrong and the disagreement is the finding --
     # tools/rastercheck exists to surface exactly that, on a PC.
@@ -1816,7 +1829,7 @@ class Gpu64Model:
     # ------------------------------------------------------------------
     # DRAW_POLYS -- milestone 9's polygon layer.
     #
-    # Written from docs/api_design.md and project/milestone9_poly_design.md,
+    # Written from docs/class2-raster-reference.md and project/milestone9_poly_design.md,
     # not from gpu64_raster_core.cpp. Every division goes through idiv() and
     # every shift is arithmetic, because the two implementations have to
     # agree on a truncation, not merely on a picture.
