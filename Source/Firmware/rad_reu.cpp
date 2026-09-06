@@ -636,6 +636,40 @@ static void *s_PollLoopBase = 0;
 //      commit path.
 void gpu64_apiWarmPollingLoop( void )
 {
+	// gpu64: re-warm the deferred-flip commit path if one is armed, and do it
+	// *before* the loop preload below so the loop is always the last thing to
+	// touch the instruction cache before the bus is released.
+	//
+	// gpu64_vsyncWarmCommit() is otherwise issued exactly once, by the
+	// PAGE_FLIP / SCENE_COMMIT that arms the flip. Until Stage 16 that was
+	// enough: the only program that ever armed a deferred flip
+	// (gpu64_vblank_demo.a) then sat in a STATUS read loop until BUSY
+	// cleared, so nothing ran between the arm and the boundary. Stage 16's
+	// SCENE_COMMIT returns immediately and the C64 keeps issuing commands, so
+	// several full dispatches now run inside the armed window, each one the
+	// biggest instruction-cache consumer in the system -- and the loop preload
+	// below cannot cover the commit path, which sits 0xE00 bytes *before*
+	// s_PollLoopBase (0x85a00 vs 0x86800 as linked), outside the window.
+	//
+	// So the commit was firing cold once a frame, at the one place where a
+	// stall between RESTART_CYCLE_COUNTER and the GPIO write takes or gives
+	// back the bus at an undefined phase. Warming here is rule 5: every caller
+	// still holds the bus, so the preload costs hold time rather than a missed
+	// C64 access, and it only runs while a flip is actually armed.
+	//
+	// BENCH A/B, 2026-09-05: still a hypothesis. The three runs that first
+	// carried it showed gpu64_loop_test's SEQ/SEQACK drop detector at a
+	// remarkably constant ~0.19 lost C64 writes per accepted flip (4/26,
+	// 25/129, 10/51) where the pre-fix run reported zero. Set this to 0 to
+	// build the other arm and find out whether this warm is the author of
+	// those drops or merely the first build to run alongside them.
+#define GPU64_WARM_COMMIT_AT_DISPATCH 1
+
+#if GPU64_WARM_COMMIT_AT_DISPATCH
+	if ( gpu64Vsync.flipPending )
+		gpu64_vsyncWarmCommit();
+#endif
+
 	if ( s_PollLoopBase )
 		CACHE_PRELOAD_INSTRUCTION_CACHE( s_PollLoopBase, GPU64_POLL_IPL_WINDOW );
 

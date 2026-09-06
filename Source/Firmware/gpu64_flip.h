@@ -17,8 +17,13 @@
    gpu64_flipPost()   -- inside the DMA hold: store the offset, write the
                          mailbox, return. Sub-microsecond, and it does not
                          care when the VideoCore gets around to it.
-   gpu64_flipDrain()  -- outside the hold, at the top of the next command
-                         dispatch: consume the reply.
+   gpu64_flipDrain()  -- at the top of the next command dispatch: consume
+                         the reply. NOTE, corrected 2026-09-06: this was
+                         written as "outside the hold" and it is not.
+                         gpu64_apiDispatch() is called from reuUsingPolling()
+                         with CLR_GPIO(bDMA_OUT) already asserted, so every
+                         microsecond the drain spins is a microsecond the
+                         C64 is halted -- see the timeout note below.
 
  The drain is not just bookkeeping, it is what keeps the split safe. Once
  posted, the flip is in flight and the page the C64 may now draw into is not
@@ -45,12 +50,24 @@
 #include <circle/types.h>
 
 // How long gpu64_flipDrain() waits for a reply before giving up, in
-// microseconds. Generous by two orders of magnitude against the ~900 us the
-// round trip actually takes -- this is a "the VideoCore is not answering"
-// bound, not a performance one. Hitting it disarms the fast path for the
-// rest of the session and falls back to Circle's blocking call, which is
-// slow but known to work.
-#define GPU64_FLIP_DRAIN_TIMEOUT_US	50000
+// microseconds. This is a "the VideoCore is not answering" bound, not a
+// performance one; the round trip itself is ~900 us. Hitting it disarms the
+// fast path for the rest of the session and falls back to Circle's blocking
+// call, which is slow but known to work.
+//
+// Was 50000. Lowered 2026-09-06: the drain runs *inside* the DMA hold (see
+// the corrected note above), so the old value was a licence to halt the C64
+// for 50 ms -- 50000 cycles -- in a single command. Whether that ever fires
+// is exactly what gpu64FlipStats.drainTimeouts now exists to answer; until
+// it does, the bound is chosen to be survivable rather than generous.
+#define GPU64_FLIP_DRAIN_TIMEOUT_US	5000
+
+// Same bound for gpu64_flipPost()'s wait on MAILBOX1 being drained by the
+// VideoCore. That wait used to be an unbounded spin on an MMIO register,
+// reachable from gpu64_vsyncCommitFlip() inside the polling loop's hold --
+// i.e. a place where "it cannot happen" was the only thing standing between
+// a wedged VideoCore and a Pi that never returns to sampling the bus.
+#define GPU64_FLIP_POST_FULL_TIMEOUT_US	5000
 
 // Per-flip cost, kept because the whole point of this module is a number
 // that was measured and has to be re-measured to know it moved. Reported by
@@ -69,6 +86,15 @@ struct GPU64FLIPSTATS
 	u32	drainTotalUs;
 
 	u32	slowCount;	// flips that fell back to the blocking mailbox
+
+	// gpu64: the two "this was supposed to be impossible" counters. Both
+	// are zero on a healthy run; either being non-zero means the C64 was
+	// halted for a multiple of GPU64_FLIP_*_TIMEOUT_US, which is the shape
+	// of damage the stage 16 derail leaves behind. Readable from the C64
+	// through GET_HEALTH, because LOG_ENABLE is not usable during a bench
+	// run (project/hw_testing.md).
+	u32	drainTimeouts;	  // drains that gave up; also disarms the fast path
+	u32	postFullTimeouts; // posts abandoned with MAILBOX1 still full
 };
 
 extern GPU64FLIPSTATS gpu64FlipStats;
@@ -96,7 +122,8 @@ void gpu64_flipWarm( void );
 
 // Waits for an in-flight flip's reply, if any. No-op when nothing is in
 // flight, which is the common case at a command dispatch. Never call this
-// from the bus-watch loop.
+// from the bus-watch loop. Note it runs with the bus held -- bounded by
+// GPU64_FLIP_DRAIN_TIMEOUT_US, which is a C64 halt of that length.
 void gpu64_flipDrain( void );
 
 #endif

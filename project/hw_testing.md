@@ -413,6 +413,82 @@ program painted — the probe used (0,0) and could not have seen that — and
 whether the probe stays clean with those twenty-odd commands replayed ahead
 of it.
 
+### gpu64_probe_latch -- which stage 16 layer arms the latch
+
+`Source/TestPRG/gpu64_probe_latch.a`. Written for the stage 16 derail (§ 16b
+of the progress tracker), after the arm-B run that accepted 204 commits and
+then lost 98.5% of every register write afterwards -- an abrupt latch, not
+accumulating timing damage, and the signature this document and CLAUDE.md
+both attribute to the `$df00`-`$df0a` REU decode path, which the gpu64
+command window `$df0b`-`$df21` had never reproduced.
+
+Stage 16 changed three things at once, and the bench data cannot separate
+them because all three scale with the same number -- commits accepted. So
+the probe adds them one at a time, in one launch, out of paths that are each
+already hardware-verified on their own:
+
+| Phase | Issues, flat out | Adds |
+|---|---|---|
+| `NOP` | class 0 `NOP` | command-window write pressure only |
+| `FLI0` | class 0 `PAGE_FLIP` arg **0** | + the flip work, in the *dispatch's* hold |
+| `FLIW` | class 0 `PAGE_FLIP` arg 1, then a `STATUS` poll until `BUSY` clears | + the same work in the *loop's* hold, with an **empty** armed window |
+| `FLIP` | class 0 `PAGE_FLIP` arg 1, flat out | + dispatch traffic **inside** the armed window |
+| `REND` | class 1 `SCENE_COMMIT` | + core 1 rendering a frame |
+
+`FLIP` is the rung worth understanding. A deferred flip needs `calibrated`
+but not `armed`, and returns `BUSY` while one is outstanding, so a program
+that asks flat out self-paces to ~60 accepted flips a second at a ~21%
+accept rate -- the same two numbers every healthy stage 16 run reports, with
+core 1 doing nothing at all. `REND` renders an **empty** scene (a camera, no
+objects), so core 1 still does the per-frame clear and the ~200-row cache
+clean but not the mesh raster; a clean `REND` against a dying
+`gpu64_loop_test` therefore narrows the answer rather than leaving it open.
+
+Per phase it reports `ATT` / `ACC` / `MISS` / `DUR`, the last being jiffies,
+so every count can be normalised per dispatch, per second and per accepted
+flip. That is deliberate: normalising three ways is what turned `MISSED`
+from noise into a fingerprint in round 4, and two counts had already been
+misread off bench photos by then. `MISS` is reported and never judged --
+the drop floor is pre-existing, so a nonzero count is the measurement, not
+the failure.
+
+Reading it:
+
+- **All three rows complete, C64 alive** -- none of the three axes arms it
+  in this combination. What is left between this and `gpu64_loop_test` is
+  the mesh raster burst and `ROTATE_LOCAL`'s argument writes.
+- **`NOP` dies, or its `MISS` sits far above the ~1/180000 floor** -- sheer
+  write pressure on the command window arms it, and stage 16 is merely the
+  first workload fast enough to get there. Core 1 and the flip are not
+  involved.
+- **`NOP` clean, `FLIP` dies (or `MISS`/`ACC` lands near 0.19)** -- the
+  deferred commit-flip window is the mechanism and core 1 is exonerated. It
+  would also explain why milestone 4b/4d was clean: nothing ran between the
+  arm and the commit there.
+- **`NOP` and `FLIP` clean, `REND` dies** -- core 1 rendering while core 0
+  polls a free-running C64 is what arms it. That is the milestone 6a burst
+  rule at 100% duty cycle, a regime 6a never measured because its own ladder
+  paced the bursts apart.
+
+The rungs run in one launch, in order, so a latch that needs total
+accumulated exposure could be armed by `NOP` and charged to `FLIP`. `FIRST
+ERR`'s attempt number and the `DUR` column are what tell those apart: an
+onset at the same absolute dispatch count wherever it lands is cumulative;
+an onset at a fixed count *within* a rung belongs to that rung.
+
+**No firmware change is needed for any of it**, which is the point -- the
+thing under test is a cycle-critical loop, and any instrumentation added to
+it would be a change to the thing being measured.
+
+Desk-checked against `tools/prgsim/runsim.py`, which models class 0 but not
+class 1: the `NOP` and `FLIP` rungs run there for real (the model mirrors
+`PAGE_FLIP`'s `BUSY` and its vblank-driven commit), and `SEQ`/`SEQACK` were
+added to the model for it, so `MISS` reads `0000` on a perfect bus. Budgets
+are `.weak`, so a desk run can shrink them:
+`64tass --cbm-prg -D N_NOP=200 -D N_FLIP=400 -o out.prg gpu64_probe_latch.a`.
+The bench always builds the defaults.
+
+
 `tools/prgsim/runsim.py --alias-drop=OFF[,OFF...]` injects a byte-level fault
 at chosen offsets, so the suite's diagnostic lines can be read against a
 known answer on a PC before a bench run is spent on them.
@@ -428,6 +504,173 @@ the 40-pin header) are physically wired into the cartridge's bus latches**
 built-in serial/USB bootloader (`doc/bootloader.txt`, the "Flashy" tool) for
 any build that's actually plugged into a C64 -- it needs those exact two pins
 for a USB-serial adapter.
+
+
+**Result (2026-09-06, three power-cycled runs): outcome 3.** `NOP` was
+20000/20000 with `MISS 0000` every run; `FLIP` derailed every run after
+43/50/69 accepted flips with `MISS 0000` and a `TRAP 01` (BRK) at a wild
+PC; `REND` was never reached. The deferred commit-flip is the fault, on
+its own, with no dropped writes and no core 1. Full write-up in
+[progress_tracker.md](progress_tracker.md) section 16b.
+
+Two things to know before re-running it. The unfinished rung's `DUR` field
+is **stale**, not zero: `dur` is only written by `finishPhase`, so a rung
+that dies mid-way still shows its predecessor's duration — derive its
+elapsed time from accepted flips at 60 Hz instead. And the accepted
+*ratio* on `FLIP` is ~2.6%, not the ~21% the class-1 runs show, because a
+class-0 `PAGE_FLIP` dispatch is roughly ten times cheaper; 60 accepted
+flips a second is the invariant, not the percentage.
+
+**`FLI0` and `FLIW` were added after that run** to split what was left.
+They are what makes the ladder decisive rather than merely suggestive,
+because the three rungs now differ by exactly one thing each:
+
+| | fires the commit from | armed window contains |
+|---|---|---|
+| `FLI0` | *(no deferred commit -- the flip happens inside the dispatch)* | -- |
+| `FLIW` | the polling loop | nothing |
+| `FLIP` | the polling loop | ~40 refused dispatches |
+
+- **`FLI0` dies too** -- the flip *work* is the fault, immediate path
+  included. Milestone 4b has carried this all along and nothing ever
+  issued enough flips to find it.
+- **`FLI0` clean, `FLIW` dies** -- the loop-fired DMA hold itself, or
+  something inside `gpu64_commitFlip()` that stalls unpredictably. Re-run
+  with `LOG_ENABLE` on and read `gpu64FlipStats`: `slowCount > 0` means
+  the mailbox fast path fell back to Circle's ~900 us blocking
+  `SetVirtualOffset()` from inside the hold ([gpu64_fb.cpp:257](../Source/Firmware/gpu64_fb.cpp#L257)).
+- **`FLI0` and `FLIW` clean, `FLIP` dies** -- the *armed window* is the
+  mechanism, and the only thing that changes across that line is
+  instruction-cache residency of the commit path. `gpu64_apiWarmPollingLoop()`
+  re-warms it while a flip is armed ([rad_reu.cpp:668](../Source/Firmware/rad_reu.cpp#L668))
+  but is called only from the class-1 and class-2 dispatch paths -- **there
+  is no class-0 call site**. So class-0 flip traffic gets one warm, at arm
+  time, and then a frame's worth of dispatches with nothing to renew it.
+  The fix is a one-liner and the comment at
+  [rad_reu.cpp:643](../Source/Firmware/rad_reu.cpp#L643) already predicts
+  the failure.
+
+Don't enable `LOG_ENABLE` for the discriminating run itself -- the overlay
+is drawn inside `PrepareFlip()`, so it adds i-cache pressure to the exact
+window under test. It's the follow-up instrument, not part of the ladder.
+
+**Result, 2026-09-06 -- outcome 3, twice.** Two power-cycled runs, five
+rungs each, identical to the digit:
+
+| rung | ATT | ACC | MISS | DUR | reading |
+|---|---|---|---|---|---|
+| `NOP` | 4E20 | 4E20 | 0000 | 01E7 | 20000/20000, both runs |
+| `FLI0` | 07D0 | 07D0 | 0000 | 0032 | 2000/2000, both runs |
+| `FLIW` | 012C | 012C | 0000 | 012C | 300/300, both runs |
+| `FLIP` | 1300 / 05A0 | 007F / 0025 | 0002 | *(stale)* | derailed, both runs |
+| `REND` | -- | -- | -- | -- | never reached |
+
+`FLIW`'s `DUR` is 300 jiffies for 300 deferred flips: exactly 60.0/s, the
+frame clock, sustained for five seconds with not one lost write. That one
+row acquits the loop-fired DMA hold *and* the mailbox/`slowCount`
+candidate at the same time, because both are present in `FLIW` in exactly
+the form they take in `FLIP`. `FLI0` acquits the flip work itself.
+
+`FLIW` and `FLIP` run the same firmware path at the same rate with the
+same holds and differ **only** in whether dispatches are issued inside the
+armed window. So the armed window is where the mechanism lives. That much
+still stands.
+
+**What did not stand: the cause.** The missing class-0 re-warm was fixed at
+[gpu64_api.cpp:1109](../Source/Firmware/gpu64_api.cpp#L1109) and the next
+run derailed exactly as before -- 29 accepted flips, squarely inside the
+25-127 spread the unfixed builds gave. The re-warm is left in place (it is
+correct by symmetry with classes 1 and 2, and removing it now would be a
+second uncontrolled variable), but it is **not** the cause and the ladder's
+conclusion above was published a run too early.
+
+Two incidental corrections the run forced:
+
+- **An immediate flip is cheap.** `FLI0` ran 2000 dispatches in 0x32
+  jiffies = 0.83 s, ~2400/s, the same rate as `NOP`. The mailbox round
+  trip is asynchronous (`gpu64_flipPost`), so the "~900 us per flip"
+  figure in the old `N_FLIP0` budget comment was simply wrong.
+- **Time-to-derail on `FLIP` varies about 3.4x** between runs (127 vs 37
+  accepted flips, ~2.1 s vs ~0.6 s; earlier runs gave 43/50/69). It is
+  probabilistic, and it is why a short run is not evidence of a fix. Give
+  a candidate fix the full 6000-iteration budget.
+
+### The subject was wrong: it is the Pi that dies (2026-09-06)
+
+Three further runs, and between them they demolish the framing every
+earlier round used. The C64 is not derailing and dragging the Pi down; the
+Pi goes away and the C64 is what is left holding a dead bus.
+
+| run | `FLIP` reading | `FIRST ERR` | what the Pi did |
+|---|---|---|---|
+| C | `0440 / 001D / 0000 / 012C` | `05 @ 03 0239` | solid green LED, HDMI black |
+| D | -- | -- | **fresh Circle boot log on HDMI**, from `00:00:00` |
+| E | `0660 / 002B / 0001 / 012C` | `01 @ 03 0459` | HDMI black, C64 `TRAP 01 4003` |
+
+Three independent reasons the Pi is the subject:
+
+1. **`FIRST ERR 05` is not an error code.** `$05` is not a legal
+   `PAGE_FLIP` failure (`BAD_ARGS` is 04, `UNSUPPORTED` 06, `BUSY` 07) --
+   it is `OP_PAGE_FLIP` itself, the last byte the 6510 drove onto the bus
+   before `lda ERRCODE` in `cmd0`. Reading an IO2 nobody is driving returns
+   the last bus value. So at `FLIP` iteration 569 the Pi stopped answering,
+   and the C64 went on looping ~500 more times reading its own last write
+   back with `ACC` frozen at 29. The C64 was *fine* at that instant.
+2. **Run D booted.** The HDMI showed a complete Circle start-up log
+   beginning at `00:00:00` with the right build id and ending normally at
+   `detectSID`, with the RAD menu logo. **No exception dump.** Circle
+   installs handlers and prints one on a fault, so this is a *hard reset*,
+   not a panic: watchdog or supply.
+3. **Run E's `TRAP 01 4003`.** A BRK at `$4003` -- the probe occupies
+   `$0801-$0ff9`, so the 6510 had run off into blank RAM and executed
+   zeros. That is what a 6510 does when the cartridge stops driving DMA
+   cleanly mid-instruction, and it retro-explains the blank `TRAP`/`VERDICT`
+   rows of runs A and B rather than needing an instrument bug.
+
+Note the failure mode *varies* run to run -- Pi hangs, Pi resets, C64
+derails first. A single deterministic software bug does not usually
+present three ways.
+
+**Two concrete defects found while reading the path** (both fixed
+2026-09-06, both in the `FLIP` rung's path and nowhere else in the ladder):
+
+- `gpu64_flipPost()` spun on `MAILBOX1_STATUS & FULL` **with no bound**,
+  on core 0, inside `gpu64_vsyncCommitFlip()`'s DMA hold. "It cannot
+  happen" was the only thing between a wedged VideoCore and a Pi that
+  never samples the bus again -- which is exactly run C. Now bounded by
+  `GPU64_FLIP_POST_FULL_TIMEOUT_US` and counted.
+- `gpu64_flipDrain()`'s timeout was **50 ms**, and `gpu64_flip.h` claimed
+  it ran "outside the hold". It does not: `gpu64_apiDispatch()` is entered
+  with `CLR_GPIO(bDMA_OUT)` already asserted, so that was a licence to
+  halt the C64 for 50000 cycles inside one command. Lowered to 5 ms,
+  counted, and the header comment corrected.
+
+`FLIP` is also the only rung that dispatches while a flip is in flight, so
+it is the only rung that can reach either of those waits at all. That is a
+second reading of "the armed window", and one that does not depend on the
+instruction cache.
+
+**The power hypothesis has never actually been tested.** `readHealth()` in
+`gpu64_api.cpp` has exactly **one** call site -- the `GET_HEALTH` opcode --
+despite its own comment describing a once-a-second poll. There is no poll.
+So the sticky-under-voltage red border it can raise could not have fired on
+any run in this campaign, and a hard Pi reset with no exception dump is
+precisely what a sagging 5V rail looks like. `gpu64_probe_latch` now issues
+`GET_HEALTH` after setup and after every rung and prints the result on a
+`HEALTH` row -- see the row legend in the probe source.
+
+**Unexplained, and worth watching:** on both runs the `TRAP` (row 16) and
+`VERDICT` (row 18) rows were *blank*, while `PHASE` showed `NIWFV` -- the
+`V` breadcrumb is written by `allDone`, which then unconditionally calls
+`verdict`, which unconditionally prints one of three non-empty strings at
+row 18. `ALIVE` showed `STAGE 11`, not the `30` `finishPhase` writes, so
+`FLIP` did not exit through `finishPhase`; BASIC's `READY.` landed at row
+20, so nothing scrolled and the rows really are empty. Both direct
+absolute stores (`phase`) worked while both `printAt` calls produced
+nothing. No reading of the three clean rungs depends on this -- their
+numbers come from rows the loop refreshes live -- but if it recurs, that
+is a corrupted-6510 fingerprint worth capturing rather than an instrument
+bug: the strings are present and the host model prints them.
 
 ### Tier 1 -- bare RPi on the bench (no C64 needed)
 
@@ -631,3 +874,64 @@ already flags that the Ultimate's (and any real REU's) IO2 decode needs
 confirming on hardware -- that's the first thing to check once milestone 2's
 trigger PRG exists, using whichever of the two tiers above matches what's
 plugged in at the time.
+
+### The rail sagged, and the ladder completed once (2026-09-06, runs F and G)
+
+First runs of the build that added the `HEALTH` row to `gpu64_probe_latch`
+(`GET_HEALTH` after setup and after every rung) and bounded the two mailbox
+waits in `gpu64_flip.cpp`.
+
+Run F, in full:
+
+| rung | ATT | ACC | MISS | DUR |
+|---|---|---|---|---|
+| `NOP`  | 4E20 | 4E1F | 0000 | 01E6 |
+| `FLI0` | 07D0 | 07D0 | 0000 | 0033 |
+| `FLIW` | 012C | 012C | 0000 | 012B |
+| `FLIP` | 1770 | 009E | 0001 | 009D |
+| `REND` | 0BB8 | 09D4 | 0B7A | 004C |
+
+`FLIP` completed its whole 6000-iteration budget and `REND` ran -- both for
+the first time in the campaign. No `TRAP`, `ALIVE STAGE 30`, C64 alive at the
+end. The `FAIL` is one NOP in 20000 answering `$FF` (`FIRST ERR FF @ 00 2020`),
+which is the documented drop floor against a rung whose rule is zero
+tolerance.
+
+Run G, a separate boot minutes later, derailed the familiar way: `FLIP` dead at
+iteration 160, `TRAP 01 5D57` (BRK far outside the probe's `$0801-$0FF9`). Its
+`SETUP 00 00 00 00 00 FF` is not a failure -- `setupErr` is `.fill 6, $ff` and
+slot 5 is `LOOP_START`, which the trap kept it from ever reaching.
+
+**Run F's HEALTH row: `00 00 05 77 01 00 00 00`.** `ss = 05` is
+`GET_THROTTLED >> 16` = bit 0 (under-voltage **has occurred**) + bit 2
+(throttling has occurred), at 37.5 C -- so not thermal. The 5V rail sagged
+during that session. This bit has been unreadable for the whole campaign
+because `readHealth()` has exactly one call site, the `GET_HEALTH` opcode, in
+spite of its comment describing a once-a-second poll.
+
+**`dd = pp = cc = 00` in both runs.** Neither bounded mailbox wait ever
+expired. The unbounded `MAILBOX1_STATUS & FULL` spin and the 50 ms drain
+timeout were real defects and the bounds stay in, but they are not the
+mechanism.
+
+Two boots of identical firmware, minutes apart, one completing 32000 dispatches
+and one dying at 160, with a brownout on the record for one of them: that
+variance is not one deterministic software bug. **Fix the supply and re-run
+before spending more on firmware theory.** Two consecutive clean `FLIP`
+completions with `ss = 00` would settle it.
+
+#### Open, and new: REND loses 98% of its SEQs
+
+`REND MISS = 0B7A` -- 2938 SEQ/SEQACK mismatches in 3000 dispatches, in 1.27 s,
+against 1-in-6000 for `FLIP` and 0-in-20000 for `NOP`. But 84% of those same
+dispatches answered `OK`, so they executed.
+
+Ruled out already: `sSeqAck = sSeq` is published unconditionally at the top of
+`gpu64_apiDispatch()` before any early return (`gpu64_api.cpp:1047`) and is
+class-independent, so this is not class 1 skipping the publish; and `$22`/`$23`
+are inside the decode window (`addr >= GPU64_REG_CMD_HI`, `rad_reu.cpp:874`),
+so it is not a boundary miss.
+
+That leaves either a detector that misreads class 1, or class-1
+`SCENE_COMMIT` traffic hitting the bus defect some 400000x harder than class 0.
+Unexplained either way, and worth a rung of its own.

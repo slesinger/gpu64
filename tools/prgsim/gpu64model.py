@@ -86,6 +86,7 @@ REG_STATUS, REG_ERRCODE = 0x0D, 0x0E
 REG_ID_LO, REG_ID_HI = 0x0F, 0x10
 REG_ARG0, REG_ARG15 = 0x11, 0x20
 REG_RESULT = 0x21
+REG_SEQ, REG_SEQACK = 0x22, 0x23
 
 
 def s16(v):
@@ -201,6 +202,14 @@ class Gpu64Model:
         self.calibrated = calibrated
 
         self.cmd_hi = 0
+        # The drop detector's pair. The C64 picks a sequence byte and writes
+        # it before a dispatch; the firmware echoes it back on every dispatch,
+        # so a mismatch means one of the writes was never sampled off the bus.
+        # Nothing here drops writes -- the model is a perfect bus -- so SEQACK
+        # always matches, which is exactly what makes it useful as an oracle:
+        # a nonzero MISSED on hardware is then unambiguously the bus.
+        self.seq = 0
+        self.seqack = 0
         self.status = 0
         self.err = ERR_OK
         self.result = 0
@@ -357,6 +366,8 @@ class Gpu64Model:
             return self.err
         if off == REG_RESULT:
             return self.result
+        if off == REG_SEQACK:
+            return self.seqack
         return 0xFF
 
     def write_reg(self, off, val):
@@ -374,6 +385,8 @@ class Gpu64Model:
             self.ident[1] = val
         elif REG_ARG0 <= off <= REG_ARG15:
             self.arg[off - REG_ARG0] = val
+        elif off == REG_SEQ:
+            self.seq = val
 
     # --- argument decoding ----------------------------------------------
     def a_u16(self, i):
@@ -469,6 +482,10 @@ class Gpu64Model:
     # --- dispatch ---------------------------------------------------------
     def dispatch(self, op):
         self.dispatches += 1
+        # Published before the class check, as gpu64_apiDispatch() does it:
+        # the echo has to be class-agnostic or a rejected command would look
+        # like a lost write.
+        self.seqack = self.seq
         if self.cmd_hi not in (0, 2):
             self.err = ERR_BAD_CLASS
             self.status |= ST_ERROR

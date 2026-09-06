@@ -8,7 +8,7 @@
 #include <circle/synchronize.h>
 #include "lowlevel_arm64.h"
 
-GPU64FLIPSTATS gpu64FlipStats = { 0, ~0u, 0, 0, 0, ~0u, 0, 0, 0 };
+GPU64FLIPSTATS gpu64FlipStats = { 0, ~0u, 0, 0, 0, ~0u, 0, 0, 0, 0, 0 };
 
 // The property buffer, as u32 words. Laid out once by gpu64_flipInit() and
 // then only word 6 ever changes:
@@ -98,12 +98,23 @@ boolean gpu64_flipPost( u32 nOffsetY )
 	// write that publishes them.
 	DataSyncBarrier();
 
+	// Full means the VideoCore has not drained our previous request. With
+	// one flip in flight at a time it is not supposed to happen -- but this
+	// runs inside gpu64_vsyncCommitFlip()'s DMA hold, on core 0, in the
+	// polling loop. An unbounded spin on an MMIO register there is not a
+	// slow path, it is a Pi that never samples the bus again; the C64 then
+	// reads a floating IO2 and derails, which is precisely the signature
+	// the stage 16 bench runs kept producing. So: bounded, counted, and on
+	// expiry we decline the flip rather than post into a full mailbox.
+	// CommitFlip() falls back to Circle's blocking call for this frame.
+	u32 tFull = flipNow();
 	while ( read32( MAILBOX1_STATUS ) & MAILBOX_STATUS_FULL )
 	{
-		// Full means the VideoCore has not drained our previous request.
-		// It cannot happen with one flip in flight at a time, and there is
-		// nothing useful to do about it if it does -- but spinning here is
-		// still bounded by the fact that we are the only writer.
+		if ( (s32)( flipNow() - tFull ) > GPU64_FLIP_POST_FULL_TIMEOUT_US )
+		{
+			gpu64FlipStats.postFullTimeouts++;
+			return FALSE;
+		}
 	}
 
 	write32( MAILBOX1_WRITE, BCM_MAILBOX_PROP_OUT | sBusAddress );
@@ -144,6 +155,12 @@ void gpu64_flipDrain( void )
 			// the rest of the session rather than pay this timeout on
 			// every flip; CommitFlip() falls back to Circle's blocking
 			// call, which is slow but proven.
+			//
+			// Counted since 2026-09-06: this happens inside the DMA hold,
+			// so one of these is a GPU64_FLIP_DRAIN_TIMEOUT_US C64 halt,
+			// and every flip after it is a ~900 us halt once a frame. That
+			// is a session-wide behaviour change nothing used to report.
+			gpu64FlipStats.drainTimeouts++;
 			sAvailable = FALSE;
 			sPending   = FALSE;
 			return;

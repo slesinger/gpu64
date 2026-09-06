@@ -331,6 +331,15 @@ struct GPU64HEALTH
 };
 static GPU64HEALTH s_Health = { 0, 0, 0, 0, 0, 0 };
 
+// Little-endian 16-bit, clamped -- these counters are diagnostics, and a
+// wrapped one would read as healthy.
+static inline void saturate16( u8 *p, u32 v )
+{
+	if ( v > 0xffff ) v = 0xffff;
+	p[ 0 ] = (u8)( v & 0xff );
+	p[ 1 ] = (u8)( v >> 8 );
+}
+
 // GET_THROTTLED bits. The low four are "right now", the high four latch.
 // C64 palette index 2, red -- deliberately not a colour any demo sets.
 #define GPU64_HEALTH_BORDER_ALARM	2
@@ -561,7 +570,7 @@ static u8 doSystem( u8 op )
 
 		readHealth();
 
-		u8 h[ 12 ];
+		u8 h[ 20 ];
 		memset( h, 0, sizeof h );
 		h[ 0 ] = (u8)( s_Health.throttled & 0xff );
 		h[ 1 ] = (u8)( ( s_Health.throttled >> 8 ) & 0xff );
@@ -575,7 +584,22 @@ static u8 doSystem( u8 op )
 		h[ 9 ] = (u8)( s_Health.tempC10 >> 8 );
 		h[ 10 ] = (u8)( s_Health.tempMax10 & 0xff );
 		h[ 11 ] = (u8)( s_Health.tempMax10 >> 8 );
-		return gpu64_blobWrite( space, addr, 12, h );
+
+		// gpu64: bytes 12-19, added 2026-09-06, are the flip path's
+		// "impossible" counters. They live here rather than behind
+		// LOG_ENABLE because a bench program cannot turn the log on without
+		// changing the thing it is measuring (project/hw_testing.md), and
+		// GET_HEALTH is already the one opcode whose job is "tell me what
+		// the Pi thinks of its own state". Saturated to 16 bits: the
+		// question is zero-or-not, not how many.
+		saturate16( h + 12, gpu64FlipStats.drainTimeouts );
+		saturate16( h + 14, gpu64FlipStats.postFullTimeouts );
+		saturate16( h + 16, gpu64FlipStats.slowCount );
+		saturate16( h + 18, gpu64FlipStats.postCount );
+
+		// Length-compatible with the 12-byte contract: a caller that asks
+		// for 12 still gets exactly what it always got.
+		return gpu64_blobWrite( space, addr, len >= 20 ? 20 : 12, h );
 	}
 
 	case 0x08:					// SET_BORDER
@@ -1106,4 +1130,34 @@ void gpu64_apiDispatch( u8 op )
 		gpu64ApiActive = 1;
 	} else
 		sStatus |= GPU64_STATUS_ERROR;
+
+	// gpu64: class 0's re-warm, and the only one that runs inside the armed
+	// window of a deferred flip.
+	//
+	// Classes 1 and 2 call gpu64_apiWarmPollingLoop() at the end of their own
+	// dispatch (gpu64_3d_class1.cpp, gpu64_raster_class2.cpp); class 0 never
+	// did, on the reasoning that its ops are small. That reasoning does not
+	// hold once a flip is armed: gpu64_vsyncWarmCommit() is issued once by the
+	// PAGE_FLIP that arms it, and every class 0 dispatch between that arm and
+	// the vblank boundary then evicts the commit path again with nothing to
+	// put it back. The commit fires cold, and a stall between
+	// RESTART_CYCLE_COUNTER and the GPIO write takes or releases the bus at an
+	// undefined phase -- polling-loop rule 3.
+	//
+	// BENCH, 2026-09-06, gpu64_probe_latch (project/hw_testing.md): the FLI0
+	// rung -- 2000 *immediate* flips, no armed window -- ran 2000/2000 clean
+	// twice. The FLIW rung -- 300 deferred flips, each one polled to
+	// completion so the armed window stays empty -- ran 300/300 clean twice,
+	// at exactly 60/s. The FLIP rung, which is FLIW with dispatches issued
+	// inside the armed window and nothing else different, derailed the C64
+	// both times. Same firmware path, same rate, same DMA holds: the armed
+	// window is the mechanism, which is this missing call.
+	//
+	// Guarded on flipPending so ordinary class 0 traffic keeps the hold length
+	// it has always had -- the cost only appears in the at-most-one-frame
+	// window where it is the fix. It is last in the dispatch so the loop
+	// preload it ends with is the final instruction-cache touch before the bus
+	// is released.
+	if ( sCmdHi == 0 && gpu64Vsync.flipPending )
+		gpu64_apiWarmPollingLoop();
 }

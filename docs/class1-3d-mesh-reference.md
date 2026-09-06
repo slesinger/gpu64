@@ -14,7 +14,7 @@ instead of RGB, the store-burst budget) and the phase-1 build history, and
 [project/gap_filling_plan.md](../project/gap_filling_plan.md) for what is
 staged next to close the gap between this section and "Status" below.
 
-## Status: retained scene graph, real core-1 overlap, handshake loop live
+## Status: retained scene graph, real core-1 overlap, handshake loop unstable
 
 **Read this before the opcode table below — it changes what several rows
 actually do today.**
@@ -33,10 +33,18 @@ stage 16 (2026-08-29), that is live for **handshake mode**:
   drawing it is still an explicit per-frame call. **These three are refused
   with `BUSY` while the autonomous loop is running** — see "Frame lifecycle"
   below for why, and use `DRAW_NODE`'s scene-graph siblings instead.
-- `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT` ($06-$08) are **live in handshake
-  mode** (`LOOP_START`'s `ARG0` = 0). Free-running mode (`ARG0` = 1,
-  vsync-driven rather than `SCENE_COMMIT`-driven) still answers
-  `UNSUPPORTED` — staged next in
+- `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT` ($06-$08) are implemented for
+  **handshake mode** (`LOOP_START`'s `ARG0` = 0) but are **not yet stable on
+  hardware — do not build on them yet.** They pass on the PC oracle and have
+  produced one clean 600-commit bench run, but most bench runs derail the C64
+  outright (a wild 6510, a collapsed IO2 interface, or a stopped machine)
+  after a few hundred commits. This is an open firmware defect, not a
+  mistake a calling program can avoid; see
+  [project/progress_tracker.md](../project/progress_tracker.md) § 16b.
+  Everything else on this page is unaffected — issue `DRAW_NODE` per frame
+  and flip yourself, the way stages 14/15 do. Free-running mode (`ARG0` = 1,
+  vsync-driven rather than `SCENE_COMMIT`-driven) answers `UNSUPPORTED` —
+  staged after the above is fixed, in
   [project/gap_filling_plan.md](../project/gap_filling_plan.md).
 - Scene-node and transform opcodes, **$20-$24 and $30-$36**, are **live**:
   a node created with `CREATE_OBJECT`/`CREATE_CAMERA` persists in a 256-node
