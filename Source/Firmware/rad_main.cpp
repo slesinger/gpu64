@@ -30,7 +30,7 @@
 #define FORCE_RESET_VECTORS
 
 #include "rad_main.h"
-#include "gpu64_font8x8.h"
+#include "gpu64_c64font.h"
 #include "build_id.h"
 #include "dirscan.h"
 #include "c64screen.h"
@@ -265,12 +265,17 @@ u32 temperature;
 // grey, grey, light grey, white -- so it needs no palette of its own and
 // cannot disturb a program's.
 //
-// The glyphs are gpu64_font8x8.h scaled up by GPU64_LOGO_SCALE, outlined by
-// smearing the same mask one scaled pixel in all eight directions first. That
-// is a lot cheaper than carrying a second, larger font, and at 4x the 8x8 VGA
-// face reads as deliberately blocky rather than as a stretched terminal font.
+// The glyphs are the C64's own character ROM (gpu64_c64font.h) scaled up by
+// GPU64_LOGO_SCALE, outlined by smearing the same mask one scaled pixel in
+// all eight directions first. That is a lot cheaper than carrying a second,
+// larger font, and at 4x the Commodore face reads as deliberately blocky
+// rather than as a stretched terminal font -- and it is the same face the
+// machine on the other end of the cartridge port draws with, which is the
+// point.
 #define GPU64_LOGO_TEXT		"HONDANI"
 #define GPU64_LOGO_SCALE	4
+// One character cell of the ROM font.
+#define GPU64_LOGO_GLYPH_H	8
 
 // Sat at the vertical centre until 2026-08-23; now anchored to the bottom of
 // the frame, this far above it. The wordmark plus its rule is treated as one
@@ -280,9 +285,12 @@ u32 temperature;
 
 static void gpu64DrawLogoGlyph( u8 *p, unsigned nPitch, int x0, int y0, char c, u8 nInk, boolean bGradient )
 {
-	const u8 *pGlyph = gpu64Font8x8[ (u8)c ];
+	// Charset 0 -- uppercase/graphics, the set a C64 boots into, and the one
+	// whose capitals are the wordmark's.
+	const u8 *pGlyph =
+		gpu64C64Font[ GPU64_CHARSET_UPPER ][ gpu64_c64ScreenCode( c, GPU64_CHARSET_UPPER ) ];
 
-	for ( unsigned gy = 0; gy < GPU64_FONT8X8_HEIGHT; gy++ )
+	for ( unsigned gy = 0; gy < GPU64_LOGO_GLYPH_H; gy++ )
 	{
 		u8 bits = pGlyph[ gy ];
 		if ( bits == 0 )
@@ -345,7 +353,7 @@ void CRAD::showTestPattern( void )
 	// Block height is the glyphs, the gap to the rule, and the rule's two
 	// lines -- the same terms the rule's own y is built from below, so the
 	// two stay in step.
-	int nBlockH = GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE + GPU64_LOGO_SCALE * 2 + 2;
+	int nBlockH = GPU64_LOGO_GLYPH_H * GPU64_LOGO_SCALE + GPU64_LOGO_SCALE * 2 + 2;
 	int y0 = (int)GPU64_FB_HEIGHT - nBlockH - GPU64_LOGO_BOTTOM;
 
 	// Outline first, face second: eight offset copies in dark grey, then the
@@ -370,7 +378,7 @@ void CRAD::showTestPattern( void )
 		}
 
 	// A grey rule under the wordmark, the width of the wordmark itself.
-	int ruleY = y0 + GPU64_FONT8X8_HEIGHT * GPU64_LOGO_SCALE + GPU64_LOGO_SCALE * 2;
+	int ruleY = y0 + GPU64_LOGO_GLYPH_H * GPU64_LOGO_SCALE + GPU64_LOGO_SCALE * 2;
 	if ( ruleY >= 0 && ruleY + 1 < (int)GPU64_FB_HEIGHT )
 		for ( int x = x0; x < x0 + (int)nChars * nGlyphW; x++ )
 			if ( x >= 0 && x < (int)GPU64_FB_WIDTH )

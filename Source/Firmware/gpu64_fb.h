@@ -54,12 +54,39 @@
 // Log overlay geometry. This used to use Circle's CCharGenerator, whose only
 // face is 8x16 -- 40 columns by 12 rows on a 200-pixel-tall surface, which
 // made the log unreadable on a real display: boot messages wrapped, and 12
-// lines of scrollback is nothing. gpu64_font8x8.h carries the same Linux
-// console font family at half the height, so the same text now gets 25 rows.
+// lines of scrollback is nothing. The C64 character ROM (gpu64_c64font.h) is
+// 8x8, so the same text now gets 25 rows -- and the log is drawn in the same
+// face as the boot wordmark and the 80x50 text mode.
 #define GPU64_LOG_CHAR_W	8
 #define GPU64_LOG_CHAR_H	8
 #define GPU64_LOG_COLS		( GPU64_FB_WIDTH / GPU64_LOG_CHAR_W )	// 40
 #define GPU64_LOG_ROWS		( GPU64_FB_HEIGHT / GPU64_LOG_CHAR_H )	// 25
+
+// --- 80x50 text mode ----------------------------------------------------
+// A second, separate display geometry: 80 columns by 50 rows of the C64's
+// own 8x8 glyphs, i.e. a 640x400 surface. It cannot be a window onto the
+// 320x200 graphics surface -- it is four times the area -- so entering it
+// re-programs the VideoCore for a different framebuffer, and leaving it
+// re-programs it back. The two modes are mutually exclusive and share
+// nothing but the palette; see CGpu64FrameBuffer::SetMode().
+//
+// The border keeps the same *proportion* it has in graphics mode (exactly
+// double, 64x72 against 32x36), so the picture the display shows is framed
+// the same way in both and switching modes does not appear to change the
+// size of the screen.
+#define GPU64_MODE_GRAPHICS	0
+#define GPU64_MODE_TEXT		1
+
+#define GPU64_TXT_COLS		80
+#define GPU64_TXT_ROWS		50
+#define GPU64_TXT_CHAR_W	8
+#define GPU64_TXT_CHAR_H	8
+#define GPU64_TXT_WIDTH		( GPU64_TXT_COLS * GPU64_TXT_CHAR_W )	// 640
+#define GPU64_TXT_HEIGHT	( GPU64_TXT_ROWS * GPU64_TXT_CHAR_H )	// 400
+#define GPU64_TXT_BORDER_W	64
+#define GPU64_TXT_BORDER_H	72
+#define GPU64_TXT_TOTAL_W	( GPU64_TXT_WIDTH + 2 * GPU64_TXT_BORDER_W )	// 768
+#define GPU64_TXT_TOTAL_H	( GPU64_TXT_HEIGHT + 2 * GPU64_TXT_BORDER_H )	// 544
 
 class CGpu64FrameBuffer
 {
@@ -111,6 +138,24 @@ public:
 	// is specified as an error, not a clip, when it runs off the page).
 	void ReadRect( u8 *pDst, unsigned x, unsigned y, unsigned w, unsigned h );
 
+	// --- display mode ---------------------------------------------------
+	// GPU64_MODE_GRAPHICS (320x200, paged, everything above) or
+	// GPU64_MODE_TEXT (640x400, single page, gpu64_text.cpp draws into it).
+	// Switching re-initialises the VideoCore framebuffer, which reallocates
+	// it: every cached PageBuffer()/GetPitch() value is stale afterwards, so
+	// nothing may hold one across a call to this. Returns FALSE if the new
+	// mode could not be programmed, in which case the old one is still up.
+	u8 GetMode( void ) const		{ return m_nMode; }
+	boolean SetMode( u8 nMode );
+
+	// Top-left of the 640x400 text surface, border excluded -- 0 unless the
+	// display is in text mode. Text mode has one page and no flip: the
+	// scanout address never moves, so a cell can be repainted in place.
+	u8 *TextSurface( void );
+	unsigned GetTextPitch( void ) const	{ return m_nTextPitch; }
+	// Pushes text-surface rows out to DRAM, as CleanRows() does for a page.
+	void CleanTextRows( unsigned y0, unsigned y1 );
+
 	// --- border ---------------------------------------------------------
 	// Paints the frame around the drawing surface on *both* pages: the
 	// border is a property of the display, not of the page being animated,
@@ -144,11 +189,28 @@ public:
 private:
 	void DrawLogOverlay( unsigned nPage );
 	void LogChar( char c );
+	// Programs the VideoCore for whichever of the two framebuffers is
+	// named, re-reads its base address and pitch, and repaints the border.
+	boolean ActivateGraphics( void );
+	boolean ActivateText( void );
+	void PaintTextBorder( void );
 
 	CBcmFrameBuffer	*m_pFB;
 	u8		*m_pBuffer;
 	unsigned	m_nPitch;
 	boolean		m_bInitialized;
+
+	// The text-mode display. A second CBcmFrameBuffer rather than a
+	// reshaped first one: the graphics object's geometry, pitch and page
+	// stride are what every hardware-verified class 1/2 path is written
+	// against, and mode switching must not perturb them. Created on the
+	// first switch into text mode and kept afterwards -- the object is a
+	// few hundred bytes of tag block, and the VideoCore's own buffer is
+	// reallocated on each Initialize() either way.
+	CBcmFrameBuffer	*m_pFBText;
+	u8		*m_pTextBuffer;
+	unsigned	m_nTextPitch;
+	u8		m_nMode;
 
 	u8		m_nDrawPage;
 	u8		m_nVisiblePage;

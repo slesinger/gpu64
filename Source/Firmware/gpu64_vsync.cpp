@@ -82,6 +82,7 @@ void gpu64_vsyncResetState( void )
 {
 	gpu64Vsync.armed         = 0;
 	gpu64Vsync.flipPending   = 0;
+	gpu64Vsync.commitDue     = 0;
 	gpu64Vsync.irqRequest    = 0;
 	gpu64Vsync.irqReleaseReq = 0;
 	// irqAsserted is deliberately left alone: it describes the state of a

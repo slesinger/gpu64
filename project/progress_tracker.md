@@ -3190,7 +3190,7 @@ comment at [rad_reu.cpp:643](../Source/Firmware/rad_reu.cpp#L643) had
 already written this failure down as a prediction; nobody had checked
 whether its remedy was reachable from class 0.
 
-**Fix** ([gpu64_api.cpp:1109](../Source/Firmware/gpu64_api.cpp#L1109)):
+**Fix** ([gpu64_api.cpp:1328](../Source/Firmware/gpu64_api.cpp#L1328)):
 call `gpu64_apiWarmPollingLoop()` at the tail of `gpu64_apiDispatch()`,
 guarded on `sCmdHi == 0 && gpu64Vsync.flipPending`. Guarded so ordinary
 class-0 traffic keeps the hold length it has always had — the added cost
@@ -3290,23 +3290,54 @@ like. `GET_HEALTH` now also reports the two flip counters (blob bytes
 sag, did either mailbox wait expire, and was the Pi still answering at the
 end of each rung.
 
+#### Closed: the derail was the async DMA hold (2026-09-06)
+
+`VERDICT PASS`, twice, on separate boots -- the ladder's first clean
+completion in the campaign. The full evidence chain is in
+[hw_testing.md](hw_testing.md), "The async hold was the killer, and FLIS is
+what proved it"; the short version:
+
+**Power was not it.** Runs H-N ran `ss = 00` at 41-50 C and derailed anyway.
+Run F's `ss = 05` was real but incidental.
+
+**Neither mailbox wait was it.** `dd = pp = cc = 00` in every run. The
+unbounded `MAILBOX1_STATUS & FULL` spin and the 50 ms drain timeout were real
+defects, are now bounded, and never fired.
+
+**A new `FLIS` rung found it in one run.** `FLIW` only *reads* a register
+inside the armed window and survived 300 armed windows; `FLIS` *writes*
+registers there without dispatching, and died after 114 and 72. Same
+dispatch, same deferred flip, same hold. So `PAGE_FLIP` is acquitted and
+writes inside the armed window are the poison.
+
+**Mechanism.** `gpu64_vsyncCommitFlip()` was one of only two DMA holds opened
+from the *top* of a loop pass, before the loop had sampled the current cycle.
+Asserting `DMA_OUT` halts the 6510 through RDY, which stops it only on
+**read** cycles; a write completes regardless, with AEC already tri-stating
+the address bus, so it lands at a floating address. That is run L's `BRK` at
+`$0001` and runs M/N's `ACC = ATT - 1` (the same corruption caught on a `jsr`
+return-address push).
+
+**Fix** ([rad_reu.cpp:1215](../Source/Firmware/rad_reu.cpp#L1215)). Gating on
+the sampled R/W does not work -- the C64's multiplexed bus only shows R/W in
+the PHI2-high half, too late to halt that cycle, and cycle N says nothing
+about N+1. Instead the frame boundary now only *arms* the commit
+(`gpu64Vsync.commitDue`) and a gate just before `noREUAccess:` fires it after
+the loop has serviced an IO2 access -- because **an IO2 access is always the
+last cycle of its instruction**, so the next cycle is provably a read. This is
+the same guarantee the CMD_LO dispatch hold has relied on since milestone 4.
+
 ### Open
 
-- **The rail sagged: fix the supply and re-run.** Runs F and G, 2026-09-06,
-  the first with a readable `HEALTH` row. Run F's read `ss = 05` --
-  `GET_THROTTLED >> 16` bit 0 (under-voltage **has occurred**) plus bit 2
-  (throttling has occurred), at 37.5 C, so not thermal. Two consecutive
-  `FLIP` completions with `ss = 00` on a better supply would close the
-  derail; anything less leaves power as the live explanation. See
-  [hw_testing.md](hw_testing.md), "The rail sagged, and the ladder completed
-  once".
-- **Run F completed the whole ladder** -- `FLIP` at its full 6000-iteration
-  budget and `REND` after it, the first time either has happened. Run G, a
-  separate boot minutes later, died at `FLIP` iteration 160 with `TRAP 01
-  5D57`. Identical firmware. That variance is not one deterministic bug.
-- **Neither mailbox wait was the mechanism.** `dd = pp = cc = 00` in both
-  runs: the unbounded `MAILBOX1_STATUS & FULL` spin and the 50 ms drain
-  timeout were real defects, now bounded, and neither ever fired.
+- **`gpu64_mirrorSnapshot()` is still an async hold**, firing 4x/s with
+  exactly the defect above. The IO2 gate cannot be reused: the mirror runs
+  only when `!gpu64ApiActive`, at a BASIC prompt that touches IO2 never. It
+  has never been implicated -- BASIC's idle loop is nearly all reads -- but it
+  wants its own answer.
+- **A read-modify-write on a gpu64 register** (`inc $DF0D`) breaks the new
+  gate's guarantee, reading in cycle 4 and writing in 5 and 6. Documented as
+  an API constraint rather than fixed; the dispatch hold has always carried
+  the same exposure.
 - **`REND` loses 98% of its SEQs.** 2938 SEQ/SEQACK mismatches in 3000
   dispatches in 1.27 s, while 84% of the same dispatches answered `OK`,
   against 1-in-6000 for `FLIP` and 0-in-20000 for `NOP`. Not class 1
@@ -3316,7 +3347,7 @@ end of each rung.
   decode-window boundary (`$22`/`$23` are inside `addr >=
   GPU64_REG_CMD_HI`). Unexplained; wants a rung of its own.
 - **The class-0 re-warm did not fix it** and is still in the tree
-  ([gpu64_api.cpp:1109](../Source/Firmware/gpu64_api.cpp#L1109)). Decide
+  ([gpu64_api.cpp:1328](../Source/Firmware/gpu64_api.cpp#L1328)). Decide
   whether to keep it once the cause is known.
 - **Core 1 absent for a whole run**, bus clean (arm B run 1). Unexplained,
   and possibly independent.
@@ -3337,3 +3368,148 @@ came from one boot with menu re-launches, so runs 2 and 3 inherited
 had derailed mid-loop — the same class as the sticky `gpu64ApiActive` bug.
 Read a report in this order: PHASE, ALIVE, FRAME's two numbers, MISSED,
 then the per-check error rows.
+
+## 17. The C64 character ROM, and the 80x50 text mode (2026-09-06)
+
+Two requests that turned out to be one: put the Commodore 64's own face on
+the HDMI screen everywhere text appears, and give gpu64 the 80x50 character
+mode the two-display model has always implied.
+
+### The font
+
+`gpu64_c64font.h/.cpp` carries the character ROM as
+`gpu64C64Font[2][256][8]` -- both halves, 256 glyphs of eight rows, MSB
+leftmost, exactly the bytes the VIC-II fetches. Alongside it,
+`gpu64C64AsciiToScreen[2][128]` and the inline `gpu64_c64ScreenCode()` map
+an ASCII byte to a screen code per charset, returning `$20` for anything
+`>= $80`, so callers never have to know the table.
+
+The **ASCII mapping is not symmetric between the halves**, and everything
+downstream has to allow for it:
+
+- Charset **1** (lower/upper) puts `'a'-'z'` at `$01-$1A` and `'A'-'Z'` at
+  `$41-$5A`, the identity mapping.
+- Charset **0** (upper/graphics) folds *both* cases onto `$01-$1A`, because
+  `$41-$5A` are graphics glyphs there.
+
+So codes `$01-$1A` are letters in **both** halves, and `$41-$5A` are letters
+in one and graphics in the other. That is the C64's own SHIFT+C= behaviour,
+not an approximation of it, and it is why the text80 demo writes its prose
+in lower case: only then does the screen stay legible when the charset is
+swapped underneath it.
+
+It replaced `gpu64_font8x8.h` at all three sites at once -- the boot
+wordmark in `rad_main.cpp`, the on-screen log in `gpu64_fb.cpp`, and the new
+text mode -- so all HDMI text is now one face. `GPU64_FONT8X8_HEIGHT` went
+with it; `showTestPattern()` had two uses left, now `GPU64_LOGO_GLYPH_H`.
+
+### The mode
+
+`GPU64_MODE_TEXT` is **a second display geometry, not a window**: 80x50
+cells of 8x8 glyphs is a 640x400 surface, four times the graphics area, so
+`CGpu64FrameBuffer::SetMode()` re-initialises the VideoCore framebuffer
+rather than re-pointing at the old one. The border is 64x72, exactly double
+the graphics border's 32x36, so the picture stays framed the same way and a
+mode change does not appear to resize the screen.
+
+Reallocating the framebuffer is the constraint that shapes the rest:
+
+- **Nothing may hold a cached `PageBuffer()` or pitch across a mode
+  switch.** In graphics mode `PageBase()` is the single choke point every
+  draw primitive goes through, and in text mode it returns 0 -- so the 2D
+  ops neutralise themselves without a per-opcode test.
+- `TEXT_MODE` ($50) is a **Stage 15b observation point**, and the strongest
+  one in the API: a class 1 render still queued for core 1 would be drawing
+  into memory the VideoCore has handed back, so it drains first. A pending
+  deferred `PAGE_FLIP` is armed for a page that is about to stop existing,
+  so the switch answers `BUSY` rather than racing it.
+- `PAGE_FLIP` returns `UNSUPPORTED` in text mode -- one page, fixed scanout
+  address, nothing to flip to -- and **classes 1 and 2 are refused in front
+  of the dispatch**, once, rather than letting a scene render into a null
+  pointer and report `OK`.
+- `GET_INFO` answers for the *live* mode: 640x400, pages = 1, border 64x72.
+  `pages = 1` is how a program discovers `PAGE_FLIP` is unavailable without
+  trying it.
+
+### The model is the C64's
+
+Three parallel 4000-byte planes -- screen codes, foreground, background --
+indexed row-major, cell `row * 80 + col`, and screen code bit 7 is reverse
+video exactly as at `$0400`. What the C64 does not have, and this does, is a
+per-cell *background* colour and all 256 palette entries in both colour
+planes.
+
+Rendering is immediate and per cell. There is no flip, so a cell is
+repainted where it stands, and every plane op repaints exactly the cells it
+changed -- `TEXT_PUT` touches 64 pixels, not a screen.
+
+**The plane ops work with the graphics display still up.** They always
+update the planes and only repaint when text mode is live, so a program can
+compose a whole screen and have it appear complete at the `TEXT_MODE 1` that
+follows. `RESET_STATE` resets the planes too, and repaints only if text mode
+happens to be the live one.
+
+Opcodes: `TEXT_MODE` $50, `TEXT_CLEAR` $51, `TEXT_PUT` $52, `TEXT_WRITE`
+$53, `TEXT_UPLOAD` $54, `TEXT_CHARSET` $55, `TEXT_SCROLL` $56, `TEXT_FILL`
+$57, `TEXT_REFRESH` $58. Full argument layouts in
+[docs/class0-2d-reference.md](../docs/class0-2d-reference.md).
+
+`TEXT_UPLOAD` is the one that matters for cost: it copies straight into one
+plane and leaves the other two alone, so a whole plane is one command
+instead of 4000 dispatches. Its bounds check is in `doText()` rather than in
+`gpu64_textUpload()`, deliberately -- a caller who gets the arithmetic wrong
+is told `OUT_OF_RANGE` rather than left with a partial upload it does not
+know about.
+
+### Text mode is sticky, and that is a trap
+
+A program that leaves text mode up hands the next one a display its drawing
+commands cannot reach: every 2D op returns `OK` and draws nowhere, and every
+class 1/2 command returns `UNSUPPORTED`. `dmInit` in `gpu64_demo_rt.inc`
+therefore issues an unconditional `TEXT_MODE 0`, which costs one dispatch
+and no mailbox round trip when the mode is already graphics. Every demo's
+`.prg` changed by ten bytes as a result.
+
+### The demo
+
+`Source/Demos/gpu64_demo_text80.a`. One screen that exercises eight of the
+nine opcodes: a `TEXT_FILL` title bar, an 80-column ruler that makes the
+width a fact rather than a claim, all 256 screen codes as sixteen
+`TEXT_UPLOAD`s of sixteen bytes, the sixteen palette colours as bars of
+reverse-video spaces, a reverse-video line built as screen codes by hand to
+show what `TEXT_WRITE`'s ASCII flag does for you everywhere else, a
+per-frame marquee, a hex frame counter and a `TEXT_PUT` blinking cursor.
+`TEXT_SCROLL` and `TEXT_REFRESH` are the two it does not use --
+`TEXT_SCROLL` moves the whole screen, which would take the static panels
+with it.
+
+Two things the PPM caught that reading would not have:
+
+- **The colour bars need an alternating backdrop.** On a panel of one
+  colour, whichever bar matched it is an invisible gap that reads as a
+  missing colour -- white on white in the first version. The panel rows now
+  alternate black and white, so both extremes are framed.
+- The charset swap every 128 frames is the demo's own regression test for
+  the asymmetric mapping above: at charset 0 the prose reads as capitals and
+  the one deliberately-capitalised line turns into graphics glyphs, which is
+  the correct C64 behaviour and looks like a bug until you know that.
+
+It deliberately leaves text mode up on exit so the screen can be
+photographed; the next gpu64 program's `dmInit` puts graphics back.
+
+### Verified
+
+Host only so far. `tools/prgsim` grew the mode: `gpu64font.py` carries the
+same two tables, `gpu64model.py` implements $50-$58 argument-for-argument
+against `doText()`, and `runsim.py` renders the 768x544 text display.
+`tools/demos.sh text80` is green at 400 frames and at 60 frames with
+`--no-vblank`; `Source/Demos/out/text80.ppm` is the expected HDMI output.
+Not yet on the bench.
+
+### Open
+
+- **Nothing is hardware-verified.** The mode switch reallocates the
+  VideoCore framebuffer twice per run, which no other gpu64 code path does,
+  and the host simulator cannot exercise that at all.
+- The conformance suite does not cover text mode; `gpu64_testkit.inc` has no
+  `TXT_*` equates yet.

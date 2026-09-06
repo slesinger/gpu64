@@ -16,8 +16,24 @@ the on-screen log overlay, cache behaviour, and anything about timing beyond
 import math
 import struct
 
+import gpu64font
+
 FB_W, FB_H, FB_PAGES = 320, 200, 3
 BORDER_W, BORDER_H = 32, 36
+
+# The 80x50 text mode (docs/class0-2d-reference.md, "Text mode"). A separate
+# display mode, not a layer: while it is up the paged 320x200 surface does not
+# exist, which is why the model refuses PAGE_FLIP and every non-zero class
+# while mode is MODE_TEXT.
+MODE_GRAPHICS, MODE_TEXT = 0, 1
+TXT_COLS, TXT_ROWS = 80, 50
+TXT_CHAR_W, TXT_CHAR_H = 8, 8
+TXT_W, TXT_H = TXT_COLS * TXT_CHAR_W, TXT_ROWS * TXT_CHAR_H
+TXT_BORDER_W, TXT_BORDER_H = 64, 72
+TXT_CELLS = TXT_COLS * TXT_ROWS
+TXT_PLANE_SCREEN, TXT_PLANE_FG, TXT_PLANE_BG = 0, 1, 2
+TXT_WRITE_ASCII = 0x01
+TXT_DEF_FG, TXT_DEF_BG = 14, 6
 
 # The palette a reset gpu64 comes up with (Source/Firmware/gpu64_fb.cpp):
 # entries 0-15 are the C64's own colours in the C64's own numbering, 16-254
@@ -227,6 +243,11 @@ class Gpu64Model:
         self.palette[255 * 3:256 * 3] = b'\xff\xff\xff'
         self.log_enabled = True
         self.api_active = False
+        self.mode = MODE_GRAPHICS
+        self.txt_screen = bytearray([0x20]) * TXT_CELLS
+        self.txt_fg = bytearray([TXT_DEF_FG]) * TXT_CELLS
+        self.txt_bg = bytearray([TXT_DEF_BG]) * TXT_CELLS
+        self.txt_charset = gpu64font.CHARSET_LOWER
         self.health_samples = 0
 
         # --- class 2 (raster) -----------------------------------------
@@ -490,6 +511,12 @@ class Gpu64Model:
             self.err = ERR_BAD_CLASS
             self.status |= ST_ERROR
             return
+        if self.cmd_hi != 0 and self.mode != MODE_GRAPHICS:
+            # Nothing outside class 0 has a page to draw into while text mode
+            # is up.
+            self.err = ERR_UNSUPPORTED
+            self.status |= ST_ERROR
+            return
         try:
             res = self.execute_r2(op) if self.cmd_hi == 2 else self.execute(op)
         except IndexError:
@@ -512,6 +539,7 @@ class Gpu64Model:
             self.vb_armed = False
             self.flip_pending = False
             self.draw_page = self.visible_page = self.pending_visible = 0
+            self.txt_reset()
             return ERR_OK
         if op == 0x02:                                  # VBLANK_ARM
             if a[0] > 1:
@@ -536,6 +564,8 @@ class Gpu64Model:
         if op == 0x05:                                  # PAGE_FLIP
             if a[0] > 1:
                 return ERR_BAD_ARGS
+            if self.mode != MODE_GRAPHICS:
+                return ERR_UNSUPPORTED
             if a[0] == 1:
                 if not self.calibrated:
                     return ERR_UNSUPPORTED
@@ -555,15 +585,18 @@ class Gpu64Model:
             info = bytearray(16)
             info[0:3] = b'G64'
             info[3], info[4] = 1, 0
-            info[5] = FB_W & 0xFF
-            info[6] = FB_W >> 8
-            info[7] = FB_H & 0xFF
-            info[8] = FB_H >> 8
+            text = self.mode == MODE_TEXT
+            w = TXT_W if text else FB_W
+            h = TXT_H if text else FB_H
+            info[5] = w & 0xFF
+            info[6] = w >> 8
+            info[7] = h & 0xFF
+            info[8] = h >> 8
             info[9] = 8
-            info[10] = FB_PAGES
+            info[10] = 1 if text else FB_PAGES
             info[11] = 0x01 | 0x04       # class 0 and class 2; class 1 is not modelled
-            info[12] = BORDER_W
-            info[13] = BORDER_H
+            info[12] = TXT_BORDER_W if text else BORDER_W
+            info[13] = TXT_BORDER_H if text else BORDER_H
             info[14] = self.frame_period_us & 0xFF
             info[15] = (self.frame_period_us >> 8) & 0xFF
             return self.blob_write(space, addr, info)
@@ -588,12 +621,35 @@ class Gpu64Model:
             space, addr, length = self.a_blob(0)
             if length < 12:
                 return ERR_BAD_ARGS
-            h = bytearray(12)
+            n = 36 if length >= 36 else (20 if length >= 20 else 12)
+            h = bytearray(n)
             self.health_samples += 1
             t = 452                                     # 45.2 C
             h[8], h[9] = t & 0xFF, t >> 8
             h[10], h[11] = t & 0xFF, t >> 8
+            if n >= 36:
+                # Bytes 20-35 are the hold-gap instrument
+                # (Source/Firmware/gpu64_holdgap.h). There is no bus and no
+                # ARM cycle counter here, so the model reports the same
+                # saturated "no sample that close" sentinel the firmware
+                # reports when nothing collided, a nominal armPerC64, and a
+                # real assert count. That is enough to desk-check that a
+                # program reads and renders the block correctly, which is
+                # all this opcode's model has ever claimed to do.
+                def w16(off, v):
+                    v = 0xFFFF if v > 0xFFFF else v
+                    h[off], h[off + 1] = v & 0xFF, v >> 8
+                w16(20, 0xFFFF)                         # minGap
+                w16(22, 0xFFFF)                         # minGapD2C
+                w16(24, 1200)                           # armPerC64, ~1.2 GHz
+                w16(26, 0)                              # bucket <1 cycle
+                w16(28, 0)                              # bucket <2
+                w16(30, 0)                              # bucket <4
+                w16(32, 0)                              # dispatch->commit close
+                w16(34, self.dispatches)                # every hold opened
             return self.blob_write(space, addr, h)
+        if 0x50 <= op < 0x60:                           # text mode
+            return self.text(op)
         if op == 0x10:                                  # CLEAR
             self.rect_fill(0, 0, FB_W, FB_H, a[0])
             return ERR_OK
@@ -681,6 +737,134 @@ class Gpu64Model:
         return ERR_BAD_OPCODE
 
     # --- matrix and vector -------------------------------------------------
+    # --- 80x50 text mode ------------------------------------------------
+    #
+    # Three parallel 4000-byte planes and nothing else: there is no pixel
+    # surface here, because the model only ever needs one at PPM time and
+    # rendering the planes then (runsim.py's write_ppm) keeps the glyph
+    # placement an independent derivation rather than a copy of the
+    # firmware's inner loop.
+
+    def txt_reset(self):
+        self.txt_screen = bytearray([0x20]) * TXT_CELLS
+        self.txt_fg = bytearray([TXT_DEF_FG]) * TXT_CELLS
+        self.txt_bg = bytearray([TXT_DEF_BG]) * TXT_CELLS
+        self.txt_charset = gpu64font.CHARSET_LOWER
+
+    def txt_put(self, col, row, code, fg, bg):
+        if col >= TXT_COLS or row >= TXT_ROWS:
+            return                                      # clipped, as SET_PIXEL is
+        i = row * TXT_COLS + col
+        self.txt_screen[i] = code
+        self.txt_fg[i] = fg
+        self.txt_bg[i] = bg
+
+    def text(self, op):
+        a = self.arg
+        if op == 0x50:                                  # TEXT_MODE
+            if a[0] > 1:
+                return ERR_BAD_ARGS
+            if a[0] == self.mode:
+                return ERR_OK
+            if self.flip_pending:
+                return ERR_BUSY
+            self.mode = a[0]
+            return ERR_OK
+        if op == 0x51:                                  # TEXT_CLEAR
+            self.txt_screen = bytearray([0x20]) * TXT_CELLS
+            self.txt_fg = bytearray([a[0]]) * TXT_CELLS
+            self.txt_bg = bytearray([a[1]]) * TXT_CELLS
+            return ERR_OK
+        if op == 0x52:                                  # TEXT_PUT
+            self.txt_put(a[0], a[1], a[2], a[3], a[4])
+            return ERR_OK
+        if op == 0x53:                                  # TEXT_WRITE
+            space, addr, length = self.a_blob(0)
+            if length == 0:
+                return ERR_OK
+            length = min(length, TXT_COLS)
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            col, row, fg, bg, flags = a[6], a[7], a[8], a[9], a[10]
+            if row >= TXT_ROWS or col >= TXT_COLS:
+                return ERR_OK
+            # Truncated at the right-hand edge, never wrapped.
+            for k in range(min(length, TXT_COLS - col)):
+                b = data[k]
+                if flags & TXT_WRITE_ASCII:
+                    b = gpu64font.screen_code(b, self.txt_charset)
+                self.txt_put(col + k, row, b, fg, bg)
+            return ERR_OK
+        if op == 0x54:                                  # TEXT_UPLOAD
+            space, addr, length = self.a_blob(0)
+            plane = a[6]
+            first = a[7] | (a[8] << 8)
+            if plane > TXT_PLANE_BG:
+                return ERR_BAD_ARGS
+            if length == 0:
+                return ERR_OK
+            if first >= TXT_CELLS or first + length > TXT_CELLS:
+                return ERR_OUT_OF_RANGE
+            res, data = self.blob_read(space, addr, length)
+            if res != ERR_OK:
+                return res
+            dst = (self.txt_screen, self.txt_fg, self.txt_bg)[plane]
+            dst[first:first + length] = data
+            return ERR_OK
+        if op == 0x55:                                  # TEXT_CHARSET
+            if a[0] > 1:
+                return ERR_BAD_ARGS
+            self.txt_charset = a[0]
+            return ERR_OK
+        if op == 0x56:                                  # TEXT_SCROLL
+            n = min(a[0], TXT_ROWS)
+            if n == 0:
+                return ERR_OK
+            moved = n * TXT_COLS
+            kept = TXT_CELLS - moved
+            for plane, fill in ((self.txt_screen, 0x20),
+                                (self.txt_fg, a[1]),
+                                (self.txt_bg, a[2])):
+                plane[0:kept] = plane[moved:TXT_CELLS]
+                plane[kept:TXT_CELLS] = bytearray([fill]) * moved
+            return ERR_OK
+        if op == 0x57:                                  # TEXT_FILL
+            col, row = s8(a[0]), s8(a[1])
+            w, h = a[2], a[3]
+            for y in range(row, row + h):
+                if y < 0 or y >= TXT_ROWS:
+                    continue
+                for x in range(col, col + w):
+                    if x < 0 or x >= TXT_COLS:
+                        continue
+                    self.txt_put(x, y, a[4], a[5], a[6])
+            return ERR_OK
+        if op == 0x58:                                  # TEXT_REFRESH
+            return ERR_OK
+        return ERR_BAD_OPCODE
+
+    def txt_surface(self):
+        """The text screen as an 8bpp TXT_W x TXT_H buffer of palette indices."""
+        buf = bytearray(TXT_W * TXT_H)
+        glyphs = gpu64font.FONT[self.txt_charset & 1]
+        for row in range(TXT_ROWS):
+            for col in range(TXT_COLS):
+                i = row * TXT_COLS + col
+                code = self.txt_screen[i]
+                fg, bg = self.txt_fg[i], self.txt_bg[i]
+                if code & 0x80:                         # reverse video
+                    fg, bg = bg, fg
+                    code &= 0x7F
+                g = glyphs[code]
+                base = row * TXT_CHAR_H * TXT_W + col * TXT_CHAR_W
+                for gy in range(TXT_CHAR_H):
+                    bits = g[gy]
+                    o = base + gy * TXT_W
+                    for gx in range(TXT_CHAR_W):
+                        buf[o + gx] = fg if bits & (0x80 >> gx) else bg
+        return buf
+
     def math(self, op):
         a = self.arg
         elem = 2 if (op & 0xF0) == 0x80 else 4

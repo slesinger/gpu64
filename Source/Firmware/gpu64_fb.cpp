@@ -3,7 +3,7 @@
  owns the display rather than sharing CScreenDevice's.
 */
 #include "gpu64_fb.h"
-#include "gpu64_font8x8.h"
+#include "gpu64_c64font.h"
 #include "gpu64_flip.h"
 #include <circle/synchronize.h>
 #include <circle/util.h>
@@ -50,6 +50,10 @@ CGpu64FrameBuffer::CGpu64FrameBuffer( void )
 	m_pBuffer( 0 ),
 	m_nPitch( 0 ),
 	m_bInitialized( FALSE ),
+	m_pFBText( 0 ),
+	m_pTextBuffer( 0 ),
+	m_nTextPitch( 0 ),
+	m_nMode( GPU64_MODE_GRAPHICS ),
 	m_nDrawPage( 0 ),
 	m_nVisiblePage( 0 ),
 	m_nPendingVisible( 0 ),
@@ -69,6 +73,8 @@ CGpu64FrameBuffer::~CGpu64FrameBuffer( void )
 {
 	delete m_pFB;
 	m_pFB = 0;
+	delete m_pFBText;
+	m_pFBText = 0;
 	g_pGpu64FB = 0;
 }
 
@@ -89,15 +95,7 @@ boolean CGpu64FrameBuffer::Initialize( void )
 		SetPaletteEntry( (u8)i, 0, 0, 0 );
 	SetPaletteEntry( GPU64_LOG_INK, 255, 255, 255 );
 
-	if ( !m_pFB->Initialize() )
-		return FALSE;
-
-	if ( m_pFB->GetDepth() != 8 )
-		return FALSE;
-
-	m_pBuffer = (u8 *)(uintptr)m_pFB->GetBuffer();
-	m_nPitch  = m_pFB->GetPitch();
-	if ( m_pBuffer == 0 || m_nPitch < GPU64_FB_TOTAL_W )
+	if ( !ActivateGraphics() )
 		return FALSE;
 
 	m_bInitialized = TRUE;
@@ -111,8 +109,6 @@ boolean CGpu64FrameBuffer::Initialize( void )
 		CleanPage( p );
 	}
 
-	m_pFB->SetVirtualOffset( 0, 0 );
-
 	// Not fatal if it fails: CommitFlip() just keeps using the blocking
 	// mailbox call the way milestone 4b shipped it.
 	gpu64_flipInit();
@@ -120,9 +116,168 @@ boolean CGpu64FrameBuffer::Initialize( void )
 	return TRUE;
 }
 
+// --- display mode -------------------------------------------------------
+
+boolean CGpu64FrameBuffer::ActivateGraphics( void )
+{
+	if ( m_pFB == 0 )
+		return FALSE;
+
+	// Circle's Initialize() re-sends the whole init tag block, allocation
+	// included, so calling it a second time is how the display is handed
+	// back to this geometry -- and why the base address and pitch have to be
+	// read again afterwards rather than trusted. Its tag block also carries
+	// SET_VIRTUAL_OFFSET 0,0, so the scanout comes back to page 0 on its
+	// own; ResetPages() below just makes this object agree.
+	gpu64_flipDrain();				// our mailbox reply, before Circle's
+
+	if ( !m_pFB->Initialize() )
+		return FALSE;
+	if ( m_pFB->GetDepth() != 8 )
+		return FALSE;
+
+	m_pBuffer = (u8 *)(uintptr)m_pFB->GetBuffer();
+	m_nPitch  = m_pFB->GetPitch();
+	if ( m_pBuffer == 0 || m_nPitch < GPU64_FB_TOTAL_W )
+		return FALSE;
+
+	return TRUE;
+}
+
+boolean CGpu64FrameBuffer::ActivateText( void )
+{
+	if ( m_pFBText == 0 )
+	{
+		// Single page: text mode renders each cell in place, so there is
+		// nothing to flip and no reason to pay for two more 768x544
+		// allocations. Virtual size equals physical for the same reason.
+		m_pFBText = new CBcmFrameBuffer( GPU64_TXT_TOTAL_W, GPU64_TXT_TOTAL_H, 8,
+						 GPU64_TXT_TOTAL_W, GPU64_TXT_TOTAL_H,
+						 0, FALSE );
+		if ( m_pFBText == 0 )
+			return FALSE;
+
+		for ( unsigned i = 0; i < 256; i++ )
+			m_pFBText->SetPalette32( (u8)i, PackRGB( m_Palette[ i * 3 + 0 ],
+								 m_Palette[ i * 3 + 1 ],
+								 m_Palette[ i * 3 + 2 ] ) );
+	}
+
+	gpu64_flipDrain();
+
+	if ( !m_pFBText->Initialize() )
+		return FALSE;
+	if ( m_pFBText->GetDepth() != 8 )
+		return FALSE;
+
+	m_pTextBuffer = (u8 *)(uintptr)m_pFBText->GetBuffer();
+	m_nTextPitch  = m_pFBText->GetPitch();
+	if ( m_pTextBuffer == 0 || m_nTextPitch < GPU64_TXT_TOTAL_W )
+		return FALSE;
+
+	return TRUE;
+}
+
+boolean CGpu64FrameBuffer::SetMode( u8 nMode )
+{
+	if ( !m_bInitialized || nMode > GPU64_MODE_TEXT )
+		return FALSE;
+	if ( nMode == m_nMode )
+		return TRUE;
+
+	if ( nMode == GPU64_MODE_TEXT )
+	{
+		if ( !ActivateText() )
+		{
+			// The VideoCore may already have been re-programmed; put the
+			// graphics display back rather than leaving no display at all.
+			ActivateGraphics();
+			return FALSE;
+		}
+
+		m_nMode = GPU64_MODE_TEXT;
+
+		// A fresh allocation's contents are undefined, and gpu64_text.cpp
+		// paints only the cells it is told about -- so the surface starts
+		// black and framed, the same courtesy Initialize() does for the
+		// graphics pages.
+		memset( m_pTextBuffer, 0, (size_t)GPU64_TXT_TOTAL_H * m_nTextPitch );
+		PaintTextBorder();
+		return TRUE;
+	}
+
+	if ( !ActivateGraphics() )
+		return FALSE;
+
+	m_nMode = GPU64_MODE_GRAPHICS;
+
+	// Same reasoning as the text side: the pages have just been reallocated,
+	// so their contents mean nothing. Repaint the border from the colour the
+	// display already had, put the paging state back to page 0 drawn and
+	// visible, and restore the log overlay if it is still on.
+	for ( unsigned n = 0; n < GPU64_FB_PAGES; n++ )
+	{
+		u8 *pBase = PageBase( n );
+		if ( pBase )
+			memset( pBase, 0, (size_t)GPU64_FB_TOTAL_H * m_nPitch );
+	}
+	m_nDrawPage = m_nVisiblePage = m_nPendingVisible = 0;
+	SetBorder( m_nBorder );
+	DrawLogOverlay( 0 );
+	CleanPage( 0 );
+	return TRUE;
+}
+
+u8 *CGpu64FrameBuffer::TextSurface( void )
+{
+	if ( !m_bInitialized || m_nMode != GPU64_MODE_TEXT || m_pTextBuffer == 0 )
+		return 0;
+	return m_pTextBuffer + (size_t)GPU64_TXT_BORDER_H * m_nTextPitch + GPU64_TXT_BORDER_W;
+}
+
+void CGpu64FrameBuffer::CleanTextRows( unsigned y0, unsigned y1 )
+{
+	if ( m_nMode != GPU64_MODE_TEXT || m_pTextBuffer == 0 )
+		return;
+	if ( y1 > GPU64_TXT_HEIGHT ) y1 = GPU64_TXT_HEIGHT;
+	if ( y0 >= y1 )
+		return;
+
+	u8 *p = m_pTextBuffer + (size_t)( GPU64_TXT_BORDER_H + y0 ) * m_nTextPitch;
+	CleanDataCacheRange( (u64)(uintptr)p, (size_t)( y1 - y0 ) * m_nTextPitch );
+}
+
+void CGpu64FrameBuffer::PaintTextBorder( void )
+{
+	if ( m_nMode != GPU64_MODE_TEXT || m_pTextBuffer == 0 )
+		return;
+
+	u8 *p = m_pTextBuffer;
+
+	memset( p, m_nBorder, (size_t)GPU64_TXT_BORDER_H * m_nTextPitch );
+	memset( p + (size_t)( GPU64_TXT_BORDER_H + GPU64_TXT_HEIGHT ) * m_nTextPitch,
+		m_nBorder, (size_t)GPU64_TXT_BORDER_H * m_nTextPitch );
+
+	u8 *pRow = p + (size_t)GPU64_TXT_BORDER_H * m_nTextPitch;
+	for ( unsigned y = 0; y < GPU64_TXT_HEIGHT; y++, pRow += m_nTextPitch )
+	{
+		memset( pRow, m_nBorder, GPU64_TXT_BORDER_W );
+		memset( pRow + GPU64_TXT_BORDER_W + GPU64_TXT_WIDTH, m_nBorder,
+			m_nTextPitch - GPU64_TXT_BORDER_W - GPU64_TXT_WIDTH );
+	}
+
+	CleanDataCacheRange( (u64)(uintptr)p, (size_t)GPU64_TXT_TOTAL_H * m_nTextPitch );
+}
+
 u8 *CGpu64FrameBuffer::PageBase( unsigned nPage )
 {
 	if ( !m_bInitialized || nPage >= GPU64_FB_PAGES )
+		return 0;
+	// In text mode m_pBuffer names an allocation the VideoCore has already
+	// replaced. Returning 0 here is what makes every drawing primitive,
+	// every clean and every flip below a no-op for the whole time the text
+	// display is up, without each of them having to test the mode.
+	if ( m_nMode != GPU64_MODE_GRAPHICS )
 		return 0;
 	return m_pBuffer + (size_t)nPage * GPU64_FB_TOTAL_H * m_nPitch;
 }
@@ -143,7 +298,11 @@ void CGpu64FrameBuffer::CleanRows( unsigned nPage, unsigned y0, unsigned y1 )
 	if ( y0 >= y1 )
 		return;
 
-	u8 *p = PageBase( nPage ) + (size_t)( GPU64_BORDER_H + y0 ) * m_nPitch;
+	u8 *pBase = PageBase( nPage );
+	if ( pBase == 0 )
+		return;
+
+	u8 *p = pBase + (size_t)( GPU64_BORDER_H + y0 ) * m_nPitch;
 	CleanDataCacheRange( (u64)(uintptr)p, (size_t)( y1 - y0 ) * m_nPitch );
 }
 
@@ -151,9 +310,12 @@ void CGpu64FrameBuffer::CleanPage( unsigned nPage )
 {
 	if ( !m_bInitialized || nPage >= GPU64_FB_PAGES )
 		return;
+	u8 *pBase = PageBase( nPage );
+	if ( pBase == 0 )
+		return;
 	// Whole physical page, border bands included -- this is also what
 	// SetBorder() relies on.
-	CleanDataCacheRange( (u64)(uintptr)PageBase( nPage ),
+	CleanDataCacheRange( (u64)(uintptr)pBase,
 			     (size_t)GPU64_FB_TOTAL_H * m_nPitch );
 }
 
@@ -163,6 +325,12 @@ void CGpu64FrameBuffer::SetBorder( u8 nColor )
 		return;
 
 	m_nBorder = nColor;
+
+	if ( m_nMode == GPU64_MODE_TEXT )
+	{
+		PaintTextBorder();
+		return;
+	}
 
 	for ( unsigned n = 0; n < GPU64_FB_PAGES; n++ )
 	{
@@ -245,6 +413,9 @@ boolean CGpu64FrameBuffer::CommitFlip( void )
 {
 	if ( !m_bInitialized )
 		return FALSE;
+	// Text mode has one page and a scanout address that must not move.
+	if ( m_nMode != GPU64_MODE_GRAPHICS )
+		return FALSE;
 
 	u32 nOffsetY = m_nPendingVisible * GPU64_FB_TOTAL_H;
 
@@ -285,12 +456,13 @@ boolean CGpu64FrameBuffer::WaitForVSync( void )
 	if ( !m_bInitialized )
 		return FALSE;
 	gpu64_flipDrain();				// as in ResetPages(): Circle's mailbox, not ours
-	return m_pFB->WaitForVerticalSync();
+	CBcmFrameBuffer *pActive = ( m_nMode == GPU64_MODE_TEXT ) ? m_pFBText : m_pFB;
+	return pActive != 0 && pActive->WaitForVerticalSync();
 }
 
 void CGpu64FrameBuffer::ResetPages( void )
 {
-	if ( !m_bInitialized )
+	if ( !m_bInitialized || m_nMode != GPU64_MODE_GRAPHICS )
 		return;
 	m_nDrawPage = m_nVisiblePage = m_nPendingVisible = 0;
 	// Circle's mailbox call below would otherwise swallow an in-flight
@@ -448,17 +620,22 @@ void CGpu64FrameBuffer::SetPaletteEntry( u8 nIndex, u8 r, u8 g, u8 b )
 	m_Palette[ nIndex * 3 + 1 ] = g;
 	m_Palette[ nIndex * 3 + 2 ] = b;
 
-	if ( m_pFB == 0 )
-		return;
-	m_pFB->SetPalette32( nIndex, PackRGB( r, g, b ) );
+	// Both display objects carry the same palette, so a mode switch never
+	// changes a colour: whichever one is programmed next already has it.
+	u32 nRGBA = PackRGB( r, g, b );
+	if ( m_pFB )
+		m_pFB->SetPalette32( nIndex, nRGBA );
+	if ( m_pFBText )
+		m_pFBText->SetPalette32( nIndex, nRGBA );
 }
 
 boolean CGpu64FrameBuffer::CommitPalette( void )
 {
-	if ( m_pFB == 0 )
+	CBcmFrameBuffer *pActive = ( m_nMode == GPU64_MODE_TEXT ) ? m_pFBText : m_pFB;
+	if ( pActive == 0 )
 		return FALSE;
 	gpu64_flipDrain();				// as in ResetPages(): Circle's mailbox, not ours
-	return m_pFB->UpdatePalette();
+	return pActive->UpdatePalette();
 }
 
 void CGpu64FrameBuffer::LogEnable( boolean bEnable )
@@ -567,7 +744,10 @@ void CGpu64FrameBuffer::DrawLogOverlay( unsigned nPage )
 			if ( c == ' ' || c == 0 )
 				continue;
 
-			const u8 *pGlyph = gpu64Font8x8[ (u8)c ];
+			// The C64's own glyphs, lowercase/uppercase set -- the log
+			// carries mixed-case text, which charset 0 cannot render.
+			const u8 *pGlyph =
+				gpu64C64Font[ GPU64_CHARSET_LOWER ][ gpu64_c64ScreenCode( c, GPU64_CHARSET_LOWER ) ];
 
 			for ( unsigned gy = 0; gy < GPU64_LOG_CHAR_H; gy++ )
 			{

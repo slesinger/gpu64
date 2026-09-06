@@ -233,6 +233,12 @@ N_FLIP0  = 2000			; measured 2000 in 0x32 jiffies = 0.83 s on the
 				; (gpu64_flipPost), so this rung is cheap.
 N_FLIW   = 300			; paced by the frame clock at 60/s, so ~5 s --
 				; six times the exposure at which FLIP dies
+N_FLIS   = 20000		; stores are cheap, so this is sized by wall clock
+				; rather than by count: ~6 s, i.e. ~400 armed
+				; windows, well past the 74 that killed FLIP
+N_FLIN   = 6000			; the same exposure as FLIP, and the same shape:
+				; one arming flip per ~37 dispatches, so ~160
+				; armed windows with ~5800 NOPs inside them
 N_FLIP   = 6000			; ~1200 accepted flips, ~20 s
 N_REND   = 3000			; ~600 accepted commits, ~10 s -- the same
 				; exposure as gpu64_loop_test's 600 attempts
@@ -246,14 +252,18 @@ ROW_HEAD     = 4
 ROW_NOP      = 5
 ROW_FLI0     = 6
 ROW_FLIW     = 7
-ROW_FLIP     = 8
-ROW_REND     = 9
-ROW_FIRSTERR = 11
-ROW_PHASE    = 13
-ROW_ALIVE    = 14
-ROW_TRAP     = 16
-ROW_VERDICT  = 18
-ROW_CURSOR   = 20
+ROW_FLIS     = 8
+ROW_FLIN     = 9
+ROW_FLIP     = 10
+ROW_REND     = 11
+ROW_GAP      = 12
+ROW_BKT      = 13
+ROW_FIRSTERR = 14
+ROW_PHASE    = 15
+ROW_ALIVE    = 16
+ROW_TRAP     = 18
+ROW_VERDICT  = 20
+ROW_CURSOR   = 22
 
 COL_VAL      = 7		; first count column; the rest are +5 apart
 COL_LBL      = 14		; value column for the label rows below
@@ -262,6 +272,8 @@ COL_LBL      = 14		; value column for the label rows below
 PH_NOP     = $0e		; N
 PH_FLI0    = $09		; I
 PH_FLIW    = $17		; W
+PH_FLIS    = $13		; S -- "stores only"
+PH_FLIN    = $01		; A -- "armed window"
 PH_FLIP    = $06		; F
 PH_REND    = $12		; R
 PH_VERDICT = $16		; V
@@ -352,20 +364,53 @@ start
 	lda abortFlag
 	bne allDone
 
-	; Rung 4 -- plus the dispatch traffic inside the armed window.
-	lda #PH_FLIP
+	; Rung 4 -- register WRITES inside the armed window, with no dispatch
+	; and therefore no DMA hold. SEQ, CMD_HI and ARG0 all go through
+	; gpu64_apiWriteReg() as plain stores; only a CMD_LO write dispatches.
+	; So this is FLIN's traffic on the bus with FLIN's hold removed, which
+	; is the one-bit split between "the write collides with the armed
+	; commit" and "the dispatch hold is required".
+	lda #PH_FLIS
 	jsr phase
 	lda #3
+	sta curPhase
+	jsr runFlis
+
+	lda abortFlag
+	bne allDone
+
+	; Rung 5 -- dispatch traffic inside the armed window, but neither a
+	; PAGE_FLIP nor a BUSY refusal: the flip is armed once, and then NOPs
+	; are hammered until the commit clears it. Same armed windows as FLIP,
+	; same dispatch rate, same DMA hold -- the only things removed are the
+	; flip opcode and the refusal path.
+	;
+	; This bisects the one ingredient FLIP still owns. It runs BEFORE FLIP
+	; deliberately: FLIP is what kills the machine, so a FLIN placed after
+	; it would never execute on exactly the runs its answer is needed for.
+	lda #PH_FLIN
+	jsr phase
+	lda #4
+	sta curPhase
+	jsr runFlin
+
+	lda abortFlag
+	bne allDone
+
+	; Rung 6 -- the same windows, now with the refused PAGE_FLIPs back.
+	lda #PH_FLIP
+	jsr phase
+	lda #5
 	sta curPhase
 	jsr runFlip
 
 	lda abortFlag
 	bne allDone
 
-	; Rung 5 -- plus core 1 rendering a frame.
+	; Rung 7 -- plus core 1 rendering a frame.
 	lda #PH_REND
 	jsr phase
-	lda #4
+	lda #6
 	sta curPhase
 	jsr runRend
 
@@ -575,6 +620,99 @@ fliwPoll
 	sta phaseDone
 fliwClear
 	rts
+
+; Rung 4. Same STATUS gate and same shape as FLIN, but inside the window
+; it issues stores instead of commands. ACC is tautological on those
+; iterations -- nothing can fail a write that is never acknowledged -- so
+; what this rung reports is exposure and, above all, whether the C64 is
+; still alive at the end of it. The arming flips are tallied for real.
+runFlis
+	lda #<N_FLIS
+	sta budLo
+	lda #>N_FLIS
+	sta budHi
+	lda #0
+	sta allowBusy
+	jsr beginPhase
+flisLoop
+	lda #$60
+	jsr setStage
+	lda STATUS
+	and #$01			; GPU64_STATUS_BUSY
+	bne flisStore
+	; No flip in flight: arm one. This is the only dispatch in the rung,
+	; and it happens with the window closed -- exactly as FLIW's do.
+	lda #1				; 1 = defer to the vblank boundary
+	sta ARG+0
+	lda #OP_PAGE_FLIP
+	jsr cmdSeq0
+	jsr tally
+	jmp flisNext
+flisStore
+	; A flip IS in flight. Write every register a command write touches
+	; except the one that triggers the dispatch.
+	jsr storeOnly
+	lda #0
+	jsr tally
+flisNext
+	lda #$61
+	jsr setStage
+	jsr endIter
+	lda phaseDone
+	beq flisLoop
+	jmp finishPhase
+
+; cmd0's writes with the dispatch trigger removed: CMD_LO is never
+; touched, so reuUsingPolling() samples and stores these and never takes
+; the bus (gpu64_apiWriteReg() in gpu64_api.h).
+storeOnly
+	jsr nextSeq
+	ldx #0
+	stx CMD_HI
+	lda #1
+	sta ARG+0
+	rts
+
+; Rung 5. STATUS is read to decide which opcode to send, so that the
+; arming flip is only ever sent when no flip is in flight -- which is why
+; allowBusy is 0 here: with that gate there is no legitimate BUSY, and any
+; refusal at all is the interface failing. The extra STATUS read per
+; iteration is not a new risk: FLIW already polls that register in a tight
+; loop, 300 times a rung, without ever derailing.
+runFlin
+	lda #<N_FLIN
+	sta budLo
+	lda #>N_FLIN
+	sta budHi
+	lda #0
+	sta allowBusy
+	jsr beginPhase
+flinLoop
+	lda #$50
+	jsr setStage
+	lda STATUS
+	and #$01			; GPU64_STATUS_BUSY
+	bne flinNop
+	; No flip in flight: arm one, and open a new window.
+	lda #1				; 1 = defer to the vblank boundary
+	sta ARG+0
+	lda #OP_PAGE_FLIP
+	jsr cmdSeq0
+	jmp flinTally
+flinNop
+	; A flip IS in flight, so this dispatch lands inside the armed window --
+	; the thing under test. NOP takes the identical class 0 path and the
+	; identical DMA hold, and cannot answer BUSY.
+	lda #OP_NOP
+	jsr cmdSeq0
+flinTally
+	jsr tally
+	lda #$51
+	jsr setStage
+	jsr endIter
+	lda phaseDone
+	beq flinLoop
+	jmp finishPhase
 
 runFlip
 	lda #<N_FLIP
@@ -1074,13 +1212,29 @@ vSetupLoop
 	cmp accTbl+5
 	bne vFail
 
+	; FLIS and FLIN: the STATUS gate means the arming flip is never sent
+	; into a busy interface and neither a NOP nor a store can be refused,
+	; so both are held to the same ACC == ATT standard as NOP and FLIW.
+	lda attTbl+6
+	cmp accTbl+6
+	bne vFail
+	lda attTbl+7
+	cmp accTbl+7
+	bne vFail
+	lda attTbl+8
+	cmp accTbl+8
+	bne vFail
+	lda attTbl+9
+	cmp accTbl+9
+	bne vFail
+
 	; FLIP and REND: BUSY is legal, so only "nothing was ever accepted"
 	; is a failure -- that is a rung that measured nothing.
-	lda accTbl+6
-	ora accTbl+7
+	lda accTbl+10
+	ora accTbl+11
 	beq vFail
-	lda accTbl+8
-	ora accTbl+9
+	lda accTbl+12
+	ora accTbl+13
 	beq vFail
 
 	lda #<txtPass
@@ -1118,6 +1272,14 @@ showLabels
 	ldy #>txtFliw
 	ldx #ROW_FLIW
 	jsr printAt
+	lda #<txtFlis
+	ldy #>txtFlis
+	ldx #ROW_FLIS
+	jsr printAt
+	lda #<txtFlin
+	ldy #>txtFlin
+	ldx #ROW_FLIN
+	jsr printAt
 	lda #<txtFlip
 	ldy #>txtFlip
 	ldx #ROW_FLIP
@@ -1141,6 +1303,14 @@ showLabels
 	lda #<txtHealth
 	ldy #>txtHealth
 	ldx #ROW_HEALTH
+	jsr printAt
+	lda #<txtGap
+	ldy #>txtGap
+	ldx #ROW_GAP
+	jsr printAt
+	lda #<txtBkt
+	ldy #>txtBkt
+	ldx #ROW_BKT
 	jmp printAt
 
 showSetup
@@ -1158,7 +1328,19 @@ suLoop
 	rts
 
 ; The current phase's row, from the live counters.
+; DUR is recomputed here rather than read from what finishPhase left
+; behind. BENCH 2026-09-06: FLIN aborted mid-rung, never reached
+; finishPhase, and its row printed FLIW's 012C -- which read as a real
+; measurement and was not one. A rung that dies now reports the time it
+; actually ran.
 showPhaseRow
+	jsr readJiffy
+	sec
+	sbc durStart
+	sta dur
+	txa
+	sbc durStart+1
+	sta dur+1
 	clc
 	lda curPhase
 	adc #ROW_NOP
@@ -1292,6 +1474,31 @@ rowDone
 ;          dd  flip drains that timed out inside the DMA hold
 ;          pp  flip posts abandoned with MAILBOX1 still full
 ;          cc  flips that fell back to Circle's blocking call
+;
+; Bytes 20-35 were added 2026-09-06 and are the hold-gap instrument
+; (Source/Firmware/gpu64_holdgap.h): how close in time two DMA holds get.
+; They print on two further rows, because this is the reading the run
+; exists to take and it has to survive being photographed.
+;
+;   GAP    mmmm dddd cccc llll
+;          mmmm  smallest release->assert gap seen, ARM cycles, any pair
+;          dddd  the same for the one pair that matters: a *dispatch*
+;                releasing the bus and then the loop-fired *commit*
+;                taking it straight back
+;          cccc  ARM cycles per C64 cycle, measured not assumed --
+;                expect ~04B0. Every other figure divides by this
+;          llll  dispatch->commit asserts closer than 4 C64 cycles
+;
+;   BKT    0000 1111 2222 aaaa
+;          0000  asserts whose gap was under 1 C64 cycle
+;          1111  under 2
+;          2222  under 4
+;          aaaa  every hold opened, the denominator
+;
+; FFFF in mmmm or dddd means saturated, i.e. no sample that close: 65535
+; ARM cycles is ~54 C64 cycles, so anything that saturates is by
+; definition not a collision. FFFF in dddd with a live llll is
+; impossible and would mean the instrument is wrong.
 ; ----------------------------------------------------------------------
 
 doHealth
@@ -1303,7 +1510,7 @@ doHealth
 	sta ARG+2
 	lda #0
 	sta ARG+3
-	lda #20
+	lda #36
 	sta ARG+4
 	lda #0
 	sta ARG+5
@@ -1326,6 +1533,54 @@ hhLoop
 	inx
 	cpx #7
 	bne hhLoop
+
+showGap
+	lda #ROW_GAP
+	jsr rowAddr
+	lda #COL_VAL
+	sta hCol
+	ldx #0
+sgLoop
+	lda gapIdx,x
+	jsr hPut16
+	inx
+	cpx #4
+	bne sgLoop
+
+	lda #ROW_BKT
+	jsr rowAddr
+	lda #COL_VAL
+	sta hCol
+	ldx #0
+sbLoop
+	lda bktIdx,x
+	jsr hPut16
+	inx
+	cpx #4
+	bne sbLoop
+	rts
+
+; A = offset of a little-endian 16-bit field in healthBuf. Prints it
+; big-endian at hCol, then steps hCol on by five -- one wider than hPut,
+; because these are four digits and they need the gap to stay readable in
+; a photograph.
+hPut16
+	sta gapTmp
+	ldy gapTmp
+	iny
+	lda healthBuf,y		; high byte first, so it reads as a number
+	ldy hCol
+	jsr putHex
+	inc hCol
+	inc hCol
+	ldy gapTmp
+	lda healthBuf,y		; then the low byte
+	ldy hCol
+	jsr putHex
+	clc
+	lda hCol
+	adc #3
+	sta hCol
 	rts
 
 ; A = byte; prints it at hCol on the row DST already points at, then
@@ -1384,6 +1639,10 @@ txtFli0		.text "FLI0"
 		.byte 0
 txtFliw		.text "FLIW"
 		.byte 0
+txtFlis		.text "FLIS"
+		.byte 0
+txtFlin		.text "FLIN"
+		.byte 0
 txtFlip		.text "FLIP"
 		.byte 0
 txtRend		.text "REND"
@@ -1395,6 +1654,10 @@ txtPhase	.text "PHASE"
 txtAlive	.text "ALIVE           STAGE"
 		.byte 0
 txtHealth	.text "HEALTH"
+		.byte 0
+txtGap		.text "GAP"
+		.byte 0
+txtBkt		.text "BKT"
 		.byte 0
 txtTrap		.text "TRAP"
 		.byte 0
@@ -1429,8 +1692,8 @@ missed		.word 0
 dur		.word 0
 durStart	.word 0
 
-attTbl		.fill 10, 0
-accTbl		.fill 10, 0
+attTbl		.fill 14, 0
+accTbl		.fill 14, 0
 
 seqCounter	.byte 1
 firstErr	.byte 0
@@ -1449,9 +1712,12 @@ trapKind	.byte 0
 trapPC		.word 0
 
 healthIdx	.byte 0, 6, 8, 9, 12, 14, 16
+gapIdx		.byte 20, 22, 24, 32
+bktIdx		.byte 26, 28, 30, 34
+gapTmp		.byte 0
 hCol		.byte 0
 healthErr	.byte 0
-healthBuf	.fill 20, 0
+healthBuf	.fill 36, 0
 oldBrk		.word 0
 oldNmi		.word 0
 nmiZp		.fill 5, 0

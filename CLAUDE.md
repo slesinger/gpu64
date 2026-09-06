@@ -70,6 +70,18 @@ build or in code reading.
    are the two worked examples.
 6. **Work added ahead of the bus sampling is exposed**, and how much depends on
    which mode it runs in. Judge loop additions by that, not by their cost.
+7. **Only open a DMA hold immediately after a sampled IO2 access.** Asserting
+   `bDMA_OUT` halts the 6510 through RDY, which stops it only on **read**
+   cycles; a write completes regardless, with AEC already tri-stating the
+   address bus, so it lands at a floating address and corrupts the C64. An
+   IO2 access is always the *last* cycle of its instruction, so the next
+   cycle is provably an opcode fetch — that is the guarantee every safe hold
+   in the tree rests on. You cannot substitute a read/write test on the
+   sampled `g2`: the C64's multiplexed bus only shows R/W in the PHI2-high
+   half, too late to halt that cycle, and cycle N tells you nothing about
+   N+1. This killed the C64 for the whole Stage 16 campaign; the exceptions
+   are a read-modify-write on a gpu64 register, and `gpu64_mirrorSnapshot()`,
+   which is still an unfixed async hold.
 
 Also: **RAD's low-level macros do not parenthesise their arguments.** Never
 pass an expression containing `?:`, `+` or `%`.

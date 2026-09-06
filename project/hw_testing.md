@@ -935,3 +935,95 @@ so it is not a boundary miss.
 That leaves either a detector that misreads class 1, or class-1
 `SCENE_COMMIT` traffic hitting the bus defect some 400000x harder than class 0.
 Unexplained either way, and worth a rung of its own.
+
+### The async hold was the killer, and FLIS is what proved it (2026-09-06, runs H-N and the fix)
+
+Runs H-N ran the `gpu64_probe_latch` ladder on a corrected supply. `ss = 00`
+throughout, 41-50 C, no throttling, both bounded mailbox waits still at zero.
+**Power is exonerated.** The derail continued regardless.
+
+| run | reached | outcome |
+|---|---|---|
+| F | `FLIP` 1770 (full budget) | completed, `ss = 05` |
+| G-K | `FLIP` 00A0 .. 0B60 | derailed |
+| L | `FLIN` 0280, MISS 0000, `TRAP 01 0003` | derailed before `FLIP` |
+| M | `FLIS` ATT 1340, ACC 133F, MISS 0000, **DUR 0072** | froze, `STAGE 60` |
+| N | `FLIS` ATT 0AC0, ACC 0ABF, MISS 0000, **DUR 0048** | froze, `STAGE 60` |
+
+Two instrument fixes made those last two rows readable. `DUR` is now
+recomputed in `showPhaseRow` instead of being read back from what
+`finishPhase` left behind -- run L had aborted mid-rung, never reached
+`finishPhase`, and printed the *previous* rung's `DUR` as if it were a
+measurement. And the new `FLIS` rung isolates the one variable nothing else
+had.
+
+#### The discriminator
+
+Both rungs arm one deferred `PAGE_FLIP` per frame and then do work inside the
+armed window. They differ in one thing:
+
+- **`FLIW`** spins on `lda $DF0D / and #$01` inside the window -- **reads
+  only**. It survived 300 armed windows across four runs, every time.
+- **`FLIS`** writes `$DF22`/`$DF0B`/`$DF11` inside the window and never
+  `CMD_LO`, so it dispatches nothing and takes no hold -- **writes**. It died
+  after 114 and 72 armed windows (`DUR` in jiffies is the window count).
+
+Same dispatch, same deferred flip, same hold, same everything else. The
+arming dispatch is therefore **not** the killer and `PAGE_FLIP` is acquitted.
+Writes inside the armed window are the poison.
+
+#### The mechanism
+
+`gpu64_vsyncCommitFlip()` and `gpu64_mirrorSnapshot()` were the only two DMA
+holds in the system opened from the *top* of a loop pass, before the loop had
+sampled anything about the current cycle. Every other hold -- the CMD_LO
+dispatch, RAD's own `$DF01` transfer -- is opened only *after* the loop
+sampled a C64 access.
+
+That difference is the bug. Asserting `DMA_OUT` halts the 6510 through RDY,
+which stops it only on **read** cycles; a write cycle completes regardless,
+and AEC has already tri-stated the address bus. A write in flight when the
+hold opens therefore lands at a floating address. That is the wiped stack and
+the `BRK` at `$0001` in run L, and it explains `ACC = ATT - 1` in runs M and N
+as the same corruption caught on a `jsr tally` return-address push, in a
+place survivable enough to keep counting.
+
+A read-cycle gate on the sampled `g2` does **not** fix this. The C64's bus is
+multiplexed: the 6510 only drives R/W during the PHI2-high half, by which time
+it is too late to halt that cycle, so the assert always lands on cycle N+1 and
+`sta abs` is three reads followed by a write. Cycle N tells you nothing about
+cycle N+1.
+
+#### The fix
+
+Use the program-structure guarantee the dispatch hold has relied on since
+milestone 4 instead. **An IO2 access is always the last cycle of its
+instruction** -- `lda abs`, `sta abs`, `sta (zp),y` all spend their final
+cycle on the operand access -- so the cycle after any sampled `$DFxx` access
+is an opcode fetch, and if an interrupt is pending the sequence's two dummy
+reads come before its three pushes. A read either way.
+
+So the frame boundary now only *arms* the commit (`gpu64Vsync.commitDue`) and
+a new gate just before `noREUAccess:` in `reuUsingPolling()` fires it once the
+loop has serviced an IO2 access.
+
+**Result: `VERDICT PASS`, twice, on separate boots** -- the whole ladder,
+`NOP` through `REND`, first clean completion in the campaign. `FLIS` went from
+dying in ~100 armed windows to running its full budget.
+
+#### Residual, documented rather than fixed
+
+- **A read-modify-write on a gpu64 register** (`inc $DF0D`) reads in its
+  fourth cycle and writes in its fifth and sixth, breaking the guarantee. The
+  CMD_LO dispatch hold has carried the same exposure since milestone 4. The
+  registers are a command port, not a counter.
+- **`gpu64_mirrorSnapshot()` is still an async hold** with exactly this
+  defect, firing 4x/s. The IO2 gate cannot be applied to it: the mirror runs
+  only when `!gpu64ApiActive`, i.e. at a BASIC prompt that touches IO2 never,
+  so gating it there would stop it updating at all. It has always been this
+  way and has never been implicated -- BASIC's idle loop is nearly all reads
+  -- but it is the same latent bug and wants its own answer.
+- **A deferred `PAGE_FLIP` now lands on the program's next `$DFxx` access**
+  rather than exactly at the boundary. Every handshake-mode program polls
+  STATUS while BUSY is set, so in practice that is the next instruction;
+  `gpu64Vsync.commitLateMax` records the worst case seen.

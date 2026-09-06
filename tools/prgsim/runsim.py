@@ -286,22 +286,35 @@ class Machine:
 
 
 def write_ppm(path, gpu, page=None):
-    """The visible page as the display would show it, border included."""
-    w = gpu64model.FB_W + 2 * gpu64model.BORDER_W
-    h = gpu64model.FB_H + 2 * gpu64model.BORDER_H
+    """The visible surface as the display would show it, border included.
+
+    Mode-aware: in text mode there is no page and no page geometry, so the
+    picture comes from the character planes at 640x400 inside a 64x72 border
+    -- exactly twice the graphics border, so the framing looks the same on
+    the same display.
+    """
+    if gpu.mode == gpu64model.MODE_TEXT:
+        fw, fh = gpu64model.TXT_W, gpu64model.TXT_H
+        bw, bh = gpu64model.TXT_BORDER_W, gpu64model.TXT_BORDER_H
+        surface = gpu.txt_surface()
+    else:
+        fw, fh = gpu64model.FB_W, gpu64model.FB_H
+        bw, bh = gpu64model.BORDER_W, gpu64model.BORDER_H
+        surface = gpu.pages[gpu.visible_page if page is None else page]
+
+    w, h = fw + 2 * bw, fh + 2 * bh
     pal = gpu.palette
-    page = gpu.pages[gpu.visible_page if page is None else page]
     border = bytes(pal[gpu.border * 3:gpu.border * 3 + 3])
-    rows = [border * w] * gpu64model.BORDER_H
-    for y in range(gpu64model.FB_H):
-        line = bytearray(border * gpu64model.BORDER_W)
-        base = y * gpu64model.FB_W
-        for x in range(gpu64model.FB_W):
-            c = page[base + x] * 3
+    rows = [border * w] * bh
+    for y in range(fh):
+        line = bytearray(border * bw)
+        base = y * fw
+        for x in range(fw):
+            c = surface[base + x] * 3
             line += pal[c:c + 3]
-        line += border * gpu64model.BORDER_W
+        line += border * bw
         rows.append(bytes(line))
-    rows += [border * w] * gpu64model.BORDER_H
+    rows += [border * w] * bh
     with open(path, 'wb') as f:
         f.write(b'P6\n%d %d\n255\n' % (w, h))
         f.write(b''.join(rows))

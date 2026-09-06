@@ -56,6 +56,13 @@ struct GPU64VSYNC
 	u8	armed;		// vblank IRQ armed (mirrors STATUS bit3)
 	u8	flipPending;	// a deferred PAGE_FLIP is waiting for the boundary
 
+	// The frame boundary has arrived and the flip is owed, but the commit
+	// has not been allowed to take the bus yet. See gpu64_vsyncCommitFlip()
+	// in rad_reu.cpp for why the commit waits for a sampled IO2 access.
+	u8	commitDue;
+	u32	commitDueFrame;	// frameCount when commitDue was raised
+	u32	commitLateMax;	// worst frames-late a commit has ever run
+
 	// IRQ handshake, deliberately shaped like REU's own irqTriggered /
 	// irqRelease pair in rad_reu.h: the API sets a request, and the loop --
 	// the only code allowed to touch bIRQ_OUT -- acts on it.
@@ -69,7 +76,8 @@ extern GPU64VSYNC gpu64Vsync;
 
 // --- provided by rad_reu.cpp (they need the DMA macros and REU state) ---
 // Commits a pending deferred PAGE_FLIP inside a bounded DMA hold. Called
-// only from the bus-watch loop.
+// only from the bus-watch loop, and only from its sampled-IO2 gate -- never
+// straight off the frame boundary. See the gate's comment in rad_reu.cpp.
 void gpu64_vsyncCommitFlip( void );
 // Preloads the above into the instruction cache. Called from the PAGE_FLIP
 // dispatch, which already holds the bus.

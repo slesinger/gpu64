@@ -18,7 +18,7 @@ opcode below can return.
 | $02 | `VBLANK_ARM` | none | Arms the vblank IRQ line. May halt up to a frame if a vblank is due imminently — see [vblank-and-animation.md](vblank-and-animation.md). |
 | $03 | `VBLANK_ACK` | none | Releases the armed IRQ line. Must follow every `VBLANK_ARM` that fired. |
 | $04 | `SET_DRAW_PAGE` | 1: page index | Selects which framebuffer page subsequent draw opcodes write to. `OUT_OF_RANGE` past `GPU64_FB_PAGES` (see the info block). |
-| $05 | `PAGE_FLIP` | 1: 0 = now, 1 = at next vblank | Makes the draw page visible and hands you a fresh page to draw into. With `ARG0 = 0` the swap is immediate. With `ARG0 = 1` it lands at the next vblank, `STATUS` bit0 (busy) stays set until it does, and a second deferred flip while one is pending returns `BUSY` and changes nothing. **Either way the draw page moves as soon as the command returns** — see [vblank-and-animation.md](vblank-and-animation.md). `UNSUPPORTED` for `ARG0 = 1` if the boot-time frame period measurement failed. |
+| $05 | `PAGE_FLIP` | 1: 0 = now, 1 = at next vblank | Makes the draw page visible and hands you a fresh page to draw into. With `ARG0 = 0` the swap is immediate. With `ARG0 = 1` it lands at the next vblank, `STATUS` bit0 (busy) stays set until it does, and a second deferred flip while one is pending returns `BUSY` and changes nothing. **Either way the draw page moves as soon as the command returns** — see [vblank-and-animation.md](vblank-and-animation.md). `UNSUPPORTED` for `ARG0 = 1` if the boot-time frame period measurement failed, and `UNSUPPORTED` in either form while text mode is up (there is only one page there). |
 | $06 | `GET_INFO` | 0-5: dest descriptor | Writes the 16-byte info block (below) to the given destination. |
 | $07 | `LOG_ENABLE` | 1: 0/1 | Turns firmware-side debug logging on or off. Has no effect on drawing. |
 | $08 | `SET_BORDER` | 1: colour | Sets the HDMI border colour. Overridden automatically by the sticky under-voltage indicator — see the health block below. |
@@ -56,6 +56,56 @@ opcode below can return.
 | $41 | `BLIT_KEYED` | as `BLIT`, +1: key colour | As `BLIT`, but pixels equal to the key colour are skipped — source stays transparent there. |
 | $42 | `READ_RECT` | source x,y,w,h + 0-5 dest descriptor | Copies a rectangle *out of* the draw page into C64 RAM or REU. Pairs with `BLIT`/`BLIT_KEYED` for a save-under-sprite/restore idiom. |
 
+## Text mode — $50–$5F
+
+A second display **mode**, not a layer over the graphics one. `TEXT_MODE 1`
+re-programs the display to 640×400 and turns it into 80 columns by 50 rows
+of 8×8 glyphs taken from the Commodore 64's own character ROM; `TEXT_MODE 0`
+puts the 320×200 paged framebuffer back. Only one of the two exists at a
+time:
+
+- While text mode is up there is no framebuffer page. Every drawing opcode
+  above still returns `OK`, but writes nowhere, `PAGE_FLIP` returns
+  `UNSUPPORTED`, and **every class 1 and class 2 command returns
+  `UNSUPPORTED`** before it runs.
+- `GET_INFO` answers for the live mode: in text mode it reports 640×400,
+  `GPU64_FB_PAGES` = 1, and a 64×72 border. Reading `pages = 1` is how a
+  program learns `PAGE_FLIP` is unavailable without trying it.
+- `SET_BORDER`, `GET_HEALTH`, `VBLANK_ARM`/`ACK`/`SYNC` and the matrix ops
+  all work normally.
+
+The model is the C64's: three parallel 4000-byte planes — **screen codes**,
+**foreground colour**, **background colour** — indexed row-major, so cell
+`row * 80 + col`. Screen code **bit 7 is reverse video**, exactly as at
+`$0400`. What the C64 does not have, and this does, is a per-cell
+*background* colour, with all 256 palette entries available in both colour
+planes.
+
+| Op | Name | ARG bytes | Does |
+|---|---|---|---|
+| $50 | `TEXT_MODE` | 1: 0 = graphics, 1 = text | Switches the display and repaints from the planes. Asking for the mode you are already in returns `OK` and costs nothing. `BAD_ARGS` above 1; `BUSY` if a deferred `PAGE_FLIP` is still pending; `UNSUPPORTED` if the display could not be re-programmed. Drains any queued class 1 render first — this is a Stage 15b observation point. |
+| $51 | `TEXT_CLEAR` | 1: fg, 1: bg | All 4000 cells to a space in those two colours. |
+| $52 | `TEXT_PUT` | col, row, code, fg, bg | One cell. Off-grid is clipped, not an error — the same contract `SET_PIXEL` has. |
+| $53 | `TEXT_WRITE` | 0-5: source descriptor, 6: col, 7: row, 8: fg, 9: bg, 10: flags | One line of text. `len` is clamped to 80 and the line is truncated at the right-hand edge, never wrapped. A `row`/`col` off the grid draws nothing and is not an error. Flags bit 0 = the payload is ASCII and gets translated to screen codes for the character set currently up; clear it to pass screen codes straight through, which is the only way to reach the graphics half of the ROM or to set bit 7. |
+| $54 | `TEXT_UPLOAD` | 0-5: source descriptor, 6: plane, 7-8: first cell (u16) | Copies `len` bytes into one plane starting at cell `first`, leaving the other two planes alone. Plane 0 = screen codes, 1 = foreground, 2 = background. `BAD_ARGS` for a plane above 2; `OUT_OF_RANGE` if `first ≥ 4000` or `first + len > 4000` — checked before anything is written, so a caller that gets the arithmetic wrong is told rather than left with a partial upload. This is the cheap way to paint: a whole plane is one command. |
+| $55 | `TEXT_CHARSET` | 1: 0 or 1 | Picks the half of the character ROM the whole screen is drawn with: 0 = upper case and graphics, 1 = lower case and upper case. Repaints; the planes do not change. `BAD_ARGS` above 1. |
+| $56 | `TEXT_SCROLL` | 1: rows, 2: fg, bg | Scrolls the **whole screen** up by `rows`, filling the rows that appear at the bottom with spaces in the given colours. |
+| $57 | `TEXT_FILL` | col (s8), row (s8), w, h, code, fg, bg | A rectangle of cells, all three planes. `col` and `row` are signed, so a rectangle may start off the left or top edge; the result is clipped. |
+| $58 | `TEXT_REFRESH` | none | Repaints all 50 rows from the planes. Only needed after something outside the API has disturbed the display. |
+
+`$59`–`$5F` are undefined and return `BAD_OPCODE`.
+
+**The plane commands work with the graphics screen still up.** They update
+the planes either way and only repaint when text mode is the live mode, so a
+program can compose an entire text screen and have it appear complete at the
+`TEXT_MODE 1` that follows. `RESET_STATE` ($01) resets the planes too — every
+cell a space, light blue on blue, charset 1.
+
+**Text mode is sticky across programs.** A program that leaves it up hands
+the next one a display its drawing commands cannot reach. The demo runtime's
+`dmInit` issues an unconditional `TEXT_MODE 0` for exactly this reason, and
+anything else that starts by assuming a framebuffer should do the same.
+
 ## Info block
 
 Written by `GET_INFO` ($06), 16 bytes:
@@ -64,12 +114,12 @@ Written by `GET_INFO` ($06), 16 bytes:
 |---|---|---|
 | 0 | 4 | `"$G64$"` magic (4 ASCII bytes) |
 | 4 | 1 | API version |
-| 5 | 2 | Framebuffer width |
-| 7 | 2 | Framebuffer height |
+| 5 | 2 | Framebuffer width (640 in text mode) |
+| 7 | 2 | Framebuffer height (400 in text mode) |
 | 9 | 1 | Bits per pixel |
-| 10 | 1 | `GPU64_FB_PAGES` — number of framebuffer pages available for `SET_DRAW_PAGE` |
+| 10 | 1 | `GPU64_FB_PAGES` — number of framebuffer pages available for `SET_DRAW_PAGE`; 1 in text mode, where `PAGE_FLIP` is `UNSUPPORTED` |
 | 11 | 1 | Implemented-classes bitmap (bit N set = class N is compiled into this build) |
-| 12 | 2 | Border width, height |
+| 12 | 2 | Border width, height (64×72 in text mode) |
 | 14 | 2 | Frame period, in the same units `VBLANK_SYNC` extrapolates from; 0 if the boot-time measurement failed |
 
 ## Health block

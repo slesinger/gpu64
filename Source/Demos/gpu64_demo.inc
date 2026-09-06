@@ -80,6 +80,22 @@ OP_BLIT		= $40
 OP_BLIT_KEYED	= $41
 OP_READ_RECT	= $42
 
+; --- class 0 text mode -- $50-$5F --------------------------------------
+; The 80x50 character screen. It is a DISPLAY MODE, not a drawing op: while
+; it is up the framebuffer commands above have nothing to draw into, a page
+; flip answers UNSUPPORTED, and so does every class 1 and class 2 command.
+; TEXT_MODE 0 goes back to graphics, and costs nothing if you are already
+; there -- which is why dmInit issues it.
+OP_TEXT_MODE	= $50
+OP_TEXT_CLEAR	= $51
+OP_TEXT_PUT	= $52
+OP_TEXT_WRITE	= $53
+OP_TEXT_UPLOAD	= $54
+OP_TEXT_CHARSET	= $55
+OP_TEXT_SCROLL	= $56
+OP_TEXT_FILL	= $57
+OP_TEXT_REFRESH	= $58
+
 ; Fixed point 8.8 ($8x) and IEEE float32 ($9x) are the same operations on
 ; different element formats, so they share a low nibble.
 OP_MAT_MUL	= $80
@@ -194,6 +210,28 @@ ERR_BAD_ID	= $0a		; class 2: a texture id of 0, past 255, or dead
 ; --- geometry and spaces -----------------------------------------------
 FB_W		= 320
 FB_H		= 200
+
+; The text screen: 80 columns by 50 rows of 8x8 ROM glyphs, 640x400 pixels.
+; A cell is addressed as row * TXT_COLS + col wherever a plane is uploaded.
+TXT_COLS	= 80
+TXT_ROWS	= 50
+TXT_CELLS	= TXT_COLS * TXT_ROWS
+
+; The three parallel planes, one byte per cell, which TEXT_UPLOAD writes.
+TXT_PLANE_SCREEN = 0
+TXT_PLANE_FG	 = 1
+TXT_PLANE_BG	 = 2
+
+; TEXT_WRITE flags: take the bytes as ASCII and translate them, rather than
+; as screen codes that are already what the ROM is indexed by.
+TXT_ASCII	= $01
+
+; Screen code bit 7 is reverse video, exactly as it is at $0400.
+TXT_REVERSE	= $80
+
+; The two halves of the character ROM, as the C64 itself numbers them.
+TXT_SET_UPPER	= 0		; upper case and graphics -- the boot set
+TXT_SET_LOWER	= 1		; lower case and upper case
 SPACE_C64	= 0
 SPACE_REU	= 1
 
@@ -278,6 +316,69 @@ argcd	.macro	off, space, addr
 	sta ARG+\off+3
 	.endm
 
+
+
+; ----------------------------------------------------------------------
+; Text mode staging.
+;
+; Unlike the class 2 record macros below, these FIRE the command as well as
+; staging it: a text screen is built out of whole commands, not out of
+; records. None of them is legal until TEXT_MODE has been accepted -- but
+; they are all safe to issue with the graphics screen still on the display,
+; because the planes are updated either way and appear the moment the mode
+; changes. That is how a program composes a screen before showing it.
+; ----------------------------------------------------------------------
+
+; One cell. Off-grid col/row is clipped, not an error -- SET_PIXEL's
+; contract, for the same reason: a moving cursor should not need edge cases.
+txtput	.macro	col, row, code, fg, bg
+	#argb 0, \col
+	#argb 1, \row
+	#argb 2, \code
+	#argb 3, \fg
+	#argb 4, \bg
+	#cmd OP_TEXT_PUT
+	.endm
+
+; A rectangle of cells, one code and one colour pair. col and row are
+; signed, w and h unsigned, and the rectangle clips exactly as RECT_FILL
+; does. Code $20 with the colours you want is how a panel gets painted.
+txtfill	.macro	col, row, w, h, code, fg, bg
+	#argb 0, \col
+	#argb 1, \row
+	#argb 2, \w
+	#argb 3, \h
+	#argb 4, \code
+	#argb 5, \fg
+	#argb 6, \bg
+	#cmd OP_TEXT_FILL
+	.endm
+
+; A string at col,row, from C64 RAM. The bytes are ASCII by default and
+; gpu64 translates them for whichever character set is up; clear \flags to
+; send screen codes instead. The line is truncated at the right-hand edge,
+; never wrapped, and at most one row (80 bytes) ever lands.
+txtw	.macro	col, row, addr, len, fg, bg, flags=TXT_ASCII
+	#argblob 0, SPACE_C64, \addr, \len
+	#argb 6, \col
+	#argb 7, \row
+	#argb 8, \fg
+	#argb 9, \bg
+	#argb 10, \flags
+	#cmd OP_TEXT_WRITE
+	.endm
+
+; A run of raw plane bytes starting at cell \first, which is row*80+col.
+; This is the bulk path -- screen codes, foregrounds or backgrounds
+; straight out of C64 RAM or the REU, with no per-cell dispatch. The run is
+; linear across the whole 4000-cell plane, so it wraps from the end of one
+; row into the start of the next.
+txtup	.macro	plane, first, addr, len, space=SPACE_C64
+	#argblob 0, \space, \addr, \len
+	#argb 6, \plane
+	#argw 7, \first
+	#cmd OP_TEXT_UPLOAD
+	.endm
 
 ; ----------------------------------------------------------------------
 ; Class 2 record staging.

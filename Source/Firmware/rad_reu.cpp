@@ -31,6 +31,7 @@
 #include "gpu64_api.h"
 #include "gpu64_vsync.h"
 #include "gpu64_ladder.h"
+#include "gpu64_holdgap.h"
 
 // gpu64: reaching CGpu64FrameBuffer::CommitFlip() from the bus-watch loop
 // without including gpu64_fb.h, which pulls in Circle's framebuffer and
@@ -75,6 +76,67 @@ bool reuRunning;
 
 static u64 armCycleCounter;
 
+// gpu64: the hold-gap instrument (gpu64_holdgap.h). One cache line, core 0
+// only. aligned(64) so it cannot share a line with anything else -- not
+// because another core writes it, but because both warm paths preload it as
+// a unit and a straddled struct would only be half-warmed.
+GPU64HOLDGAP gpu64HoldGap __attribute__( ( aligned( 64 ) ) );
+
+// Called immediately after CLR_GPIO( bDMA_OUT ), i.e. with the bus already
+// held, so this has no cycle budget to blow. stamp is armCycleCounter, which
+// the caller's RESTART_CYCLE_COUNTER anchored at the start of the VIC
+// half-cycle the assert happens in; both call sites are built the same way,
+// so whatever bias that carries is identical on the release side and cancels.
+__attribute__( ( always_inline ) ) inline void gpu64_holdGapAssert( u64 stamp, u8 kind )
+{
+	GPU64HOLDGAP *g = &gpu64HoldGap;
+	g->asserts++;
+
+	if ( g->lastKind == GPU64_HOLD_KIND_NONE )
+		return;
+
+	u64 d = stamp - g->lastRelease;
+	u32 gap = ( d > 0xfffffffful ) ? 0xfffffffful : (u32)d;
+
+	if ( gap < g->minGap )
+		g->minGap = gap;
+
+	u32 t = g->armPerC64;
+
+	if ( g->lastKind == GPU64_HOLD_KIND_DISPATCH && kind == GPU64_HOLD_KIND_COMMIT )
+	{
+		if ( gap < g->minGapD2C )
+			g->minGapD2C = gap;
+		if ( t && gap < t * GPU64_HOLDGAP_CLOSE_CYCLES )
+			g->d2cClose++;
+	}
+
+	// Bucket by whole C64 cycles. If armPerC64 never got measured everything
+	// lands in the overflow bucket, which is a readable "no data" rather than
+	// a divide by zero.
+	if ( t == 0 )
+	{
+		g->bucket[ GPU64_HOLDGAP_BUCKETS - 1 ]++;
+		return;
+	}
+
+	u32 b = 0;
+	while ( b < GPU64_HOLDGAP_BUCKETS - 1 && gap >= t )
+	{
+		t <<= 1;
+		b++;
+	}
+	g->bucket[ b ]++;
+}
+
+// Called immediately after SET_GPIO( bDMA_OUT ). Two stores to a line that
+// both warm paths keep resident; see the cost note in gpu64_holdgap.h.
+__attribute__( ( always_inline ) ) inline void gpu64_holdGapRelease( u64 stamp, u8 kind )
+{
+	gpu64HoldGap.lastRelease = stamp;
+	gpu64HoldGap.lastKind = kind;
+}
+
 static volatile u8 forceRead;
 
 #include "lowlevel_dma.h"
@@ -87,6 +149,13 @@ void resetREU()
 	// gpu64: the API register file resets with it -- a fresh REU session must
 	// not inherit a previous program's staged ARGs, sticky CMD_HI or error.
 	gpu64_apiReset();
+
+	// gpu64: and so does the hold-gap instrument, so a bench run's numbers
+	// are that run's and not a previous program's. armPerC64 is cleared here
+	// and re-measured by reuUsingPolling()'s start-up block below.
+	memset( &gpu64HoldGap, 0, sizeof( gpu64HoldGap ) );
+	gpu64HoldGap.minGap = 0xffffffff;
+	gpu64HoldGap.minGapD2C = 0xffffffff;
 
 	reu.irqRelease = 0;
 
@@ -376,10 +445,17 @@ void gpu64_mirrorSnapshot()
 	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground );
 }
 
-// gpu64: commits a vblank-deferred PAGE_FLIP, at the frame boundary the C64
-// asked for. Everything else a boundary does is inlined into the loop
-// (gpu64_vsyncAdvance(), gpu64_vsync.h) precisely so this is the only call
-// on the path -- and this one only happens when a flip is actually pending.
+// gpu64: commits a vblank-deferred PAGE_FLIP. Everything else a frame
+// boundary does is inlined into the loop (gpu64_vsyncAdvance(),
+// gpu64_vsync.h) precisely so this is the only call on the path -- and this
+// one only happens when a flip is actually pending.
+//
+// WHEN it is called matters as much as what it does. The frame boundary only
+// *arms* it (gpu64Vsync.commitDue); the loop fires it from the sampled-IO2
+// gate just before noREUAccess:, where the C64's next cycle is provably a
+// read. Taking the bus next to a C64 write cycle is what killed the C64 in
+// bench runs M and N -- the long comment at that gate has the reasoning and
+// the evidence.
 //
 // The commit is bracketed in a DMA hold, exactly like the command dispatch
 // and the mirror snapshot. SetVirtualOffset() is a mailbox round-trip to the
@@ -405,16 +481,19 @@ void gpu64_vsyncCommitFlip( void )
 	(void)g2;
 
 	// gpu64: WAIT_FOR_CPU_HALFCYCLE first, same reason as
-	// gpu64_mirrorSnapshot() above -- the loop calls us while it is already
-	// in a VIC half-cycle, so WAIT_FOR_VIC_HALFCYCLE alone is not a sync and
-	// the bus would be taken at whatever phase the vsync test finished on.
-	// This one fires on every deferred page flip, i.e. once a frame for the
-	// whole run, which is exactly the shape of damage that accumulates.
+	// gpu64_mirrorSnapshot() above -- WAIT_FOR_VIC_HALFCYCLE alone is not a
+	// sync and the bus would be taken at whatever phase the caller finished
+	// on. The gate now calls us from inside the CPU half-cycle (it has just
+	// sampled the bus), possibly late enough to have slipped past the
+	// falling edge, which is exactly the case the dispatch hold's own
+	// WAIT_FOR_CPU_HALFCYCLE covers. This fires once a frame for the whole
+	// run, which is exactly the shape of damage that accumulates.
 	WAIT_FOR_CPU_HALFCYCLE
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
 	CLR_GPIO( bDMA_OUT );
+	gpu64_holdGapAssert( armCycleCounter, GPU64_HOLD_KIND_COMMIT );
 
 	gpu64_commitFlip();
 
@@ -422,6 +501,7 @@ void gpu64_vsyncCommitFlip( void )
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 	SET_GPIO( bDMA_OUT );
+	gpu64_holdGapRelease( armCycleCounter, GPU64_HOLD_KIND_COMMIT );
 
 	gpu64Vsync.flipPending = 0;
 	gpu64Regs.status &= ~GPU64_STATUS_BUSY;
@@ -441,6 +521,12 @@ void gpu64_vsyncWarmCommit( void )
 	// gpu64: and the mailbox post the commit now ends in, which lives in
 	// another translation unit and is not covered by the preload above.
 	gpu64_flipWarm();
+
+	// gpu64: and the hold-gap instrument's single line, so the store the
+	// commit's release does cannot take a cold miss in the one window where
+	// the C64 is already free-running again (gpu64_holdgap.h, rule 4).
+	CACHE_PRELOAD_DATA_CACHE( &gpu64HoldGap, sizeof( gpu64HoldGap ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64HoldGap, sizeof( gpu64HoldGap ), sizeof( gpu64HoldGap ) * 8 );
 }
 
 // gpu64: forces every cache line of a buffer resident before a DMA burst
@@ -678,6 +764,8 @@ void gpu64_apiWarmPollingLoop( void )
 
 	CACHE_PRELOAD_DATA_CACHE( &gpu64Vsync, sizeof( GPU64VSYNC ), CACHE_PRELOADL1KEEP )
 	FORCE_READ_LINEAR32a( &gpu64Vsync, sizeof( GPU64VSYNC ), sizeof( GPU64VSYNC ) * 8 );
+	CACHE_PRELOAD_DATA_CACHE( &gpu64HoldGap, sizeof( gpu64HoldGap ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64HoldGap, sizeof( gpu64HoldGap ), sizeof( gpu64HoldGap ) * 8 );
 }
 
 // gpu64: this and the other four functions sharing the ".text.section_polling"
@@ -731,13 +819,28 @@ u8 reuUsingPolling( int step )
 
 		if ( step == 1 ) return 0;
 
+		// gpu64: this block is also where armPerC64 comes from
+		// (gpu64_holdgap.h). Each pass through the pair below is exactly one
+		// C64 cycle, and RESTART_CYCLE_COUNTER already stamps every one of
+		// them, so the conversion factor costs two compares per iteration
+		// against a ~600-ARM-cycle half-cycle -- and the bus is held for all
+		// of it. The window starts at 4000 rather than 0 so the measurement
+		// is taken with this loop's own i-cache lines already resident.
+		u64 calib0 = 0, calib1 = 0;
+
 		for ( u16 i = 0; i < 20000; i++ )
 		{
 			WAIT_FOR_CPU_HALFCYCLE
 			WAIT_FOR_VIC_HALFCYCLE
 			RESTART_CYCLE_COUNTER
+			if ( i == 4000 ) calib0 = armCycleCounter;
+			if ( i == 19999 ) calib1 = armCycleCounter;
 		}
+
+		gpu64HoldGap.armPerC64 = (u32)( ( calib1 - calib0 ) / ( 19999 - 4000 ) );
+
 		SET_GPIO( bDMA_OUT );
+		gpu64_holdGapRelease( armCycleCounter, GPU64_HOLD_KIND_STARTUP );
 	}
 
 reuEmulationMainLoop:
@@ -801,8 +904,20 @@ reuEmulationMainLoop:
 			{
 				gpu64_vsyncAdvance( gpu64Now );
 				gpu64Regs.status |= GPU64_STATUS_VBLANK_PENDING;
-				if ( gpu64Vsync.flipPending )
-					{ gpu64_vsyncCommitFlip(); GPU64_LADDER_SKIP }
+				// gpu64: do not commit here. This point is *ahead* of the
+				// loop's bus sample, so nothing is yet known about the cycle
+				// the DMA assert would land on -- and a commit that lands
+				// beside a C64 write cycle corrupts the C64 (bench runs
+				// M/N, 2026-09-06; see gpu64_vsyncCommitFlip()). Record that
+				// the flip is owed and let the sampled-IO2 gate below fire
+				// it. Two flags rather than one because flipPending is the
+				// API's "a flip is in flight" state, visible to the C64 as
+				// STATUS.BUSY, while commitDue is purely this loop's.
+				if ( gpu64Vsync.flipPending && !gpu64Vsync.commitDue )
+				{
+					gpu64Vsync.commitDue = 1;
+					gpu64Vsync.commitDueFrame = gpu64Vsync.frameCount;
+				}
 			}
 		}
 
@@ -906,6 +1021,7 @@ reuEmulationMainLoop:
 						RESTART_CYCLE_COUNTER
 						WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
 						CLR_GPIO( bDMA_OUT );
+						gpu64_holdGapAssert( armCycleCounter, GPU64_HOLD_KIND_DISPATCH );
 
 						gpu64_apiDispatch( D );
 
@@ -922,6 +1038,7 @@ reuEmulationMainLoop:
 						WAIT_FOR_VIC_HALFCYCLE
 						RESTART_CYCLE_COUNTER
 						SET_GPIO( bDMA_OUT );
+						gpu64_holdGapRelease( armCycleCounter, GPU64_HOLD_KIND_DISPATCH );
 						GPU64_LADDER_SKIP
 					} else
 						// Inlined (gpu64_api.h): a cross-TU call here has to
@@ -1061,6 +1178,50 @@ reuEmulationMainLoop:
 				WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_READ2 );
 				SET_GPIO( bOE_Dx | bDIR_Dx );
 			}
+
+		// gpu64: the deferred flip commit fires here, and only here.
+		//
+		// Reaching this point with IO2_ACCESS set means the loop has just
+		// serviced a C64 load or store to $DFxx -- and an absolute-addressed
+		// load or store spends its *last* cycle on that access. So the C64's
+		// next cycle is an opcode fetch (or, if an interrupt is pending, the
+		// interrupt sequence's two dummy reads, which come before its three
+		// pushes): a read, either way. Asserting DMA_OUT now therefore halts
+		// the CPU via RDY on a read cycle, with no write in flight.
+		//
+		// That guarantee is the whole point. The old code committed from the
+		// frame-clock branch at the top of the pass, where the cycle about to
+		// happen is unknown, and the C64's own multiplexed bus makes it
+		// unknowable: the CPU only drives R/W during the PHI2-high half, by
+		// which time it is too late to halt that cycle. Runs M and N put a
+		// number on the cost -- a test that only *reads* a register inside
+		// the armed window survived 300 flips, while one that *writes*
+		// registers (without dispatching) died after 114 and 72. Same
+		// dispatch, same hold, same everything else; writes were the only
+		// difference.
+		//
+		// Consequence for API users: a deferred PAGE_FLIP now lands on the
+		// program's next $DFxx access rather than exactly at the boundary.
+		// Every handshake-mode program polls STATUS while BUSY is set, so in
+		// practice that is the very next instruction. commitLateMax records
+		// the worst case seen, for GET_HEALTH/logging to report.
+		//
+		// Known hole, documented rather than fixed: a read-modify-write on a
+		// gpu64 register (inc $DF0D and friends) reads in its fourth cycle
+		// and writes in its fifth and sixth, so it would break the guarantee.
+		// The API has no reason to be used that way -- its registers are a
+		// command port, not a counter -- and the CMD_LO dispatch hold has
+		// carried the same exposure since milestone 4.
+		if ( gpu64Vsync.commitDue && IO2_ACCESS )
+		{
+			register u32 late = gpu64Vsync.frameCount - gpu64Vsync.commitDueFrame;
+			if ( late > gpu64Vsync.commitLateMax )
+				gpu64Vsync.commitLateMax = late;
+
+			gpu64Vsync.commitDue = 0;
+			gpu64_vsyncCommitFlip();
+			GPU64_LADDER_SKIP
+		}
 
 	noREUAccess:
 		if ( reu.irqTriggered && !CPU_IRQ_LOW )

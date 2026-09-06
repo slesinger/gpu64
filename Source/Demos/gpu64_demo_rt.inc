@@ -54,6 +54,15 @@ dmiCls
 	lda #0
 	sta CMD_HI
 
+	; Text mode is sticky in the same way, and it is a DISPLAY mode: a
+	; program that left the 80x50 character screen up would otherwise have
+	; every drawing command here land in a framebuffer that is not on the
+	; display, and every class 1 or class 2 command answer UNSUPPORTED.
+	; Asking for graphics mode while already in it costs one dispatch and
+	; changes nothing, so this is unconditional.
+	#argb 0, 0
+	#cmd OP_TEXT_MODE
+
 	; GET_INFO does not answer through a register: it DMA-writes the
 	; 16-byte info block into memory you nominate. Bytes 14-15 are the
 	; measured frame period in microseconds, and 0 means "no frame clock".

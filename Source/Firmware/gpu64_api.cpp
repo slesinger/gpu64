@@ -6,9 +6,11 @@
 #include "gpu64_fb.h"
 #include "gpu64_vsync.h"
 #include "gpu64_flip.h"
+#include "gpu64_holdgap.h"
 #include "gpu64_ladder.h"
 #include "gpu64_3d.h"
 #include "gpu64_raster.h"
+#include "gpu64_text.h"
 #include <circle/util.h>
 #include <circle/bcmpropertytags.h>
 
@@ -421,6 +423,13 @@ static u8 doSystem( u8 op )
 		gpu64_3dSync();
 #endif
 		if ( pFB ) pFB->ResetPages();
+		// The text planes are part of the state RESET_STATE names, and
+		// resetting them while the graphics display is up is exactly the
+		// stage-a-screen-then-switch case gpu64_text.h describes -- so this
+		// repaints only if text mode happens to be the live one.
+		gpu64_textReset();
+		if ( pFB && pFB->GetMode() == GPU64_MODE_TEXT )
+			gpu64_textRenderRows( 0, GPU64_TXT_ROWS );
 		return GPU64_ERR_OK;
 
 	case 0x02:					// VBLANK_ARM
@@ -481,6 +490,12 @@ static u8 doSystem( u8 op )
 			return GPU64_ERR_BAD_ARGS;
 		if ( pFB == 0 )
 			return GPU64_ERR_UNSUPPORTED;
+		// Text mode has one page at a fixed scanout address -- there is
+		// nothing to flip to. Refusing is better than silently succeeding:
+		// a program porting a double-buffered loop to text mode finds out
+		// at the first flip rather than by wondering why nothing moves.
+		if ( pFB->GetMode() != GPU64_MODE_GRAPHICS )
+			return GPU64_ERR_UNSUPPORTED;
 		if ( sArg[ 0 ] == 1 )
 		{
 			if ( !gpu64Vsync.calibrated )
@@ -533,12 +548,20 @@ static u8 doSystem( u8 op )
 		info[ 0 ] = 'G'; info[ 1 ] = '6'; info[ 2 ] = '4';
 		info[ 3 ] = 1;					// version major
 		info[ 4 ] = 0;					// version minor
-		info[ 5 ] = (u8)( GPU64_FB_WIDTH & 0xff );
-		info[ 6 ] = (u8)( GPU64_FB_WIDTH >> 8 );
-		info[ 7 ] = (u8)( GPU64_FB_HEIGHT & 0xff );
-		info[ 8 ] = (u8)( GPU64_FB_HEIGHT >> 8 );
+		// Geometry is per *mode*, not per build: in text mode the surface
+		// is 640x400 with one page and a 64x72 border. A program that reads
+		// the info block after TEXT_MODE therefore gets numbers it can
+		// actually draw against -- and pages = 1 is how it learns PAGE_FLIP
+		// is not available without trying it.
+		const boolean bText = pFB && pFB->GetMode() == GPU64_MODE_TEXT;
+		const unsigned nW = bText ? GPU64_TXT_WIDTH : GPU64_FB_WIDTH;
+		const unsigned nH = bText ? GPU64_TXT_HEIGHT : GPU64_FB_HEIGHT;
+		info[ 5 ] = (u8)( nW & 0xff );
+		info[ 6 ] = (u8)( nW >> 8 );
+		info[ 7 ] = (u8)( nH & 0xff );
+		info[ 8 ] = (u8)( nH >> 8 );
 		info[ 9 ] = 8;					// bits per pixel
-		info[ 10 ] = GPU64_FB_PAGES;
+		info[ 10 ] = bText ? 1 : GPU64_FB_PAGES;
 		// Bitmap of implemented classes, built from the build's own
 		// toggles rather than written out by hand -- this byte is how a
 		// program discovers class 2 exists, and a hardcoded literal here
@@ -551,8 +574,8 @@ static u8 doSystem( u8 op )
 #ifdef GPU64_RASTER_ENABLED
 		info[ 11 ] |= 0x04;				// class 2, the raster layer
 #endif
-		info[ 12 ] = GPU64_BORDER_W;			// border width, each side
-		info[ 13 ] = GPU64_BORDER_H;			// border height, each side
+		info[ 12 ] = bText ? GPU64_TXT_BORDER_W : GPU64_BORDER_W;
+		info[ 13 ] = bText ? GPU64_TXT_BORDER_H : GPU64_BORDER_H;
 		// Measured frame period in microseconds, 0 if the frame clock could
 		// not be calibrated -- which is also how a program can tell in
 		// advance that every vblank feature will return UNSUPPORTED.
@@ -570,7 +593,7 @@ static u8 doSystem( u8 op )
 
 		readHealth();
 
-		u8 h[ 20 ];
+		u8 h[ 36 ];
 		memset( h, 0, sizeof h );
 		h[ 0 ] = (u8)( s_Health.throttled & 0xff );
 		h[ 1 ] = (u8)( ( s_Health.throttled >> 8 ) & 0xff );
@@ -597,9 +620,27 @@ static u8 doSystem( u8 op )
 		saturate16( h + 16, gpu64FlipStats.slowCount );
 		saturate16( h + 18, gpu64FlipStats.postCount );
 
-		// Length-compatible with the 12-byte contract: a caller that asks
-		// for 12 still gets exactly what it always got.
-		return gpu64_blobWrite( space, addr, len >= 20 ? 20 : 12, h );
+		// gpu64: bytes 20-35, added 2026-09-06, are the hold-gap instrument
+		// (gpu64_holdgap.h) -- how close in time two DMA holds get. Same
+		// reasoning as the block above for why they ride GET_HEALTH.
+		//
+		// The three gap figures are raw ARM cycles saturated to 16 bits,
+		// which is the useful range by construction: 65535 ARM cycles is
+		// ~54 C64 cycles, so anything that saturates is by definition not a
+		// collision. armPerC64 ships with them so the reader never has to
+		// assume a clock.
+		saturate16( h + 20, gpu64HoldGap.minGap );
+		saturate16( h + 22, gpu64HoldGap.minGapD2C );
+		saturate16( h + 24, gpu64HoldGap.armPerC64 );
+		saturate16( h + 26, gpu64HoldGap.bucket[ 0 ] );
+		saturate16( h + 28, gpu64HoldGap.bucket[ 1 ] );
+		saturate16( h + 30, gpu64HoldGap.bucket[ 2 ] );
+		saturate16( h + 32, gpu64HoldGap.d2cClose );
+		saturate16( h + 34, gpu64HoldGap.asserts );
+
+		// Length-compatible with the 12- and 20-byte contracts: a caller
+		// that asks for either still gets exactly what it always got.
+		return gpu64_blobWrite( space, addr, len >= 36 ? 36 : ( len >= 20 ? 20 : 12 ), h );
 	}
 
 	case 0x08:					// SET_BORDER
@@ -832,6 +873,117 @@ static u8 matInverse( u32 n, u32 elemSize, const u8 *pA, u8 *pC )
 	return GPU64_ERR_OK;
 }
 
+// --- text mode, $50-$5F -------------------------------------------------
+//
+// A separate branch of the class 0 dispatcher rather than more cases in
+// doDraw(), because none of doDraw()'s preamble applies: these ops do not
+// touch a draw page, are not an observation point for a queued class 1
+// render (TEXT_MODE is, and says so), and are legal with the graphics
+// display up. See gpu64_text.h for the model.
+static u8 doText( u8 op )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 )
+		return GPU64_ERR_UNSUPPORTED;
+
+	switch ( op )
+	{
+	case 0x50:					// TEXT_MODE
+		if ( sArg[ 0 ] > 1 )
+			return GPU64_ERR_BAD_ARGS;
+		if ( sArg[ 0 ] == pFB->GetMode() )
+			return GPU64_ERR_OK;		// already there, and a no-op reprogram costs a mailbox round trip
+		// Stage 15b observation point, and the strongest one in the API:
+		// this reallocates the framebuffer, so a class 1 render still
+		// queued for core 1 would be drawing into memory the VideoCore has
+		// handed back. Drain before touching the display.
+#ifdef GPU64_3D_ENABLED
+		gpu64_3dSync();
+#endif
+		// A flip armed for a page that is about to stop existing has to
+		// land (or be cancelled) first; flipDrain() at the top of every
+		// dispatch has already retired an immediate one, this covers the
+		// deferred case.
+		if ( gpu64Vsync.flipPending )
+			return GPU64_ERR_BUSY;
+		if ( !gpu64_textSetMode( sArg[ 0 ] ) )
+			return GPU64_ERR_UNSUPPORTED;
+		return GPU64_ERR_OK;
+
+	case 0x51:					// TEXT_CLEAR
+		gpu64_textClear( sArg[ 0 ], sArg[ 1 ] );
+		return GPU64_ERR_OK;
+
+	case 0x52:					// TEXT_PUT
+		// Off-grid is clipped, not an error -- the same contract SET_PIXEL
+		// has, so a program plotting a moving cursor need not special-case
+		// the edges.
+		gpu64_textPut( sArg[ 0 ], sArg[ 1 ], sArg[ 2 ], sArg[ 3 ], sArg[ 4 ] );
+		return GPU64_ERR_OK;
+
+	case 0x53:					// TEXT_WRITE
+	{
+		u8 space; u32 addr, len;
+		argBlob( 0, &space, &addr, &len );
+		if ( len == 0 )
+			return GPU64_ERR_OK;
+		if ( len > GPU64_TXT_COLS )
+			len = GPU64_TXT_COLS;		// a row is the most that can land anyway
+		u8 res = gpu64_blobRead( space, addr, len, sBlobA );
+		if ( res != GPU64_ERR_OK )
+			return res;
+		gpu64_textWrite( sArg[ 6 ], sArg[ 7 ], sArg[ 8 ], sArg[ 9 ],
+				 sBlobA, len, sArg[ 10 ] );
+		return GPU64_ERR_OK;
+	}
+
+	case 0x54:					// TEXT_UPLOAD
+	{
+		u8 space; u32 addr, len;
+		argBlob( 0, &space, &addr, &len );
+		u8 plane = sArg[ 6 ];
+		u32 first = (u32)sArg[ 7 ] | ( (u32)sArg[ 8 ] << 8 );
+		if ( plane > GPU64_TXT_PLANE_BG )
+			return GPU64_ERR_BAD_ARGS;
+		if ( len == 0 )
+			return GPU64_ERR_OK;
+		// Checked here, not in gpu64_textUpload(), so a caller that gets
+		// the arithmetic wrong is told rather than truncated: a partial
+		// upload would leave the planes in a state the program does not
+		// know about.
+		if ( first >= GPU64_TXT_CELLS || first + len > GPU64_TXT_CELLS )
+			return GPU64_ERR_OUT_OF_RANGE;
+		u8 res = gpu64_blobRead( space, addr, len, sBlobA );
+		if ( res != GPU64_ERR_OK )
+			return res;
+		gpu64_textUpload( plane, first, sBlobA, len );
+		return GPU64_ERR_OK;
+	}
+
+	case 0x55:					// TEXT_CHARSET
+		if ( sArg[ 0 ] > 1 )
+			return GPU64_ERR_BAD_ARGS;
+		gpu64_textSetCharset( sArg[ 0 ] );
+		return GPU64_ERR_OK;
+
+	case 0x56:					// TEXT_SCROLL
+		gpu64_textScroll( sArg[ 0 ], sArg[ 1 ], sArg[ 2 ] );
+		return GPU64_ERR_OK;
+
+	case 0x57:					// TEXT_FILL
+		gpu64_textFill( (int)(s8)sArg[ 0 ], (int)(s8)sArg[ 1 ],
+				sArg[ 2 ], sArg[ 3 ],
+				sArg[ 4 ], sArg[ 5 ], sArg[ 6 ] );
+		return GPU64_ERR_OK;
+
+	case 0x58:					// TEXT_REFRESH
+		gpu64_textRenderRows( 0, GPU64_TXT_ROWS );
+		return GPU64_ERR_OK;
+	}
+
+	return GPU64_ERR_BAD_OPCODE;
+}
+
 static u8 doMath( u8 op )
 {
 	// Low nibble picks the operation, high nibble the element format:
@@ -1056,6 +1208,18 @@ void gpu64_apiDispatch( u8 op )
 
 	u8 res;
 
+	// Classes 1 and 2 both draw into a framebuffer page, and in text mode
+	// there is no page -- PageBase() returns 0 and every one of their writes
+	// would land nowhere (gpu64_fb.cpp). Refusing here says so, once, in
+	// front of both classes, rather than letting a whole scene render into
+	// a null pointer and report OK.
+	if ( sCmdHi != 0 && g_pGpu64FB && g_pGpu64FB->GetMode() != GPU64_MODE_GRAPHICS )
+	{
+		sErr = GPU64_ERR_UNSUPPORTED;
+		sStatus |= GPU64_STATUS_ERROR;
+		return;
+	}
+
 #ifdef GPU64_3D_ENABLED
 	if ( sCmdHi == 1 )
 	{
@@ -1085,6 +1249,8 @@ void gpu64_apiDispatch( u8 op )
 	} else
 	if ( op < 0x10 )
 		res = doSystem( op );
+	else if ( op >= 0x50 && op < 0x60 )
+		res = doText( op );
 	else if ( op < 0x80 )
 		res = doDraw( op );
 	else if ( op < 0xA0 )

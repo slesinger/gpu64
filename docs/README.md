@@ -24,11 +24,11 @@ Opcodes are grouped into **classes**, selected by `CMD_HI`:
 ## Reading order
 
 1. **[getting-started.md](getting-started.md)** — register map, what a
-   command costs the C64, issuing a command, blob descriptors, the ten demo
-   programs and how to build/run them. Start here.
+   command costs the C64, issuing a command, blob descriptors, the eleven
+   demo programs and how to build/run them. Start here.
 2. **[class0-2d-reference.md](class0-2d-reference.md)** — system, whole
-   surface, primitives, palette, blit, info/health blocks, matrix and
-   vector ops.
+   surface, primitives, palette, blit, the 80x50 text mode, info/health
+   blocks, matrix and vector ops.
 3. **[class1-3d-mesh-reference.md](class1-3d-mesh-reference.md)** — the
    retained scene graph: meshes, nodes, render ops, current build status.
 4. **[class2-raster-reference.md](class2-raster-reference.md)** — the
