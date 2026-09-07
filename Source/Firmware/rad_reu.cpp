@@ -68,6 +68,36 @@ void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border,
 // eventually; resetting on resetREU() is the simple fix for now.
 u8 gpu64ApiActive = 0;
 
+// gpu64: mirror liveness state (2026-09-06 rework -- see the long comment on
+// gpu64_mirrorSnapshot() below for the whole design).
+//
+// File scope rather than reuUsingPolling() locals for two reasons: resetREU()
+// has to clear them and cannot reach that function's registers, and the
+// per-pass test at the top of the loop wants them on the same already-hot
+// cache line as gpu64ApiActive above.
+//
+// enabled       -- the latch. Cleared the moment the machine stops being "a
+//                  BASIC prompt with nothing running"; only resetREU(), i.e.
+//                  a C64 reset, ever sets it again.
+// seenPrompt    -- has this session ever observed the direct-mode prompt?
+//                  Until it has, the CURLIN test below is disarmed, because
+//                  the KERNAL's power-on RAM test runs for ~2s with $3A
+//                  holding uninitialised garbage and would latch the mirror
+//                  off before BASIC ever came up.
+// irqWatchdog   -- main-loop passes (~1 C64 cycle each) since the last jiffy
+//                  IRQ vector fetch was seen on the bus.
+// awaitIrq      -- set by every re-arm, cleared by the first vector fetch
+//                  after it. The watchdog does not run while this is set,
+//                  because a freshly reset C64 does not have a jiffy IRQ yet
+//                  and takes far longer to get one than the watchdog allows.
+//                  See GPU64_MIRROR_IRQ_TIMEOUT below.
+// jiffy         -- vector fetches counted toward the next snapshot.
+u8 gpu64MirrorEnabled = 1;
+static u8 gpu64MirrorSeenPrompt = 0;
+static u32 gpu64MirrorIrqWatchdog = 0;
+static u8 gpu64MirrorAwaitIrq = 1;
+static u8 gpu64MirrorJiffy = 0;
+
 u32 REU_SIZE_KB = 1024;
 
 REUSTATE reu AAA;
@@ -146,6 +176,15 @@ void resetREU()
 	// gpu64: see the comment on gpu64ApiActive's declaration above -- this
 	// is what actually clears it now.
 	gpu64ApiActive = 0;
+
+	// gpu64: and this is the mirror's only re-arm. A C64 reset is the one
+	// event after which "BASIC owns the machine again" is true by
+	// construction, so it is the one event that undoes the latch.
+	gpu64MirrorEnabled = 1;
+	gpu64MirrorSeenPrompt = 0;
+	gpu64MirrorIrqWatchdog = 0;
+	gpu64MirrorAwaitIrq = 1;
+	gpu64MirrorJiffy = 0;
 	// gpu64: the API register file resets with it -- a fresh REU session must
 	// not inherit a previous program's staged ARGs, sticky CMD_HI or error.
 	gpu64_apiReset();
@@ -361,14 +400,66 @@ static u8 gpu64MirrorScreen[ 1000 ];
 static u8 gpu64MirrorColor[ 1000 ];
 static u8 gpu64MirrorBorder = 0, gpu64MirrorBackground = 0;
 
-// gpu64: how often (in reuUsingPolling() main-loop passes, roughly one C64
-// CPU cycle each) to grab a mirror snapshot. 1000000 was the original guess
-// and measured ~1fps on real hardware (RAD cartridge + RPi 3A+) -- too slow,
-// per hw feedback. Scaled down from that real calibration point for ~4fps;
-// the fps-per-count ratio itself is still only measured at the one data
-// point above, so this is an extrapolation, not a second hardware
-// measurement -- worth re-checking on hardware rather than assumed exact.
-#define GPU64_MIRROR_POLL_INTERVAL 250000
+// gpu64: the mirror's clock is now the C64's own jiffy IRQ, counted at the
+// $FFFF vector fetch in reuUsingPolling() below, not main-loop passes. The
+// KERNAL programs CIA1 timer A for ~60Hz on both PAL and NTSC, so 15 ticks
+// is ~4 snapshots a second. Measured in VICE with a non-stopping checkpoint
+// on a load of $FFFF: exactly 178 hits in 178 jiffies at the BASIC prompt --
+// one per jiffy, no strays -- and 0 hits on the NMI vector $FFFA/$FFFB, so
+// RESTORE cannot clock the mirror. 15 ticks is the rate the old pass counter
+// was calibrated to, and fast enough that a typed LOAD line and the cursor
+// blink read normally on HDMI.
+#define GPU64_MIRROR_JIFFY_INTERVAL 15
+
+// gpu64: main-loop passes (~1 C64 cycle each) without a jiffy IRQ vector
+// fetch before the mirror concludes that BASIC no longer owns the machine.
+// ~1s at 985kHz, i.e. ~60 jiffies -- short enough that an ML program which
+// takes the IRQ over stops the mirror well inside a second.
+//
+// It only starts counting once a vector fetch has actually been seen
+// (gpu64MirrorAwaitIrq). That is not a refinement, it is the whole reason a
+// reset used to leave HDMI frozen for good, reported from the bench
+// 2026-09-06: "when I reset, the C64 resets but mirror stays freezed". The
+// KERNAL's reset path runs RAMTAS *before* its CLI, and RAMTAS is a
+// per-byte read/write/verify sweep of all ~38.9K of free RAM at ~50 cycles a
+// byte -- close to two seconds with interrupts masked throughout. The
+// re-arm on the reset line fired correctly; the watchdog then expired in the
+// middle of the RAM test and cleared the latch again, and nothing but
+// another reset could ever set it. The comment that used to be here put the
+// RAM test at ~200ms, which is where the error came from.
+#define GPU64_MIRROR_IRQ_TIMEOUT 1000000
+
+// gpu64: the two C64 zero-page bytes the snapshot probes before it commits
+// to the 2ms burst.
+//
+// CURLIN+1 ($3A) is BASIC's current line number, high byte: $FF while a
+// direct-mode statement is being executed, the running line's number while a
+// program executes. Measured in VICE (x64sc, binary monitor) on 2026-09-06:
+// $FF at the prompt after any command, $00 for line 10 / $00 for line 20
+// during RUN, $FF for the whole of a LOAD. So "$3A != $FF" is the canonical
+// "a BASIC program is RUNning", and it is true from the first statement of
+// RUN, before the program has drawn anything.
+//
+// The one exception, also measured, is the *cold* prompt: BASIC's cold start
+// zeroes CURLIN, so $3A reads $00 from power-on until the first direct-mode
+// statement runs, which is indistinguishable from "executing line 0-255".
+// That is why the latch is armed by a prompt sighting first (see below) and
+// why $3A takes no part in the bail decision -- gating the snapshot on
+// $3A == $FF would mean never mirroring the fresh boot screen at all, which
+// is the mirror's entire reason to exist.
+//
+// BLNSW ($CC) is the KERNAL's cursor-blink switch: 0 exactly while the
+// input loop at the prompt is blinking the cursor, non-zero whenever the
+// KERNAL is doing something else -- printing, LISTing, or driving the serial
+// bus for LOAD/SAVE. It is not a program/no-program signal (it says nothing
+// about ML), it is a "safe to steal 2ms of bus right now" signal: the IEC
+// protocol is software-timed on both ends and a 2ms freeze mid-byte is
+// exactly how a LOAD turns into ?LOAD ERROR. Measured in the same VICE
+// session: $00 at the cold prompt and at the prompt between commands, $01
+// for the whole of a RUN, $01 across SEARCHING FOR / the serial transfer of
+// a LOAD (true drive emulation).
+#define GPU64_C64_CURLIN_HI 0x003A
+#define GPU64_C64_BLNSW     0x00CC
 
 // gpu64: milestone 3 screen mirror. Grabs a brief DMA burst -- the same
 // CLR_GPIO(bDMA_OUT)/DMA_READBYTE_P1..P3 cycle-stealing technique REU's own
@@ -376,6 +467,44 @@ static u8 gpu64MirrorBorder = 0, gpu64MirrorBackground = 0;
 // bus takeover -- to read the default screen RAM ($0400-$07E7) and color RAM
 // ($D800-$DBE7), plus the current border/background color ($D020/$D021),
 // then hands them to CRAD::showMirror() (rad_main.cpp) for rendering.
+//
+// WHEN this runs was reworked on 2026-09-06, for two independent reasons.
+//
+// (1) Correctness. This was the last async DMA hold in the tree: it fired on
+// a free-running pass counter, so CLR_GPIO(bDMA_OUT) landed on whatever C64
+// cycle the loop happened to be in. That is polling-loop rule 7 -- halting
+// the 6510 through RDY stops it only on *read* cycles, and a write in flight
+// completes with AEC already tri-stating the address bus, i.e. into a
+// floating address. It is the same defect that killed the C64 through the
+// whole Stage 16 campaign, and it was live here at 4 holds a second. It has
+// never been implicated (BASIC's idle loop is nearly all reads, and the
+// prompt touches IO2 never, so the sampled-IO2 gate the flip commit uses was
+// not available to it) -- but "never observed" is not "cannot happen".
+//
+// The gate this now uses instead is the C64's own IRQ sequence: the loop
+// sees the vector fetch at $FFFF (bTriggerFF00 is a hardware $FFxx decode,
+// so unlike $A480 or $EA31 it is actually visible), and the very next 6510
+// cycle after that fetch is the handler's opcode fetch -- a read, by
+// construction, the same guarantee the IO2 gate rests on. It arrives once
+// per jiffy, which is also exactly the clock the mirror wants.
+//
+// (2) Scope. The mirror exists so the user can see the READY prompt on HDMI
+// and LOAD something without switching to the VIC-II screen. Once a program
+// is actually running it has no business stealing 2ms of bus 4 times a
+// second, so it now latches off for good, re-armed only by a C64 reset
+// (resetREU()). Three things latch it off:
+//
+//   - CURLIN+1 != $FF, probed below: a BASIC program is RUNning.
+//   - no jiffy IRQ for ~1s (GPU64_MIRROR_IRQ_TIMEOUT, checked in the loop):
+//     something has taken the IRQ over or masked it -- an ML program.
+//   - the gpu64 API being engaged at all (gpu64ApiActive), as before.
+//
+// Residual case, documented rather than fixed: an ML program SYSed from
+// direct mode that leaves the KERNAL IRQ alone and never touches gpu64 keeps
+// the latch armed. It costs almost nothing -- BLNSW will be non-zero, so
+// every tick bails after the two probe bytes, a ~6 cycle hold at 4Hz -- and
+// HDMI simply holds the last mirrored frame, which is the intended
+// end state anyway.
 // Scoped per project/bus_access_design.md: fixed default addresses only (no VIC
 // bank / $D018 detection yet -- a program that relocates its screen will
 // render wrong until that's added), standard text mode only, and gpu64's own
@@ -400,17 +529,66 @@ void gpu64_mirrorSnapshot()
 	register u8 x;
 
 	// gpu64: WAIT_FOR_CPU_HALFCYCLE first -- see the long note in
-	// gpu64_blobRead() below. This is called from the polling loop *after*
-	// its own top-of-loop WAIT_FOR_VIC_HALFCYCLE, so we are already inside a
-	// VIC half-cycle and a bare WAIT_FOR_VIC_HALFCYCLE falls straight
-	// through. RESTART_CYCLE_COUNTER would then anchor mid-half-cycle and
-	// TIMING_TRIGGER_DMA would already have elapsed, putting CLR_GPIO at an
+	// gpu64_blobRead() below. The gate now calls us from inside the CPU
+	// half-cycle, having just sampled the bus (it used to be the VIC half,
+	// from the top of the loop); either way a bare WAIT_FOR_VIC_HALFCYCLE is
+	// not a sync. It falls straight through when we are already in the VIC
+	// half, RESTART_CYCLE_COUNTER then anchors mid-half-cycle,
+	// TIMING_TRIGGER_DMA has already elapsed, and CLR_GPIO lands at an
 	// undefined phase.
 	WAIT_FOR_CPU_HALFCYCLE
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 	WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
 	CLR_GPIO( bDMA_OUT );
+
+	// gpu64: probe first, burst second. Both bytes are read every tick --
+	// CURLIN unconditionally, because BLNSW is non-zero for the whole of a
+	// BASIC program's run and gating the CURLIN read on it would mean never
+	// noticing RUN at all.
+	c_a = GPU64_C64_CURLIN_HI;
+	DMA_READBYTE_P1( c_a );
+	DMA_READBYTE_P2();
+	DMA_READBYTE_P3( x, false );
+	register u8 curlinHi = x;
+
+	c_a = GPU64_C64_BLNSW;
+	DMA_READBYTE_P1( c_a );
+	DMA_READBYTE_P2();
+	DMA_READBYTE_P3( x, false );
+	register u8 blnsw = x;
+
+	// gpu64: the prompt sighting that arms the CURLIN latch. Direct mode plus
+	// a blinking cursor is BASIC idle at READY and nothing else. It cannot
+	// fire before the user's first command (see the $3A note above), which is
+	// exactly the point -- $3A is only trustworthy once it has been seen to
+	// hold $FF, and until then the latch stays disarmed rather than reading
+	// the cold prompt's $00 as "line 0 is running".
+	if ( curlinHi == 0xFF && blnsw == 0 )
+		gpu64MirrorSeenPrompt = 1;
+	else
+	if ( curlinHi != 0xFF && gpu64MirrorSeenPrompt )
+		// A BASIC program is running. Done mirroring until the next reset.
+		gpu64MirrorEnabled = 0;
+
+	// gpu64: BLNSW alone decides whether we may take the bus for 2ms; $3A
+	// decides whether we keep mirroring at all, and has already had its say
+	// above.
+	register u8 bail = ( blnsw != 0 ) ? 1 : 0;
+
+	if ( bail )
+	{
+		// gpu64: give the bus back on a cycle boundary, exactly like the
+		// command dispatch does -- not wherever the probe finished. The two
+		// DMA_READBYTE_P3s above already dropped the address latch and the
+		// bus transceiver (DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER with
+		// releaseDMA false), so the DMA line is all that is still ours.
+		WAIT_FOR_CPU_HALFCYCLE
+		WAIT_FOR_VIC_HALFCYCLE
+		RESTART_CYCLE_COUNTER
+		SET_GPIO( bDMA_OUT );
+		return;
+	}
 
 	for ( u16 i = 0; i < 1000; i++ )
 	{
@@ -443,6 +621,177 @@ void gpu64_mirrorSnapshot()
 	gpu64MirrorBackground = x & 0x0F;
 
 	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground );
+}
+
+// gpu64: the boot-phase mirror. RAD spends everything between "the C64 is
+// running" and "the user pressed the button" in rad_main.cpp's radIsWaiting
+// spin, which used to be a bare 1250-cycle button poll -- so HDMI showed
+// nothing at all until the user had blind-navigated the RAD menu into REU
+// mode. Reported from the bench 2026-09-06: "after start it does not
+// activate, I have to press blindly REU menu button and then X to go to
+// BASIC."
+//
+// This replaces that spin. It is the same $FFFF vector-fetch gate the REU
+// polling loop runs (see the long comment at that gate, and rule 7 in
+// CLAUDE.md): sample the bus every C64 cycle, and when the 6510 is fetching
+// the high byte of the IRQ vector -- last cycle of the interrupt sequence,
+// next cycle provably an opcode fetch -- take the bus and snapshot. Nothing
+// else is being serviced here, so a missed sample costs one jiffy tick and
+// nothing more; the phase discipline is what matters, not the throughput.
+//
+// Safe to run at this point in the boot flow because everything the sample
+// sequence and the snapshot need is already set up: gpioInit() has
+// configured the latch/OE/DIR/MPLEX/DMA pins, initREU() has filled in the
+// reu.TIMING_* fields the WAIT_UP_TO_CYCLE calls read, and
+// checkIfMachineRunning() has already blocked until the C64 clock is
+// measurably alive -- so the half-cycle waits below cannot hang on a dead
+// clock in the normal case. The abnormal case (clock stops while we sit
+// here) is handled by bounding the top-of-loop wait rather than by hoping,
+// because a hang here would also swallow the RAD button and leave the user
+// with no way into the menu.
+//
+// Returns when the RAD button is pressed, i.e. exactly where the old spin's
+// "goto hijacking" was.
+__attribute__( ( optimize( "align-functions=256" ) ) )
+__attribute__( ( section( ".text.section_polling" ) ) )
+void gpu64_mirrorIdleLoop( void )
+{
+	register u32 g2 = bBUTTON, g3;
+	register u16 resetCount = 0;
+	register u32 ipl = 0;
+	register u32 noClock = 0;
+
+	// gpu64: warm both this loop and the snapshot it calls. warmCache() runs
+	// on the way into REU emulation, which is *after* this -- nothing has
+	// preloaded either one yet at this point in the boot.
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_mirrorIdleLoop, 1024 * 2 )
+	FORCE_READ_LINEARa( (void*)gpu64_mirrorIdleLoop, 1024 * 2, 1024 * 2 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_mirrorSnapshot, 1024 * 4 )
+	FORCE_READ_LINEARa( (void*)gpu64_mirrorSnapshot, 1024 * 4, 1024 * 4 );
+
+	// gpu64: the mirror is armed on every entry here. resetREU() is the
+	// other arm point and only runs once REU emulation starts; a user who
+	// power-cycles into the menu and back out must not find the latch stuck
+	// from a previous session.
+	gpu64MirrorEnabled = 1;
+	gpu64MirrorSeenPrompt = 0;
+	gpu64MirrorIrqWatchdog = 0;
+	gpu64MirrorAwaitIrq = 1;
+	gpu64MirrorJiffy = 0;
+
+mirrorIdleLoop:
+
+	CLR_GPIO( bMPLEX_SEL );
+	WAIT_FOR_CPU_HALFCYCLE
+	BEGIN_CYCLE_COUNTER
+
+	while ( 1 )
+	{
+		// gpu64: bounded form of WAIT_FOR_VIC_HALFCYCLE. The REU loop can use
+		// the unbounded macro because by then the machine is committed; here
+		// the RAD button still has to work, and a C64 whose clock stopped
+		// while we were watching would otherwise strand the user in a spin
+		// with no exit. On timeout we simply fall through with whatever g2
+		// held: the button test below is all that still matters.
+		noClock = 0;
+		{
+			register u32 timeout = 0;
+			do {
+				g2 = read32( ARM_GPIO_GPLEV0 );
+				if ( ++timeout > 1000000 ) { noClock = 1; break; }
+			} while ( CPU_HALF_CYCLE );
+		}
+
+		// gpu64: the button is tested before anything that needs the C64
+		// clock, so a stopped clock degrades to exactly the button poll this
+		// loop replaced rather than to a hang.
+		if ( BUTTON_PRESSED )
+			return;
+
+		if ( noClock )
+			continue;
+
+		// gpu64: same incremental i-cache refresh the REU loop does. The
+		// snapshot's showMirror() paints 40x25 cells into the framebuffer and
+		// cleans a page, which is more than enough to evict this loop between
+		// ticks -- and a cold miss in the sample sequence is a misread
+		// address, which under the gate below is a DMA hold opened on a cycle
+		// nothing is known about. Rule 4.
+		void *p = (u8*)( && mirrorIdleLoop ) + ipl;
+		CACHE_PRELOADIKEEP( p );
+		ipl += 64; if ( ipl >= 1024 * 2 ) ipl = 0;
+
+		// gpu64: re-arm on the C64's reset line -- pressing the RAD reset
+		// button at the BASIC prompt is the user's way of saying "start
+		// mirroring again", and before this it did nothing visible on HDMI at
+		// all. resetREU() does the same thing for the REU-emulation half of
+		// the machine's life; this is the boot-phase half, where resetREU()
+		// never runs.
+		//
+		// On the RELEASE edge, not the assert: while the line is held the
+		// 6510 is stopped and no jiffy IRQ arrives, so a press held longer
+		// than GPU64_MIRROR_IRQ_TIMEOUT (~1s -- easy for a thumb) would let
+		// the watchdog below retire the mirror again right after arming it.
+		// Holding the watchdog clear for the duration and arming when the
+		// machine actually restarts avoids having to reason about which of
+		// the two wins.
+		if ( CPU_RESET )
+		{
+			resetCount = 1;
+			gpu64MirrorIrqWatchdog = 0;
+		} else
+		if ( resetCount )
+		{
+			resetCount = 0;
+			gpu64MirrorEnabled = 1;
+			gpu64MirrorSeenPrompt = 0;
+			gpu64MirrorIrqWatchdog = 0;
+			gpu64MirrorAwaitIrq = 1;
+			gpu64MirrorJiffy = 0;
+		}
+
+		// gpu64: the liveness timer, same as the REU loop's. Without the
+		// KERNAL IRQ there is no clock and no prompt to mirror.
+		//
+		// Suspended until the first vector fetch after a re-arm: the C64 we
+		// just watched come out of reset spends ~2s in RAMTAS with interrupts
+		// masked, which is twice the timeout. Waiting forever is the right
+		// behaviour anyway -- a re-armed mirror with no IRQ takes no bus and
+		// paints nothing, so there is nothing to time out of.
+		if ( gpu64MirrorEnabled && !gpu64MirrorAwaitIrq )
+		{
+			if ( ++gpu64MirrorIrqWatchdog >= GPU64_MIRROR_IRQ_TIMEOUT )
+				gpu64MirrorEnabled = 0;
+		}
+
+		// gpu64: the bus sample, copied cycle-for-cycle from
+		// reuUsingPolling(). g2 carries RESET/BUTTON/RW/$FFxx, g3 the
+		// multiplexed low address byte.
+		SET_GPIO( bDIR_Dx );
+		WAIT_FOR_CPU_HALFCYCLE
+		RESTART_CYCLE_COUNTER
+		WAIT_UP_TO_CYCLE( reu.WAIT_FOR_SIGNALS + reu.TIMING_OFFSET_CBTD );
+		g2 = read32( ARM_GPIO_GPLEV0 );
+
+		SET_GPIO( bMPLEX_SEL );
+
+		WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_MULTIPLEXER );
+		g3 = read32( ARM_GPIO_GPLEV0 );
+		CLR_GPIO( bMPLEX_SEL );
+
+		if ( ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF &&
+				gpu64MirrorEnabled )
+		{
+			gpu64MirrorIrqWatchdog = 0;
+			gpu64MirrorAwaitIrq = 0;
+
+			if ( ++gpu64MirrorJiffy >= GPU64_MIRROR_JIFFY_INTERVAL )
+			{
+				gpu64MirrorJiffy = 0;
+				gpu64_mirrorSnapshot();
+			}
+		}
+	}
 }
 
 // gpu64: commits a vblank-deferred PAGE_FLIP. Everything else a frame
@@ -796,9 +1145,6 @@ u8 reuUsingPolling( int step )
 {
 	register u32 g2 = bBUTTON, g3;
 	register u16 resetCount = 0;
-	// gpu64: counts main-loop passes toward the next mirror snapshot -- see
-	// gpu64_mirrorSnapshot() and GPU64_MIRROR_POLL_INTERVAL above.
-	register u32 gpu64MirrorPollCounter = 0;
 
 	// gpu64: milestone 6's load-ladder instrumentation (gpu64_ladder.h).
 	// Expands to nothing unless GPU64_LADDER_ENABLED is defined.
@@ -882,15 +1228,24 @@ reuEmulationMainLoop:
 			return 2;
 		}
 
-		// gpu64: default-state screen mirror (milestone 3) -- time-based, not
-		// IO2-access-based, so this fires independent of whatever the C64
-		// program is doing this cycle. Stops entirely once a program engages
-		// the gpu64 API (see gpu64ApiActive above).
-		if ( !gpu64ApiActive && ++gpu64MirrorPollCounter >= GPU64_MIRROR_POLL_INTERVAL )
+		// gpu64: default-state screen mirror (milestone 3), watchdog half.
+		// The snapshot itself is NOT taken here any more -- this point is
+		// ahead of the loop's bus sample, so nothing is known about the cycle
+		// a DMA assert would land on, and that was rule 7 live at 4Hz. It now
+		// fires from the $FFFF vector-fetch gate further down, where the
+		// C64's next cycle is provably a read. See gpu64_mirrorSnapshot().
+		//
+		// All that is left here is the liveness timer: if the jiffy IRQ stops
+		// arriving, BASIC is no longer driving the machine and the mirror
+		// retires until the next reset.
+		// Suspended until the first vector fetch after a re-arm -- see
+		// GPU64_MIRROR_IRQ_TIMEOUT: the reset that re-armed the latch is
+		// followed by ~2s of RAMTAS with interrupts masked, and timing out
+		// inside that window is what froze HDMI after every reset.
+		if ( !gpu64ApiActive && gpu64MirrorEnabled && !gpu64MirrorAwaitIrq )
 		{
-			gpu64MirrorPollCounter = 0;
-			gpu64_mirrorSnapshot();
-			GPU64_LADDER_SKIP
+			if ( ++gpu64MirrorIrqWatchdog >= GPU64_MIRROR_IRQ_TIMEOUT )
+				gpu64MirrorEnabled = 0;
 		}
 
 		// gpu64: the frame clock (gpu64_vsync.h). Only meaningful once a
@@ -1221,6 +1576,42 @@ reuEmulationMainLoop:
 			gpu64Vsync.commitDue = 0;
 			gpu64_vsyncCommitFlip();
 			GPU64_LADDER_SKIP
+		}
+
+		// gpu64: and the screen mirror fires here, for the same reason and on
+		// the same kind of guarantee.
+		//
+		// The C64 has no reason to touch IO2 at a BASIC prompt, so the mirror
+		// cannot use the gate above. What it can use is the interrupt
+		// sequence itself. Reaching this point with ADDRESS_FFxx set on a
+		// read of $FF means the 6510 is fetching the high byte of the
+		// IRQ/BRK vector -- the last cycle of the interrupt sequence, whose
+		// two dummy reads and three pushes are already behind it. The next
+		// cycle is the handler's opcode fetch. A read, by construction, so
+		// DMA_OUT halts the CPU there with no write in flight.
+		//
+		// It is also the jiffy clock: this fires ~60 times a second while the
+		// KERNAL IRQ is alive, and stops the moment it isn't -- which is the
+		// signal the watchdog at the top of the loop is timing.
+		//
+		// The NMI vector is $FFFA/$FFFB, so RESTORE cannot reach this. The
+		// write case is excluded because a write to $FFxx says nothing about
+		// the next cycle (and $FF00 is REU's own transfer trigger, handled
+		// far above). Same known hole as the commit gate: a read-modify-write
+		// whose read cycle lands on $FFFF would be followed by a write, but
+		// $FFFF is the reset vector in ROM and nothing does INC on it.
+		if ( ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF &&
+				!gpu64ApiActive && gpu64MirrorEnabled )
+		{
+			gpu64MirrorIrqWatchdog = 0;
+			gpu64MirrorAwaitIrq = 0;
+
+			if ( ++gpu64MirrorJiffy >= GPU64_MIRROR_JIFFY_INTERVAL )
+			{
+				gpu64MirrorJiffy = 0;
+				gpu64_mirrorSnapshot();
+				GPU64_LADDER_SKIP
+			}
 		}
 
 	noREUAccess:

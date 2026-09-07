@@ -76,12 +76,14 @@ build or in code reading.
    address bus, so it lands at a floating address and corrupts the C64. An
    IO2 access is always the *last* cycle of its instruction, so the next
    cycle is provably an opcode fetch — that is the guarantee every safe hold
-   in the tree rests on. You cannot substitute a read/write test on the
-   sampled `g2`: the C64's multiplexed bus only shows R/W in the PHI2-high
-   half, too late to halt that cycle, and cycle N tells you nothing about
-   N+1. This killed the C64 for the whole Stage 16 campaign; the exceptions
-   are a read-modify-write on a gpu64 register, and `gpu64_mirrorSnapshot()`,
-   which is still an unfixed async hold.
+   in the tree rests on. The screen mirror, which never sees an IO2 access,
+   uses the other decode the loop can see: a **read of $FFFF**, the IRQ/BRK
+   vector high-byte fetch, whose next cycle is the handler's opcode fetch by
+   construction. You cannot substitute a read/write test on the sampled `g2`:
+   the C64's multiplexed bus only shows R/W in the PHI2-high half, too late
+   to halt that cycle, and cycle N tells you nothing about N+1. This killed
+   the C64 for the whole Stage 16 campaign; the one remaining exception is a
+   read-modify-write on a gpu64 register.
 
 Also: **RAD's low-level macros do not parenthesise their arguments.** Never
 pass an expression containing `?:`, `+` or `%`.

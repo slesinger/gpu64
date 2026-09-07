@@ -2101,6 +2101,23 @@ u32 handleOneRasterLine( int fade1024, u8 fadeText = 1 )
 			u32 r = readKeyRenderMenu( fade );
 
 			if ( r ) return r;
+
+			// gpu64: mirror the menu to HDMI (bench request 2026-09-06 --
+			// the user was navigating it blind). c64ScreenRAM/c64ColorRAM are
+			// the menu's source of truth; the C64 copy below lags them, so
+			// this needs no bus access and is if anything more current than
+			// the VIC-II picture.
+			//
+			// Placed here rather than anywhere else in this dispatcher for
+			// two reasons: the C64's CPU is DMA-halted for the whole menu, so
+			// the ~250us this costs cannot make the 6510 miss anything; and
+			// keyScanRasterLine is 275 (PAL), which leaves ~70 raster lines
+			// before the next entry in rasterCommands (line 33 of the
+			// following frame) -- so no $D018 or colour split gets served
+			// late either. It inherits readKeyRenderMenu()'s every-3rd-frame
+			// cadence, ~17fps.
+			extern void gpu64_showMenuMirror( const u8 *screen, const u8 *color );
+			gpu64_showMenuMirror( c64ScreenRAM, c64ColorRAM );
 		} else
 		{
 			if ( !badline )

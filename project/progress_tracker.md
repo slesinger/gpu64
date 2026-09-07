@@ -123,7 +123,10 @@ is basic legibility, e.g. reading a directory listing on the HDMI screen.
 The mirror and gpu64's own framebuffer API are mutually exclusive: once a
 program engages the API, snapshot polling stops entirely. `gpu64ApiActive`
 (rad_reu.cpp) gates this, set by the $DF0B trigger and cleared in
-`resetREU()` on every fresh REU session.
+`resetREU()` on every fresh REU session. Since 2026-09-06 the mirror also
+stops for good when a BASIC program RUNs or when the KERNAL IRQ goes away,
+and is re-armed only by a reset -- see *Mirror lifecycle and the $FFFF gate*
+below.
 
 ### Implementation
 
@@ -136,8 +139,11 @@ program engages the API, snapshot polling stops entirely. `gpu64ApiActive`
   -- which the CPU cannot see when it is banked out anyway -- plus a hardcoded
   standard C64 16-colour palette (Pepto's values), since colour RAM only ever
   stores a 4-bit palette index.
-- A counter in `reuUsingPolling()`'s per-cycle loop
-  (`gpu64MirrorPollCounter`/`GPU64_MIRROR_POLL_INTERVAL`) triggers the burst.
+- The burst is triggered by the C64's own jiffy IRQ: a gate in
+  `reuUsingPolling()` watches for the read of $FFFF (the IRQ/BRK vector high
+  byte) and counts `GPU64_MIRROR_JIFFY_INTERVAL` of them, ~4 snapshots a
+  second. This replaced a free-running pass counter on 2026-09-06 -- see
+  *Mirror lifecycle and the $FFFF gate* below for both reasons.
 - `gpu64_mirrorSnapshot()` gets its own instruction-cache preload in
   `warmCache()`, since it is called from inside the cycle-critical loop but is
   not covered by that function's own 7KB preload window.
@@ -3329,11 +3335,9 @@ the same guarantee the CMD_LO dispatch hold has relied on since milestone 4.
 
 ### Open
 
-- **`gpu64_mirrorSnapshot()` is still an async hold**, firing 4x/s with
-  exactly the defect above. The IO2 gate cannot be reused: the mirror runs
-  only when `!gpu64ApiActive`, at a BASIC prompt that touches IO2 never. It
-  has never been implicated -- BASIC's idle loop is nearly all reads -- but it
-  wants its own answer.
+- ~~**`gpu64_mirrorSnapshot()` is still an async hold**, firing 4x/s with
+  exactly the defect above.~~ Resolved 2026-09-06 by gating it on the $FFFF
+  IRQ vector fetch -- see *Mirror lifecycle and the $FFFF gate*.
 - **A read-modify-write on a gpu64 register** (`inc $DF0D`) breaks the new
   gate's guarantee, reading in cycle 4 and writing in 5 and 6. Documented as
   an API constraint rather than fixed; the dispatch hold has always carried
@@ -3513,3 +3517,157 @@ Not yet on the bench.
   and the host simulator cannot exercise that at all.
 - The conformance suite does not cover text mode; `gpu64_testkit.inc` has no
   `TXT_*` equates yet.
+
+## Mirror lifecycle and the $FFFF gate (2026-09-06)
+
+Two problems with one answer.
+
+**The defect.** `gpu64_mirrorSnapshot()` was the last async DMA hold in the
+tree. It fired on a free-running pass counter, so `CLR_GPIO(bDMA_OUT)` landed
+on whatever C64 cycle the loop happened to be in -- polling-loop rule 7, the
+defect that killed the C64 through the whole Stage 16 campaign, live here at
+four holds a second. The IO2 gate that fixed the flip commit was not
+available: the mirror runs only when `!gpu64ApiActive`, at a BASIC prompt that
+touches IO2 never.
+
+**The scope.** The mirror exists so the user can see READY on HDMI and LOAD
+something without switching to the VIC-II screen. Once a program is running it
+has no business stealing 2 ms of bus four times a second -- and if that program
+is loading from disk, the steal is how a LOAD becomes `?LOAD ERROR`.
+
+**The gate.** The loop can see two address decodes: IO2 and `ADDRESS_FFxx`
+(GPIO 13, a hardware $FFxx decode). A *read* of $FFFF is the IRQ/BRK vector
+high-byte fetch: the last cycle of the interrupt sequence, with its two dummy
+reads and three pushes already done, so the next cycle is the handler's opcode
+fetch -- a read by construction, the same guarantee the IO2 gate rests on. It
+is also the jiffy clock, which is exactly what the mirror wanted anyway. No
+C64 RAM is written and no vector is hooked; the gate is pure observation.
+
+**The lifecycle.** Inside the hold the snapshot now probes two zero-page bytes
+before committing to the burst:
+
+- `BLNSW` ($CC), the KERNAL cursor-blink switch, decides whether the 2 ms
+  steal is safe *now*. Non-zero means the KERNAL is printing, LISTing or
+  driving the serial bus, and the tick bails after ~6 cycles.
+- `CURLIN+1` ($3A) decides whether to keep mirroring at all. Once a prompt has
+  been seen (`$3A == $FF && $CC == 0`), a later `$3A != $FF` means a BASIC
+  program is RUNning and the mirror latches off until `resetREU()`.
+
+A third rule, `GPU64_MIRROR_IRQ_TIMEOUT` in the loop, latches it off when the
+jiffy IRQ stops for ~1 s: an ML program that took the IRQ over.
+
+**Verified in VICE** (x64sc binary monitor, `tools/`-external scratch client),
+because none of this is testable on the host simulator:
+
+| state | $3A | $CC |
+|---|---|---|
+| cold prompt | `$00` | `$00` |
+| prompt after any command | `$FF` | `$00` |
+| RUN, lines 10/20 | `$00`/`$00` (line no.) | `$01` |
+| LOAD (true drive, SEARCHING + transfer) | `$FF` | `$01` |
+
+A non-stopping checkpoint on a load of $FFFF counted **178 hits in 178
+jiffies** at the prompt -- one per jiffy, no strays -- and **0** on the NMI
+vector $FFFA/$FFFB, so RESTORE cannot clock the mirror.
+
+The cold-prompt `$3A == $00` is the one measurement that changed the design:
+BASIC's cold start zeroes CURLIN, and $00 is indistinguishable from "executing
+line 0-255". So $3A takes no part in the bail decision (gating the snapshot on
+`$3A == $FF` would never mirror the fresh boot screen -- the mirror's entire
+purpose), and the latch stays disarmed until a prompt sighting proves $3A is
+meaningful.
+
+`warmCache()`'s i-cache preload for the function went 2 KB -> 4 KB: the rework
+grew it from 0x694 to 0x9ec bytes, and running the tail of the colour-RAM
+burst from cold lines is rule 4's cold-fail/warm-pass signature.
+
+### Bench run 2026-09-06, and covering the rest of the session
+
+The gate works ("it works in principle"), but the mirror only ever ran during
+REU emulation -- which is the *last* phase of a RAD session. From power-on
+through the RAD menu, HDMI was dark: *"after start it does not activate, I
+have to press blindly REU menu button and then X to go to BASIC. Pressing the
+REU reset button doesn't do anything to the hdmi."* Three additions:
+
+**Boot phase.** `rad_main.cpp`'s `radIsWaiting` was a bare 1250-cycle button
+spin. It is now `gpu64_mirrorIdleLoop()` (`rad_reu.cpp`): the same per-C64-cycle
+sample sequence and the same $FFFF gate as `reuUsingPolling()`, returning on
+`BUTTON_PRESSED` exactly where the old spin's `goto hijacking` was. Everything
+it needs is already up by then -- `gpioInit()` for the latch/OE/DIR/MPLEX/DMA
+pins, `initREU()` for the `reu.TIMING_*` fields the `WAIT_UP_TO_CYCLE` calls
+read, and `checkIfMachineRunning()` for a live C64 clock. It warms its own
+i-cache and the snapshot's, since `warmCache()` does not run until REU
+emulation starts.
+
+Its top-of-loop half-cycle wait is **bounded** and the button is tested before
+anything that needs the C64 clock. An unbounded wait there is not like one in
+`reuUsingPolling()`: this is the only path into the RAD menu, so a stopped
+clock would leave the user with no way in at all. On timeout the loop degrades
+to precisely the button poll it replaced.
+
+**Reset.** The idle loop re-arms the latch on the reset line's **release**
+edge, and holds the IRQ watchdog clear while the line is asserted. Arming on
+the assert edge instead would be undone by the watchdog on any press held
+longer than `GPU64_MIRROR_IRQ_TIMEOUT` (~1 s), because the stopped 6510 sends
+no jiffy IRQ. `resetREU()` already covers the REU-emulation side.
+
+**The RAD menu.** `CRAD::showMenuMirror()`, called from `rad_hijack.cpp`'s
+raster dispatcher immediately after `readKeyRenderMenu()`. It takes **no bus
+access at all**: the menu's 40x25 lives in Pi RAM (`c64ScreenRAM` /
+`c64ColorRAM`) and is pushed to the C64 incrementally, so the Pi-side copy is
+the source of truth and is if anything ahead of the VIC picture. The C64's CPU
+is DMA-halted for the whole menu, and `keyScanRasterLine` (275 PAL) leaves
+~70 rasters before the next `rasterCommands` entry, so the ~250 us render
+makes nothing late. Cadence is inherited from `readKeyRenderMenu()`'s
+every-3rd-frame test, ~17 fps.
+
+It differs from `showMirror()` in one respect: the glyph base is picked per
+row -- `font_logo` for rows 0-3, `font_bin+2048` for 4-20, `font_bin` for
+21-24 -- because the menu runs three charsets in a single frame off $D018
+raster splits (`rasterCommandsPAL` switches at rasters 33, 83 and 219 against
+a first text raster of 51). A single-charset render would show the file
+browser in graphics characters. Border/background colour splits and the
+sprites are deliberately not reproduced; the user scoped this as *"it does not
+need to mirror the REU menu completely. Just screen and color is
+sufficient."*
+
+### Bench run 2026-09-07: the reset that never came back
+
+Boot mirror and menu mirror both passed -- *"After boot, the mirror starts
+working. Perfect. [...] REU menu works perfect."* The reset re-arm did not:
+*"When I reset, the C64 resets but mirror stays freezed."*
+
+The re-arm itself fires. What undid it was the IRQ watchdog, on a bad
+estimate written into the `GPU64_MIRROR_IRQ_TIMEOUT` comment: *"the power-on
+RAM test is the longest, ~200ms, and it runs before the CLI anyway."* The
+second half is right and is exactly the problem. The KERNAL's reset path is
+`IOINIT / RAMTAS / RESTOR / CINT / CLI`, and RAMTAS is a per-byte
+read-write-verify sweep of all ~38.9K of free RAM at roughly 50 cycles a byte
+-- **close to two seconds with interrupts masked throughout**, not 200 ms. So:
+reset released, latch armed, watchdog cleared; ~1 s later, still inside the
+RAM test and still with no jiffy IRQ possible, the watchdog expired and
+cleared the latch; and only a reset sets it, so HDMI stayed frozen for good.
+It could not show up at power-on, which is why the boot mirror looked fine --
+`checkIfMachineRunning()` plus `DELAY( 1 << 27 )` put the idle loop's first
+pass long after that RAM test is over.
+
+Fixed with `gpu64MirrorAwaitIrq`: set by every re-arm (`resetREU()`, the idle
+loop's reset-release edge, and idle-loop entry), cleared by the first $FFFF
+vector fetch after it, and the watchdog does not count while it is set. A
+re-armed mirror now waits indefinitely for BASIC to come up. That is the
+right shape regardless of the RAMTAS number -- a mirror waiting for its first
+IRQ takes no bus and paints nothing, so there is nothing to time out of; the
+watchdog's actual job is to notice an IRQ that *stopped*, and it cannot do
+that before it has seen one start.
+
+### Open
+
+- **The reset fix is not on the bench yet** (built 2026-09-07, SD card was not
+  mounted). Boot mirror and menu mirror are hardware-verified.
+- A program autostarted without dwelling at the prompt (a fastloader
+  cartridge) may never arm the CURLIN latch. Such programs take the IRQ over
+  (watchdog) or engage the API (`gpu64ApiActive`) in practice.
+- An ML program SYSed from direct mode that leaves the KERNAL IRQ alone and
+  never touches gpu64 keeps the latch armed. It costs a ~6-cycle probe hold at
+  4 Hz, `$CC` being non-zero, and HDMI holds the last mirrored frame -- the
+  intended end state anyway.

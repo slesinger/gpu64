@@ -164,6 +164,15 @@ public:
 	// are each 1000 bytes (40*25), row-major.
 	void showMirror( const u8 *screen, const u8 *color, u8 border, u8 background );
 
+	// gpu64: the same thing for the RAD menu, which never goes near the C64's
+	// screen RAM -- it keeps its 40x25 in Pi RAM (c64ScreenRAM/c64ColorRAM in
+	// rad_hijack.cpp) and pushes it to the C64 incrementally. So this takes
+	// no bus access at all; it is called from the menu's own raster loop.
+	// The one thing it does that showMirror() doesn't is pick the glyph base
+	// per row, because the menu runs three charsets in one frame via $D018
+	// raster splits (logo rows 0-3, lowercase 4-20, uppercase 21-24).
+	void showMenuMirror( const u8 *screen, const u8 *color );
+
 private:
 	static void FIQHandler( void *pParam );
 

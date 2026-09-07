@@ -76,11 +76,17 @@ void warmCache()
 	// cycle-critical loop but is a separate function, so it isn't covered by
 	// the preload above -- an instruction-cache miss mid-burst could blow the
 	// per-byte DMA_READBYTE timing the same way an uncached reuUsingPolling()
-	// itself would. Size is a guess (matches geoRAMUsingPolling's below);
-	// unverified on real hardware.
+	// itself would.
+	//
+	// 4KB, not the 2KB guess this used to carry (copied from
+	// geoRAMUsingPolling below): the 2026-09-06 mirror rework took the
+	// function from 0x694 to 0x9f0 bytes, i.e. straight past a window nobody
+	// had ever measured it against, which would have left the tail of the
+	// colour-RAM burst running cold. Measured with nm -S on kernel8.elf --
+	// re-check it there if this function grows again.
 	extern void gpu64_mirrorSnapshot( void );
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_mirrorSnapshot, 1024 * 2 );
-	FORCE_READ_LINEARa( (void*)gpu64_mirrorSnapshot, 1024 * 2, 65536 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_mirrorSnapshot, 1024 * 4 );
+	FORCE_READ_LINEARa( (void*)gpu64_mirrorSnapshot, 1024 * 4, 65536 );
 
 	// gpu64: milestone 4's blob transfers are in the same position -- called
 	// from inside the polling loop, not covered by its preload window, and
@@ -465,6 +471,69 @@ void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border,
 		pRAD->showMirror( screen, color, border, background );
 }
 
+// gpu64: the menu's charset for rows 0-3. Same extern-not-#include reasoning
+// as font_bin above: rad_hijack.cpp owns the storage.
+extern u8 font_logo[ 4096 ];
+
+// gpu64: mirror of the RAD menu itself (bench request, 2026-09-06: "Can you
+// mirror the REU menu also?" / "It does not need to mirror the REU menu
+// completely. Just screen and color is sufficient.").
+//
+// The menu composes its display out of three charsets switched by $D018
+// raster splits -- rasterCommandsPAL in rad_hijack.cpp puts font_logo in at
+// raster 33, font_bin's lowercase half at 83, and its uppercase half at 219,
+// which against a first text raster of 51 is rows 0-3, 4-20 and 21-24. A
+// single-charset render would show the file browser in graphics characters,
+// so the row bands are worth the four lines they cost here. Everything else
+// the menu does with rasters -- the border/background colour splits, the
+// sprites -- is deliberately not reproduced: "screen and color is
+// sufficient".
+void CRAD::showMenuMirror( const u8 *screen, const u8 *color )
+{
+	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
+	if ( p == 0 )
+		return;
+	unsigned nPitch = m_Gpu64FB.GetPitch();
+
+	for ( unsigned cy = 0; cy < 25; cy++ )
+	{
+		const u8 *charset;
+		if ( cy < 4 )
+			charset = font_logo;			// PAGE2_UPPERCASE, raster 33
+		else if ( cy < 21 )
+			charset = font_bin + 2048;		// PAGE1_LOWERCASE, raster 83
+		else
+			charset = font_bin;				// PAGE1_UPPERCASE, raster 219
+
+		for ( unsigned cx = 0; cx < 40; cx++ )
+		{
+			unsigned cellIdx = cy * 40 + cx;
+			const u8 *glyph = &charset[ (unsigned)screen[ cellIdx ] * 8 ];
+			u8 fg = color[ cellIdx ] & 15;
+
+			for ( unsigned gy = 0; gy < 8; gy++ )
+			{
+				u8 rowBits = glyph[ gy ];
+				u8 *pDst = p + (size_t)( cy * 8 + gy ) * nPitch + cx * 8;
+				for ( unsigned gx = 0; gx < 8; gx++ )
+					pDst[ gx ] = ( rowBits & ( 0x80 >> gx ) ) ? fg : 0;
+			}
+		}
+	}
+
+	if ( m_Gpu64FB.GetBorder() != 0 )
+		m_Gpu64FB.SetBorder( 0 );
+
+	m_Gpu64FB.CleanPage( m_Gpu64FB.GetDrawPage() );
+}
+
+// gpu64: free-function handle for rad_hijack.cpp, same indirection as above.
+void gpu64_showMenuMirror( const u8 *screen, const u8 *color )
+{
+	if ( g_pRAD )
+		g_pRAD->showMenuMirror( screen, color );
+}
+
 void CRAD::Run( void )
 {
 	// gpu64: first thing logged, every boot. The card's config.txt names the
@@ -562,14 +631,19 @@ void CRAD::Run( void )
 	radIsWaiting:
 		CLR_GPIO( bMPLEX_SEL );
 
-		while ( 1 )
+		// gpu64: this used to be a bare 1250-cycle button poll, which meant
+		// HDMI stayed dark from power-on until the user had blind-navigated
+		// the RAD menu into REU mode -- reported from the bench 2026-09-06.
+		// gpu64_mirrorIdleLoop() (rad_reu.cpp) is the same poll plus the
+		// $FFFF vector-fetch mirror gate, and returns on the same button
+		// press this loop was watching for. Everything it needs -- the GPIO
+		// setup from gpioInit(), the bus timings from initREU(), and a C64
+		// clock proven live by checkIfMachineRunning() -- is already in place
+		// by the time control reaches here.
 		{
-			RESTART_CYCLE_COUNTER						
-			WAIT_UP_TO_CYCLE( 1250 );	
-			g2 = read32( ARM_GPIO_GPLEV0 );			
-	
-			if ( BUTTON_PRESSED ) 
-				goto hijacking;
+			extern void gpu64_mirrorIdleLoop( void );
+			gpu64_mirrorIdleLoop();
+			goto hijacking;
 		}
 
 

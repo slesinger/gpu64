@@ -1017,12 +1017,14 @@ dying in ~100 armed windows to running its full budget.
   fourth cycle and writes in its fifth and sixth, breaking the guarantee. The
   CMD_LO dispatch hold has carried the same exposure since milestone 4. The
   registers are a command port, not a counter.
-- **`gpu64_mirrorSnapshot()` is still an async hold** with exactly this
-  defect, firing 4x/s. The IO2 gate cannot be applied to it: the mirror runs
-  only when `!gpu64ApiActive`, i.e. at a BASIC prompt that touches IO2 never,
-  so gating it there would stop it updating at all. It has always been this
-  way and has never been implicated -- BASIC's idle loop is nearly all reads
-  -- but it is the same latent bug and wants its own answer.
+- ~~**`gpu64_mirrorSnapshot()` is still an async hold** with exactly this
+  defect, firing 4x/s.~~ Fixed 2026-09-06. The IO2 gate could not be applied
+  to it -- the mirror runs only when `!gpu64ApiActive`, i.e. at a BASIC prompt
+  that touches IO2 never -- so it got its own gate of the same kind: the
+  *read* of $FFFF that fetches the IRQ/BRK vector high byte, whose next cycle
+  is the handler's opcode fetch. That is also the jiffy clock the mirror wants.
+  See *Mirror lifecycle and the $FFFF gate* in
+  [progress_tracker.md](progress_tracker.md).
 - **A deferred `PAGE_FLIP` now lands on the program's next `$DFxx` access**
   rather than exactly at the boundary. Every handshake-mode program polls
   STATUS while BUSY is set, so in practice that is the next instruction;
