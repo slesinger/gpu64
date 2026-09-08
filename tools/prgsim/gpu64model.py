@@ -17,6 +17,7 @@ import math
 import struct
 
 import gpu64font
+from gpu64class1 import Class1Mixin, ST_FRAME_READY
 
 FB_W, FB_H, FB_PAGES = 320, 200, 3
 BORDER_W, BORDER_H = 32, 36
@@ -208,7 +209,7 @@ def flt_write(buf, i, v):
     struct.pack_into('<f', buf, 4 * i, v)
 
 
-class Gpu64Model:
+class Gpu64Model(Class1Mixin):
     def __init__(self, mem_read, mem_write, reu_size=16 * 1024 * 1024,
                  frame_period_us=20000, calibrated=True):
         self.mem_read = mem_read
@@ -250,6 +251,9 @@ class Gpu64Model:
         self.txt_charset = gpu64font.CHARSET_LOWER
         self.health_samples = 0
 
+        # --- class 1 (the retained scene graph) ------------------------
+        self.c1_init()
+
         # --- class 2 (raster) -----------------------------------------
         # ids are 1..255; each entry is (w, h, texels) with texels stored
         # column-major, texel(u, v) at texels[u * h + v].
@@ -282,6 +286,18 @@ class Gpu64Model:
         self.vb_armed = False
         self.flip_pending = False
         self.dispatches = 0
+        self.reg_writes = 0
+        # The same two totals split by command class, so a demo's 3D traffic
+        # can be told apart from the class 0 text and HUD it also draws --
+        # the class 1 loop owns the framebuffer and cannot do the latter at
+        # all, so a before/after that lumped them together would credit
+        # class 1 with work that merely moved to the C64's own screen.
+        # Register writes are attributed to the class of the dispatch they
+        # were staged for, which is exact: ARG/ID writes always precede the
+        # CMD_LO that consumes them.
+        self.class_disp = [0, 0, 0, 0]
+        self.class_writes = [0, 0, 0, 0]
+        self.pending_writes = 0
         self.reu_cmd = 0
         self.reu_c64 = 0
         self.reu_addr = 0
@@ -305,6 +321,22 @@ class Gpu64Model:
                 self.flip_pending = False
                 self._commit_flip()
                 self.status &= ~ST_BUSY
+                # A class-1 loop frame pushed while that flip was outstanding
+                # only becomes committable now. See c1_push_frame().
+                #
+                # Raising FRAME_READY HERE -- on the frame clock, with no
+                # dispatch involved -- is deliberate and is the behaviour the
+                # API documents. Do not "fix" this to fire only on a command:
+                # the firmware did exactly that until 2026-09-08 (pollLoopFrame()
+                # was reachable only from gpu64_3dDispatch()), which made a
+                # read-only STATUS poll loop unable to ever see the bit rise,
+                # and cost the Quake demo a 133 ms freeze on 2% of its frames
+                # at the bench. gpu64_vsyncCommitFlip() now harvests from
+                # inside its DMA hold, which is what this line models.
+                if self.c1_ready_deferred:
+                    self.c1_ready_deferred = False
+                    self.status |= ST_FRAME_READY
+                    self.result = self.c1_frame_page
 
     def _prepare_flip(self):
         """The half of a flip CGpu64FrameBuffer::PrepareFlip() performs.
@@ -396,6 +428,12 @@ class Gpu64Model:
         if off <= 0x0A:
             self.reu_write(off, val)
             return
+        # Every write into the gpu64 window, counted for its own sake: what a
+        # command costs the C64 is these, not the dispatch. Comparing an
+        # immediate-mode demo with a retained one is a comparison of this
+        # number per frame.
+        self.reg_writes += 1
+        self.pending_writes += 1
         if off == REG_CMD_HI:
             self.cmd_hi = val
         elif off == REG_CMD_LO:
@@ -503,11 +541,15 @@ class Gpu64Model:
     # --- dispatch ---------------------------------------------------------
     def dispatch(self, op):
         self.dispatches += 1
+        c = self.cmd_hi if self.cmd_hi in (0, 1, 2) else 3
+        self.class_disp[c] += 1
+        self.class_writes[c] += self.pending_writes
+        self.pending_writes = 0
         # Published before the class check, as gpu64_apiDispatch() does it:
         # the echo has to be class-agnostic or a rejected command would look
         # like a lost write.
         self.seqack = self.seq
-        if self.cmd_hi not in (0, 2):
+        if self.cmd_hi not in (0, 1, 2):
             self.err = ERR_BAD_CLASS
             self.status |= ST_ERROR
             return
@@ -518,7 +560,12 @@ class Gpu64Model:
             self.status |= ST_ERROR
             return
         try:
-            res = self.execute_r2(op) if self.cmd_hi == 2 else self.execute(op)
+            if self.cmd_hi == 2:
+                res = self.execute_r2(op)
+            elif self.cmd_hi == 1:
+                res = self.execute_r1(op)
+            else:
+                res = self.execute(op)
         except IndexError:
             res = ERR_OUT_OF_RANGE
         self.err = res
@@ -594,7 +641,7 @@ class Gpu64Model:
             info[8] = h >> 8
             info[9] = 8
             info[10] = 1 if text else FB_PAGES
-            info[11] = 0x01 | 0x04       # class 0 and class 2; class 1 is not modelled
+            info[11] = 0x01 | 0x02 | 0x04       # classes 0, 1 and 2
             info[12] = TXT_BORDER_W if text else BORDER_W
             info[13] = TXT_BORDER_H if text else BORDER_H
             info[14] = self.frame_period_us & 0xFF
@@ -769,6 +816,16 @@ class Gpu64Model:
             if self.flip_pending:
                 return ERR_BUSY
             self.mode = a[0]
+            # A mode change REALLOCATES the surface -- CGpu64FrameBuffer::
+            # SetMode() re-runs Circle's Initialize(), which re-sends the
+            # whole init tag block. So the graphics pages do not survive a
+            # switch in either direction: the firmware memsets all three
+            # and puts the paging state back to page 0 drawn and visible.
+            # A program that carries a framebuffer across a mode change
+            # loses it, and this is where it finds that out.
+            for page in self.pages:
+                page[:] = bytes(len(page))
+            self.draw_page = self.visible_page = self.pending_visible = 0
             return ERR_OK
         if op == 0x51:                                  # TEXT_CLEAR
             self.txt_screen = bytearray([0x20]) * TXT_CELLS

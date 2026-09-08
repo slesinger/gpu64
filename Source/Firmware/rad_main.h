@@ -162,7 +162,7 @@ public:
 	// GPU_OUTPUT_BOX showTestPattern() uses; the two are mutually exclusive
 	// at any given moment (see gpu64ApiActive in rad_reu.cpp). screen/color
 	// are each 1000 bytes (40*25), row-major.
-	void showMirror( const u8 *screen, const u8 *color, u8 border, u8 background );
+	void showMirror( const u8 *screen, const u8 *color, u8 border, u8 background, u8 d018 );
 
 	// gpu64: the same thing for the RAD menu, which never goes near the C64's
 	// screen RAM -- it keeps its 40x25 in Pi RAM (c64ScreenRAM/c64ColorRAM in

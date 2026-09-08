@@ -1,0 +1,1916 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 -- the same room, as a retained scene.
+;
+;      WHAT THIS PROGRAM IS FOR
+;
+;      gpu64_demo_quake.a draws this room with class 2. It holds the level
+;      on the gpu64 side, but a FRAME is still eight commands and about
+;      sixty register writes -- a camera, two lights, a face range, a
+;      monster batch, a weapon sprite, a status bar, a flip -- and the C64
+;      is halted for every one of them.
+;
+;      This program draws the same room with class 1, as a SCENE. The level
+;      is a mesh node, the monsters are sprite nodes, the torch and the
+;      muzzle flash are light nodes, and the camera is a node too. Nothing
+;      here issues a draw call at all: LOOP_START hands the framebuffer to
+;      gpu64, which renders the scene on core 1 at its own frame clock, and
+;      a frame on the C64 side is at most
+;
+;              SET_POSITION + SET_ORIENTATION  on the camera,
+;              SET_ORIENTATION                 on the monster that turns,
+;              SET_POSITION + SET_ORIENTATION  on the monster that walks,
+;              SCENE_COMMIT,
+;
+;      six commands of which five are a handful of register writes each.
+;      "At most", because the camera is sent only when the player actually
+;      moved: the room -- thirty triangles, ten textures, a directional
+;      light, a point light, four nodes' worth of transform -- is resident
+;      and is never sent again after start-up, and so is the camera. A
+;      frame on which he stands still is four commands, three of them the
+;      two monsters that are always moving.
+;
+;      WHAT IS DELIBERATELY MISSING
+;
+;      The weapon, and the status bar. Both were drawn over the finished 3D
+;      view with class 0, and in handshake mode the render loop owns the
+;      framebuffer: there is no moment between the loop's frames at which
+;      the C64 may draw into the page that is about to be shown. That is a
+;      real limitation of the stage 16 loop rather than an oversight, and
+;      it is written up in docs/class1-3d-mesh-reference.md. The report goes
+;      on the C64's own screen instead, which is where a bench reader can
+;      photograph it anyway.
+;
+;      THE CONTROLS
+;
+;              W / S           walk forward and back
+;              A / D           turn left and right
+;              Q / E           strafe left and right
+;              F1 / F3         look up and down, F7 centres
+;              SPACE           fire -- a muzzle flash that lights the room
+;              RUN/STOP        quit
+;
+;      WHAT THE C64 SCREEN SHOWS
+;
+;        SETUP    OK, or the number of the start-up command that failed and
+;                 its ERRCODE. The steps are numbered in the order they are
+;                 issued, from 1.
+;        FRAMES   frames attempted.
+;        OK       SCENE_COMMITs that answered OK. Commits are paced on
+;                 STATUS bit 4 (FRAME_READY), so this should track FRAMES
+;                 closely; committing flat out instead is ~80% BUSY by
+;                 design, which is what the stage 16 loop test measured.
+;        MISSED   dispatches whose SEQACK did not match the SEQ written for
+;                 them -- the pre-existing bus-sampling defect (CLAUDE.md),
+;                 about one write in 180000. Every node update here is
+;                 re-sent from the top when this trips, so this counts
+;                 detections and not lost frames.
+;        ERR      ERRCODE of the last SCENE_COMMIT that was not OK.
+;        STALLS   frames on which the render loop did not report a finished
+;                 frame before the wait ran out. Should stay 00.
+;
+;      Run it: LOAD"GPU64-QUAKE3D",8,1 then RUN. RUN/STOP finishes.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_demo.inc"
+
+; The textures are the class-2 demo's, in class 1's texel order -- see the
+; head of gpu64_quake_tex.inc, which needs these before it is included.
+TEXW	= 32
+TEXH	= 32
+TEXLEN	= TEXW * TEXH
+TEXSH	= 5			; log2 of the width and of the height, which
+				; is what UPLOAD_TEXTURE takes
+
+; ----------------------------------------------------------------------
+; Class 1 opcodes. See docs/class1-3d-mesh-reference.md. They are named
+; here rather than in gpu64_demo.inc because this is the first demo to
+; speak class 1 at all.
+; ----------------------------------------------------------------------
+OP_SCENE_RESET       = $00
+OP_SET_VIEWPORT      = $01
+OP_SET_PERSPECTIVE   = $02
+OP_SET_LIGHT3D       = $03
+OP_BUILD_COLORMAP    = $04
+OP_SET_BACKGROUND    = $05
+OP_LOOP_START        = $06
+OP_LOOP_STOP         = $07
+OP_SCENE_COMMIT      = $08
+OP_UPLOAD_MESH       = $10
+OP_UPLOAD_TEXTURE    = $11
+OP_CREATE_OBJECT     = $20
+OP_CREATE_CAMERA     = $21
+OP_SET_ACTIVE_CAMERA = $23
+OP_SET_VISIBLE       = $24
+OP_CREATE_SPRITE     = $25
+OP_CREATE_LIGHT      = $26
+OP_SET_SPRITE        = $27
+OP_SET_POINT_LIGHT   = $28
+OP_SET_POSITION      = $30
+OP_SET_ORIENTATION   = $31
+
+; The sequence-number pair. Writing SEQ costs one register write and buys a
+; detector for the dropped-write defect; SEQACK reads back the SEQ of the
+; command gpu64 actually dispatched.
+SEQ      = $df22
+SEQACK   = $df23
+
+ST_FRAME_READY = $10		; STATUS bit 4: the loop has a finished frame
+
+SPR_DIRECTIONAL = $01		; the sprite's texture id is the first of
+				; eight views and its yaw picks which
+
+; --- resource ids ------------------------------------------------------
+; Textures and meshes share one id space, so the mesh sits clear of the ten
+; texture ids. The two wall textures must keep the numbers the generated
+; faceBlob names.
+TEX_BRICK = 1
+TEX_STONE = 2
+TEX_MON   = 4			; .. 11: eight views, the first of them named
+MESH_ID   = 20
+
+; --- node ids ----------------------------------------------------------
+CAM_ID    = 1
+LEVEL_ID  = 2
+MON0_ID   = 10			; in the corner, still: walking round IT is
+MON1_ID   = 11			; on the platform, turning on the spot
+MON2_ID   = 12			; on the floor, walking the width of the room
+TORCH_ID  = 20
+FLASH_ID  = 21
+
+; ----------------------------------------------------------------------
+; The world, in CLASS 1 axes.
+;
+; tools/gen_quakemesh.py did the conversion once, at build time: class 2 is
+; a map renderer with x east, y north and z up, and class 1 is left-handed
+; with x right, y UP and z away from the camera, so a class-2 point (x,y,z)
+; is the class-1 point (x, z, y). Everything below is already converted.
+; The PLAYER's own bookkeeping is not, and is converted where it is sent --
+; see sendCamera, which is the only place in this program that knows the
+; two coordinate systems are different.
+; ----------------------------------------------------------------------
+WU	.function n
+	.endf (n * 256) & $ffff
+
+Z_RAMP	= 384			; 1.5 -- the top of the ramp, 8.8
+
+TORCH_X	= 8 * 256		; the torch on the platform: class-2
+TORCH_Y	= Z_RAMP		; (8, 0, Z_RAMP) with its last two swapped
+TORCH_Z	= 0
+TORCH_R	= $0500			; 5.0 world units of reach
+TORCH_S	= 6			; colormap levels it lifts at its centre, of
+				; sixteen -- so six is a lot
+
+FLASH_R	= $0600			; 6.0: the flash has to reach the far wall of
+				; a room this size, not just the floor
+FLASH_N	= 10			; frames a shot stays lit
+
+MON_W	= $00c0			; 0.75 x 1.5 world units
+MON_H	= $0180
+
+; ----------------------------------------------------------------------
+; The player, kept in CLASS 2 axes and 8.8 units -- unchanged from
+; gpu64_demo_quake.a, so the walk, the wall clamp and the ramp height are
+; the same code doing the same arithmetic on the same numbers. Only the
+; four values that go on the bus are converted.
+; ----------------------------------------------------------------------
+X_LO	= $0080			; 0.5
+X_HI	= $0980			; 9.5
+Y_LO	= $fb80			; -4.5
+Y_HI	= $0480			; 4.5
+RAMP_X0	= 6 * 256
+EYE_UP	= $0080
+START_X	= 384			; 1.5 -- at the west end, looking up the room
+
+TURN	= 3			; binary degrees a frame, 256 to the circle
+PITCH_LIM = 48
+
+; The keyboard matrix, read exactly as the class 2 demo reads it.
+CIA_PRA	= $dc00
+CIA_PRB	= $dc01
+COL_A	= %11111110		; F7, F1, F3
+COL_B	= %11111101		; W, A, S, E
+COL_C	= %11111011		; D
+COL_D	= %01111111		; Q, SPACE, RUN/STOP
+KA_F7	= $08
+KA_F1	= $10
+KA_F3	= $20
+KB_W	= $02
+KB_A	= $04
+KB_S	= $20
+KB_E	= $40
+KC_D	= $04
+KD_Q	= $40
+KD_SPC	= $10
+KD_STOP	= $80
+
+; How long to wait for the loop to report a finished frame before giving up
+; on it. The loop runs at the display's frame clock, so a ready frame is at
+; most tens of thousands of cycles away; this is well past that and exists
+; only so a loop that has stopped answering ends the program instead of
+; hanging it.
+READY_WAIT = 8000
+
+; Zero page. $f7-$fa is the RS232 area, free while a PRG runs. eyeZ is NOT
+; here: dmText uses $fb as a pointer, and the two would collide.
+posX	= $f7			; the player, class 2 axes, 8.8 -- adjacent
+posY	= $f9			; so that one routine adds a step to either
+
+	#basicStub
+
+; ======================================================================
+; Start-up.
+;
+; Everything from here to LOOP_START happens once. It is the whole cost of
+; the room: after it, a frame is six commands.
+; ======================================================================
+start
+	jsr dmInit
+
+	#argb 0, BLACK
+	#cmd OP_SET_BORDER
+	#argb 0, BLACK
+	#cmd OP_CLEAR
+
+	; The palette: 8 hues x 32 brightnesses, which BUILD_COLORMAP below
+	; turns into class 1's sixteen lighting levels. PAL_LOAD's count is a
+	; byte, so 256 entries take two calls.
+	;
+	; Class 1's colormap runs BRIGHT-wards -- level 15 is full brightness
+	; -- where class 2's runs the other way. That is why a point light
+	; here adds levels and the same light in gpu64_demo_quake.a subtracts
+	; them, and it is the one thing a reader porting between the two
+	; layers has to hold in mind.
+	#argblob 0, SPACE_C64, palData, 128*3
+	#argb 6, 0
+	#argb 7, 128
+	#cmd OP_PAL_LOAD
+	#argblob 0, SPACE_C64, palData+128*3, 128*3
+	#argb 6, 128
+	#argb 7, 128
+	#cmd OP_PAL_LOAD
+
+	lda #1				; class 1 from here to the end
+	sta CMD_HI
+
+	lda #OP_SCENE_RESET
+	jsr cmd1
+	jsr logSetup
+
+	; The whole screen. There is no status bar to leave room for, because
+	; the C64 cannot draw one while the loop owns the framebuffer.
+	#argw 0, 0
+	#argw 2, 0
+	#argw 4, FB_W
+	#argw 6, FB_H
+	lda #OP_SET_VIEWPORT
+	jsr cmd1
+	jsr logSetup
+
+	; 90 degrees, which is the field of view the class 2 demo gets from a
+	; projection distance of 160 pixels across a 320-wide view. Near 0.25
+	; because the walls come close in a room ten units across; far 120,
+	; which is as far as the 8.8 depth format reaches.
+	;
+	; The order matters: the focal length is derived from the fov AND the
+	; viewport width, so SET_PERSPECTIVE has to come after SET_VIEWPORT.
+	#argw 0, $4000
+	#argw 2, $0040
+	#argw 4, $7800
+	lda #OP_SET_PERSPECTIVE
+	jsr cmd1
+	jsr logSetup
+
+	; The one directional light, plus an ambient floor so the faces it
+	; misses are not flat black. The direction is TOWARDS the light.
+	#argw 0, -1280			; (-5, 7, -6) in 8.8
+	#argw 2, 1792
+	#argw 4, -1536
+	#argb 6, 4
+	lda #OP_SET_LIGHT3D
+	jsr cmd1
+	jsr logSetup
+
+	#argb 0, SKY_COL
+	lda #OP_SET_BACKGROUND
+	jsr cmd1
+	jsr logSetup
+
+	; Reads the palette that is up and builds the sixteen-level colormap
+	; every lit pixel is looked up in. It has to follow PAL_LOAD.
+	lda #OP_BUILD_COLORMAP
+	jsr cmd1
+	jsr logSetup
+
+	; --- the textures -------------------------------------------------
+	lda #<brickTex
+	ldx #>brickTex
+	ldy #TEX_BRICK
+	jsr uploadTex
+	jsr logSetup
+
+	lda #<stoneTex
+	ldx #>stoneTex
+	ldy #TEX_STONE
+	jsr uploadTex
+	jsr logSetup
+
+	; Eight views of the monster, at TEX_MON..TEX_MON+7. A DIRECTIONAL
+	; sprite names only the first of them and gpu64 picks the one you are
+	; looking at. Each view is TEXLEN = 1024 bytes, exactly four pages, so
+	; the low byte of the address never changes.
+	lda #0
+	sta texN
+stTex
+	lda texN
+	asl a
+	asl a
+	clc
+	adc #>monTex
+	tax
+	lda texN
+	clc
+	adc #TEX_MON
+	tay
+	lda #<monTex
+	jsr uploadTex
+	jsr logSetup
+	inc texN
+	lda texN
+	cmp #8
+	bne stTex
+
+	; --- the level, once ----------------------------------------------
+	; Thirty triangles and sixty-two vertices, generated from the class 2
+	; room by tools/gen_quakemesh.py. This one command is the whole of
+	; what a class 2 frame used to re-name every sixtieth of a second.
+	#id16 MESH_ID
+	#argblob 0, SPACE_C64, vertBlob, VBLOBLEN
+	#argblob 6, SPACE_C64, faceBlob, FBLOBLEN
+	lda #OP_UPLOAD_MESH
+	jsr cmd1
+	jsr logSetup
+
+	jsr buildScene
+
+	; He starts where the class 2 demo starts him: at the west end,
+	; looking up the room.
+	lda #<START_X
+	sta posX
+	lda #>START_X
+	sta posX+1
+	lda #0
+	sta posY
+	sta posY+1
+	sta plYaw
+	sta plPitch
+	jsr eyeHeight
+
+	; The camera has to be somewhere before LOOP_START renders from it.
+	; Unconditionally, not through sendCamera: this is also what seeds the
+	; shadow that every later frame's "did anything move?" is measured
+	; against.
+	jsr scPosSend
+	jsr scRotSend
+
+	; And now gpu64 has the screen. ARG0 = 0 is handshake mode: one frame
+	; per SCENE_COMMIT. (Mode 1, free-running, is a later stage and this
+	; firmware answers UNSUPPORTED for it rather than quietly running the
+	; wrong protocol.)
+	#argb 0, 0
+	lda #OP_LOOP_START
+	jsr cmd1
+	sta loopErr
+	jsr logSetup
+
+	jsr showLabels
+	jsr showSetup
+
+	lda loopErr
+	beq frame
+	jmp finish
+
+; ======================================================================
+; A frame.
+;
+; Note what is not here: no clear, no draw, no flip, no vblank wait. Core 1
+; does all four from the scene this loop mutates. The C64's whole job is to
+; say where things are and then say go.
+; ======================================================================
+frame
+	jsr movePlayer
+	jsr sendCamera
+	jsr sendMonsters
+	jsr sendFlash
+
+	; Pace on the loop, not on the bus. A commit issued before the last
+	; frame has finished answers BUSY and is thrown away; a program that
+	; commits flat out gets about four in five refused. One commit per
+	; ready frame is what the handshake is for.
+	jsr waitReady
+
+	; SCENE_COMMIT is sent WITHOUT the retry the node updates get. A
+	; dropped commit costs one frame of latency and nothing else, whereas
+	; a retry after a commit that did land would answer BUSY and look
+	; like an error that never happened.
+	lda #OP_SCENE_COMMIT
+	sta seqOp
+	lda missed
+	sta cmSnap
+	jsr csDispatch
+
+	; Was it this dispatch that the bus dropped? It matters more here than
+	; anywhere else in the frame: a dropped SCENE_COMMIT leaves ERRCODE
+	; holding the *previous* command's answer, which is OK -- so a dropped
+	; commit is counted below as a frame that succeeded. If OK and CMT MISS
+	; ever come out equal, that is what happened and no commit succeeded at
+	; all.
+	lda missed
+	cmp cmSnap
+	beq frNoMiss
+	inc cmMiss
+	bne frNoMiss
+	inc cmMiss+1
+frNoMiss
+
+	lda seqErr
+	beq frOk
+	sta lastErr
+
+	; Split by answer. BUSY (07) is the loop refusing a commit because the
+	; last frame is still in flight -- a pacing outcome. UNSUPPORTED (06)
+	; is not: it means the loop is not running, or there is no frame clock.
+	cmp #ERR_BUSY
+	bne frNot07
+	inc e07
+	bne frFirst
+	inc e07+1
+	jmp frFirst
+frNot07
+	cmp #ERR_UNSUPPORTED
+	bne frNotXX
+	inc e06
+	bne frFirst
+	inc e06+1
+	jmp frFirst
+frNotXX
+	; Whatever this is, it is not one of the two answers the protocol is
+	; supposed to produce. Keep the code as well as the count -- 82 of
+	; these at the bench on 2026-09-08 said only that they existed.
+	sta xxCode
+	inc eXX
+	bne frFirst
+	inc eXX+1
+
+frFirst
+	lda firstSet
+	bne frCount
+	inc firstSet
+	lda seqErr
+	sta firstCode
+	lda frames
+	sta firstFrame
+	lda frames+1
+	sta firstFrame+1
+	jmp frCount
+frOk
+	; The last frame on which a commit was accepted. Paired with FRAMES it
+	; says whether the run died at a countable event or just stopped being
+	; looked at: if lastOk is far below FRAMES, commits were still being
+	; refused for a long tail; if it tracks FRAMES to the end, whatever
+	; froze the HDMI never showed up in an errcode at all.
+	lda frames
+	sta lastOkFrame
+	lda frames+1
+	sta lastOkFrame+1
+	inc okFrames
+	bne frCount
+	inc okFrames+1
+frCount
+	inc frames
+	bne +
+	inc frames+1
++
+	jsr showFrame
+
+	; RUN/STOP off this program's own matrix scan, and only believed on
+	; two consecutive frames: the KERNAL's $91 is maintained by an IRQ
+	; that fights the sei-guarded column reads in readKeys.
+	lda keyD
+	and #KD_STOP
+	bne frUp
+	inc stopCt
+	lda stopCt
+	cmp #2
+	bcs finish
+	jmp frame
+frUp
+	lda #0
+	sta stopCt
+	jmp frame
+
+; ======================================================================
+; Shutting down. LOOP_STOP hands the framebuffer back to immediate mode --
+; without it the next program to run finds the loop still rendering this
+; program's scene over the top of whatever it draws.
+; ======================================================================
+finish
+	lda #OP_LOOP_STOP
+	jsr cmd1
+
+	lda #0
+	sta CMD_HI
+
+	lda #20
+	jsr dmRow
+	jsr dmText
+	.text "STOPPED - RUN/STOP AGAIN TO EXIT"
+	.byte 0
+
+-	jsr readKeys			; wait for the key that stopped us to
+	lda keyD			; come back up, so the second press is
+	and #KD_STOP			; a real one
+	beq -
+-	jsr readKeys
+	lda keyD
+	and #KD_STOP
+	bne -
+	jsr $e544			; KERNAL clear screen
+	rts
+
+; ======================================================================
+; The scene, built once.
+;
+; Every node here is created and placed at start-up and then either never
+; touched again -- the level, the torch, the monster in the corner -- or
+; touched with one command a frame. This routine is the reason a frame is
+; short.
+; ======================================================================
+buildScene
+	; The camera. LOOP_START refuses to run without an active one, so
+	; these two are not optional.
+	#id16 CAM_ID
+	lda #OP_CREATE_CAMERA
+	jsr cmd1
+	jsr logSetup
+
+	#id16 CAM_ID
+	lda #OP_SET_ACTIVE_CAMERA
+	jsr cmd1
+	jsr logSetup
+
+	; The level at the world origin: the mesh is already in world
+	; coordinates, so this node is placed once and never moves.
+	#id16 LEVEL_ID
+	#argw 0, MESH_ID
+	lda #OP_CREATE_OBJECT
+	jsr cmd1
+	jsr logSetup
+
+	#id16 LEVEL_ID
+	#arg1616 0, 0
+	#arg1616 4, 0
+	#arg1616 8, 0
+	lda #OP_SET_POSITION
+	jsr cmd1
+	jsr logSetup
+
+	; --- the three monsters -------------------------------------------
+	lda #0
+	sta monN
+bsMon
+	jsr bsMonId
+	#argw 0, TEX_MON
+	lda #OP_CREATE_SPRITE
+	jsr cmd1
+	jsr logSetup
+
+	jsr bsMonId
+	#argw 0, MON_W
+	#argw 2, MON_H
+	#argb 4, SPR_DIRECTIONAL
+	lda #OP_SET_SPRITE
+	jsr cmd1
+	jsr logSetup
+
+	jsr monStagePos
+	jsr bsMonId
+	lda #OP_SET_POSITION
+	jsr cmd1
+	jsr logSetup
+
+	jsr monStageFace
+	jsr bsMonId
+	lda #OP_SET_ORIENTATION
+	jsr cmd1
+	jsr logSetup
+
+	inc monN
+	lda monN
+	cmp #3
+	bne bsMon
+
+	; --- the torch ----------------------------------------------------
+	; A light is a node like any other: created, positioned by the
+	; ordinary transform opcodes, and then left alone for the whole run.
+	; The class 2 demo had to re-send this light, position and all, every
+	; single frame to keep it lit.
+	#id16 TORCH_ID
+	lda #OP_CREATE_LIGHT
+	jsr cmd1
+	jsr logSetup
+
+	#id16 TORCH_ID
+	#arg1616 0, TORCH_X
+	#arg1616 4, TORCH_Y
+	#arg1616 8, TORCH_Z
+	lda #OP_SET_POSITION
+	jsr cmd1
+	jsr logSetup
+
+	#id16 TORCH_ID
+	#argb 0, TORCH_S
+	#argw 1, TORCH_R
+	lda #OP_SET_POINT_LIGHT
+	jsr cmd1
+	jsr logSetup
+
+	; --- the muzzle flash ---------------------------------------------
+	; Created here and switched straight off. Creating it up front is
+	; what makes firing cost a SET_VISIBLE instead of a node allocation
+	; in the middle of a frame.
+	#id16 FLASH_ID
+	lda #OP_CREATE_LIGHT
+	jsr cmd1
+	jsr logSetup
+
+	#id16 FLASH_ID
+	#argb 0, 0
+	lda #OP_SET_VISIBLE
+	jsr cmd1
+	jsr logSetup
+
+	#id16 FLASH_ID
+	#argb 0, 0			; strength comes with the trigger
+	#argw 1, FLASH_R
+	lda #OP_SET_POINT_LIGHT
+	jsr cmd1
+	jmp logSetup
+
+; ID_LO/ID_HI = the id of monster monN. Node ids here are all under 256, so
+; the high byte is a constant.
+bsMonId
+	ldx monN
+	lda monIds,x
+	sta ID_LO
+	lda #0
+	sta ID_HI
+	rts
+
+monIds	.byte MON0_ID, MON1_ID, MON2_ID
+
+; ----------------------------------------------------------------------
+; The monster records: eight bytes each so indexing one is three shifts.
+; x, y, z are class 1 world 8.8 and face is the direction the monster
+; itself points, in the class-2 byte units the walk arithmetic uses.
+;
+; These are the class 2 demo's three things -- (3,-3,0), (10,1,Z_RAMP) and
+; (5,0,0) with the last two axes swapped. A sprite's position is its FEET,
+; the same measure class 2's `base` was.
+; ----------------------------------------------------------------------
+MRECLEN	= 8
+monRec
+	.word WU(3),  0,      WU(-3)
+	.byte 32, 0
+	.word WU(10), Z_RAMP, WU(1)
+	.byte 0, 0
+	.word WU(5),  0,      0
+	.byte 64, 0
+
+; Stage monster monN's position as three 16.16 vectors.
+monStagePos
+	jsr monOffX
+	ldy #0
+	jsr putTab1616
+	ldy #4
+	jsr putTab1616
+	ldy #8
+	jmp putTab1616
+
+; Stage monster monN's facing as an orientation.
+monStageFace
+	jsr monOffX
+	lda monRec+6,x
+	jmp faceToYaw
+
+; X = the byte offset of monster monN's record.
+monOffX
+	lda monN
+	asl a
+	asl a
+	asl a
+	tax
+	rts
+
+; ======================================================================
+; The camera: the two commands that are the whole of what this program
+; tells gpu64 about where the player is.
+;
+; This is the only routine that knows the player and the scene are in
+; different coordinate systems:
+;
+;   class 1 x = posX,  y = eyeZ,  z = posY        the axis swap
+;   class 1 yaw   = (64 - plYaw) << 8             class 2 yaw 0 looks +x,
+;                                                 class 1 yaw 0 looks +z
+;   class 1 pitch = -(plPitch << 8)               class 2 pitch is positive
+;                                                 looking UP, class 1
+;                                                 positive is looking DOWN
+;
+; Both go through cmdSeq1, which re-sends the WHOLE command -- arguments
+; included -- if SEQACK says a write was dropped. Re-firing CMD_LO alone
+; would not do: the write that was lost is as likely to have been an
+; argument byte, and the ARG window still holds whatever did land.
+;
+; And neither is sent at all unless the player actually moved. The scene
+; keeps the camera between frames, so standing still costs nothing -- which
+; is the difference from class 2, where the camera went out every frame
+; whether it had changed or not. The comparison is against the SOURCE bytes
+; (posX/posY/eyeZ, plYaw/plPitch) and not against the ARG window: the ARG
+; registers are write-only, and reading them back would sample a floating
+; bus rather than what was staged.
+;
+; The shadow is updated only after a send whose SEQACK matched. A command
+; that may or may not have landed has to stay recorded as NOT sent -- mark
+; it sent and a dropped camera update becomes permanent, because no later
+; frame would ever see a difference to correct it.
+; ======================================================================
+sendCamera
+	jsr camPosChanged
+	beq +
+	jsr scPosSend
++
+	jsr camRotChanged
+	beq +
+	jsr scRotSend
++	rts
+
+; Unconditional. Start-up calls these two directly, before LOOP_START, to
+; put the camera somewhere and to seed the shadows with what was sent.
+scPosSend
+	jsr scStagePos
+	jsr scPosCmd
+	beq +
+	jsr scPosCmd
+	bne scpDone
++	jsr camPosKeep
+scpDone	rts
+
+scRotSend
+	jsr scStageRot
+	jsr scRotCmd
+	beq +
+	jsr scRotCmd
+	bne scrDone
++	jsr camRotKeep
+scrDone	rts
+
+scStagePos
+	ldx #posX
+	ldy #0
+	jsr put1616
+	jsr argEye			; ARG4..7
+	ldx #posY
+	ldy #8
+	jmp put1616
+
+scPosCmd
+	#id16 CAM_ID
+	lda #OP_SET_POSITION
+	jmp cmdSeq1
+
+scStageRot
+	lda #0
+	sta ARG+0
+	lda #64
+	sec
+	sbc plYaw
+	sta ARG+1
+
+	lda #0
+	sta ARG+2
+	sec				; 0 - (plPitch << 8), which is a
+	sbc plPitch			; borrow-free subtract of the high
+	sta ARG+3			; byte alone when the low byte is 0
+
+	lda #0
+	sta ARG+4
+	sta ARG+5
+	rts
+
+scRotCmd
+	#id16 CAM_ID
+	lda #OP_SET_ORIENTATION
+	jmp cmdSeq1
+
+; A = 0 when the camera is where it was left. Six bytes for the position
+; and two for the angles, because those eight are everything the two
+; commands above are built from.
+camPosChanged
+	lda posX
+	cmp camPosSh+0
+	bne cpcDiff
+	lda posX+1
+	cmp camPosSh+1
+	bne cpcDiff
+	lda posY
+	cmp camPosSh+2
+	bne cpcDiff
+	lda posY+1
+	cmp camPosSh+3
+	bne cpcDiff
+	lda eyeZ
+	cmp camPosSh+4
+	bne cpcDiff
+	lda eyeZ+1
+	cmp camPosSh+5
+	bne cpcDiff
+	lda #0
+	rts
+cpcDiff	lda #1
+	rts
+
+camPosKeep
+	lda posX
+	sta camPosSh+0
+	lda posX+1
+	sta camPosSh+1
+	lda posY
+	sta camPosSh+2
+	lda posY+1
+	sta camPosSh+3
+	lda eyeZ
+	sta camPosSh+4
+	lda eyeZ+1
+	sta camPosSh+5
+	rts
+
+camRotChanged
+	lda plYaw
+	cmp camRotSh+0
+	bne crcDiff
+	lda plPitch
+	cmp camRotSh+1
+	bne crcDiff
+	lda #0
+	rts
+crcDiff	lda #1
+	rts
+
+camRotKeep
+	lda plYaw
+	sta camRotSh+0
+	lda plPitch
+	sta camRotSh+1
+	rts
+
+; ======================================================================
+; The two monsters that move.
+;
+; Three bytes of state between them, and one command each. A class 2 frame
+; re-sent all three whole sixteen-byte records inside the batch whether
+; they had changed or not; the one standing in the corner is not mentioned
+; here at all.
+; ======================================================================
+sendMonsters
+	; The one on the platform turns on the spot, a full circle every 256
+	; frames, so all eight of its views come round without it moving.
+	lda frameCt
+	sta monRec+1*MRECLEN+6
+
+	; The one on the floor walks the width of the room and back. In class
+	; 1 that is its z, and its facing flips at each end.
+	ldy #64				; walking toward +z
+	lda frameCt
+	and #$7f
+	cmp #$40
+	bcc +
+	eor #$7f			; 127 - p: the way back
+	ldy #192
++
+	sty monRec+2*MRECLEN+6
+	sec
+	sbc #32				; -32..31
+	sta smTmp
+	asl a				; x8 -> -4.0 .. 3.9 world units. The
+	asl a				; high byte is the sign of the value
+	asl a				; BEFORE the shift, which is right for
+	sta monRec+2*MRECLEN+4		; this range and only for this range.
+	lda smTmp
+	and #$80
+	beq +
+	lda #$ff
++
+	sta monRec+2*MRECLEN+5
+
+	lda #1
+	sta monN
+	jsr smFaceOnce
+	beq +
+	jsr smFaceOnce
++
+	lda #2
+	sta monN
+	jsr smPosOnce
+	beq +
+	jsr smPosOnce
++
+	jsr smFaceOnce
+	beq +
+	jsr smFaceOnce
++	rts
+
+smPosOnce
+	jsr monStagePos
+	jsr bsMonId
+	lda #OP_SET_POSITION
+	jmp cmdSeq1
+
+smFaceOnce
+	jsr monStageFace
+	jsr bsMonId
+	lda #OP_SET_ORIENTATION
+	jmp cmdSeq1
+
+; ======================================================================
+; The muzzle flash.
+;
+; Nothing at all is sent on a frame he is not firing, which is the point of
+; a light being a node: it keeps its position, its radius and its strength
+; between frames, so "still off" costs nothing. Class 2's inline SET_LIGHT
+; had to be re-sent every frame just to stay lit.
+; ======================================================================
+sendFlash
+	lda flashCt
+	bne sfLit
+
+	lda flashArm			; out, and already switched off?
+	beq sfDone
+	lda #0
+	sta flashArm
+	jsr sfVisOnce			; no: this is the frame that clears it
+	beq sfDone
+	jmp sfVisOnce
+
+sfLit
+	lda flashArm
+	cmp #2
+	beq sfMove
+	lda #2
+	sta flashArm
+	jsr sfVisOnce
+	beq sfMove
+	jsr sfVisOnce
+
+sfMove
+	; At his eye, so what it lights is whatever he is pointing at.
+	ldx #posX
+	ldy #0
+	jsr put1616
+	jsr argEye
+	ldx #posY
+	ldy #8
+	jsr put1616
+	#id16 FLASH_ID
+	lda #OP_SET_POSITION
+	jsr cmdSeq1
+
+	; 10..1 -> strength 40..4. Forty is far past the sixteen levels the
+	; colormap has and the lookup clamps, so near the muzzle the wall
+	; goes white.
+	lda flashCt
+	asl a
+	asl a
+	sta ARG+0
+	#argw 1, FLASH_R
+	#id16 FLASH_ID
+	lda #OP_SET_POINT_LIGHT
+	jsr cmdSeq1
+
+	dec flashCt
+sfDone
+	rts
+
+; SET_VISIBLE with the state flashArm now says it should be: 2 means lit.
+sfVisOnce
+	lda flashArm
+	cmp #2
+	beq +
+	lda #0
+	.byte $2c			; bit $a901 -- skips the next two bytes
++	lda #1
+	sta ARG+0
+	#id16 FLASH_ID
+	lda #OP_SET_VISIBLE
+	jmp cmdSeq1
+
+; ======================================================================
+; Wait for the render loop to finish a frame.
+;
+; STATUS bit 4 is FRAME_READY, and this is a plain register read: no
+; dispatch, no DMA hold, nothing the loop has to stop for. The counter is a
+; dead-loop guard only.
+; ======================================================================
+waitReady
+	lda #<READY_WAIT
+	sta waitCt
+	lda #>READY_WAIT
+	sta waitCt+1
+	; BOTH bits, not just FRAME_READY. FRAME_READY says core 1 has finished
+	; rendering; it says nothing about the flip the *previous* commit armed,
+	; which only retires at the next vblank and until then makes
+	; SCENE_COMMIT answer BUSY on gpu64Vsync.flipPending. Waiting on
+	; FRAME_READY alone is what produced 15838 BUSY answers against 6099
+	; accepted commits at the bench on 2026-09-08: the render finishes in
+	; well under a frame, so the program went back round three times per
+	; displayed frame and halted the C64 for a dispatch each time, to be
+	; told the same thing. STATUS bit 0 is cleared by the vsync commit in
+	; the same breath as gpu64Vsync.flipPending (rad_reu.cpp), so it is
+	; exactly the missing half of the condition.
+wrPoll
+	lda STATUS
+	and #( ST_FRAME_READY | ST_BUSY )
+	cmp #ST_FRAME_READY
+	beq wrDone
+	lda waitCt
+	bne +
+	dec waitCt+1
++	dec waitCt
+	lda waitCt
+	ora waitCt+1
+	bne wrPoll
+
+	; Gave up. Stamp it: which frame the FIRST stall happened on, and the
+	; STATUS byte the C64 was still being handed when the budget ran out.
+	; Read STATUS again rather than keeping it in the poll loop -- the loop
+	; runs 8000 times per stall and this runs once.
+	inc waitFail
+	lda STATUS
+	sta lastStat
+	lda stallSet
+	bne wrDone
+	inc stallSet
+	lda frames
+	sta stallFrame
+	lda frames+1
+	sta stallFrame+1
+wrDone
+	rts
+
+; ======================================================================
+; Dispatch.
+;
+; cmd1 is the plain one: the write to CMD_LO halts the C64 for the whole
+; command, so ERRCODE is valid on the very next instruction and there is
+; nothing to poll.
+;
+; csDispatch adds the sequence number. It writes an incrementing SEQ before
+; the dispatch and compares SEQACK after it; a mismatch means the SEQ
+; write, an argument write or CMD_LO itself was not sampled by the polling
+; loop -- the pre-existing bus defect CLAUDE.md documents, about one write
+; in 180000, not a bug in this program. It returns A = 0 when the command
+; was seen, and leaves the ERRCODE in seqErr.
+;
+; cmdSeq1 is csDispatch for a caller that has already staged its arguments
+; and does not need to re-stage them (SET_VISIBLE, SET_POINT_LIGHT and the
+; rest all leave their ARG bytes alone). Callers whose arguments are
+; computed re-run the staging as well -- see sendCamera.
+; ======================================================================
+cmd1
+	ldx #1
+	stx CMD_HI
+	sta CMD_LO
+	lda ERRCODE
+	rts
+
+cmdSeq1
+	sta seqOp
+csDispatch
+	inc seqCounter
+	bne +
+	inc seqCounter			; never 0: a SEQACK that has never been
++					; written must not read as a match
+	lda seqCounter
+	sta SEQ
+	lda seqOp
+	jsr cmd1
+	sta seqErr
+	lda SEQACK
+	cmp seqCounter
+	beq csOk
+	inc missed
+	bne +
+	inc missed+1
++
+	lda #1				; A != 0: the caller should send again
+	rts
+csOk
+	lda #0
+	rts
+
+; ======================================================================
+; Argument staging helpers.
+; ======================================================================
+
+; X = the zero page address of a signed 8.8 value, Y = an ARG offset.
+; Writes the four bytes of the 16.16 SET_POSITION takes: the 8.8 value
+; shifted left eight and sign-extended.
+put1616
+	lda #0
+	sta ARG,y
+	iny
+	lda $00,x
+	sta ARG,y
+	iny
+	lda $01,x
+	sta ARG,y
+	iny
+	lda $01,x
+	and #$80
+	beq +
+	lda #$ff
++	sta ARG,y
+	rts
+
+; The same for eyeZ, which is in ordinary RAM rather than zero page. It is
+; a height above the floor and so is never negative, which is why the top
+; byte is a constant zero.
+argEye
+	lda #0
+	sta ARG+4
+	lda eyeZ
+	sta ARG+5
+	lda eyeZ+1
+	sta ARG+6
+	lda #0
+	sta ARG+7
+	rts
+
+; X = a byte offset into monRec, Y = an ARG offset. Leaves X advanced by
+; two, so three calls walk one record's x, y and z.
+putTab1616
+	lda #0
+	sta ARG,y
+	iny
+	lda monRec,x
+	sta ARG,y
+	iny
+	inx
+	lda monRec,x
+	sta ARG,y
+	iny
+	and #$80
+	beq +
+	lda #$ff
++	sta ARG,y
+	inx
+	rts
+
+; A = a class 2 facing byte. Stages the class 1 orientation that means the
+; same direction: yaw = (64 - facing) << 8, pitch and roll zero.
+faceToYaw
+	sta ftTmp
+	lda #0
+	sta ARG+0
+	lda #64
+	sec
+	sbc ftTmp
+	sta ARG+1
+	lda #0
+	sta ARG+2
+	sta ARG+3
+	sta ARG+4
+	sta ARG+5
+	rts
+
+; A = the low byte of the texture address, X = its high byte, Y = the id.
+uploadTex
+	sta ARG+1
+	stx ARG+2
+	sty ID_LO
+	lda #0
+	sta ID_HI
+	sta ARG+3
+	lda #SPACE_C64
+	sta ARG+0
+	#argw 4, TEXLEN
+	#argb 6, TEXSH
+	#argb 7, TEXSH
+	lda #OP_UPLOAD_TEXTURE
+	jmp cmd1
+
+; A = an ERRCODE, returned unchanged. Counts the start-up commands and
+; remembers the FIRST one that failed, by its number from 1 and its code.
+logSetup
+	tay
+	inc setupIdx
+	cpy #0
+	beq lsDone
+	lda setupBadCode
+	bne lsDone
+	sty setupBadCode
+	lda setupIdx
+	sta setupBadAt
+lsDone
+	tya
+	rts
+
+; ======================================================================
+; The player. Unchanged from gpu64_demo_quake.a: same axes, same units,
+; same tables. Nothing below this line knows that gpu64 is drawing a scene
+; graph rather than a batch of records.
+; ======================================================================
+movePlayer
+	inc frameCt
+	jsr readKeys
+
+	; Look up and down. The limit is 48 binary degrees either way -- far
+	; enough to see the ceiling, not far enough to turn the room over.
+	lda keyA
+	and #KA_F7
+	bne +
+	lda #0
+	sta plPitch
++
+	lda keyA
+	and #KA_F1
+	bne +
+	lda plPitch
+	cmp #PITCH_LIM
+	beq +
+	clc
+	adc #2
+	sta plPitch
++
+	lda keyA
+	and #KA_F3
+	bne +
+	lda plPitch
+	cmp #256-PITCH_LIM
+	beq +
+	sec
+	sbc #2
+	sta plPitch
++
+
+	; Turn first, so the walk that follows uses the angle he is facing by
+	; the end of the frame. Yaw counts anticlockwise: +y is to his left.
+	lda keyB
+	and #KB_A
+	bne +
+	lda plYaw
+	clc
+	adc #TURN
+	sta plYaw
++
+	lda keyC
+	and #KC_D
+	bne +
+	lda plYaw
+	sec
+	sbc #TURN
+	sta plYaw
++
+
+	; vecX,vecY is now one step forward: about an eighth of a world unit.
+	lda plYaw
+	jsr setDir
+
+	lda keyB
+	and #KB_W
+	bne +
+	lda vecX
+	ldx #posX
+	jsr addSgn
+	lda vecY
+	ldx #posY
+	jsr addSgn
++
+	lda keyB
+	and #KB_S
+	bne +
+	lda vecX
+	jsr negA
+	ldx #posX
+	jsr addSgn
+	lda vecY
+	jsr negA
+	ldx #posY
+	jsr addSgn
++
+
+	; Strafing right is the forward vector turned a quarter circle:
+	; (sin yaw, -cos yaw). No second lookup, just the two bytes swapped.
+	lda keyB
+	and #KB_E
+	bne +
+	lda vecY
+	ldx #posX
+	jsr addSgn
+	lda vecX
+	jsr negA
+	ldx #posY
+	jsr addSgn
++
+	lda keyD
+	and #KD_Q
+	bne +
+	lda vecY
+	jsr negA
+	ldx #posX
+	jsr addSgn
+	lda vecX
+	ldx #posY
+	jsr addSgn
++
+
+	; Fire. SPACE raises the muzzle flash and re-arms the one-shot that
+	; puts it out again; holding the key keeps it lit, which is what a
+	; held trigger should look like.
+	lda keyD
+	and #KD_SPC
+	bne +
+	lda #FLASH_N
+	sta flashCt
+	lda flashArm
+	bne +
+	lda #1
+	sta flashArm
++
+	jsr clampPos
+	jmp eyeHeight
+
+setDir
+	tax
+	lda sinTab,x
+	jsr asr2
+	sta vecY
+	txa
+	clc
+	adc #64
+	tax
+	lda sinTab,x
+	jsr asr2
+	sta vecX
+	rts
+
+asr2
+	cmp #$80			; carry = sign, so ROR keeps it
+	ror a
+	cmp #$80
+	ror a
+	rts
+
+negA
+	eor #$ff
+	clc
+	adc #1
+	rts
+
+; A = a signed 8-bit step, X = the zero page address of a 16-bit value:
+; add one to the other.
+addSgn
+	ldy #0
+	cmp #$80
+	bcc +
+	ldy #$ff			; sign-extend into the high byte
++
+	clc
+	adc $00,x
+	sta $00,x
+	tya
+	adc $01,x
+	sta $01,x
+	rts
+
+; Keep him inside the room: half a unit clear of every wall. There is no
+; collision detection here -- the room is a box, and a box is four
+; compares.
+;
+; x is always positive, so a negative high byte can only mean he walked
+; backwards through the west wall. y is signed, and biasing the high byte
+; by $80 turns the signed compare into the unsigned one the 6502 has.
+YHB	= (>Y_HI) ^ $80
+YLB	= (>Y_LO) ^ $80
+
+clampPos
+	lda posX+1
+	bmi cpLoX
+	cmp #>X_HI
+	bcc cpChkLo
+	bne cpHiX
+	lda posX
+	cmp #<X_HI
+	bcc cpChkLo
+cpHiX
+	lda #<X_HI
+	sta posX
+	lda #>X_HI
+	sta posX+1
+	jmp cpYax
+cpChkLo
+	lda posX+1
+	cmp #>X_LO
+	bcc cpLoX
+	bne cpYax
+	lda posX
+	cmp #<X_LO
+	bcs cpYax
+cpLoX
+	lda #<X_LO
+	sta posX
+	lda #>X_LO
+	sta posX+1
+
+cpYax
+	lda posY+1
+	eor #$80
+	cmp #YHB
+	bcc cpChkYlo
+	bne cpHiY
+	lda posY
+	cmp #<Y_HI
+	bcc cpChkYlo
+cpHiY
+	lda #<Y_HI
+	sta posY
+	lda #>Y_HI
+	sta posY+1
+	rts
+cpChkYlo
+	lda posY+1
+	eor #$80
+	cmp #YLB
+	bcc cpLoY
+	bne cpYdone
+	lda posY
+	cmp #<Y_LO
+	bcs cpYdone
+cpLoY
+	lda #<Y_LO
+	sta posY
+	lda #>Y_LO
+	sta posY+1
+cpYdone
+	rts
+
+; The height of the ramp under his feet, plus half a unit for the eye.
+;
+; The ramp climbs 1.5 units over the 3 from x=6 to x=9, so the floor he is
+; standing on is ( x - 6 ) / 2, clamped to the top. One subtract and one
+; shift is the whole of what a sloped floor costs the 6502.
+eyeHeight
+	lda posY+1			; the ramp is only three units wide,
+	bpl +				; so off its sides the floor is flat
+	lda posY
+	jsr negA
+	lda posY+1
+	eor #$ff
+	adc #0
++
+	cmp #2
+	bcs ehFlat
+
+	lda posX+1
+	cmp #6
+	bcc ehFlat
+
+	sec
+	lda posX
+	sbc #<RAMP_X0
+	sta eyeZ
+	lda posX+1
+	sbc #>RAMP_X0
+	sta eyeZ+1
+	lsr eyeZ+1
+	ror eyeZ
+
+	lda eyeZ+1
+	cmp #>Z_RAMP
+	bcc ehAdd
+	bne ehClamp
+	lda eyeZ
+	cmp #<Z_RAMP
+	bcc ehAdd
+ehClamp
+	lda #<Z_RAMP
+	sta eyeZ
+	lda #>Z_RAMP
+	sta eyeZ+1
+ehAdd
+	clc
+	lda eyeZ
+	adc #<EYE_UP
+	sta eyeZ
+	lda eyeZ+1
+	adc #>EYE_UP
+	sta eyeZ+1
+	rts
+
+ehFlat
+	lda #<EYE_UP
+	sta eyeZ
+	lda #>EYE_UP
+	sta eyeZ+1
+	rts
+
+; The keyboard, read straight off the matrix: four columns carry every key
+; this program uses.
+readKeys
+	sei
+	lda #$ff
+	sta $dc02			; port A drives the columns
+	lda #$00
+	sta $dc03			; port B reads the rows
+
+	lda #COL_A
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyA
+	lda #COL_B
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyB
+	lda #COL_C
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyC
+	lda #COL_D
+	sta CIA_PRA
+	lda CIA_PRB
+	sta keyD
+
+	lda #$ff			; leave it as the KERNAL expects
+	sta CIA_PRA
+	cli
+	rts
+
+; ======================================================================
+; The report, on the C64's own screen.
+; ======================================================================
+showLabels
+	lda #0
+	jsr dmRow
+	jsr dmText
+	.text "GPU64 QUAKE3D - A RETAINED SCENE"
+	.byte 0
+
+	lda #4
+	jsr dmRow
+	jsr dmText
+	.text "FRAMES"
+	.byte 0
+	lda #5
+	jsr dmRow
+	jsr dmText
+	.text "OK"
+	.byte 0
+	lda #6
+	jsr dmRow
+	jsr dmText
+	.text "MISSED"
+	.byte 0
+	lda #7
+	jsr dmRow
+	jsr dmText
+	.text "ERR"
+	.byte 0
+	lda #8
+	jsr dmRow
+	jsr dmText
+	.text "STALLS"
+	.byte 0
+
+	; The diagnostic half, added 2026-09-08 after a bench run in which
+	; every commit was refused and the single ERR byte could not say why.
+	;
+	; CLOCK is the measured frame period from GET_INFO, and it is the
+	; first thing to read: SCENE_COMMIT requires a calibrated frame clock
+	; and answers UNSUPPORTED without one, while LOOP_START does not check
+	; it at all -- so a display gpu64 could not measure gives exactly
+	; "SETUP OK" followed by an all-UNSUPPORTED run.
+	lda #9
+	jsr dmRow
+	jsr dmText
+	.text "CLOCK"
+	.byte 0
+	lda #10
+	jsr dmRow
+	jsr dmText
+	.text "CMT 06"
+	.byte 0
+	lda #11
+	jsr dmRow
+	jsr dmText
+	.text "CMT 07"
+	.byte 0
+	lda #12
+	jsr dmRow
+	jsr dmText
+	.text "CMT XX"
+	.byte 0
+	lda #13
+	jsr dmRow
+	jsr dmText
+	.text "CMTMISS"
+	.byte 0
+	lda #14
+	jsr dmRow
+	jsr dmText
+	.text "FIRST"
+	.byte 0
+
+	; The stall stamps, added after the 2026-09-08 run that stalled 162
+	; times and then froze the HDMI side with no errcode to show for it.
+	; Reads as: first-stall frame, last-accepted-commit frame, and the
+	; STATUS byte waitReady gave up on.
+	lda #15
+	jsr dmRow
+	jsr dmText
+	; Not "STALL@" -- printAt only converts $41-$5A, and "@" ($40) falls
+	; through to screen code $40, which is a graphic, not an at-sign.
+	.text "STALLAT"
+	.byte 0
+
+	; And the clock itself, which is known before the first frame and
+	; never changes.
+	lda #9
+	jsr dmRow
+	jsr showCol
+	lda dmInfo+15
+	jsr dmHexA
+	lda dmInfo+14
+	jsr dmHexA
+
+	lda #16
+	jsr dmRow
+	jsr dmText
+	.text "W/S WALK   A/D TURN   Q/E STRAFE"
+	.byte 0
+	lda #17
+	jsr dmRow
+	jsr dmText
+	.text "F1/F3 LOOK F7 LEVEL SPACE FIRE"
+	.byte 0
+	lda #18
+	jsr dmRow
+	jsr dmText
+	.text "RUN/STOP QUITS"
+	.byte 0
+	rts
+
+showSetup
+	lda #2
+	jsr dmRow
+	jsr dmText
+	.text "SETUP "
+	.byte 0
+	lda setupBadCode
+	bne ssBad
+	jsr dmText
+	.text "OK"
+	.byte 0
+	rts
+ssBad
+	jsr dmText
+	.text "FAILED AT STEP "
+	.byte 0
+	lda setupBadAt
+	jsr dmHexA
+	jsr dmText
+	.text " CODE "
+	.byte 0
+	lda setupBadCode
+	jmp dmHexA
+
+showFrame
+	lda #4
+	jsr dmRow
+	jsr showCol
+	lda frames+1
+	jsr dmHexA
+	lda frames
+	jsr dmHexA
+
+	lda #5
+	jsr dmRow
+	jsr showCol
+	lda okFrames+1
+	jsr dmHexA
+	lda okFrames
+	jsr dmHexA
+
+	lda #6
+	jsr dmRow
+	jsr showCol
+	lda missed+1
+	jsr dmHexA
+	lda missed
+	jsr dmHexA
+
+	lda #7
+	jsr dmRow
+	jsr showCol
+	lda lastErr
+	jsr dmHexA
+
+	lda #8
+	jsr dmRow
+	jsr showCol
+	lda waitFail
+	jsr dmHexA
+
+	lda #10
+	jsr dmRow
+	jsr showCol
+	lda e06+1
+	jsr dmHexA
+	lda e06
+	jsr dmHexA
+
+	lda #11
+	jsr dmRow
+	jsr showCol
+	lda e07+1
+	jsr dmHexA
+	lda e07
+	jsr dmHexA
+
+	lda #12
+	jsr dmRow
+	jsr showCol
+	lda eXX+1
+	jsr dmHexA
+	lda eXX
+	jsr dmHexA
+	ldy #0
+	lda #$20
+	sta (DST),y
+	inc DST
+	bne +
+	inc DST+1
++	lda xxCode
+	jsr dmHexA
+
+	lda #13
+	jsr dmRow
+	jsr showCol
+	lda cmMiss+1
+	jsr dmHexA
+	lda cmMiss
+	jsr dmHexA
+
+	lda #14
+	jsr dmRow
+	jsr showCol
+	lda firstCode
+	jsr dmHexA
+	ldy #0
+	lda #$20			; dmHexA left DST on the next column
+	sta (DST),y
+	inc DST
+	bne +
+	inc DST+1
++	lda firstFrame+1
+	jsr dmHexA
+	lda firstFrame
+	jsr dmHexA
+
+	lda #15
+	jsr dmRow
+	jsr showCol
+	lda stallFrame+1
+	jsr dmHexA
+	lda stallFrame
+	jsr dmHexA
+	jsr dmSpace
+	lda lastOkFrame+1
+	jsr dmHexA
+	lda lastOkFrame
+	jsr dmHexA
+	jsr dmSpace
+	lda lastStat
+	jmp dmHexA
+
+; One blank column, for the fields that print two numbers on a row.
+dmSpace
+	ldy #0
+	lda #$20
+	sta (DST),y
+	inc DST
+	bne +
+	inc DST+1
++	rts
+
+; Past the widest label.
+showCol
+	clc
+	lda DST
+	adc #8
+	sta DST
+	bcc +
+	inc DST+1
++	rts
+
+; ======================================================================
+; State
+; ======================================================================
+camPosSh .fill 6, 0		; the camera as gpu64 last confirmed it -- see
+camRotSh .fill 2, 0		; sendCamera. Seeded by start-up's forced send.
+eyeZ	.word 0			; the eye, class 2 axes, 8.8 -- see the note
+				; on the zero page map above
+plYaw	.byte 0
+plPitch	.byte 0
+frameCt	.byte 0
+vecX	.byte 0
+vecY	.byte 0
+keyA	.byte $ff
+keyB	.byte $ff
+keyC	.byte $ff
+keyD	.byte $ff
+stopCt	.byte 0
+
+flashCt	.byte 0			; frames the muzzle flash has left
+flashArm .byte 0		; 0 = out and switched off, 1 = fired this
+				; frame, 2 = lit
+
+texN	.byte 0
+monN	.byte 0
+smTmp	.byte 0
+ftTmp	.byte 0
+
+seqCounter .byte 0
+seqOp	.byte 0
+seqErr	.byte 0
+missed	.word 0
+
+frames	.word 0
+okFrames .word 0
+lastErr	.byte 0
+loopErr	.byte 0
+waitCt	.word 0
+waitFail .byte 0
+stallSet .byte 0		; first-stall stamp taken yet?
+stallFrame .word 0		; ...and the frame it happened on
+lastOkFrame .word 0		; last frame a commit was accepted on
+lastStat .byte 0		; STATUS as read when waitReady gave up
+
+cmSnap	.byte 0			; missed, sampled either side of the commit
+cmMiss	.word 0
+e06	.word 0			; commits answered UNSUPPORTED
+e07	.word 0			; ...BUSY
+eXX	.word 0			; ...anything else
+xxCode	.byte 0			; the code of the last one of those
+firstSet .byte 0
+firstCode .byte 0
+firstFrame .word 0
+
+setupIdx .byte 0
+setupBadAt .byte 0
+setupBadCode .byte 0
+
+; A whole circle of sines, 256 units round, +-127.
+sinTab
+	.for i = 0, i < 256, i += 1
+	.byte round(127 * sin(i * 2 * pi / 256)) & $ff
+	.next
+
+; --- the palette: 8 hues x 32 brightnesses -----------------------------
+palHues = [[80,60,50], [150,120,95], [110,110,120], [90,130,90], [170,150,60], [70,90,150], [180,90,60], [200,200,200]]
+
+palData
+	.for h = 0, h < 8, h += 1
+	  .for s = 0, s < 32, s += 1
+	  .byte round(palHues[h][0] * s / 31.0), round(palHues[h][1] * s / 31.0), round(palHues[h][2] * s / 31.0)
+	  .next
+	.next
+
+SKY_COL	= 2*32+6		; what shows where nothing was drawn
+
+	.include "gpu64_quake_tex.inc"
+	.include "gpu64_demo_quake3d.inc"
+
+	.include "gpu64_demo_rt.inc"

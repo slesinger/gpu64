@@ -70,20 +70,44 @@ build or in code reading.
    are the two worked examples.
 6. **Work added ahead of the bus sampling is exposed**, and how much depends on
    which mode it runs in. Judge loop additions by that, not by their cost.
-7. **Only open a DMA hold immediately after a sampled IO2 access.** Asserting
-   `bDMA_OUT` halts the 6510 through RDY, which stops it only on **read**
-   cycles; a write completes regardless, with AEC already tri-stating the
-   address bus, so it lands at a floating address and corrupts the C64. An
-   IO2 access is always the *last* cycle of its instruction, so the next
-   cycle is provably an opcode fetch — that is the guarantee every safe hold
-   in the tree rests on. The screen mirror, which never sees an IO2 access,
-   uses the other decode the loop can see: a **read of $FFFF**, the IRQ/BRK
-   vector high-byte fetch, whose next cycle is the handler's opcode fetch by
-   construction. You cannot substitute a read/write test on the sampled `g2`:
+7. **A DMA hold must be armed on one cycle and opened on the next, once
+   that next cycle has confirmed itself.** Asserting `bDMA_OUT` halts the
+   6510 through RDY, which stops it only on **read** cycles; a write
+   completes regardless, with AEC already tri-stating the address bus, so it
+   lands at a floating address and corrupts the C64. This killed the C64 for
+   the whole Stage 16 campaign.
+
+   The original rule was "open immediately after a sampled IO2 access",
+   resting on an IO2 access being the *last* cycle of its instruction. That
+   holds for absolute loads and stores — all the API itself emits — and
+   fails for `inc $DF11` (reads, then writes twice) and for `sta $DFFF,X`
+   (an unconditional dummy read in IO2, then the write). Both were live
+   exposures, recorded as an API constraint rather than fixed, until
+   2026-09-07.
+
+   The rule that replaced it: let N be the cycle the previous pass sampled
+   and N+1 the cycle this pass just sampled. A hold may open during N+1 iff
+   **(1)** N was a sampled IO2 access or the $FFFF vector read, **(2)** the
+   previous pass really was the previous C64 cycle — `PMCCNTR_EL0` stamps,
+   compared against `gpu64HoldGap.armPerC64`, because a pass that held the
+   bus is not adjacent to anything, **(3)** N+1 is a read, and **(4)** N+1's
+   low address byte differs from N's. Then N+1 is an opcode fetch and N+2 is
+   provably a read, because no 6502 instruction and no interrupt sequence
+   writes before its third cycle. Term 4 is what closes the indexed case:
+   indexed addressing fixes up only the *high* byte, so the dummy and real
+   addresses share a low byte and term 3 alone would be satisfied by the
+   real read. The arming cycle is deliberately not one of the terms — an arm
+   is only a request for the bus, and simply waits for the first qualifying
+   pair. See `Source/Firmware/gpu64_holdgate.h`.
+
+   The screen mirror never sees an IO2 access — it runs only when
+   `!gpu64ApiActive`, at a BASIC prompt — so it arms on the other decode the
+   loop can see: a **read of $FFFF**, the IRQ/BRK vector high-byte fetch.
+   You cannot substitute a read/write test on the sampled `g2` for term 1:
    the C64's multiplexed bus only shows R/W in the PHI2-high half, too late
-   to halt that cycle, and cycle N tells you nothing about N+1. This killed
-   the C64 for the whole Stage 16 campaign; the one remaining exception is a
-   read-modify-write on a gpu64 register.
+   to halt that cycle. The one remaining hold that still fires on the old
+   unconfirmed rule is `gpu64_mirrorIdleLoop()`'s, which runs before
+   `armPerC64` is calibrated and with only KERNAL/BASIC alive.
 
 Also: **RAD's low-level macros do not parenthesise their arguments.** Never
 pass an expression containing `?:`, `+` or `%`.

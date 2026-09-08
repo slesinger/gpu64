@@ -413,10 +413,14 @@ void gpu64_showTestPattern( CRAD *pRAD )
 // generated .bin-to-array dump with no include guard and no `extern`,
 // designed for exactly one translation unit (rad_hijack.cpp already includes
 // it) to own the storage; including it a second time here would duplicate
-// the 4KB array and fail to link. font_bin only gets mutated as menu-logo
-// scratch space during the earlier hijack/menu phase -- by the time
-// showMirror() runs (during REU emulation, a later phase), that mutation is
-// long done and font_bin is stable to read from.
+// the 4KB array and fail to link.
+//
+// The old note here said font_bin's menu-phase mutation was "long done and
+// stable to read from" by the time the mirror runs. Stable, yes -- but the
+// mutation is not undone: the menu's oscilloscope permanently overwrites
+// screen codes $40-$DF, cursor glyph $A0 included. showMirror() reads the
+// character ROM instead now; only showMenuMirror() still wants font_bin,
+// and it wants the scribbles, because they are on the C64's screen too.
 extern unsigned char font_bin[ 4096 ];
 
 // gpu64: milestone 3 screen mirror, rendering into the 8bpp framebuffer.
@@ -426,20 +430,41 @@ extern unsigned char font_bin[ 4096 ];
 // is now a 1:1 fit with no upscaling at all (it used to draw at 2x into a
 // COLOR16 framebuffer), and colour RAM's 4-bit values index palette entries
 // 0-15 directly, since the reset palette *is* the C64 palette.
-void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 background )
+void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 background, u8 d018 )
 {
 	u8 *p = m_Gpu64FB.PageBuffer( m_Gpu64FB.GetDrawPage() );
 	if ( p == 0 )
 		return;
 	unsigned nPitch = m_Gpu64FB.GetPitch();
 
+	// gpu64: the C64's own character ROM, not font_bin. font_bin is RAD's
+	// lookalike face -- six scanlines tall where the ROM is seven, so every
+	// character came out a pixel low with a gap above it -- and
+	// rad_hijack.cpp's menu oscilloscope has already scribbled through screen
+	// codes $40-$DF by the time the mirror runs. Screen code $A0 is in that
+	// range, and $A0 is the reverse space a blinking cursor lands on: the
+	// cursor showed as one stray row instead of a filled 8x8 cell. The ROM's
+	// $80-$FF half is genuine reverse video, so the cursor needs no special
+	// case.
+	//
+	// Which half: $D018 bits 3-1 are the VIC's character base within its
+	// 16KB bank, in 2KB steps. Bank 0 is assumed throughout the mirror (see
+	// the scoping note above gpu64_mirrorSnapshot() in rad_reu.cpp), and
+	// there base 2 is the ROM's uppercase/graphics half at $1000 and base 3
+	// its lowercase/uppercase half at $1800 -- exactly what PRINT CHR$(14)
+	// and CHR$(142) switch between. Any other base is a charset the program
+	// built in RAM, which the mirror has no copy of; fall back to uppercase
+	// rather than draw 1000 cells of garbage.
+	const u8 ( *font )[ 8 ] =
+		gpu64C64Font[ ( ( ( d018 >> 1 ) & 7 ) == 3 ) ? GPU64_CHARSET_LOWER
+													 : GPU64_CHARSET_UPPER ];
+
 	for ( unsigned cy = 0; cy < 25; cy++ )
 	{
 		for ( unsigned cx = 0; cx < 40; cx++ )
 		{
 			unsigned cellIdx = cy * 40 + cx;
-			u8 code = screen[ cellIdx ];
-			const u8 *glyph = &font_bin[ (unsigned)code * 8 ];
+			const u8 *glyph = font[ screen[ cellIdx ] ];
 			u8 fg = color[ cellIdx ] & 15;
 
 			for ( unsigned gy = 0; gy < 8; gy++ )
@@ -465,14 +490,19 @@ void CRAD::showMirror( const u8 *screen, const u8 *color, u8 border, u8 backgrou
 // gpu64: same free-function indirection as gpu64_showTestPattern() above --
 // lets rad_reu.cpp's gpu64_mirrorSnapshot() reach CRAD::showMirror() without
 // pulling in the full Circle/screen include stack.
-void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border, u8 background )
+void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border, u8 background, u8 d018 )
 {
 	if ( pRAD )
-		pRAD->showMirror( screen, color, border, background );
+		pRAD->showMirror( screen, color, border, background, d018 );
 }
 
 // gpu64: the menu's charset for rows 0-3. Same extern-not-#include reasoning
 // as font_bin above: rad_hijack.cpp owns the storage.
+//
+// Note the menu mirror is the one text surface that must *keep* font_bin,
+// where showMirror() above no longer may. The menu is RAD's own screen, drawn
+// with a charset RAD uploads into the C64's character RAM -- oscilloscope
+// scribbles and all -- so font_bin is exactly what the C64 is displaying.
 extern u8 font_logo[ 4096 ];
 
 // gpu64: mirror of the RAD menu itself (bench request, 2026-09-06: "Can you

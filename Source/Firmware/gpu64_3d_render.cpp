@@ -233,6 +233,143 @@ static void project( Gpu64_3dRasterVert *pOut, const ClipVert *pIn,
 
 	pOut->u = pIn->u;
 	pOut->v = pIn->v;
+
+	// View-space position, for the point lights. Carried, not recomputed:
+	// this is the value the vertex has had since the model transform and
+	// that clipNear() has already interpolated for a clipped corner.
+	pOut->px = pIn->p.x;
+	pOut->py = pIn->p.y;
+	pOut->pz = pIn->p.z;
+}
+
+// --- billboards ---------------------------------------------------------
+
+// Class 2's octant, unchanged (octant8() in gpu64_raster_core.cpp): which
+// eighth of the compass a direction falls in, by comparisons alone.
+static unsigned octant8( s64 x, s64 y )
+{
+	if ( y >= 0 )
+	{
+		if ( x >= 0 ) return ( y <= x ) ? 0 : 1;
+		return ( y >= -x ) ? 2 : 3;
+	}
+	if ( x < 0 ) return ( -y < -x ) ? 4 : 5;
+	return ( -y > x ) ? 6 : 7;
+}
+
+// Which of eight views of a sprite the camera is looking at. Class 2's rule
+// (gpu64_rasterThings()), moved into class 1's axes and angle unit:
+//
+//   * the ground plane is x/z here, not x/y -- y is up in class 1
+//   * yaw is a u16 binary angle, not a u8, so the half-octant bias that
+//     centres view 0 on the sprite's facing is 65536/16 and not 256/16.
+//     Porting the -16 across unchanged would be wrong by a factor of 256,
+//     and wrong in a way that only shows at some camera angles.
+//
+// The vector is sprite -> camera, so view 0 is the sprite facing the player.
+static unsigned spriteView( const Gpu64_3dState *pState, const Gpu64_3dVec *pPos, u16 nYaw )
+{
+	const s64 dx = (s64)pState->viewPos.x - pPos->x;
+	const s64 dz = (s64)pState->viewPos.z - pPos->z;
+
+	const u16 g = (u16)( nYaw - ( GPU64_ANGLE_TURN / 16 ) );
+	const s64 sg = gpu64_3dSin( g );
+	const s64 cg = gpu64_3dCos( g );
+
+	// Into the sprite's own frame: forward is +z at yaw 0 and yaw turns it
+	// towards +x, which is gpu64_3dMatFromEuler()'s convention.
+	const s64 f = ( dz * cg + dx * sg ) >> GPU64_FX15_SHIFT;
+	const s64 r = ( dx * cg - dz * sg ) >> GPU64_FX15_SHIFT;
+
+	return octant8( f, r );
+}
+
+unsigned gpu64_3dDrawSprite( const Gpu64_3dState *pState,
+			     Gpu64_3dTarget *pTarget,
+			     const Gpu64_3dVec *pPos,
+			     u16 nW, u16 nH,
+			     u16 nTexId,
+			     u16 nYaw,
+			     u8 nFlags,
+			     Gpu64_3dTextureLookup pLookup,
+			     void *pLookupCtx )
+{
+	if ( pLookup == 0 || nW == 0 || nH == 0 || pState->focal <= 0 )
+		return 0;
+
+	Gpu64_3dVec rel, v;
+	rel.x = pPos->x - pState->viewPos.x;
+	rel.y = pPos->y - pState->viewPos.y;
+	rel.z = pPos->z - pState->viewPos.z;
+	gpu64_3dVecRotate( &v, &pState->viewRot, &rel );
+
+	// Culled on its feet: a card is at one depth, so there is no clipping
+	// case to handle and nothing to salvage from a sprite behind the near
+	// plane.
+	if ( v.z < pState->nearZ || v.z > pState->farZ )
+		return 0;
+
+	u16 texid = nTexId;
+	if ( nFlags & GPU64_3D_SPRITE_DIRECTIONAL )
+		texid = (u16)( nTexId + spriteView( pState, pPos, nYaw ) );
+
+	const Gpu64_3dTexture *pTex = pLookup( pLookupCtx, texid );
+	if ( pTex == 0 )
+		// A sprite has no flat-colour fallback: index 0 is its transparency
+		// and a solid rectangle in place of a missing view would be worse
+		// than nothing. One missing view of eight is skipped, exactly like a
+		// mesh a node points at that no longer resolves.
+		return 0;
+
+	const s64 z = v.z;
+
+	const s64 cx = ( (s64)pState->vpX + pState->vpW / 2 ) << 16;
+	const s64 cy = ( (s64)pState->vpY + pState->vpH / 2 ) << 16;
+
+	const s32 sxc   = (s32)( cx + ( (s64)v.x * pState->focal ) / z );
+	const s32 syFeet = (s32)( cy - ( (s64)v.y * pState->focal ) / z );
+
+	const s64 w16 = (s64)nW << 8;			// 8.8 world -> 16.16
+	const s64 h16 = (s64)nH << 8;
+
+	const s32 halfW = (s32)( ( ( w16 * pState->focal ) / z ) / 2 );
+	const s32 hPix  = (s32)( ( h16 * pState->focal ) / z );
+
+	// The position is where the sprite's feet are -- class 2's convention
+	// for a thing -- and it stands up the screen from there, so it is not
+	// half-buried in the floor it is standing on.
+	const s32 x0 = sxc - halfW, x1 = sxc + halfW;
+	const s32 y1 = syFeet,      y0 = syFeet - hPix;
+
+	u8 light = GPU64_3D_LIGHT_LEVELS - 1;
+	if ( !( nFlags & GPU64_3D_SPRITE_UNLIT ) )
+	{
+		// A card always faces the camera, so its normal in view space is
+		// (0,0,-1) and N.L is just the light's own -z component. That is
+		// what makes a sprite respond to SET_LIGHT like every face around
+		// it rather than being the one flat-bright thing in the room.
+		s16 lightView[ 3 ];
+		gpu64_3dNormalRotate( lightView, &pState->viewRot, pState->lightDir );
+
+		s32 ndotl = -(s32)lightView[ 2 ];
+		if ( ndotl < 0 ) ndotl = 0;
+
+		const u32 span = ( GPU64_3D_LIGHT_LEVELS - 1 ) - pState->ambient;
+		u32 lit = pState->ambient + ( ( (u32)ndotl * span ) >> GPU64_FX15_SHIFT );
+		if ( lit > GPU64_3D_LIGHT_LEVELS - 1 )
+			lit = GPU64_3D_LIGHT_LEVELS - 1;
+
+		// The point lights once, at the middle of the card. Per record, not
+		// per pixel: a billboard is small and near-planar, and class 2 made
+		// the same call for the same reason.
+		light = gpu64_3dLightAt( pState, (u8)lit,
+					 v.x >> 8, ( v.y + (s32)( h16 / 2 ) ) >> 8, v.z >> 8 );
+	}
+
+	const s32 invZ = (s32)( ( (s64)pState->nearZ << 16 ) / z );
+
+	gpu64_3dRasterSprite( pState, pTarget, x0, y0, x1, y1, invZ, pTex, nFlags, light );
+	return 1;
 }
 
 unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,

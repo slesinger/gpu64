@@ -3333,15 +3333,20 @@ the loop has serviced an IO2 access -- because **an IO2 access is always the
 last cycle of its instruction**, so the next cycle is provably a read. This is
 the same guarantee the CMD_LO dispatch hold has relied on since milestone 4.
 
+That last sentence is true of every access the API itself emits and false in
+general; the two shapes it is false for, and the rule that replaced it, are in
+*The hold gate: arming is not firing* below.
+
 ### Open
 
 - ~~**`gpu64_mirrorSnapshot()` is still an async hold**, firing 4x/s with
   exactly the defect above.~~ Resolved 2026-09-06 by gating it on the $FFFF
   IRQ vector fetch -- see *Mirror lifecycle and the $FFFF gate*.
-- **A read-modify-write on a gpu64 register** (`inc $DF0D`) breaks the new
+- ~~**A read-modify-write on a gpu64 register** (`inc $DF0D`) breaks the new
   gate's guarantee, reading in cycle 4 and writing in 5 and 6. Documented as
   an API constraint rather than fixed; the dispatch hold has always carried
-  the same exposure.
+  the same exposure.~~ Fixed 2026-09-07 -- see *The hold gate: arming is not
+  firing* below.
 - **`REND` loses 98% of its SEQs.** 2938 SEQ/SEQACK mismatches in 3000
   dispatches in 1.27 s, while 84% of the same dispatches answered `OK`,
   against 1-in-6000 for `FLIP` and 0-in-20000 for `NOP`. Not class 1
@@ -3671,3 +3676,425 @@ that before it has seen one start.
   never touches gpu64 keeps the latch armed. It costs a ~6-cycle probe hold at
   4 Hz, `$CC` being non-zero, and HDMI holds the last mirrored frame -- the
   intended end state anyway.
+
+
+## The hold gate: arming is not firing (2026-09-07)
+
+Stage 16b's fix (*It is the Pi that dies, not the C64*) turned the deferred
+commit into an armed flag fired after a sampled IO2 access, and rested the
+whole thing on one claim:
+
+> an IO2 access is always the last cycle of its instruction, so the next cycle
+> is provably a read
+
+That claim is true of every access the API emits, and of nothing else. The
+audit here set out to fix the one exception already on the Open list and found
+a second with a wider blast radius.
+
+### The two shapes it is false for
+
+| Instruction | c4 | c5 | c6 | c7 |
+|---|---|---|---|---|
+| `inc $DF11` | read $DF11 | **write** $DF11 | **write** $DF11 | -- |
+| `sta $DFFF,X` (X=$12) | read $DF11 *(dummy)* | **write** $E011 | -- | -- |
+| `inc $DFFF,X` (X=$12) | read $DF11 *(dummy)* | read $E011 | **write** | **write** |
+
+`inc` was the known one. `sta abs,X` is the one that matters more: its fourth
+cycle is an **unconditional** dummy read at the *un-fixed* address -- the NMOS
+6502 performs it whether or not the index carries -- so any program with a
+table anywhere in `$DFxx` puts IO2 reads on the bus one cycle before a write
+to somewhere else entirely. A hold armed on that read opened straight into the
+write, which is the Stage 16 corruption mechanism exactly.
+
+Fable 5.1, asked for a second opinion, made the distinction that shaped the
+fix: for a *forward-confirming* rule the plain indexed store is not a hole at
+all, because the rule requires N+1 to be a read and for a store N+1 *is* the
+write, so the rule simply declines. Only the indexed RMW can fool a naive
+forward rule -- and conflating the two would have meant over-fixing, adding
+restrictions around indexed stores that the rule already handles.
+
+### The rule that replaced it
+
+Let N be the cycle the previous pass sampled and N+1 the cycle this pass just
+sampled. A hold may open during N+1 iff:
+
+1. N was a sampled IO2 access or the $FFFF vector read;
+2. the previous pass really was the previous C64 cycle -- `PMCCNTR_EL0` stamps
+   compared against `gpu64HoldGap.armPerC64`, because a pass that held the bus
+   is not adjacent to anything;
+3. N+1 is a read;
+4. N+1's low address byte differs from N's.
+
+Then N+1 is an opcode fetch and N+2 is provably a read, because **no NMOS 6502
+instruction, documented or undocumented, writes before its third cycle**, and
+neither does the interrupt sequence (two dummy reads first).
+
+Term 4 is the one that is not obvious. Indexed addressing fixes up only the
+*high* address byte, so the un-fixed and fixed addresses of `inc $DFFF,X`
+share their low byte; without term 4, c5's real read would confirm c4's arm
+and the hold would open into c6's write. The loop sees `ADDRESS0to7` every
+cycle, so this costs one comparison. Term 4 also subsumes "not the same
+register twice", which is what catches plain `inc $DF11`.
+
+The arming cycle is deliberately **not** one of the terms. An earlier draft
+anchored the address test on state captured at arm time, and it was wrong: an
+arm can persist several cycles while the confirm keeps declining, so the
+captured address may describe a cycle well in the past and the
+"different low byte" proof is void. Worked example: `inc $DF0D` with a commit
+armed on c4 -- c5 and c6 decline, and c7 would then have fired against a *c4*
+anchor. Replacing it with state describing only the immediately previous pass
+makes the four terms a self-contained statement about N and N+1, and reduces
+the arm to what it should always have been: a request for the bus, waiting for
+the first qualifying pair.
+
+### What it is applied to
+
+- **The commit gate** and **the mirror's $FFFF gate** arm rather than fire.
+- **The CMD_LO dispatch** defers *only* when the previous cycle was an IO2
+  read at the same address. So `sta CMD_LO` -- what every program in this tree
+  emits, whose preceding cycle is an operand fetch -- takes the unchanged
+  milestone-4 path, byte for byte. `inc CMD_LO` now defers on c5 (writing the
+  `$FF` that `gpu64_apiReadReg()` returns) and dispatches inline on c6 with
+  `$00`, because c6 arrives with an IO2 *write* behind it and is therefore
+  unambiguous. It dispatches once, as a NOP: the instruction became correct,
+  not merely safe.
+- **`gpu64_mirrorIdleLoop()` was left on the old unconfirmed gate.** It runs
+  before `armPerC64` is calibrated, so term 2 cannot be evaluated, and the
+  only code alive at that point is KERNAL/BASIC, which contains no RMW or
+  indexed access to `$FFFF`.
+
+### Cost
+
+`reuUsingPolling()` grew 0x1d9c -> 0x24d4. Most of that is not the gate: with
+the deferred dispatch's duplicated hold stubbed out the function came back
+*larger*, at 0x2608, so de-duplication offers nothing and the growth is the
+compiler rearranging a loop body carrying five more live registers.
+`GPU64_POLL_IPL_WINDOW` went to 0x2800, leaving 812 bytes of margin.
+
+Six counters were added to the health blob at bytes 36-47 (`GATE` and `DISP`
+in the probe's report), and `resetREU()` now preserves `armPerC64` -- it is
+called from *inside* the polling loop on a C64 derail, long after the only
+calibration.
+
+### Residuals, stated rather than fixed
+
+- A dropped sample for cycle N can let an RMW's second write look
+  unambiguous and dispatch early. Bounded by the ~1/180000 command-write drop
+  floor.
+- A deferred dispatch fires at the next confirmed-safe cycle, so a program
+  staging ARGs between `CMD_LO` and its STATUS poll would be seen. The
+  documented protocol cannot reach this, and the RMW case resolves on the very
+  next cycle anyway.
+- `gpu64_mirrorIdleLoop()`, above.
+
+### The instrument
+
+`Source/TestPRG/gpu64_probe_rmw.a`. Six rungs, ~29 s: four drive a shape into
+an armed commit window (`BASE` control, `STAP` = `sta $DFFF,X`, `INCA` =
+`inc $DF11`, `INCP` = `inc $DFFF,X`), and two put the dispatch shapes on
+CMD_LO itself (`DISS` = `sta CMD_LO,X`, `DISI` = `inc CMD_LO`). Rungs run
+cheapest-diagnosis-first so a machine that dies part-way still names the shape
+that killed it via the PHASE breadcrumb. `DISP` is the dispatch rungs'
+self-check: both defer, only `DISS` fires, and a zero there means those two
+rungs measured nothing.
+
+Desk-checked under `tools/prgsim/runsim.py`: six rungs complete, ACC == ATT
+throughout, no trap. It reports `FAIL (NO DEFER)` by construction -- the model
+has no polling loop and therefore no hold gate to count.
+
+### Verified on hardware 2026-09-08 -- PASS
+
+`gpu64_probe_rmw`, first run, build `63c052ff-dirty src:927d6c91`.
+
+```
+HEALTH 00 00 00 77 01 00 00 00      throttle 00, sticky 00, 37.5 C
+GATE   371C 1FAC 05DA DE7C
+DISP   2EE0 1770
+       ATT  ACC  MISS DUR
+BASE   4E20 4E20 0000 02E0
+STAP   4E20 4E20 0000 01AF
+INCA   4E20 4E20 0000 01E9
+INCP   4E20 4E20 0000 01C2
+DISS   1770 1770 0000 009E
+DISI   1770 1770 0000 008D
+PHASE  BSAPDIV                      VERDICT PASS
+```
+
+Every rung ran to budget with ACC == ATT, no `FIRST ERR`, no trap. Each of
+the three unsafe shapes executed 160000 times (20000 iterations x 8 per
+armed window) with a commit hold trying to open into it.
+
+**The two counters are exact, not merely non-zero**, which is what makes
+this a confirmation of the mechanism rather than just an absence of
+crashes:
+
+- `DISP` = 12000 deferred / 6000 fired = exactly `N_DISS + N_DISI` and
+  exactly `N_DISS`. Both dispatch rungs took the ambiguity path; only
+  `DISS` fired the deferral, because `DISI`'s first arm is superseded by
+  its second write, as designed.
+- `GATE` armed 14108 - 12000 dispatch = **2108 commit arms**, fired
+  8108 - 6000 = **2108 commit fires**. Every commit arm was honoured and
+  the 6000-arm gap is precisely the by-design supersessions. Nothing
+  outstanding.
+
+`ageMax` = 1498 C64 cycles is the worst arm-to-fire wait and is benign:
+term 1 only lets a hold open on the cycle *after* an IO2 access, so an arm
+taken on the last shape of a burst waits out `tally`/`endIter`/
+`showPhaseRow` before the next IO2 access arrives. ~1.5 ms, under a tenth
+of a frame, and the exact arm/fire balance shows nothing is stuck.
+
+`MISS` = 0 across 14108 sequenced dispatches, of which 2108 were accepted
+flips. The ~1/180000 drop floor predicts ~0.08, so zero is unremarkable --
+but the Stage 16b open finding *"the MISSED rate tracks flips, 0.154-0.196
+per accepted flip"* predicts ~325 here and this run does not reproduce it
+at all. Different program and no class 1 render traffic, so it is a data
+point against the flip alone being the trigger, not a refutation.
+
+## 16c. The loop passes on the bench (2026-09-08)
+
+The re-verification § 16b's fix earned, run before any Stage 17 work was
+written. One run, one power cycle, `gpu64_loop_test` on
+`63c052ff-dirty src:dbd25c3d`:
+
+```
+SETUP   00 00 00 00 00 00 00 00 00
+SCENE   00 0B 00 00 00 00 07 07
+POST    00 06 00
+FRAME   0258/0075
+ROT ERR 00      COMMIT ERR 07      PAGE 01
+MISSED  000F    FIRST ERR 07 @ 0001
+PHASE   SCAPV   ALIVE - 30
+VERDICT PASS
+```
+
+**The derail is gone.** `PHASE SCAPV` with the spinner parked at stage 30 is
+the whole program: setup, scene, 600 animation frames, the POST checks after
+`LOOP_STOP`, and a verdict. No `TRAP`, no stall, no wild PC. This is the
+first clean end-to-end handshake-loop run with an actual scene on it, and it
+is the async-DMA-hold fix (polling-loop rule 7) doing what the `FLIS` rung
+predicted it would.
+
+**`FRAME 0258/0075` is the healthy shape, not a defect.** `animFrame` issues
+`ROTATE_LOCAL` + `SCENE_COMMIT` flat out with no `FRAME_READY` wait, so every
+commit past the frame clock is refused `BUSY` by construction: 117 accepted
+in 600 attempts is 19.5%, against the ~21% every healthy class-1 stage 16 run
+has reported. `FIRST ERR 07 @ 0001` is the same fact on the first commit --
+`LOOP_START` queues a frame of its own, and the flat-out loop asks for the
+next one before that frame is done. 117 accepted at 60/s puts the animation
+at about two seconds.
+
+**`MISSED 000F` is the known flip-correlated drop, unchanged.** 15 lost
+writes across 1200 dispatches (600 `ROTATE_LOCAL` + 600 `SCENE_COMMIT`) is
+1.25% of dispatches -- but **0.128 per accepted flip**, which sits with the
+0.154 / 0.194 / 0.196 measured in § 16b's arm-A runs. That open item tracks
+flips, and this run does not move it in either direction. It is emphatically
+*not* `REND`'s 98% SEQ loss, which remains unexplained and unreproduced here.
+
+### What this settles for Stage 17
+
+- The commit protocol is hardware-verified with a scene, so
+  `docs/class1-3d-mesh-reference.md`'s "do not build on it yet" no longer
+  describes the firmware.
+- A demo must not commit flat out. Poll `STATUS` bit4 and commit once per
+  ready frame; the 80% `BUSY` rate above is what "flat out" buys.
+- At ~0.13 lost writes per accepted flip, a per-frame command **will** be
+  dropped every several frames. The Stage 17 demo therefore checks
+  `SEQACK` against the `SEQ` it wrote and re-issues on a mismatch, per
+  CLAUDE.md's "never assume a register write landed" -- this is the first
+  gpu64 program for which that is a visible-quality issue rather than a
+  statistical one.
+
+## 17. The room, as a scene (2026-09-08)
+
+Stage 17 of `project/gap_filling_plan.md`: port the Quake-style demo off
+class 2's immediate mode and onto the retained class-1 scene graph plus the
+stage 16 commit protocol, as the test of whether "per-object command writes
+plus an autonomous loop" is actually cheaper on the bus than redrawing
+everything every frame. The Doom-style demos (`DRAW_COLUMNS`/`DRAW_WALLS`/
+`DRAW_SECTORS`) are deliberately not ported and stay on class 2 for good.
+
+`Source/Demos/gpu64_demo_quake.a` is untouched. The port is a second
+program, `Source/Demos/gpu64_demo_quake3d.a`, drawing the same room, the
+same two monsters, the same torch and muzzle flash, with the same controls.
+Keeping both is the whole point: they are the before and the after.
+
+### What the port needed that class 1 did not have
+
+The old demo's world is not only triangles. Two monsters are billboards,
+the torch and the muzzle flash are point lights, and class 2 had opcodes
+for both while the retained scene graph had neither. Rather than fake them
+(a sprite as two textured triangles, a light as a colormap trick), class 1
+gained them as node types — the same decision as everywhere else in this
+class: the C64 names a thing once and thereafter only moves it.
+
+| Opcode | Name | Args | What it adds |
+|---|---|---|---|
+| $25 | `CREATE_SPRITE` | 2 | A `SPRITE` node, textured, 1x1 unit, upright, masked. |
+| $26 | `CREATE_LIGHT` | 0 | A `LIGHT` node, switched off. |
+| $27 | `SET_SPRITE` | 5 | Size (w, h as 8.8) and flags. |
+| $28 | `SET_POINT_LIGHT` | 3 | Strength and radius (8.8). |
+
+Both are positioned by the ordinary transform opcodes ($30-$36) and
+switched with `SET_VISIBLE`, so a muzzle flash is one command a frame and a
+monster that walks is a `SET_POSITION`. Sprite flags cover the directional
+case milestone 11 built for class 2: `DIRECTIONAL` makes the texture ID
+name eight consecutive views and the camera's position picks which one.
+Eight lights are live at a time, first eight in scene order.
+
+The renderer draws objects first and sprites second within a frame, because
+sprites depth-test against geometry that has to be in the z-buffer already.
+A node whose mesh or texture ID does not resolve is skipped rather than
+failing the frame.
+
+### Verifying a scene on a PC
+
+Class 1's picture is made on core 1 from state the C64 only ever mutates,
+which is exactly the shape that a 6502-level simulator cannot check by
+itself: `tools/prgsim` knows the bus, not the rasteriser. The split built
+for this stage keeps each side doing what it is good at.
+
+- `tools/prgsim/gpu64class1.py` models the class 1 *protocol* only — the
+  node table, the shadow copy, `LOOP_START`/`SCENE_COMMIT`'s state machine,
+  `FRAME_READY`, `BUSY`. Every accepted commit emits one text record of the
+  scene as it then stands: a line per node, plus the camera, lights and
+  render state, into a frame stream.
+- `tools/hostsim/scenesim` replays that stream through the **firmware's
+  own** `gpu64_3dSceneRender()`, compiled natively, and writes PPMs. So
+  focal length, the Euler matrix, the light normalisation, the colormap and
+  every rasteriser rule are computed by the code that runs on the Pi, on
+  both sides of the check.
+
+`tools/demos.sh quake3d` runs the pair end to end and leaves
+`Source/Demos/out/quake3d.ppm` plus the whole frame stream under
+`Source/Demos/out/quake3d.c1/`. A 1603-frame run renders in under a second
+and was checked for blank frames (none; ink 38879-64000 of 64000) and for
+frame-to-frame variety (1078 distinct checksums). The muzzle flash was
+verified numerically as well as by eye — mean luma 18.5 before the shot,
+71.4 during it, 15.4 after.
+
+**Two bugs the harness found, both invisible in a build.**
+
+1. *The frame stream carried the node's slot but not its id.* Every node
+   arrived on the scenesim side with id 0, so `activeCameraId` never
+   resolved and the room was rendered from the world origin. The fix is one
+   extra field, but the lesson is the general one: a scene-graph record is
+   not complete without the identity the scene looks nodes up by.
+2. *The generated mesh was wound backwards.* `tools/gen_quakemesh.py`
+   reversed every face on the theory that the class-2 → class-1 axis map
+   `(x,y,z) → (x,z,y)` mirrors the space. It does not matter what the swap
+   does to handedness in the abstract — class 1's rule is "clockwise **on
+   screen**", and the FACES list was already authored clockwise as seen by
+   a viewer standing *inside* the room. The reversal culled 24 of 30
+   triangles and drew a few slivers. Removing it took the frame from 6/30
+   faces to 26/30 and from 16800 ink to 64000.
+
+### What a frame looks like now
+
+```
+frame   jsr movePlayer          ; C64-side, no bus traffic
+        jsr sendCamera          ; only if he actually moved
+        jsr sendMonsters        ; three commands, they always move
+        jsr sendFlash           ; only on the frame the gun fires
+        jsr waitReady           ; poll STATUS bit 4 -- a read, no hold
+        SCENE_COMMIT
+```
+
+No clear, no draw, no flip, no vblank wait: core 1 does all four from the
+scene this loop mutates, while the C64 keeps running. Three details the
+stage 16 bench run (§ 16c) made non-negotiable and that this demo is the
+first program to actually obey:
+
+- **Pace on `FRAME_READY`, never commit flat out.** `waitReady` is a plain
+  `STATUS` read — no dispatch, no DMA hold, nothing the loop has to stop
+  for. Committing flat out gets about four commits in five refused `BUSY`.
+- **Check `SEQACK`.** At ~0.13 lost writes per accepted flip, a per-frame
+  command is dropped every several frames, and on a retained scene a
+  dropped update is *permanent* — nothing later re-sends it. Every node
+  update goes through `cmdSeq1`, which re-sends the **whole** command,
+  arguments included: the byte that was lost is as likely to have been an
+  argument as the opcode, and the ARG window still holds whatever landed.
+- **`SCENE_COMMIT` deliberately does not retry.** A dropped commit costs
+  one frame of latency; a retry after a commit that *did* land would answer
+  `BUSY` and report an error that never happened.
+
+The camera is sent only when it changed, which is what makes standing still
+nearly free. The comparison is against the source bytes (`posX`, `posY`,
+`eyeZ`, `plYaw`, `plPitch`) and not against the ARG window — **the ARG
+registers are write-only, and reading them back samples a floating bus** —
+and the shadow copy is updated only after a send whose `SEQACK` matched, so
+a command that may or may not have landed stays recorded as not sent.
+
+### What the port could not bring across
+
+The weapon sprite and the status bar. Both were class 0 drawn over the
+finished 3D view, and in handshake mode the loop owns the framebuffer:
+there is no moment between its frames at which the C64 may draw into the
+page that is about to be shown. This is a real limitation of the stage 16
+loop rather than an oversight, and it is now written up for users in
+`docs/class1-3d-mesh-reference.md`. The demo puts its report on the C64's
+own screen instead. A HUD that has to be on the HDMI screen belongs in the
+scene as an unlit sprite node in front of the camera.
+
+### The before and after, measured
+
+`tools/prgsim` now counts register writes as well as dispatches, and splits
+both by command class. The figures are **marginal**: a 400-frame run
+subtracted from an 800-frame one, so the one-time start-up traffic is out of
+them -- and that start-up is small either way, 61 dispatches / 573 register
+writes for class 1 against 45 / 448 for class 2, because the mesh, the ten
+textures and the colormap all move by REU DMA and cost the C64 a blob
+descriptor rather than the bytes. "Moving" holds W and A down so the camera
+changes every frame; "still" touches no key.
+
+| Per frame | class 2, immediate | class 1, retained |
+|---|---|---|
+| moving — dispatches | 11 | 6 |
+| moving — register writes | 102 | 70 |
+| still — dispatches | 11 | 4 |
+| still — register writes | 102 | 42 |
+
+Class 2's row is the same in both regimes to the byte -- 8845/82048 at
+n=800 whether keys are held or not -- because immediate mode redraws
+everything every frame by construction. Class 1's still row is what
+retaining buys: the camera is not sent, and the frame is the two monsters
+and a commit.
+
+**A caveat that has to be stated, or the table flatters class 1.** Split by
+class, class 2's 11 dispatches are 7 of actual class 2 rendering (74
+register writes) plus 4 of class 0 (28 writes) -- the status bar and the HUD
+text it draws onto the HDMI view, which class 1 cannot do at all while the
+loop owns the framebuffer. So the like-for-like rendering comparison is 7 /
+74 against class 1's 6 / 70 moving and 4 / 42 still: barely ahead with the
+player moving, properly ahead when he is not, and the headline 11 -> 6 is in
+large part the HUD moving to the C64's own screen rather than traffic that
+vanished. The camera is what costs class 1 its moving frames -- a
+`SET_POSITION` is twelve argument bytes and a `SET_ORIENTATION` six.
+
+**And the figure that matters most is not in the table.** The C64 is
+DMA-halted for the whole of every dispatch and only for a dispatch --
+`waitReady`'s `STATUS` poll is a plain read that costs nothing -- so the
+dispatch column is also how many times a frame the C64 stops dead. What it
+buys is larger than the ratio: the frame those six commands describe is
+rendered on core 1 while the C64 runs, which is not something immediate
+mode can do at any price.
+
+### Verified
+
+- `tools/demos.sh` green on all twelve demos, quake3d included; the class 1
+  demo renders through `scenesim` rather than the model's own `--ppm`,
+  which is new plumbing in that script.
+- 1603 class 1 frames from one prgsim run, rendered by the firmware raster
+  core: no blank frames, 1078 distinct frame checksums, muzzle flash
+  present at the frame it should be.
+- `SETUP OK` with `OK` tracking `FRAMES` in the model — the commit pacing
+  works against the protocol model, including `FRAME_READY` only rising
+  once the flip that the commit armed has actually retired.
+- Firmware builds clean for the Pi (`63c052ff-dirty src:927d6c91`).
+
+### Open
+
+- **Not run on hardware.** Everything above is host verification. The bench
+  run is the next thing this needs, and § 16c's PASS is what makes it worth
+  taking to the bench at all.
+- Free-running mode (`LOOP_START ARG0=1`) is stage 18; this demo drives the
+  handshake mode only.

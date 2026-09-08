@@ -1013,10 +1013,18 @@ dying in ~100 armed windows to running its full budget.
 
 #### Residual, documented rather than fixed
 
-- **A read-modify-write on a gpu64 register** (`inc $DF0D`) reads in its
+- ~~**A read-modify-write on a gpu64 register** (`inc $DF0D`) reads in its
   fourth cycle and writes in its fifth and sixth, breaking the guarantee. The
-  CMD_LO dispatch hold has carried the same exposure since milestone 4. The
-  registers are a command port, not a counter.
+  CMD_LO dispatch hold has carried the same exposure since milestone 4.~~
+  Fixed 2026-09-07. The audit that found it also found a second shape with
+  the same defect and a wider blast radius: `sta $DFFF,X` performs an
+  *unconditional* dummy read at the un-fixed address -- in IO2 -- and writes
+  on the next cycle, so a hold armed on the read opens into the write. Both
+  are closed by arming on the access and confirming on the following cycle
+  before opening; see rule 7 in [CLAUDE.md](../CLAUDE.md) and
+  `Source/Firmware/gpu64_holdgate.h`. The instrument is
+  `Source/TestPRG/gpu64_probe_rmw.a`, which drives four shapes into an armed
+  commit window and puts the two dispatch shapes on CMD_LO itself.
 - ~~**`gpu64_mirrorSnapshot()` is still an async hold** with exactly this
   defect, firing 4x/s.~~ Fixed 2026-09-06. The IO2 gate could not be applied
   to it -- the mirror runs only when `!gpu64ApiActive`, i.e. at a BASIC prompt

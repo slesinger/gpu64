@@ -319,6 +319,37 @@ argcd	.macro	off, space, addr
 
 
 ; ----------------------------------------------------------------------
+; Class 1 staging.
+;
+; Class 1 addresses a node or a resource through ID_LO/ID_HI, which is a
+; 16-bit register pair of its own and NOT part of the ARG window -- so an
+; id is staged with #id16 and everything else with the macros above.
+; ----------------------------------------------------------------------
+
+id16	.macro	val
+	lda #<(\val)
+	sta ID_LO
+	lda #>(\val)
+	sta ID_HI
+	.endm
+
+; A 16.16 world coordinate staged from an 8.8 CONSTANT, which is how a
+; program that thinks in 8.8 talks to SET_POSITION. SET_POSITION is 16.16
+; and not 8.8 because a scene node may stand anywhere in a 65536-unit
+; world, where DRAW_MESH's immediate-mode offset only ever had to reach
+; across one model.
+arg1616	.macro	off, val
+	lda #0
+	sta ARG+\off
+	lda #<(\val)
+	sta ARG+\off+1
+	lda #>(\val)
+	sta ARG+\off+2
+	lda #(((\val) < 0) ? $ff : $00)
+	sta ARG+\off+3
+	.endm
+
+; ----------------------------------------------------------------------
 ; Text mode staging.
 ;
 ; Unlike the class 2 record macros below, these FIRE the command as well as

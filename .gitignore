@@ -4,8 +4,9 @@
 # generated per-build by tools/build.sh (stamped into the boot log)
 /Source/Firmware/build_id.h
 
-# gpu64 host sim: build product and rendered output
+# gpu64 host sim: build products and rendered output
 tools/hostsim/hostsim
+tools/hostsim/scenesim
 tools/hostsim/out/
 
 # gpu64 rastercheck: build product and scratch scenario

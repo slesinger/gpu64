@@ -39,11 +39,12 @@ static void renderCell( u8 *pSurf, unsigned nPitch, unsigned nCol, unsigned nRow
 	u8 nFg   = gpu64Text.fg[ nCell ];
 	u8 nBg   = gpu64Text.bg[ nCell ];
 
-	// Screen code bit 7 is reverse video, as on the C64's own screen -- the
-	// ROM has no second copy of the glyphs, the inversion is in the
-	// renderer. Swapping the two colours rather than inverting the bits
-	// keeps a reversed cell's ink and paper both under the program's
-	// control.
+	// Screen code bit 7 is reverse video, as on the C64's own screen. The
+	// ROM does carry a reversed copy of every glyph at $80-$FF, but this
+	// renders the plain glyph with the two colours swapped instead:
+	// identical pixels, and it keeps a reversed cell's ink and paper both
+	// under the program's control, which indexing the reversed half would
+	// not.
 	if ( nCode & 0x80 )
 	{
 		u8 t = nFg; nFg = nBg; nBg = t;

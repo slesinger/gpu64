@@ -35,6 +35,16 @@
 #define GPU64_3D_LIGHT_LEVELS	16
 #define GPU64_3D_COLORMAP_BYTES	( GPU64_3D_LIGHT_LEVELS * 256 )
 
+// Stage 17: point lights, eight of them, the same cap class 2 has. Eight is
+// what a byte-wide mask makes free to test.
+#define GPU64_3D_MAX_LIGHTS	8
+
+// The shift `fall` is scaled by, and class 2's number for the same reason
+// (gpu64_raster_core.cpp): r2 reaches 2^32 at the largest radius, and a
+// smaller shift would round a wide, gentle light's `fall` to zero -- it
+// would silently stop existing.
+#define GPU64_3D_LIGHT_SHIFT	40
+
 // --- wire formats -------------------------------------------------------
 
 // Face blob element, exactly as it arrives. Byte 11 is padding to a stride
@@ -53,6 +63,15 @@ struct Gpu64_3dFaceWire
 #define GPU64_3D_FACE_DOUBLE_SIDED	0x01
 #define GPU64_3D_FACE_FLAT_COLOUR	0x02	// texid is a palette index
 #define GPU64_3D_FACE_UNLIT		0x04
+
+// Sprite flags -- SET_SPRITE's third argument. Masked and depth-writing are
+// the defaults because they are what a monster standing in a room needs;
+// the flags turn each of those off for the cases that do not (a solid card,
+// a muzzle flare that must not occlude what is behind it).
+#define GPU64_3D_SPRITE_DIRECTIONAL	0x01	// texid names 8 consecutive views
+#define GPU64_3D_SPRITE_NODEPTH		0x02	// test z, do not write it
+#define GPU64_3D_SPRITE_OPAQUE		0x04	// index 0 is a colour, not a hole
+#define GPU64_3D_SPRITE_UNLIT		0x08
 
 // Unpacked face, as it is stored in the arena. The normal is computed once
 // at upload from winding order (design doc, Mesh format) -- per frame it is
@@ -107,6 +126,31 @@ struct Gpu64_3dResource
 	Gpu64_3dTexture	tex;
 };
 
+// --- point lights -------------------------------------------------------
+//
+// Stage 17. The arithmetic is class 2's, slot for slot -- see
+// gpu64_rasterSetLight() and lightAdjust() in gpu64_raster_core.cpp -- so
+// that a program porting a level from one layer to the other gets the same
+// falloff from the same strength and radius. Two differences, both forced by
+// the layer:
+//
+//   * the position is in VIEW space, not world space, and 8.8. Class 1 has
+//     no world-space vertex to compare against: gpu64_3dDrawMesh() fuses the
+//     view and model rotations into one matrix and transforms straight into
+//     view space, which is the whole reason a vertex costs one rotation and
+//     not two. So the light is what moves into view space -- once per frame,
+//     in gpu64_3dSceneApplyLights(), for at most eight of them -- rather than
+//     every pixel moving back out of it.
+//   * the light ADDS. Class 2's colormap runs dark-wards, so a light there
+//     subtracts; class 1's runs the other way (level 15 is full brightness,
+//     see gpu64_3dBuildColormap), so here it adds and clamps at 15.
+struct Gpu64_3dPointLight
+{
+	s32	x, y, z;			// 8.8 VIEW space
+	s64	r2;				// radius squared, 16.16 (8.8 squared)
+	s64	fall;				// ( strength << 40 ) / r2
+};
+
 // --- render state -------------------------------------------------------
 
 struct Gpu64_3dState
@@ -130,6 +174,14 @@ struct Gpu64_3dState
 	// lighting costs one indexed byte load per pixel and zero DRAM traffic.
 	u8	colormap[ GPU64_3D_COLORMAP_BYTES ];
 	boolean	bColormapValid;
+
+	// The point lights, in view space, rebuilt from the scene's LIGHT nodes
+	// once per frame by gpu64_3dSceneApplyLights() -- derived state, exactly
+	// like viewRot/viewPos below, and never set directly by an opcode.
+	// lightMask is the fast "any lights at all" test the rasteriser's inner
+	// loop branches on; a slot with fall == 0 is off.
+	Gpu64_3dPointLight lights[ GPU64_3D_MAX_LIGHTS ];
+	u8		lightMask;
 
 	// camera, as a view transform: rotate by this, then add this offset.
 	Gpu64_3dMat	viewRot;
@@ -178,6 +230,24 @@ struct Gpu64_3dScratch
 	Gpu64_3dVec	view[ GPU64_3D_MAX_VERTS ];
 };
 
+// Draws one billboard at a world position: transform, cull, pick the view,
+// light it, project it, rasterise. Returns 1 if it put anything on the
+// screen and 0 if it was culled or its texture did not resolve.
+//
+// nYaw is the direction the sprite faces, used only when nFlags has
+// GPU64_3D_SPRITE_DIRECTIONAL: then nTexId names the first of eight
+// consecutive views and which one is drawn depends on where the camera is
+// standing, the same rule DRAW_THINGS has had since milestone 11.
+unsigned gpu64_3dDrawSprite( const Gpu64_3dState *pState,
+			     Gpu64_3dTarget *pTarget,
+			     const Gpu64_3dVec *pPos,	// 16.16 world, at its feet
+			     u16 nW, u16 nH,		// 8.8 world units
+			     u16 nTexId,
+			     u16 nYaw,
+			     u8 nFlags,
+			     Gpu64_3dTextureLookup pLookup,
+			     void *pLookupCtx );
+
 unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,
 			   Gpu64_3dTarget *pTarget,
 			   Gpu64_3dScratch *pScratch,
@@ -196,6 +266,13 @@ struct Gpu64_3dRasterVert
 	s32	sx, sy;				// 16.16 surface coordinates
 	s32	invZ;				// 16.16, near/z -- 1.0 at the near plane
 	s32	u, v;				// 16.16 texel coordinates
+
+	// View-space position, 16.16, carried through only for the point
+	// lights: interpolated across the triangle the same affine way u and v
+	// are, and read per pixel by lightAdjust(). Costs nothing when no light
+	// is live -- the whole lit path is behind one branch outside the pixel
+	// loop -- and is left uninitialised by callers that set no lights.
+	s32	px, py, pz;
 };
 
 // Affine-mapped, z-tested, single light level for the whole triangle (flat
@@ -207,6 +284,28 @@ void gpu64_3dRasterTriangle( const Gpu64_3dState *pState,
 			     const Gpu64_3dTexture *pTex,
 			     u8 nFlat,
 			     u8 nLight );
+
+// The point lights evaluated at one view-space point, 8.8 -- what a sprite
+// (and anything else lit per record rather than per pixel) uses. Returns
+// nLevel unchanged when no light reaches the point.
+u8 gpu64_3dLightAt( const Gpu64_3dState *pState, u8 nLevel, s32 x, s32 y, s32 z );
+
+// A screen-aligned billboard: an axis-aligned rectangle at one constant
+// depth, drawn from a texture whose index 0 is see-through unless
+// GPU64_3D_SPRITE_OPAQUE says otherwise. Separate from the triangle
+// rasteriser rather than two triangles through it, because everything the
+// triangle path spends its setup on -- three plane gradients, an edge walk,
+// a per-pixel z step -- is a constant here.
+//
+// Coordinates are 16.16 surface coordinates, x0/y0 inclusive-ish and x1/y1
+// exclusive-ish in the same pixel-centre sense the triangle rasteriser uses.
+void gpu64_3dRasterSprite( const Gpu64_3dState *pState,
+			   Gpu64_3dTarget *pTarget,
+			   s32 x0, s32 y0, s32 x1, s32 y1,
+			   s32 nInvZ,
+			   const Gpu64_3dTexture *pTex,
+			   u8 nFlags,
+			   u8 nLight );
 
 // --- mesh and texture construction --------------------------------------
 // Parse a blob pair / a texture blob into an arena block. pAlloc is the

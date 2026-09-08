@@ -158,6 +158,29 @@ static const Gpu64_3dTexture *lookupTex( void *pCtx, u16 nId )
 	return 0;
 }
 
+// --- the sprite views, in their own table -------------------------------
+// Eight consecutive IDs starting at kSpriteBaseId, and a lookup that records
+// which one it was last asked for -- which is the only way to observe the
+// directional-view choice, since eight billboards of a rotating monster all
+// look like billboards.
+
+#define kSpriteBaseId	100
+
+struct SpriteTex
+{
+	Gpu64_3dTexture	tex[ 8 ];
+	u16		lastId;
+};
+
+static const Gpu64_3dTexture *lookupSpriteTex( void *pCtx, u16 nId )
+{
+	SpriteTex *pT = (SpriteTex *)pCtx;
+	pT->lastId = nId;
+	if ( nId >= kSpriteBaseId && nId < kSpriteBaseId + 8 )
+		return &pT->tex[ nId - kSpriteBaseId ];
+	return 0;
+}
+
 // --- camera -------------------------------------------------------------
 // A camera is a node with a position and an orientation; the view transform
 // is its inverse -- rotate the world by the transpose, after subtracting the
@@ -174,6 +197,23 @@ static void setCamera( Gpu64_3dState *pState, s32 x, s32 y, s32 z,
 	pState->viewPos.y = y;
 	pState->viewPos.z = z;
 	pState->bHaveCamera = TRUE;
+}
+
+// The same transform project() applies, in doubles: world 16.16 point ->
+// screen pixels. Used by the point-light test to say where on the screen a
+// given *world* point should end up, independently of the renderer.
+static void worldToScreen( const Gpu64_3dState *pState, const Gpu64_3dVec *pW,
+			   double *pSx, double *pSy )
+{
+	Gpu64_3dVec rel, v;
+	rel.x = pW->x - pState->viewPos.x;
+	rel.y = pW->y - pState->viewPos.y;
+	rel.z = pW->z - pState->viewPos.z;
+	gpu64_3dVecRotate( &v, &pState->viewRot, &rel );
+
+	const double f = (double)pState->focal / (double)v.z / 65536.0;
+	*pSx = ( pState->vpX + pState->vpW / 2.0 ) + (double)v.x * f;
+	*pSy = ( pState->vpY + pState->vpH / 2.0 ) - (double)v.y * f;
 }
 
 // --- output -------------------------------------------------------------
@@ -566,6 +606,308 @@ int main( int argc, char **argv )
 			return 1;
 		}
 		printf( "scene graph: all checks passed\n" );
+	}
+
+	// --- point lights are anchored in the world, not in the view --------
+	//
+	// The one bug this catches is the one the design review caught on paper:
+	// class 1 has no world-space vertex anywhere -- pScratch->view[] is view
+	// space and the model and view rotations are fused -- so the lights are
+	// moved into view space once a frame by gpu64_3dSceneApplyLights(), and
+	// the rasteriser interpolates the view-space position. Get that wrong in
+	// either direction and the hotspot slides across the wall when the camera
+	// moves. So: render the same wall and the same light from two different
+	// cameras, and check the hotspot lands on the same *world* point both
+	// times.
+	//
+	// The wall is the box's -z face at world z = 50, so the closest point on
+	// it to a light at (lx, ly, lz) is (lx, ly, 50) exactly.
+	{
+		int failures = 0;
+
+		// Point the directional light straight up, so the -z wall face gets
+		// N.L = 0 and sits at plain ambient. Without this the face is at
+		// level 15 already and a point light that only ever adds has nothing
+		// visible to contribute.
+		const s16 savedDir[ 3 ] = { state.lightDir[ 0 ], state.lightDir[ 1 ], state.lightDir[ 2 ] };
+		const u8 savedAmbient = state.ambient;
+		state.lightDir[ 0 ] = 0; state.lightDir[ 1 ] = 32767; state.lightDir[ 2 ] = 0;
+		state.ambient = 3;
+
+		Gpu64_3dScene scene;
+		gpu64_3dSceneReset( &scene );
+
+		const u16 kLightId = 7;
+		Gpu64_3dVec lightPos;
+		// Kept well inside the wall's own ±24 x ±14 extent, and given a
+		// radius small enough that the whole lit disc lands on the wall: a
+		// hotspot clipped by an edge has a centroid pulled away from its
+		// centre, which is a property of the test geometry and not of the
+		// lighting.
+		lightPos.x = (s32)( -8 * GPU64_FX16_ONE );
+		lightPos.y = 0;
+		lightPos.z = (s32)( 47 * GPU64_FX16_ONE );		// 3 units off the wall
+
+		if ( gpu64_3dSceneCreateLight( &scene, kLightId ) != GPU64_3D_OK ||
+		     gpu64_3dSceneSetPosition( &scene, kLightId, &lightPos ) != GPU64_3D_OK ||
+		     gpu64_3dSceneSetPointLight( &scene, kLightId, 12, (u16)( 5 * GPU64_FX8_ONE ) ) != GPU64_3D_OK )
+		{
+			fprintf( stderr, "hostsim: LIGHT scene setup failed\n" );
+			return 1;
+		}
+
+		Gpu64_3dVec wallHit = lightPos;
+		wallHit.z = 50 * GPU64_FX16_ONE;
+
+		Gpu64_3dVec wallPos;
+		wallPos.x = 0; wallPos.y = 0; wallPos.z = 70 * GPU64_FX16_ONE;
+		Gpu64_3dMat noRot;
+		gpu64_3dMatFromEuler( &noRot, 0, 0, 0 );
+
+		static u8 unlitPixels[ sizeof( g_Pixels ) ];
+
+		// Two kinds of camera move. The first two keep the wall
+		// fronto-parallel -- the camera only translates -- so the affine
+		// interpolation of the view-space position is exact across a
+		// constant-depth face and the hotspot must land on the world point to
+		// within a pixel or two. That is the world-anchoring test proper: a
+		// light left in world space, or transformed twice, is off by the
+		// camera's own displacement, tens of pixels here.
+		//
+		// The orbit that follows turns the camera as well, and the error it
+		// prints is the affine limit itself -- the same approximation affine
+		// texture mapping makes, measured against an exact projection of the
+		// world point. It grows with the obliquity and is bounded, not
+		// eliminated; the ceiling below is there to catch it becoming
+		// something else, not to certify it as small.
+		struct Pose { s32 x, y, z; u16 yaw; double tol; const char *pName; };
+		static const Pose pose[] = {
+			{ 0, 0, 0, 0, 4.0, "head-on" },
+			{ -15 * GPU64_FX16_ONE, 8 * GPU64_FX16_ONE, 0, 0, 4.0, "translated" },
+			{ 0, 0, (s32)( -10 * GPU64_FX16_ONE ), 0, 4.0, "backed off" },
+			{ 0, 0, 0, (u16)( 65536 / 72 ), 30.0, "orbit 5 deg" },
+			{ 0, 0, 0, (u16)( 65536 / 36 ), 30.0, "orbit 10 deg" },
+			{ 0, 0, 0, (u16)( 65536 / 18 ), 30.0, "orbit 20 deg" },
+		};
+
+		for ( unsigned cam = 0; cam < sizeof( pose ) / sizeof( pose[ 0 ] ); cam++ )
+		{
+			if ( pose[ cam ].yaw == 0 )
+				setCamera( &state, pose[ cam ].x, pose[ cam ].y, pose[ cam ].z, 0, 0, 0 );
+			else
+			{
+				// On a circle of radius 60 about the lit wall's centre,
+				// looking at it: the wall stays the same size and stays
+				// centred, so the only thing that changes between these
+				// frames is how obliquely it is seen.
+				const double a = pose[ cam ].yaw * 2.0 * 3.14159265358979 / 65536.0;
+				setCamera( &state,
+					   (s32)( -60.0 * __builtin_sin( a ) * GPU64_FX16_ONE ), 0,
+					   (s32)( ( 50.0 - 60.0 * __builtin_cos( a ) ) * GPU64_FX16_ONE ),
+					   pose[ cam ].yaw, 0, 0 );
+			}
+
+			// Unlit reference first, then the lit frame; the hotspot is the
+			// difference between them, which needs no threshold guessing.
+			state.lightMask = 0;
+			gpu64_3dClearViewport( &state, &target );
+			gpu64_3dDrawMesh( &state, &target, &scratch, &mesh,
+					   &wallPos, &noRot, 256, lookupTex, &tt );
+			memcpy( unlitPixels, g_Pixels, sizeof( g_Pixels ) );
+
+			gpu64_3dSceneApplyLights( &scene, &state );
+			if ( state.lightMask != 1 )
+			{
+				fprintf( stderr, "hostsim: LIGHT ApplyLights gave mask %02x, want 01\n",
+					 state.lightMask );
+				failures++;
+			}
+			gpu64_3dClearViewport( &state, &target );
+			gpu64_3dDrawMesh( &state, &target, &scratch, &mesh,
+					   &wallPos, &noRot, 256, lookupTex, &tt );
+
+			unsigned nDiff = 0;
+			double sumX = 0, sumY = 0;
+			for ( unsigned y = 0; y < GPU64_3D_SURFACE_H; y++ )
+				for ( unsigned x = 0; x < GPU64_3D_SURFACE_W; x++ )
+				{
+					const unsigned i = y * GPU64_3D_SURFACE_W + x;
+					if ( g_Pixels[ i ] == unlitPixels[ i ] )
+						continue;
+					nDiff++;
+					sumX += x;
+					sumY += y;
+				}
+
+			double wantX, wantY;
+			worldToScreen( &state, &wallHit, &wantX, &wantY );
+
+			snprintf( path, sizeof( path ), "%s/pointlight%u.ppm", pOutDir, cam );
+			writePPM( path, &state );
+
+			if ( nDiff < 300 )
+			{
+				fprintf( stderr, "hostsim: LIGHT %s lit only %u pixels\n",
+					 pose[ cam ].pName, nDiff );
+				failures++;
+				continue;
+			}
+
+			const double gotX = sumX / nDiff, gotY = sumY / nDiff;
+			const double dx = gotX - wantX, dy = gotY - wantY;
+			const double err = __builtin_sqrt( dx * dx + dy * dy );
+			printf( "point light %-12s: %5u lit px, centroid (%6.1f,%6.1f), "
+				"world point at (%6.1f,%6.1f), err %5.1f px\n",
+				pose[ cam ].pName, nDiff, gotX, gotY, wantX, wantY, err );
+
+			if ( err > pose[ cam ].tol )
+			{
+				fprintf( stderr, "hostsim: LIGHT %s hotspot is %.1f px off (limit %.1f)\n",
+					 pose[ cam ].pName, err, pose[ cam ].tol );
+				failures++;
+			}
+		}
+
+		// A light switched off with SET_VISIBLE must leave no slot behind:
+		// this is the muzzle-flash switch, and a flash that never goes out is
+		// the failure it would produce.
+		if ( gpu64_3dSceneSetVisible( &scene, kLightId, FALSE ) != GPU64_3D_OK )
+		{
+			fprintf( stderr, "hostsim: LIGHT SET_VISIBLE(0) failed\n" );
+			failures++;
+		}
+		gpu64_3dSceneApplyLights( &scene, &state );
+		if ( state.lightMask != 0 )
+		{
+			fprintf( stderr, "hostsim: LIGHT hidden light left mask %02x\n", state.lightMask );
+			failures++;
+		}
+
+		state.lightDir[ 0 ] = savedDir[ 0 ];
+		state.lightDir[ 1 ] = savedDir[ 1 ];
+		state.lightDir[ 2 ] = savedDir[ 2 ];
+		state.ambient = savedAmbient;
+		state.lightMask = 0;
+
+		if ( failures )
+		{
+			fprintf( stderr, "hostsim: %d point-light check(s) failed\n", failures );
+			return 1;
+		}
+		printf( "point lights: all checks passed\n" );
+	}
+
+	// --- directional sprites: which of the eight views is chosen ---------
+	//
+	// The sprite carries a yaw and the camera has a position; between them
+	// they pick one of eight consecutive texture IDs. View 0 is the sprite
+	// seen from the front -- the one it is facing -- and the views advance by
+	// one as the sprite turns. Nothing about that is checkable by eye on a
+	// billboard, so it is checked here by recording which ID the texture
+	// lookup was asked for.
+	{
+		int failures = 0;
+
+		SpriteTex st;
+		memset( &st, 0, sizeof( st ) );
+		for ( unsigned i = 0; i < 8; i++ )
+		{
+			u8 flat[ 16 * 16 ];
+			// Index 0 is a sprite's transparency, so no view may contain it;
+			// each view gets its own solid hue.
+			memset( flat, (int)( 8 + i * 8 + 7 ), sizeof( flat ) );
+			if ( gpu64_3dBuildTexture( &st.tex[ i ], flat, sizeof( flat ), 4, 4, hostAlloc, 0 ) != GPU64_3D_OK )
+			{
+				fprintf( stderr, "hostsim: SPRITE texture %u build failed\n", i );
+				return 1;
+			}
+		}
+
+		// Camera at the origin looking down +z; the sprite stands in front of
+		// it. A sprite yawed to 0 faces +z, i.e. away from this camera, so
+		// the view it shows must be the back one, 4; yawed to 180 degrees it
+		// faces the camera and must show view 0.
+		setCamera( &state, 0, 0, 0, 0, 0, 0 );
+
+		Gpu64_3dVec spritePos;
+		spritePos.x = 0; spritePos.y = (s32)( -6 * GPU64_FX16_ONE ); spritePos.z = 60 * GPU64_FX16_ONE;
+
+		unsigned view[ 8 ];
+		for ( unsigned i = 0; i < 8; i++ )
+		{
+			const u16 yaw = (u16)( i * ( 65536 / 8 ) );
+			st.lastId = 0xffff;
+
+			gpu64_3dClearViewport( &state, &target );
+			const unsigned n = gpu64_3dDrawSprite( &state, &target, &spritePos,
+							        (u16)( 10 * GPU64_FX8_ONE ), (u16)( 12 * GPU64_FX8_ONE ),
+							        kSpriteBaseId, yaw,
+							        GPU64_3D_SPRITE_DIRECTIONAL, lookupSpriteTex, &st );
+			if ( n != 1 || st.lastId == 0xffff )
+			{
+				fprintf( stderr, "hostsim: SPRITE yaw %u drew nothing\n", yaw );
+				failures++;
+				view[ i ] = 0xff;
+				continue;
+			}
+			view[ i ] = st.lastId - kSpriteBaseId;
+
+			if ( i == 4 )
+			{
+				snprintf( path, sizeof( path ), "%s/sprite.ppm", pOutDir );
+				writePPM( path, &state );
+			}
+		}
+
+		printf( "sprite views by yaw:" );
+		for ( unsigned i = 0; i < 8; i++ )
+			printf( " %u", view[ i ] );
+		printf( "\n" );
+
+		// Facing away at yaw 0, facing the camera at yaw 180.
+		if ( view[ 0 ] != 4 )
+		{
+			fprintf( stderr, "hostsim: SPRITE facing away chose view %u, want 4\n", view[ 0 ] );
+			failures++;
+		}
+		if ( view[ 4 ] != 0 )
+		{
+			fprintf( stderr, "hostsim: SPRITE facing the camera chose view %u, want 0\n", view[ 4 ] );
+			failures++;
+		}
+		// Every view used exactly once, and in step with the yaw: a sweep
+		// that repeats or skips a view is an octant boundary in the wrong
+		// place, which is invisible in any single frame.
+		for ( unsigned i = 0; i < 8; i++ )
+		{
+			const unsigned want = ( view[ 0 ] + i ) & 7;
+			const unsigned wantAlt = ( view[ 0 ] + 8 - i ) & 7;
+			if ( view[ i ] != want && view[ i ] != wantAlt )
+			{
+				fprintf( stderr, "hostsim: SPRITE yaw step %u chose view %u\n", i, view[ i ] );
+				failures++;
+			}
+		}
+
+		// A sprite behind the camera is culled, not wrapped round to the far
+		// side of the viewport.
+		Gpu64_3dVec behind = spritePos;
+		behind.z = (s32)( -20 * GPU64_FX16_ONE );
+		if ( gpu64_3dDrawSprite( &state, &target, &behind,
+					  (u16)( 10 * GPU64_FX8_ONE ), (u16)( 12 * GPU64_FX8_ONE ),
+					  kSpriteBaseId, 0, GPU64_3D_SPRITE_DIRECTIONAL,
+					  lookupSpriteTex, &st ) != 0 )
+		{
+			fprintf( stderr, "hostsim: SPRITE behind the camera was not culled\n" );
+			failures++;
+		}
+
+		if ( failures )
+		{
+			fprintf( stderr, "hostsim: %d sprite check(s) failed\n", failures );
+			return 1;
+		}
+		printf( "directional sprites: all checks passed\n" );
 	}
 
 	printf( "PPMs written to %s/\n", pOutDir );

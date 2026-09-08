@@ -201,6 +201,14 @@ static Gpu64_3dResource *resSlot( u16 nId )
 	return pFree;
 }
 
+// Stage 17: the mesh half of the same idea, for gpu64_3dSceneRender(). The
+// portable scene render must not know about s_Res[], so it asks through this.
+static const Gpu64_3dMesh *lookupMesh( void *, u16 nId )
+{
+	const Gpu64_3dResource *pR = resFind( nId, GPU64_3D_RES_MESH );
+	return pR ? &pR->mesh : 0;
+}
+
 static const Gpu64_3dTexture *lookupTexture( void *, u16 nId )
 {
 	const Gpu64_3dResource *pR = resFind( nId, GPU64_3D_RES_TEXTURE );
@@ -250,6 +258,10 @@ static boolean isShadowRedirectable( u8 op )
 	case GPU64_3D_OP_DESTROY_NODE:
 	case GPU64_3D_OP_SET_ACTIVE_CAMERA:
 	case GPU64_3D_OP_SET_VISIBLE:
+	case GPU64_3D_OP_CREATE_SPRITE:
+	case GPU64_3D_OP_CREATE_LIGHT:
+	case GPU64_3D_OP_SET_SPRITE:
+	case GPU64_3D_OP_SET_POINT_LIGHT:
 	case GPU64_3D_OP_SET_POSITION:
 	case GPU64_3D_OP_SET_ORIENTATION:
 	case GPU64_3D_OP_MOVE_LOCAL:
@@ -273,7 +285,11 @@ static boolean isShadowRedirectable( u8 op )
 // backward across it. pollLoopFrame() is Stage 16's non-blocking counterpart
 // -- same forward-reference reason.
 static boolean drainAndFlush( void );
-static void    pollLoopFrame( void );
+// always_inline so gpu64_3dPollLoopFrame() below is self-contained: the
+// vsync commit warms exactly one address range for it (gpu64_vsyncWarmCommit()
+// in rad_reu.cpp), and a call out to a separate body 2.4 KB away would sit
+// outside that window and take the cold miss inside the hold.
+static void    pollLoopFrame( void ) __attribute__( ( always_inline ) );
 static boolean pushLoopFrame( void );
 
 void gpu64_3dInit( void )
@@ -611,6 +627,30 @@ static u8 opCreateCamera( void )
 	return gpu64_3dSceneCreateCamera( sceneTarget(), stagedId() );
 }
 
+static u8 opCreateSprite( void )
+{
+	return gpu64_3dSceneCreateSprite( sceneTarget(), stagedId(), argU16( 0 ) );
+}
+
+static u8 opCreateLight( void )
+{
+	return gpu64_3dSceneCreateLight( sceneTarget(), stagedId() );
+}
+
+static u8 opSetSprite( void )
+{
+	return gpu64_3dSceneSetSprite( sceneTarget(), stagedId(),
+					argU16( 0 ), argU16( 2 ), sArg[ 4 ] );
+}
+
+static u8 opSetPointLight( void )
+{
+	// Strength is in colormap levels at the centre and radius is 8.8 world
+	// units; either being zero turns the light off without destroying it.
+	return gpu64_3dSceneSetPointLight( sceneTarget(), stagedId(),
+					    sArg[ 0 ], argU16( 1 ) );
+}
+
 static u8 opDestroyNode( void )
 {
 	return gpu64_3dSceneDestroyNode( sceneTarget(), stagedId() );
@@ -714,8 +754,13 @@ static u8 precheckDrawNode( boolean *pNeedsDraw )
 	if ( s_LoopRunning )
 		return GPU64_ERR_BUSY;
 
-	Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, stagedId(), GPU64_3D_NODE_OBJECT );
+	// NODE_NONE here means "any type"; the type test below is what rejects
+	// a camera or a light, so that DRAW_NODE on one of those is BAD_ID and
+	// not the "no such node" the old OBJECT-only filter reported.
+	Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, stagedId(), GPU64_3D_NODE_NONE );
 	if ( pN == 0 )
+		return GPU64_ERR_BAD_ID;
+	if ( pN->type != GPU64_3D_NODE_OBJECT && pN->type != GPU64_3D_NODE_SPRITE )
 		return GPU64_ERR_BAD_ID;
 
 	if ( !pN->visible )
@@ -724,7 +769,11 @@ static u8 precheckDrawNode( boolean *pNeedsDraw )
 		return GPU64_ERR_OK;
 	}
 
-	if ( resFind( pN->meshId, GPU64_3D_RES_MESH ) == 0 )
+	// A sprite's texture is resolved at draw time, not here: which of the
+	// eight directional views it needs depends on the camera, which is
+	// applied on core 1 after the drain. A sprite whose texture is missing
+	// draws nothing and reports 0, the same as a fully-culled mesh.
+	if ( pN->type == GPU64_3D_NODE_OBJECT && resFind( pN->meshId, GPU64_3D_RES_MESH ) == 0 )
 		return GPU64_ERR_BAD_ID;
 	if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
 		return GPU64_ERR_UNSUPPORTED;
@@ -821,9 +870,8 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 		// the drain, and nothing about the node or the resource table is
 		// locked between the two -- re-finding both here is what makes that
 		// safe rather than merely convenient.
-		Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, pCmd->id, GPU64_3D_NODE_OBJECT );
-		const Gpu64_3dResource *pR = pN ? resFind( pN->meshId, GPU64_3D_RES_MESH ) : 0;
-		if ( pN == 0 || pR == 0 || !makeTarget( &target, pCmd->page ) )
+		Gpu64_3dNode *pN = gpu64_3dSceneFind( &s_Scene, pCmd->id, GPU64_3D_NODE_NONE );
+		if ( pN == 0 || !makeTarget( &target, pCmd->page ) )
 		{
 			// precheckDrawNode() already proved this can't happen.
 			pCmd->err = GPU64_ERR_BAD_ID;
@@ -836,8 +884,29 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 		// *now*, not from wherever it was at some earlier SET_ACTIVE_CAMERA.
 		gpu64_3dSceneApplyCamera( &s_Scene, &s_State );
 
-		const unsigned n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
-						     &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
+		// Lights are view-space, so they have to be re-gathered after the
+		// camera and never before it (gpu64_3dSceneApplyLights()'s own
+		// contract). Cheap enough to redo per DRAW_NODE: it is a walk of the
+		// node table, not a draw.
+		gpu64_3dSceneApplyLights( &s_Scene, &s_State );
+
+		unsigned n;
+		if ( pN->type == GPU64_3D_NODE_SPRITE )
+		{
+			n = gpu64_3dDrawSprite( &s_State, &target, &pN->pos,
+						 pN->spriteW, pN->spriteH, pN->texId,
+						 pN->yaw, pN->spriteFlags, lookupTexture, 0 );
+		} else
+		{
+			const Gpu64_3dResource *pR = resFind( pN->meshId, GPU64_3D_RES_MESH );
+			if ( pR == 0 )
+			{
+				pCmd->err = GPU64_ERR_BAD_ID;
+				return;
+			}
+			n = gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
+					       &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
+		}
 		cleanViewport( pCmd->page );
 
 		pCmd->result = (u8)( n > 255 ? 255 : n );
@@ -873,6 +942,8 @@ void gpu64_3dExecuteRenderScene( Gpu64_3dCmd *pCmd )
 {
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dExecuteRenderScene, 1024 * 2 );
 	FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRenderScene, 1024 * 2, 1024 * 2 );
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneRender, 1024 * 2 );
+	FORCE_READ_LINEARa( (void*)gpu64_3dSceneRender, 1024 * 2, 1024 * 2 );
 	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneApplyCamera, 1024 * 2 );
 	FORCE_READ_LINEARa( (void*)gpu64_3dSceneApplyCamera, 1024 * 2, 1024 * 2 );
 
@@ -886,32 +957,8 @@ void gpu64_3dExecuteRenderScene( Gpu64_3dCmd *pCmd )
 		return;
 	}
 
-	gpu64_3dClearViewport( &s_State, &target );
-
-	// Fresh every frame, same rule DRAW_NODE's own comment gives: a program
-	// that moves the camera between two commits must see the next frame
-	// rendered from where the camera is now.
-	gpu64_3dSceneApplyCamera( &s_Scene, &s_State );
-
-	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
-	{
-		const Gpu64_3dNode *pN = &s_Scene.node[ i ];
-		if ( pN->type != GPU64_3D_NODE_OBJECT || !pN->visible )
-			continue;
-
-		const Gpu64_3dResource *pR = resFind( pN->meshId, GPU64_3D_RES_MESH );
-		if ( pR == 0 )
-			continue;
-
-		gpu64_3dDrawMesh( &s_State, &target, &s_Scratch, &pR->mesh,
-				   &pN->pos, &pN->rot, pN->scale, lookupTexture, 0 );
-
-		// Store-burst discipline (CLAUDE.md multicore rules): gpu64_3d_span.h's
-		// own yield covers the rasteriser's inner loop, but a scene of many
-		// small meshes can otherwise chain draw after draw with no yield
-		// between them at all. One here per node closes that gap.
-		GPU64_3D_YIELD();
-	}
+	gpu64_3dSceneRender( &s_Scene, &s_State, &target, &s_Scratch,
+			      lookupMesh, 0, lookupTexture, 0 );
 
 	cleanViewport( pCmd->page );
 
@@ -990,6 +1037,10 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_DESTROY_NODE:		return opDestroyNode();
 	case GPU64_3D_OP_SET_ACTIVE_CAMERA:	return opSetActiveCamera();
 	case GPU64_3D_OP_SET_VISIBLE:		return opSetVisible();
+	case GPU64_3D_OP_CREATE_SPRITE:		return opCreateSprite();
+	case GPU64_3D_OP_CREATE_LIGHT:		return opCreateLight();
+	case GPU64_3D_OP_SET_SPRITE:		return opSetSprite();
+	case GPU64_3D_OP_SET_POINT_LIGHT:	return opSetPointLight();
 
 	case GPU64_3D_OP_SET_POSITION:		return opSetPosition();
 	case GPU64_3D_OP_SET_ORIENTATION:	return opSetOrientation();
@@ -1262,7 +1313,7 @@ static boolean pushLoopFrame( void )
 // ops -- LOOP_START/SCENE_COMMIT already validated the framebuffer exists
 // before ever pushing, so gpu64_3dExecuteRenderScene() has nothing left to
 // fail on.
-static void pollLoopFrame( void )
+static inline void pollLoopFrame( void )
 {
 	if ( !s_LoopFramePending )
 		return;
@@ -1296,6 +1347,13 @@ static void pollLoopFrame( void )
 	gpu64Regs.result = pSlot->result;
 	gpu64Regs.status |= GPU64_STATUS_FRAME_READY;
 	s_LoopFramePending = FALSE;
+}
+
+// The frame-clock entry point. See gpu64_3d.h for why this exists and why
+// gpu64_vsyncCommitFlip()'s DMA hold is the only place allowed to call it.
+void gpu64_3dPollLoopFrame( void )
+{
+	pollLoopFrame();
 }
 
 u8 gpu64_3dDispatch( u8 op )

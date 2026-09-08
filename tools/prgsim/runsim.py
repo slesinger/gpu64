@@ -58,6 +58,14 @@ Options:
                     number and a delta.
     --ppm-frame=N:PATH
                     write the page being flipped away at frame N. Repeatable.
+    --c1-stream=PATH
+        Write the class-1 frame stream -- one record per accepted
+        SCENE_COMMIT, plus the resource blobs beside it -- for
+        tools/hostsim/scenesim to render with the firmware's own renderer.
+        The model does not rasterise class 1 (see tools/prgsim/gpu64class1.py),
+        so this, not --ppm, is how a class-1 demo gets a picture on a PC.
+        For a class-1 demo a "frame" is an accepted SCENE_COMMIT, so
+        --stop-after counts those.
     --trace N       dump the last N instructions if something goes wrong
     --max N         instruction budget (default 200 million)
 """
@@ -69,6 +77,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cpu6502 import Cpu6502                                   # noqa: E402
 import gpu64model                                              # noqa: E402
+import gpu64class1                                            # noqa: E402
 from gpu64model import Gpu64Model                             # noqa: E402
 
 SCREEN = 0x0400
@@ -113,7 +122,7 @@ def screen_to_ascii(c):
 
 class Machine:
     def __init__(self, calibrated=True, stop_after=4, frame_log=False,
-                 ppm_frames=None, key_script=None):
+                 ppm_frames=None, key_script=None, c1_stream=None):
         self.mem = bytearray(65536)
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
@@ -127,6 +136,16 @@ class Machine:
         self.frame = 0
         self.cia_pra = 0xFF
         self.key_script = list(key_script or [])
+        # A class-1 program never issues PAGE_FLIP: the autonomous loop owns
+        # the framebuffer, and its frame boundary is the accepted
+        # SCENE_COMMIT the model reports here instead.
+        self.gpu.frame_hook = self.on_c1_frame
+        self.c1_stream = None
+        if c1_stream:
+            self.c1_stream = open(c1_stream, 'w')
+            self.c1_stream.write(gpu64class1.FRAME_STREAM_DOC)
+            self.gpu.c1_stream = self.c1_stream
+            self.gpu.c1_stream_dir = os.path.dirname(os.path.abspath(c1_stream))
 
     # Straight RAM, used by the model's DMA: a blob fetch sees memory, not
     # the IO2 window, and never re-enters the register file.
@@ -197,14 +216,23 @@ class Machine:
         self.mem[addr] = val & 0xFF
 
     def on_flip(self):
+        self.frame_boundary(self.gpu.draw_page)
+
+    def on_c1_frame(self, page):
+        # The page the autonomous loop just rendered into. Its ink count is
+        # always zero -- the model does not rasterise class 1 -- so the
+        # useful half of a --frame-log line here is the demo's own status
+        # rows on the C64 screen.
+        self.frame_boundary(page)
+
+    def frame_boundary(self, page):
         self.frame += 1
         path = self.ppm_frames.get(self.frame)
         if path is not None:
-            write_ppm(path, self.gpu, page=self.gpu.draw_page)
+            write_ppm(path, self.gpu, page=page)
         if not self.frame_log:
             return
-        page = self.gpu.pages[self.gpu.draw_page]
-        ink = sum(1 for b in page if b)
+        ink = sum(1 for b in self.gpu.pages[page] if b)
         rows = self.screen()
         status = ' | '.join(r.strip() for r in rows[20:25] if r.strip())
         print("frame %4d  ink %6d  %s" % (self.frame, ink, status))
@@ -338,6 +366,7 @@ def main(argv):
     stop_after = 4
     frame_log = '--frame-log' in opts
     ppm_frames = {}
+    c1_stream = None
     demo = '--demo' in opts
     key_script = []
     for o in opts:
@@ -361,10 +390,12 @@ def main(argv):
             max_insns = int(o.split('=')[1])
         if o.startswith('--ppm='):
             ppm = o.split('=', 1)[1]
+        if o.startswith('--c1-stream='):
+            c1_stream = o.split('=', 1)[1]
 
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
-                key_script=key_script)
+                key_script=key_script, c1_stream=c1_stream)
     addr, size = m.load_prg(args[0])
     # A BASIC stub sits at $0801; the code itself starts at $0810.
     start = 0x0810
@@ -378,7 +409,14 @@ def main(argv):
     for i, r in enumerate(rows):
         if r:
             print("%2d| %s" % (i, r))
-    print("--- %d dispatches ---" % m.gpu.dispatches)
+    print("--- %d dispatches, %d register writes ---"
+          % (m.gpu.dispatches, m.gpu.reg_writes))
+    print("--- by class: %s ---"
+          % "  ".join("c%d %d/%dw" % (c, m.gpu.class_disp[c], m.gpu.class_writes[c])
+                      for c in range(4) if m.gpu.class_disp[c]))
+    if m.c1_stream is not None:
+        m.c1_stream.close()
+        print("--- %d class-1 frames ---" % m.gpu.c1_frames)
 
     if ppm is not None and ok:
         write_ppm(ppm, m.gpu)

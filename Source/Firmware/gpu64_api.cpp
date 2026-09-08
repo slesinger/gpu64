@@ -7,6 +7,7 @@
 #include "gpu64_vsync.h"
 #include "gpu64_flip.h"
 #include "gpu64_holdgap.h"
+#include "gpu64_holdgate.h"
 #include "gpu64_ladder.h"
 #include "gpu64_3d.h"
 #include "gpu64_raster.h"
@@ -593,7 +594,7 @@ static u8 doSystem( u8 op )
 
 		readHealth();
 
-		u8 h[ 36 ];
+		u8 h[ 48 ];
 		memset( h, 0, sizeof h );
 		h[ 0 ] = (u8)( s_Health.throttled & 0xff );
 		h[ 1 ] = (u8)( ( s_Health.throttled >> 8 ) & 0xff );
@@ -638,9 +639,28 @@ static u8 doSystem( u8 op )
 		saturate16( h + 32, gpu64HoldGap.d2cClose );
 		saturate16( h + 34, gpu64HoldGap.asserts );
 
-		// Length-compatible with the 12- and 20-byte contracts: a caller
-		// that asks for either still gets exactly what it always got.
-		return gpu64_blobWrite( space, addr, len >= 36 ? 36 : ( len >= 20 ? 20 : 12 ), h );
+		// gpu64: bytes 36-47, added 2026-09-07, are the hold *gate*
+		// (gpu64_holdgate.h) -- the forward-confirmation rule that replaced
+		// "fire on the IO2 access and hope it was the last cycle". Riding
+		// GET_HEALTH for the same reason as the two blocks above.
+		//
+		// What to read: armed == fired means every request for the bus got
+		// it, which is the expected steady state. ageMax is the interesting
+		// one -- the worst wait from arm to hold, in C64 cycles -- because a
+		// number above about 10 says a program is reaching the API in a way
+		// the gate keeps declining. dispatchDeferred counts read-modify-write
+		// on CMD_LO, and should be 0 for every program in this tree.
+		saturate16( h + 36, gpu64HoldGate.armed );
+		saturate16( h + 38, gpu64HoldGate.fired );
+		saturate16( h + 40, gpu64HoldGate.ageMax );
+		saturate16( h + 42, gpu64HoldGate.declined );
+		saturate16( h + 44, gpu64HoldGate.dispatchDeferred );
+		saturate16( h + 46, gpu64HoldGate.dispatchFired );
+
+		// Length-compatible with the 12-, 20- and 36-byte contracts: a caller
+		// that asks for any of them still gets exactly what it always got.
+		return gpu64_blobWrite( space, addr,
+				len >= 48 ? 48 : ( len >= 36 ? 36 : ( len >= 20 ? 20 : 12 ) ), h );
 	}
 
 	case 0x08:					// SET_BORDER

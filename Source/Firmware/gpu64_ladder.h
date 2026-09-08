@@ -254,17 +254,25 @@
 //   aarch64-none-elf-nm -S external/Circle/app/Firmware/kernel8.elf \
 //     | grep reuUsingPolling
 #if defined( GPU64_LADDER_ENABLED ) || defined( GPU64_POLL_IPL_WIDE )
-	#define GPU64_POLL_IPL_WINDOW	0x2000
-	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 8 )
+	#define GPU64_POLL_IPL_WINDOW	0x2c00
+	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 11 )
 #else
 	// 0x1a00 measured 120-176B under the function's actual size across
 	// several rounds (see [[gpu64-poll-loop-exceeds-ipl-window]]) -- recorded
 	// as real but benign, since widening it previously changed nothing on
 	// hardware. Bumped to 0x1c00 for margin while touching this file for the
-	// Stage 16 loop-freeze fix (unrelated bug); re-measure with the nm -S
-	// command above after any further change to reuUsingPolling().
-	#define GPU64_POLL_IPL_WINDOW	0x1c00
-	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 7 )
+	// Stage 16 loop-freeze fix (unrelated bug).
+	//
+	// Bumped again to 0x2800 on 2026-09-07 for the hold gate
+	// (gpu64_holdgate.h), which took reuUsingPolling() from 0x1d9c to 0x24d4.
+	// Most of that is not the gate's own code -- removing the gate's
+	// duplicated dispatch hold and rebuilding made the function *larger*, at
+	// 0x2608 -- it is the compiler rearranging a loop body that now carries
+	// five more live registers. Either way the whole function is inside the
+	// window again, which it had not been since the ladder rounds.
+	// Re-measure with the nm -S command above after any further change.
+	#define GPU64_POLL_IPL_WINDOW	0x2800
+	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 10 )
 #endif
 
 // Core 0's per-pass bookkeeping -- and **everything core 0 touches on the hot

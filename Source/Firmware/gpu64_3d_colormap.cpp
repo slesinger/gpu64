@@ -41,6 +41,20 @@ void gpu64_3dStateDefaults( Gpu64_3dState *pState )
 			pState->colormap[ l * 256 + i ] = (u8)i;
 	pState->bColormapValid = FALSE;
 
+	// No point lights. Set here field by field rather than left to a memset
+	// this function has never done: every other field above is explicit, and
+	// a light that survived a session reset would light the next program's
+	// scene from a position its own scene graph has no node for.
+	for ( unsigned i = 0; i < GPU64_3D_MAX_LIGHTS; i++ )
+	{
+		pState->lights[ i ].x = 0;
+		pState->lights[ i ].y = 0;
+		pState->lights[ i ].z = 0;
+		pState->lights[ i ].r2 = 0;
+		pState->lights[ i ].fall = 0;
+	}
+	pState->lightMask = 0;
+
 	gpu64_3dMatIdentity( &pState->viewRot );
 	pState->viewPos.x = pState->viewPos.y = pState->viewPos.z = 0;
 	pState->bHaveCamera = FALSE;

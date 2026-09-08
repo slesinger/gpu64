@@ -31,6 +31,8 @@
 #define GPU64_3D_NODE_NONE	0
 #define GPU64_3D_NODE_OBJECT	1
 #define GPU64_3D_NODE_CAMERA	2
+#define GPU64_3D_NODE_SPRITE	3	// stage 17: a billboard in the world
+#define GPU64_3D_NODE_LIGHT	4	// stage 17: a point light
 
 struct Gpu64_3dNode
 {
@@ -39,6 +41,20 @@ struct Gpu64_3dNode
 	u8	visible;		// SET_VISIBLE; nonzero = drawn
 
 	u16	meshId;			// OBJECT only -- resolved by the caller
+
+	// SPRITE only. texId is the base texture; with
+	// GPU64_3D_SPRITE_DIRECTIONAL it is the first of eight consecutive
+	// views and the node's own yaw picks between them.
+	u16	texId;
+	u16	spriteW, spriteH;	// 8.8 world units
+	u8	spriteFlags;		// GPU64_3D_SPRITE_*
+
+	// LIGHT only. Either being zero turns the light off without destroying
+	// the node -- the same "twelve stores end a muzzle flash" convention
+	// class 2's SET_LIGHT has, and the reason a flash does not need
+	// CREATE/DESTROY every time it fires.
+	u8	lightStrength;		// colormap levels at the centre
+	u16	lightRadius;		// 8.8 world units
 
 	Gpu64_3dVec	pos;		// 16.16 world space
 
@@ -85,6 +101,8 @@ Gpu64_3dNode *gpu64_3dSceneFind( Gpu64_3dScene *pScene, u16 nId, u8 nType );
 
 u8 gpu64_3dSceneCreateObject( Gpu64_3dScene *pScene, u16 nId, u16 nMeshId );
 u8 gpu64_3dSceneCreateCamera( Gpu64_3dScene *pScene, u16 nId );
+u8 gpu64_3dSceneCreateSprite( Gpu64_3dScene *pScene, u16 nId, u16 nTexId );
+u8 gpu64_3dSceneCreateLight( Gpu64_3dScene *pScene, u16 nId );
 u8 gpu64_3dSceneDestroyNode( Gpu64_3dScene *pScene, u16 nId );
 u8 gpu64_3dSceneSetActiveCamera( Gpu64_3dScene *pScene, u16 nId );
 u8 gpu64_3dSceneSetVisible( Gpu64_3dScene *pScene, u16 nId, boolean bVisible );
@@ -106,6 +124,15 @@ u8 gpu64_3dSceneMoveWorld( Gpu64_3dScene *pScene, u16 nId, s32 dx, s32 dy, s32 d
 u8 gpu64_3dSceneRotateLocal( Gpu64_3dScene *pScene, u16 nId, u16 dYaw, u16 dPitch, u16 dRoll );
 u8 gpu64_3dSceneSetScale( Gpu64_3dScene *pScene, u16 nId, u16 nScale );
 
+// --- per-type properties ($27-$28) ----------------------------------------
+// Position and orientation are NOT here: a sprite and a light are placed
+// with the same SET_POSITION/ROTATE_LOCAL every other node uses, which is
+// the invariant that makes the transform opcodes worth having. These two
+// carry only what is specific to the type.
+
+u8 gpu64_3dSceneSetSprite( Gpu64_3dScene *pScene, u16 nId, u16 nW, u16 nH, u8 nFlags );
+u8 gpu64_3dSceneSetPointLight( Gpu64_3dScene *pScene, u16 nId, u8 nStrength, u16 nRadius );
+
 u8 gpu64_3dSceneGetTransform( Gpu64_3dScene *pScene, u16 nId,
 			       Gpu64_3dVec *pPos, u16 *pYaw, u16 *pPitch, u16 *pRoll );
 
@@ -121,5 +148,47 @@ u8 gpu64_3dSceneGetTransform( Gpu64_3dScene *pScene, u16 nId,
 // same as DRAW_MESH always has. Deterministic either way: never leaves
 // whatever was there before.
 void gpu64_3dSceneApplyCamera( const Gpu64_3dScene *pScene, Gpu64_3dState *pState );
+
+// --- the point lights -------------------------------------------------------
+// Gathers the scene's live LIGHT nodes into pState->lights[], transforming
+// each into view space, and sets pState->lightMask. Derived state, rebuilt
+// every frame exactly like the camera above -- an opcode never writes
+// pState->lights[] directly.
+//
+// MUST be called after gpu64_3dSceneApplyCamera(): it reads the view
+// transform that call produces. Call it the other way round and the lights
+// are placed by the *previous* frame's camera, which looks like lights that
+// lag the player by one frame -- visible only while moving.
+//
+// At most GPU64_3D_MAX_LIGHTS are taken, in scene order. A light is skipped
+// when it is hidden (SET_VISIBLE 0) or inert (strength or radius zero), so
+// a node created and not yet given parameters cannot occupy one of the eight
+// slots a real light needs.
+void gpu64_3dSceneApplyLights( const Gpu64_3dScene *pScene, Gpu64_3dState *pState );
+
+// --- one whole frame -------------------------------------------------------
+// Clear the viewport, apply the active camera, apply the lights, then draw
+// every visible OBJECT node followed by every visible SPRITE node, in scene
+// order. This is the body of the autonomous loop's frame, and it lives here
+// -- portable, with no resource table of its own -- so that tools/hostsim
+// renders a class-1 frame through *this* code rather than through a
+// re-implementation of it. Stage 17: a demo verified on the host is only
+// evidence about the bench if the node loop is literally the same one.
+//
+// The two lookups are how this reaches tables it must not own: meshes and
+// textures both live in gpu64_3d_class1.cpp on the firmware and in the host
+// harness on a PC. A node whose mesh does not resolve is skipped, not a
+// failure -- one stale id must not blank an otherwise-good frame.
+//
+// Does NOT touch the framebuffer's page bookkeeping or any cache
+// maintenance: the caller owns the target and what has to be flushed after.
+typedef const Gpu64_3dMesh *( *Gpu64_3dMeshLookup )( void *pCtx, u16 nId );
+
+void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
+			   Gpu64_3dState *pState,
+			   Gpu64_3dTarget *pTarget,
+			   Gpu64_3dScratch *pScratch,
+			   Gpu64_3dMeshLookup pMeshLookup, void *pMeshCtx,
+			   Gpu64_3dTextureLookup pTexLookup, void *pTexCtx );
 
 #endif

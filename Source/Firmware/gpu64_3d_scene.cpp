@@ -5,6 +5,7 @@
  gpu64_3d_scene.h for what is deliberately not here (mesh resolution).
 */
 #include "gpu64_3d_scene.h"
+#include "gpu64_3d_span.h"		// GPU64_3D_YIELD
 #include <circle/util.h>
 
 static void rebuildRot( Gpu64_3dNode *pN )
@@ -78,6 +79,38 @@ u8 gpu64_3dSceneCreateCamera( Gpu64_3dScene *pScene, u16 nId )
 		return GPU64_3D_OUT_OF_MEMORY;
 
 	nodeDefaults( pN, nId, GPU64_3D_NODE_CAMERA );
+	return GPU64_3D_OK;
+}
+
+u8 gpu64_3dSceneCreateSprite( Gpu64_3dScene *pScene, u16 nId, u16 nTexId )
+{
+	Gpu64_3dNode *pN = nodeSlot( pScene, nId );
+	if ( pN == 0 )
+		return GPU64_3D_OUT_OF_MEMORY;
+
+	nodeDefaults( pN, nId, GPU64_3D_NODE_SPRITE );
+	pN->texId = nTexId;
+
+	// One world unit square, masked, screen-upright: a sprite created and
+	// never given a size is still a sprite you can see, which is what makes
+	// SET_SPRITE optional rather than a second half of CREATE_SPRITE.
+	pN->spriteW = GPU64_FX8_ONE;
+	pN->spriteH = GPU64_FX8_ONE;
+	pN->spriteFlags = 0;
+	return GPU64_3D_OK;
+}
+
+u8 gpu64_3dSceneCreateLight( Gpu64_3dScene *pScene, u16 nId )
+{
+	Gpu64_3dNode *pN = nodeSlot( pScene, nId );
+	if ( pN == 0 )
+		return GPU64_3D_OUT_OF_MEMORY;
+
+	// Strength and radius are left at zero by nodeDefaults(), i.e. the light
+	// exists and is off. It lights nothing until SET_POINT_LIGHT gives it
+	// both, and gpu64_3dSceneApplyLights() will not spend a slot on it in
+	// the meantime.
+	nodeDefaults( pN, nId, GPU64_3D_NODE_LIGHT );
 	return GPU64_3D_OK;
 }
 
@@ -217,6 +250,31 @@ u8 gpu64_3dSceneGetTransform( Gpu64_3dScene *pScene, u16 nId,
 	return GPU64_3D_OK;
 }
 
+// --- per-type properties ------------------------------------------------------
+
+u8 gpu64_3dSceneSetSprite( Gpu64_3dScene *pScene, u16 nId, u16 nW, u16 nH, u8 nFlags )
+{
+	Gpu64_3dNode *pN = gpu64_3dSceneFind( pScene, nId, GPU64_3D_NODE_SPRITE );
+	if ( pN == 0 )
+		return GPU64_3D_BAD_ID;
+
+	pN->spriteW = nW;
+	pN->spriteH = nH;
+	pN->spriteFlags = nFlags;
+	return GPU64_3D_OK;
+}
+
+u8 gpu64_3dSceneSetPointLight( Gpu64_3dScene *pScene, u16 nId, u8 nStrength, u16 nRadius )
+{
+	Gpu64_3dNode *pN = gpu64_3dSceneFind( pScene, nId, GPU64_3D_NODE_LIGHT );
+	if ( pN == 0 )
+		return GPU64_3D_BAD_ID;
+
+	pN->lightStrength = nStrength;
+	pN->lightRadius = nRadius;
+	return GPU64_3D_OK;
+}
+
 // --- the active camera ------------------------------------------------------
 
 void gpu64_3dSceneApplyCamera( const Gpu64_3dScene *pScene, Gpu64_3dState *pState )
@@ -254,4 +312,118 @@ void gpu64_3dSceneApplyCamera( const Gpu64_3dScene *pScene, Gpu64_3dState *pStat
 	gpu64_3dMatTranspose( &pState->viewRot, &pCam->rot );
 	pState->viewPos = pCam->pos;
 	pState->bHaveCamera = TRUE;
+}
+
+// --- the point lights ---------------------------------------------------------
+
+void gpu64_3dSceneApplyLights( const Gpu64_3dScene *pScene, Gpu64_3dState *pState )
+{
+	unsigned n = 0;
+
+	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES && n < GPU64_3D_MAX_LIGHTS; i++ )
+	{
+		const Gpu64_3dNode *pN = &pScene->node[ i ];
+
+		if ( pN->type != GPU64_3D_NODE_LIGHT || !pN->visible )
+			continue;
+		if ( pN->lightRadius == 0 || pN->lightStrength == 0 )
+			continue;
+
+		// Into view space, once, here -- the reason Gpu64_3dPointLight is
+		// documented as view space and not world space. gpu64_3dDrawMesh()
+		// fuses the view and model rotations into one matrix, so there is no
+		// world-space vertex anywhere downstream for a world-space light to
+		// be compared against.
+		Gpu64_3dVec rel, v;
+		rel.x = pN->pos.x - pState->viewPos.x;
+		rel.y = pN->pos.y - pState->viewPos.y;
+		rel.z = pN->pos.z - pState->viewPos.z;
+		gpu64_3dVecRotate( &v, &pState->viewRot, &rel );
+
+		Gpu64_3dPointLight *pL = &pState->lights[ n ];
+		pL->x = v.x >> 8;			// 16.16 -> 8.8
+		pL->y = v.y >> 8;
+		pL->z = v.z >> 8;
+		pL->r2 = (s64)pN->lightRadius * (s64)pN->lightRadius;
+
+		// ( strength << SHIFT ) / r2, so fall * ( r2 - d2 ) >> SHIFT is the
+		// strength at the centre and zero at the radius. Class 2's
+		// gpu64_rasterSetLight() to the letter.
+		pL->fall = ( (s64)pN->lightStrength << GPU64_3D_LIGHT_SHIFT ) / pL->r2;
+		n++;
+	}
+
+	pState->lightMask = (u8)( ( 1u << n ) - 1 );
+
+	for ( unsigned i = n; i < GPU64_3D_MAX_LIGHTS; i++ )
+	{
+		pState->lights[ i ].r2 = 0;
+		pState->lights[ i ].fall = 0;
+	}
+}
+
+// --- one whole frame -------------------------------------------------------
+// Contract in gpu64_3d_scene.h. Extracted verbatim from stage 16's
+// gpu64_3dExecuteRenderScene() so the firmware and tools/hostsim run the
+// same node loop rather than two that agree by inspection.
+void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
+			   Gpu64_3dState *pState,
+			   Gpu64_3dTarget *pTarget,
+			   Gpu64_3dScratch *pScratch,
+			   Gpu64_3dMeshLookup pMeshLookup, void *pMeshCtx,
+			   Gpu64_3dTextureLookup pTexLookup, void *pTexCtx )
+{
+	gpu64_3dClearViewport( pState, pTarget );
+
+	// Fresh every frame, same rule DRAW_NODE's own comment gives: a program
+	// that moves the camera between two commits must see the next frame
+	// rendered from where the camera is now.
+	gpu64_3dSceneApplyCamera( pScene, pState );
+
+	// After the camera, never before: the light slots this fills are in view
+	// space, so they are only meaningful against the view matrix the camera
+	// just set. Once per frame, not once per node.
+	gpu64_3dSceneApplyLights( pScene, pState );
+
+	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
+	{
+		const Gpu64_3dNode *pN = &pScene->node[ i ];
+		if ( pN->type != GPU64_3D_NODE_OBJECT || !pN->visible )
+			continue;
+
+		const Gpu64_3dMesh *pMesh =
+			pMeshLookup ? pMeshLookup( pMeshCtx, pN->meshId ) : 0;
+		if ( pMesh == 0 )
+			continue;
+
+		gpu64_3dDrawMesh( pState, pTarget, pScratch, pMesh,
+				   &pN->pos, &pN->rot, pN->scale,
+				   pTexLookup, pTexCtx );
+
+		// Store-burst discipline (CLAUDE.md multicore rules):
+		// gpu64_3d_span.h's own yield covers the rasteriser's inner loop,
+		// but a scene of many small meshes can otherwise chain draw after
+		// draw with no yield between them at all. One here per node closes
+		// that gap.
+		GPU64_3D_YIELD();
+	}
+
+	// Sprites after the objects, in scene order. They are depth-tested like
+	// everything else, so this is not a painter's-algorithm ordering
+	// requirement -- it is only that a sprite is cheap and a mesh is not, so
+	// drawing the geometry first gives the sprite's z-test the most to reject
+	// against.
+	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
+	{
+		const Gpu64_3dNode *pN = &pScene->node[ i ];
+		if ( pN->type != GPU64_3D_NODE_SPRITE || !pN->visible )
+			continue;
+
+		gpu64_3dDrawSprite( pState, pTarget, &pN->pos,
+				     pN->spriteW, pN->spriteH, pN->texId,
+				     pN->yaw, pN->spriteFlags,
+				     pTexLookup, pTexCtx );
+
+		GPU64_3D_YIELD();
+	}
 }

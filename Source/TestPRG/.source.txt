@@ -7,116 +7,52 @@
 ;            {__       {__       {__            {__
 ;              {_________         {______________		Expansion Unit
 ;
-;      gpu64 -- stage 16: LOOP_START / SCENE_COMMIT / LOOP_STOP.
+;      gpu64 -- shared harness for the API conformance suite.
 ;
-;      WHAT THIS TESTS
+;      Every gpu64_test_*.a includes this. It is not a program on its own.
 ;
-;      The handshake-mode autonomous render loop end to end -- nothing else
-;      in Source/TestPRG exercises these three opcodes at all:
+;      WHY A HARNESS
 ;
-;        1. LOOP_START before an active camera exists answers NO_CAMERA, and
-;           does not start the loop (checked by immediately doing the real
-;           SET_ACTIVE_CAMERA/LOOP_START right after and requiring THAT to
-;           succeed).
-;        2. LOOP_START while already running, and CLEAR_VIEWPORT (immediate
-;           mode) while the loop is running, both answer BUSY -- the "loop
-;           owns the framebuffer" rule from precheckClearViewport().
-;        3. While the loop runs, ROTATE_LOCAL is shadow-redirected: it
-;           returns immediately (no ring wait) and only takes visible effect
-;           after the next SCENE_COMMIT.
-;        4. SCENE_COMMIT's OK/RESULT/STATUS for six consecutive frames:
-;           RESULT is the page just rendered into (must cycle through the
-;           three flip pages, i.e. stay under 3), and STATUS read
-;           immediately after must have FRAME_READY (bit 4) clear -- a
-;           commit that just armed a new frame has, by construction, not
-;           finished it yet.
-;        5. LOOP_STOP always answers OK. After it, SCENE_COMMIT answers
-;           UNSUPPORTED (there is no loop to commit) and CLEAR_VIEWPORT is
-;           accepted again -- immediate mode restored.
+;      The suite's whole value is that a bench run produces a verdict, not a
+;      screenful of numbers to interpret. A tester should be able to look at
+;      one line from across the room and know whether to look closer. So the
+;      harness owns all of the output and the tests own none of it: a test
+;      computes a fail code and calls one macro.
 ;
-;      HOW TO READ THE RESULT
+;      A fail code of 0 is a pass. Anything else is printed as F<hex> and
+;      the convention is that it is *the byte that was wrong* wherever there
+;      is one -- almost always the unexpected ERRCODE, so a failure line
+;      reads back as "this opcode answered $04 when it should have answered
+;      $00" without any lookup table. Codes that cannot be an ERRCODE are
+;      used for the failures that are not about ERRCODE at all:
 ;
-;        GPU64 LOOP TEST
+;        $E1  a buffer did not match what it was compared against
+;        $E2  a buffer was not uniformly filled with the expected byte
+;        $E3  a single byte read back from the framebuffer was wrong
+;        $E4  a value was in range when it should not have been, or the
+;             other way round -- used where there is no byte to show
+;        $FE  the command returned OK where an error was required. This one
+;             is worth calling out: it means an error path did not fire, and
+;             an error path that never fires is not a tested error path.
 ;
-;        SETUP  00 00 00 00 00 00 00 00 00     all zero = every setup
-;                                              command was accepted (same
-;                                              nine steps as gpu64_3d_cube.a)
-;        SCENE  00 0B 00 00 00 00 07 07        the five checks above, in
-;                                              order -- see EXPECTED below
-;        POST   00 06 00                       LOOP_STOP, SCENE_COMMIT-
-;                                              after-stop, CLEAR_VIEWPORT-
-;                                              after-stop
-;        FRAME  nnnn/mmmm                      commits attempted / commits
-;                                              that answered OK. The two
-;                                              are separate because a run
-;                                              where every commit is
-;                                              refused still counts frames,
-;                                              and the old single number
-;                                              could not tell that from a
-;                                              healthy run.
-;        ROT ERR  00                           last ROTATE_LOCAL's ERRCODE
-;        COMMIT ERR  00                        last SCENE_COMMIT's ERRCODE
-;        PAGE   00                             last SCENE_COMMIT's RESULT
-;        MISSED  0000                         count of ROTATE_LOCAL/
-;                                              SCENE_COMMIT dispatches whose
-;                                              SEQACK didn't match the SEQ
-;                                              this program wrote -- i.e. a
-;                                              write the bus-watch loop did
-;                                              not sample (see
-;                                              project/reliability_protocol_design.md).
-;                                              Should stay 0000; nonzero
-;                                              confirms the pre-existing
-;                                              drop defect, not a new bug.
-;        FIRST ERR  00 @ 0000                  the FIRST commit ERRCODE
-;                                              that was not OK, and the
-;                                              frame it happened on. Sticky:
-;                                              COMMIT ERR above only shows
-;                                              the last one, which a single
-;                                              good frame afterwards erases.
-;        PHASE  SCAPV                          one letter per stage the
-;                                              program reached: S(etup)
-;                                              C(scene) A(nimate) or
-;                                              K(skipped) P(ost) V(erdict).
-;                                              If it stops short, THAT is
-;                                              where the hang is.
-;        ALIVE  -  STAGE 30                    a spinner advanced once per
-;                                              animation frame, and where
-;                                              in the frame the program is:
-;                                              10/11 = before/after the
-;                                              ROTATE_LOCAL dispatch,
-;                                              20/21 = before/after the
-;                                              SCENE_COMMIT dispatch,
-;                                              30 = between frames. A
-;                                              frozen spinner means the C64
-;                                              itself is stopped; a turning
-;                                              spinner with a frozen HDMI
-;                                              picture means it is not.
-;        TRAP  00 PC 0000                      shown ONLY if a BRK or an
-;                                              NMI was taken -- the marker
-;                                              (01 = BRK, 02 = NMI) and the
-;                                              return address. A run that
-;                                              derailed into the weeds
-;                                              usually hits a BRK; without
-;                                              this it looked identical to
-;                                              a hang.
+;      USING IT
 ;
-;      The box turns on HDMI, driven by the render loop rather than by the
-;      C64 issuing DRAW_NODE itself. Watch it turn, then press RUN/STOP to
-;      end the animation early -- or just leave it alone: it stops on its
-;      own after AUTO_STOP_FRAMES commits, so the POST checks and the
-;      verdict always run even if nobody is at the keyboard. That matters
-;      because a run that needs an operator keypress produces no verdict at
-;      all when the thing being tested is whether the C64 is still alive.
+;      Layout of a test program:
 ;
-;        VERDICT PASS
+;              .include "gpu64_testkit.inc"    ; equates + macros
+;      start   jsr kitInit
+;              #title "GPU64 SOMETHING TEST"
+;              ... tests ...
+;              jmp kitFinish
+;              .include "gpu64_testkit_rt.inc" ; the runtime, once, at the end
 ;
-;      EXPECTED for SCENE, in order: 00 (CREATE_CAMERA), 0B (LOOP_START, no
-;      camera yet -- NO_CAMERA), 00 (SET_ACTIVE_CAMERA), 00 (CREATE_OBJECT),
-;      00 (SET_POSITION), 00 (LOOP_START for real), 07 (LOOP_START again
-;      while running -- BUSY), 07 (CLEAR_VIEWPORT while running -- BUSY).
+;      A test is three steps: stage arguments, dispatch, judge.
 ;
-;      Requires a firmware built with GPU64_3D_ENABLED, and the RAD menu
-;      switched to REU mode with T.
+;              #argb 0, 6
+;              lda #OP_CLEAR
+;              jsr cmd0                ; A = ERRCODE
+;              #wantOk                 ; X = fail code
+;              #check "CLEAR"          ; prints and counts
 ;
 ;      Copyright (c) 2026 Honza Slesinger
 ;
@@ -126,6 +62,10 @@
 ;      (at your option) any later version.
 ;
 
+; ----------------------------------------------------------------------
+; The register window. gpu64 owns $DF0B-$DFFF; REU keeps $DF00-$DF0A.
+; ----------------------------------------------------------------------
+
 CMD_HI   = $df0b
 CMD_LO   = $df0c
 STATUS   = $df0d
@@ -134,1506 +74,860 @@ ID_LO    = $df0f
 ID_HI    = $df10
 ARG      = $df11
 RESULT   = $df21
-SEQ      = $df22
-SEQACK   = $df23
 
-STATUS_FRAME_READY = $10
+ST_BUSY		= $01
+ST_ERROR	= $02
+ST_VB_PEND	= $04
+ST_VB_ARMED	= $08
+ST_FRAME_RDY	= $10
 
-ERR_BUSY = $07
+; --- class 0 opcodes ---------------------------------------------------
+OP_NOP		= $00
+OP_RESET_STATE	= $01
+OP_VBLANK_ARM	= $02
+OP_VBLANK_ACK	= $03
+OP_SET_DRAW_PAGE = $04
+OP_PAGE_FLIP	= $05
+OP_GET_INFO	= $06
+OP_LOG_ENABLE	= $07
+OP_SET_BORDER	= $08
+OP_VBLANK_SYNC	= $09
+OP_GET_HEALTH	= $0a
+OP_CLEAR	= $10
+OP_SET_PIXEL	= $20
+OP_LINE		= $21
+OP_RECT		= $22
+OP_RECT_FILL	= $23
+OP_PAL_SET	= $30
+OP_PAL_LOAD	= $31
+OP_BLIT		= $40
+OP_BLIT_KEYED	= $41
+OP_READ_RECT	= $42
 
-; class 0
-OP_PAL_LOAD      = $31
+; The 80x50 character screen. TEXT_MODE is a DISPLAY mode, not a drawing
+; op: while it is up there is no framebuffer page, so PAGE_FLIP and every
+; class 1 and class 2 command answer UNSUPPORTED. The plane ops are legal
+; in either mode -- with the graphics display up they update the planes and
+; paint nothing, which is how a program stages a whole screen and has it
+; appear complete at the switch. $59-$5F are undefined.
+OP_TEXT_MODE	= $50
+OP_TEXT_CLEAR	= $51
+OP_TEXT_PUT	= $52
+OP_TEXT_WRITE	= $53
+OP_TEXT_UPLOAD	= $54
+OP_TEXT_CHARSET	= $55
+OP_TEXT_SCROLL	= $56
+OP_TEXT_FILL	= $57
+OP_TEXT_REFRESH	= $58
 
-; class 1 -- docs/class1-3d-mesh-reference.md
-OP_SET_VIEWPORT     = $01
-OP_SET_PERSPECTIVE  = $02
-OP_SET_LIGHT        = $03
-OP_BUILD_COLORMAP   = $04
-OP_SET_BACKGROUND   = $05
-OP_LOOP_START       = $06
-OP_LOOP_STOP        = $07
-OP_SCENE_COMMIT     = $08
-OP_UPLOAD_MESH      = $10
-OP_UPLOAD_TEXTURE   = $11
-OP_CREATE_OBJECT    = $20
-OP_CREATE_CAMERA    = $21
-OP_SET_ACTIVE_CAMERA = $23
-OP_SET_POSITION     = $30
-OP_ROTATE_LOCAL     = $34
-OP_CLEAR_VIEWPORT   = $40
+; Fixed point 8.8 ($8x) and IEEE float32 ($9x) share a low nibble.
+OP_MAT_MUL	= $80
+OP_MAT_ADD	= $81
+OP_MAT_SUB	= $82
+OP_MAT_SCALE	= $83
+OP_MAT_TRANSPOSE = $84
+OP_MAT_IDENTITY	= $85
+OP_MAT_INVERSE	= $86
+OP_FLT_MUL	= $90
+OP_FLT_ADD	= $91
+OP_FLT_SUB	= $92
+OP_FLT_SCALE	= $93
+OP_FLT_TRANSPOSE = $94
+OP_FLT_IDENTITY	= $95
+OP_FLT_INVERSE	= $96
+
+; --- class 2 opcodes -- the raster layer (CMD_HI = 2) ------------------
+; Columns, spans and scaled sprites: the primitives a Doom-shaped renderer
+; needs. See docs/api_design.md, "Class 2 opcodes".
+R2_RESET	= $00
+R2_SET_VIEW	= $01
+R2_SET_COLORMAP	= $02
+R2_STATS	= $03
+R2_FILL_VIEW	= $04
+R2_SET_CAMERA	= $05
+R2_SET_SECTORS	= $06
+R2_SET_CAMERA3D	= $07
+R2_SET_LIGHT	= $08
+R2_UPLOAD_TEX	= $10
+R2_FREE_TEX	= $11
+R2_UPLOAD_VERTS	= $12
+R2_UPLOAD_TEXINFO = $13
+R2_UPLOAD_POLYS = $14
+R2_DRAW_COLUMNS	= $20
+R2_DRAW_SPANS	= $21
+R2_DRAW_SPRITE	= $22
+R2_DRAW_WALLS	= $23
+R2_DRAW_SECTORS	= $24
+R2_DRAW_THINGS	= $25
+R2_DRAW_POLYS	= $26
+R2_DRAW_WORLD	= $27
+
+; Record stride, both batch kinds -- a power of two so indexing record n is
+; a shift and not a multiply.
+R2_REC		= 16
+
+; DRAW_SECTORS' own stride, and the sector record. Thirty-two bytes because a
+; two-sided wall names two sectors and three textures and none of that fits
+; beside the geometry in sixteen -- and because a level is uploaded once, so
+; the extra bytes are never paid for again.
+R2_WALL2	= 32
+R2_SEC		= 8
+R2_NO_SECTOR	= $ff		; backSec: this wall is solid
+
+; Column record flags (byte 14), sprite flags (ARG14), batch flags (ARG8).
+R2_COL_MASKED	= $01
+R2_SPR_MASKED	= $01
+R2_SPR_FLIPX	= $02
+R2_BATCH_SUM	= $01
+R2_BATCH_CAM3D	= $02		; DRAW_THINGS: project through SET_CAMERA3D
+
+; Wall record flags (byte 14) and SET_CAMERA flags (ARG5).
+R2_WALL_MASKED	= $01
+R2_WALL_FLATLIT	= $02
+R2_CAM_PAINT	= $01
+
+; DRAW_SECTORS wall flags (byte 15) and sector flags (byte 7).
+R2_WALL_NOFLATS	= $04		; this wall's columns paint no flats
+R2_SEC_SKY	= $01		; ceiling not painted, no upper band drawn
+
+; DRAW_THINGS record flags (byte 12). A separate set from the DRAW_SPRITE
+; ones because a thing needs four bits and FLIPX and FLATLIT would otherwise
+; both want $02.
+R2_THING_MASKED	 = $01
+R2_THING_FLIPX	 = $02
+R2_THING_NODEPTH = $04		; ignore the depth buffer: neither tested
+				; nor written, so the thing is on top
+R2_THING_FLATLIT = $08
+R2_THING_DIR	 = $10		; eight views: tex is the FIRST of eight
+				; consecutive ids and byte 13 is the
+				; direction the thing faces. gpu64 picks
+				; the view from where the camera stands.
+
+; DRAW_POLYS. A face record is 16 bytes and indexes the vertex pool and the
+; texinfo table; a vertex is 8 bytes and a texinfo 16.
+R2_POLY		 = 16
+R2_VERT		 = 8
+R2_TEXINFO	 = 16
+R2_POLY_MASKED	 = $01
+R2_POLY_FLATLIT	 = $02
+R2_POLY_TWOSIDED = $04		; no backface cull: drawn from either side
+
+; Milestone 13. The resident world: faces uploaded once and drawn by range,
+; so a frame costs no bulk transfer at all. This is how many slots it has.
+R2_WORLD_MAX	 = 2048
+
+; texid 0 in a record is not an error: it means "solid colour", the palette
+; index being the low byte of the record's u field.
+R2_SOLID	= 0
+
+; --- error codes -------------------------------------------------------
+ERR_OK		= $00
+ERR_BAD_OPCODE	= $01
+ERR_BAD_CLASS	= $02
+ERR_OUT_OF_RANGE = $03
+ERR_BAD_ARGS	= $04
+ERR_SINGULAR	= $05
+ERR_UNSUPPORTED	= $06
+ERR_BUSY	= $07
+ERR_OUT_OF_MEM	= $08
+ERR_QUEUE_FULL	= $09
+ERR_BAD_ID	= $0a
+ERR_NO_CAMERA	= $0b
+ERR_WORKER_TIME	= $0c
+
+; --- harness fail codes ------------------------------------------------
+F_CMP		= $e1
+F_FILL		= $e2
+F_PIXEL		= $e3
+F_RANGE		= $e4
+F_NOERR		= $fe
+
+; --- framebuffer geometry, as the API reference states it --------------
+FB_W		= 320
+FB_H		= 200
+FB_PAGES	= 3
+BORDER_W	= 32
+BORDER_H	= 36
+
+; --- text mode geometry ------------------------------------------------
+; A second display geometry, not a window: 640x400 inside a 64x72 border,
+; which is exactly twice the graphics figures so the framing looks the same
+; on the same display. GET_INFO reports these while text mode is up, and
+; that is how a program confirms the switch really happened.
+TXT_COLS	= 80
+TXT_ROWS	= 50
+TXT_CELLS	= TXT_COLS * TXT_ROWS		; 4000
+TXT_W		= 640
+TXT_H		= 400
+TXT_PAGES	= 1
+TXT_BORDER_W	= 64
+TXT_BORDER_H	= 72
+
+; The three parallel planes TEXT_UPLOAD writes, one byte per cell, indexed
+; row-major as cell = row * 80 + col.
+TXT_PLANE_SCREEN = 0
+TXT_PLANE_FG	= 1
+TXT_PLANE_BG	= 2
+
+; TEXT_WRITE flags: take the payload as ASCII and translate it to screen
+; codes for the character set currently up. Clear it to pass screen codes
+; through untouched, which is the only way to reach the graphics half of
+; the ROM or to set bit 7.
+TXT_ASCII	= $01
+
+; Screen code bit 7 is reverse video, exactly as at $0400.
+TXT_REVERSE	= $80
+
+TXT_SET_UPPER	= 0			; upper case and graphics
+TXT_SET_LOWER	= 1			; lower case and upper case
+
+SPACE_C64	= 0
+SPACE_REU	= 1
 
 SCREEN   = $0400
 
-; zero page scratch. $fb-$fe are free in a BASIC-hosted program.
+; Zero page. $f7-$fe is the tape/RS232 area, unused while a PRG runs.
+P1       = $f7
+P2       = $f9
 SRC      = $fb
 DST      = $fd
 
-PALBUF   = $4000		; 256 x 3 bytes
-TEXBUF   = $5000		; 64 x 64 texels
-
-TEX_ID   = 1
-MESH_ID  = 2
-CAM_ID   = 10
-OBJ_ID   = 20
-
-; How many SCENE_COMMITs get their ERRCODE/RESULT/STATUS individually
-; checked in the verdict, rather than just shown live. Six is enough to
-; prove the page cycles rather than sticking on one value.
-COMMIT_LOG_COUNT = 6
-
-; The animation ends by itself after this many commits, whether or not
-; anyone touches the keyboard. At roughly a frame each that is about ten
-; seconds -- long enough to watch the box turn and well past the frame-98
-; onset that a short desk check once missed, short enough that a bench run
-; costs seconds. Without it the only exit was RUN/STOP, so a run left
-; unattended (or one where the C64 stops responding to the keyboard)
-; produced no POST checks and no verdict at all.
-AUTO_STOP_FRAMES = 600
-
-; Screen rows. Kept as named constants because the trap handlers and the
-; spinner write to the screen directly, without going through printAt.
-ROW_FRAME    = 6
-ROW_ROT      = 7
-ROW_COMMIT   = 8
-ROW_PAGE     = 9
-ROW_MISSED   = 10
-ROW_FIRSTERR = 11
-ROW_PHASE    = 13
-ROW_ALIVE    = 14
-ROW_TRAP     = 16
-ROW_VERDICT  = 18
-ROW_CURSOR   = 20
-
-COL_VAL      = 14
-
-; Phase breadcrumb letters, as screen codes (letter - $40).
-PH_SETUP   = $13		; S
-PH_SCENE   = $03		; C
-PH_ANIM    = $01		; A
-PH_SKIP    = $0b		; K -- the loop never started, animation skipped
-PH_POST    = $10		; P
-PH_VERDICT = $16		; V
-
-; Trap markers.
-TRAP_BRK = $01
-TRAP_NMI = $02
-
-; KERNAL vectors and calls.
-CBINV = $0316			; BRK
-NMINV = $0318			; NMI
-PLOT  = $fff0
-
-* = $0801
-	.byte $0b, $08, $0a, $00, $9e
-	.text "2064"
-	.byte $00, $00, $00
-
-* = $0810
-
-start
-	; Remembered so a trap can put the stack back the way BASIC left it and
-	; still let the final RTS return there.
-	tsx
-	stx entrySP
-
-	jsr clearScreen
-	lda #<txtTitle
-	ldy #>txtTitle
-	ldx #0
-	jsr printAt
-
-	jsr installTraps
-
-	; Same generated palette/texture as gpu64_3d_cube.a -- see there for
-	; why they are built rather than shipped as data.
-	jsr buildPalette
-	jsr buildTexture
-
-	lda #PH_SETUP
-	jsr phase
-	jsr doSetup
-	jsr showSetup
-	jsr showLabels
-
-	lda #PH_SCENE
-	jsr phase
-	jsr doSceneSetup
-	jsr showScene
-
-	; If LOOP_START (the real one, sceneErr+5) failed there is nothing to
-	; animate -- skip straight to the verdict rather than spinning on a
-	; loop that never started. The breadcrumb records which of the two
-	; happened, because "no FRAME count" on its own does not say whether
-	; the animation was skipped or hung on its first commit.
-	lda sceneErr+5
-	beq runAnim
-
-	lda #PH_SKIP
-	jsr phase
-	jmp skipAnim
-
-runAnim
-	lda #PH_ANIM
-	jsr phase
-	jsr animLoop
-
-skipAnim
-	; Once more with the final numbers -- also the only thing that fills
-	; the live rows in at all when the animation was skipped.
-	jsr showAnim
-
-	lda #PH_POST
-	jsr phase
-	jsr doPostChecks
-	jsr showPost
-
-	lda #PH_VERDICT
-	jsr phase
-	jsr verdict
-
-	jsr removeTraps
-
-	lda #0
-	sta CMD_HI
-
-	; Park the cursor below the report so BASIC's READY. and whatever the
-	; operator types next does not scroll the thing they came to read off
-	; the top of the screen.
-	clc
-	ldx #ROW_CURSOR
-	ldy #0
-	jsr PLOT
-	rts
-
 ; ----------------------------------------------------------------------
-; Breadcrumb, traps, spinner: the three things that tell an operator at
-; the bench whether the C64 is alive, and if not, where it died. All of
-; them write the screen directly rather than through printAt, so they are
-; safe to call from an interrupt handler.
-; ----------------------------------------------------------------------
-
-; A = screen code. Appends one letter to the phase row.
-phase
-	ldx phaseIdx
-	cpx #16
-	bcs phaseFull
-	sta SCREEN + ROW_PHASE * 40 + COL_VAL, x
-	inc phaseIdx
-phaseFull
-	rts
-
-installTraps
-	lda CBINV
-	sta oldBrk
-	lda CBINV+1
-	sta oldBrk+1
-	lda NMINV
-	sta oldNmi
-	lda NMINV+1
-	sta oldNmi+1
-
-	sei
-	lda #<brkTrap
-	sta CBINV
-	lda #>brkTrap
-	sta CBINV+1
-	lda #<nmiTrap
-	sta NMINV
-	lda #>nmiTrap
-	sta NMINV+1
-	cli
-	rts
-
-; Put them back before returning to BASIC -- these vectors point into a
-; program BASIC is free to overwrite, so leaving them installed turns the
-; next RESTORE keypress into a jump into whatever is there now.
-removeTraps
-	sei
-	lda oldBrk
-	sta CBINV
-	lda oldBrk+1
-	sta CBINV+1
-	lda oldNmi
-	sta NMINV
-	lda oldNmi+1
-	sta NMINV+1
-	cli
-	rts
-
-; The KERNAL's IRQ entry has already pushed Y, X and A on top of the P/PCL/
-; PCH the hardware pushed, so the interrupted address is six and seven
-; bytes above the stack pointer. (The KERNAL NMI entry pushes nothing, but
-; nmiTrap below pushes the same three itself, which lines the offsets up.)
-brkTrap
-	tsx
-	lda $0105,x
-	sta trapPC
-	lda $0106,x
-	sta trapPC+1
-	lda #TRAP_BRK
-	sta trapKind
-	jsr showTrap
-
-	; Nothing here is trustworthy any more, but the report is worth more
-	; than the crash: put the stack back to what BASIC handed us and fall
-	; into the post-stop path, so LOOP_STOP still runs and a verdict still
-	; prints. trapKind makes that verdict a FAIL.
-	ldx entrySP
-	txs
-	cli
-	jmp skipAnim
-
-; An NMI is not necessarily fatal -- RESTORE is one -- so this one records
-; and resumes rather than unwinding. It still fails the verdict: on this
-; program nothing should be generating NMIs at all.
-nmiTrap
-	pha
-	txa
-	pha
-	tya
-	pha
-	tsx
-	lda $0105,x
-	sta trapPC
-	lda $0106,x
-	sta trapPC+1
-	lda #TRAP_NMI
-	sta trapKind
-
-	; showTrap goes through printAt, which owns SRC/DST, and rowAddr, which
-	; owns rowTmp. This handler resumes, so it has to hand all three back
-	; exactly as it found them -- otherwise the trap that was supposed to
-	; diagnose a fault causes one. rowTmp matters even though it looks like
-	; a pure scratch byte: it stays live across the four instructions
-	; between rowAddr's `sta rowTmp` and its `ldx rowTmp`, and every display
-	; routine in this program goes through rowAddr while the traps are
-	; installed, so an NMI landing in that window would otherwise resume the
-	; interrupted call with the trap row's number in place of its own.
-	lda SRC
-	sta nmiZp+0
-	lda SRC+1
-	sta nmiZp+1
-	lda DST
-	sta nmiZp+2
-	lda DST+1
-	sta nmiZp+3
-	lda rowTmp
-	sta nmiZp+4
-	jsr showTrap
-	lda nmiZp+0
-	sta SRC
-	lda nmiZp+1
-	sta SRC+1
-	lda nmiZp+2
-	sta DST
-	lda nmiZp+3
-	sta DST+1
-	lda nmiZp+4
-	sta rowTmp
-
-	pla
-	tay
-	pla
-	tax
-	pla
-	rti
-
-showTrap
-	lda #<txtTrap
-	ldy #>txtTrap
-	ldx #ROW_TRAP
-	jsr printAt
-	lda #ROW_TRAP
-	jsr rowAddr
-	ldy #COL_VAL
-	lda trapKind
-	jsr putHex
-	iny
-	lda trapPC+1
-	jsr putHex
-	lda trapPC
-	jsr putHex
-	rts
-
-; One glyph per animation frame. A frozen spinner and a frozen HDMI picture
-; is a dead C64; a turning spinner and a frozen picture is not.
-spin
-	inc spinIdx
-	lda spinIdx
-	and #3
-	sta spinIdx
-	tax
-	lda spinTable,x
-	sta SCREEN + ROW_ALIVE * 40 + COL_VAL
-	rts
-
-; A = where in the frame we are; see the ALIVE line in the header. Written
-; straight to the screen so it is current even if the next instruction is
-; the one that never returns.
-setStage
-	sta stageVal
-	pha
-	lsr
-	lsr
-	lsr
-	lsr
-	jsr hexDigit
-	sta SCREEN + ROW_ALIVE * 40 + COL_VAL + 8
-	pla
-	and #$0f
-	jsr hexDigit
-	sta SCREEN + ROW_ALIVE * 40 + COL_VAL + 9
-	rts
-
-; ----------------------------------------------------------------------
-; Command helpers.
+; Argument staging.
 ;
-; Writing CMD_LO is what dispatches; CMD_HI is sticky and selects the class.
-; The C64 is DMA-halted for the whole dispatch, so there is nothing to poll
-; and no handshake -- ERRCODE is valid on the very next instruction.
+; ARG registers are write-only and are NOT cleared between commands, so
+; every opcode must stage every byte it reads, every time. These macros
+; exist so that is obvious at the call site: an opcode's argument block
+; reads top to bottom in the same order the reference table lists it.
 ; ----------------------------------------------------------------------
 
-cmd0
-	ldx #0
-	stx CMD_HI
-	sta CMD_LO
-	lda ERRCODE
-	rts
+argb	.macro	off, val
+	lda #\val
+	sta ARG+\off
+	.endm
 
-cmd1
-	ldx #1
-	stx CMD_HI
-	sta CMD_LO
-	lda ERRCODE
-	rts
+argw	.macro	off, val
+	lda #<(\val)
+	sta ARG+\off
+	lda #>(\val)
+	sta ARG+\off+1
+	.endm
 
-; A = opcode. Same contract as cmd1, but also writes an incrementing SEQ
-; before dispatch and checks SEQACK after dispatch -- detector-only, no
-; retry (project/reliability_protocol_design.md, "Recommended next step").
-; A mismatch means the SEQ write, an ARG write, or CMD_LO itself was not
-; sampled by reuUsingPolling() -- the pre-existing bus-reliability defect
-; CLAUDE.md documents, not a new bug. Counted in missed/missed+1.
-cmdSeq1
-	pha
-	inc seqCounter
-	lda seqCounter
-	cmp #255
-	bne cs1ok
-	lda #1
-	sta seqCounter
-cs1ok
-	lda seqCounter
-	sta SEQ
-	pla
-	jsr cmd1
-	pha
-	lda SEQACK
-	cmp seqCounter
-	beq cs1match
-	inc missed
-	bne cs1match
-	inc missed+1
-cs1match
-	pla
-	rts
+; The 6-byte blob descriptor: space, 24-bit addr, 16-bit len. This is how
+; every bulk payload crosses -- never byte-by-byte through the window.
+argblob	.macro	off, space, addr, len
+	lda #\space
+	sta ARG+\off
+	lda #<(\addr)
+	sta ARG+\off+1
+	lda #>(\addr)
+	sta ARG+\off+2
+	lda #0
+	sta ARG+\off+3
+	lda #<(\len)
+	sta ARG+\off+4
+	lda #>(\len)
+	sta ARG+\off+5
+	.endm
 
-; Records the ERRCODE in A into the setup log, in order.
-logSetup
-	ldx setupIdx
-	sta setupErr,x
-	inc setupIdx
-	rts
+; The 4-byte compact descriptor the math opcodes use: no len, because the
+; dimensions and the element size already imply it.
+argcd	.macro	off, space, addr
+	lda #\space
+	sta ARG+\off
+	lda #<(\addr)
+	sta ARG+\off+1
+	lda #>(\addr)
+	sta ARG+\off+2
+	lda #0
+	sta ARG+\off+3
+	.endm
 
-logScene
-	ldx sceneIdx
-	sta sceneErr,x
-	inc sceneIdx
-	rts
-
-logPost
-	ldx postIdx
-	sta postErr,x
-	inc postIdx
-	rts
 
 ; ----------------------------------------------------------------------
-; Setup: the same nine steps as gpu64_3d_cube.a, each logged. Identical
-; scene (viewport/perspective/light/background/colormap/texture/mesh) --
-; only how the box gets drawn differs from there.
+; Class 2 record staging.
+;
+; These write a 16-byte record into a batch array in your own RAM -- they
+; do NOT touch the ARG window. A batch is built once and then handed to
+; gpu64 as a single command, which is the entire point of the class: 800
+; primitives cost one dispatch, not 800.
+;
+; \rec is the address of the record. Use them for a fixed batch; a real
+; renderer writes the same bytes from a loop.
 ; ----------------------------------------------------------------------
 
-doSetup
+; A wall column: screen column \x, rows \y0..\y1 inclusive, sampling
+; texture column \u of texture \tex from v = \v stepping \dv per row.
+r2col	.macro	rec, x, y0, y1, tex, light, u, v, dv, flags=0
+	lda #<(\x)
+	sta \rec+0
+	lda #>(\x)
+	sta \rec+1
+	lda #<(\y0)
+	sta \rec+2
+	lda #>(\y0)
+	sta \rec+3
+	lda #<(\y1)
+	sta \rec+4
+	lda #>(\y1)
+	sta \rec+5
+	lda #\tex
+	sta \rec+6
+	lda #\light
+	sta \rec+7
+	lda #<(\u)
+	sta \rec+8
+	lda #>(\u)
+	sta \rec+9
+	lda #<(\v)
+	sta \rec+10
+	lda #>(\v)
+	sta \rec+11
+	lda #<(\dv)
+	sta \rec+12
+	lda #>(\dv)
+	sta \rec+13
+	lda #\flags
+	sta \rec+14
 	lda #0
-	sta setupIdx
+	sta \rec+15
+	.endm
 
+; A floor/ceiling span: screen row \y, columns \x0..\x1 inclusive,
+; sampling from u,v stepping du,dv per column. All four are 8.8.
+r2span	.macro	rec, y, x0, x1, tex, light, u, v, du, dv
+	lda #<(\y)
+	sta \rec+0
+	lda #>(\y)
+	sta \rec+1
+	lda #<(\x0)
+	sta \rec+2
+	lda #>(\x0)
+	sta \rec+3
+	lda #<(\x1)
+	sta \rec+4
+	lda #>(\x1)
+	sta \rec+5
+	lda #\tex
+	sta \rec+6
+	lda #\light
+	sta \rec+7
+	lda #<(\u)
+	sta \rec+8
+	lda #>(\u)
+	sta \rec+9
+	lda #<(\v)
+	sta \rec+10
+	lda #>(\v)
+	sta \rec+11
+	lda #<(\du)
+	sta \rec+12
+	lda #>(\du)
+	sta \rec+13
+	lda #<(\dv)
+	sta \rec+14
+	lda #>(\dv)
+	sta \rec+15
+	.endm
+
+; The batch command itself: where the records are, how many, and whether
+; the last two bytes are a checksum.
+; The camera, for DRAW_WALLS. Angle is binary -- 256 to the circle, 0 looking
+; along +x. Heights and the projection distance are 8.8; the projection
+; distance is in pixels, so 160.0 across a 320-wide view is a 90-degree field
+; of view.
+r2cam	.macro	x, y, ang, eye, ceil, proj, flags=0, floorc=0, ceilc=0, horizon=0
+	#argw 0, \x
+	#argw 2, \y
+	#argb 4, \ang
+	#argb 5, \flags
+	#argw 6, \eye
+	#argw 8, \ceil
+	#argw 10, \proj
+	#argb 12, \floorc
+	#argb 13, \ceilc
+	#argb 14, \horizon
+	.endm
+
+; The 3D camera, for DRAW_POLYS. Position is world 8.8 with z up, measured
+; the same way the sector table's absolute floor heights are. Yaw is binary,
+; 256 to the circle, 0 looking along +x -- SET_CAMERA's convention. Pitch is
+; the same units and is a real rotation, positive looking up.
+r2cam3	.macro	x, y, z, yaw, pitch, proj, flags=0
+	#argw 0, \x
+	#argw 2, \y
+	#argw 4, \z
+	#argb 6, \yaw
+	#argb 7, \pitch
+	#argw 8, \proj
+	#argb 10, \flags
+	.endm
+
+; Milestone 12. One dynamic point light, SET_LIGHT. Radius and strength are
+; both inline: a muzzle flash has to be sendable every frame without a DMA.
+; A radius or a strength of zero turns the slot off.
+r2light	.macro	slot, x, y, z, radius, strength
+	#argb 0, \slot
+	#argw 1, \x
+	#argw 3, \y
+	#argw 5, \z
+	#argw 7, \radius
+	#argb 9, \strength
+	.endm
+
+; One vertex of the pool, UPLOAD_VERTS. Eight bytes and not six so the 6502
+; indexes the table with a shift.
+r2vertd	.macro	x, y, z
+	.word	(\x) & $ffff, (\y) & $ffff, (\z) & $ffff, 0
+	.endm
+
+; One texinfo, UPLOAD_TEXINFO: Quake's two texture axes. A face's texel
+; coordinates are s = ( P . sAxis ) >> 8 + sOff, in 8.8 texels, so two faces
+; naming one texinfo are guaranteed to align whatever their shapes.
+r2texinfod .macro sx, sy, sz, soff, tx, ty, tz, toff
+	.word	(\sx) & $ffff, (\sy) & $ffff, (\sz) & $ffff, (\soff) & $ffff
+	.word	(\tx) & $ffff, (\ty) & $ffff, (\tz) & $ffff, (\toff) & $ffff
+	.endm
+
+; One face: a convex polygon, its vertices consecutive in the pool starting
+; at `first`. tex = 0 draws the flat colour in `col` and needs no texinfo.
+r2polyd	.macro	first, nverts, texinfo, tex, col, light, flags=0
+	.word	\first
+	.byte	\nverts, \texinfo, \tex, \col, \light, \flags
+	.fill	8, 0			; reserved -- must be zero
+	.endm
+
+; UPLOAD_VERTS / UPLOAD_TEXINFO: where the table is and how many entries.
+; count = 0 drops it.
+r2verts	.macro	addr, count
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_VERT
+	#argw 6, \count
+	.endm
+
+r2texinfo .macro addr, count
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_TEXINFO
+	#argw 6, \count
+	.endm
+
+; DRAW_POLYS' batch. Same shape as r2batch; the stride happens to match.
+r2batchp .macro	addr, count, flags=0, key=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_POLY+((\flags)&1)*2
+	#argw 6, \count
+	#argb 8, \flags
+	#argb 9, \key
+	.endm
+
+; UPLOAD_POLYS: fill part of the resident world with poly records. `first` is
+; the destination index, so a level bigger than the staging buffer arrives as
+; several commands. count = 0 with first = 0 drops the pool.
+r2world	.macro	addr, count, first=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_POLY
+	#argw 6, \count
+	#argw 8, \first
+	.endm
+
+; DRAW_WORLD: draw a range of the resident world through SET_CAMERA3D. No
+; blob at all -- this is the whole point of the resident pool.
+r2drawworld .macro first, count, key=0
+	#argw 0, \first
+	#argw 2, \count
+	#argb 9, \key
+	.endm
+
+; A wall segment in WORLD space -- it does not change when the player moves,
+; which is the whole point of it. u1 and u2 are the texture coordinate at
+; each endpoint, so no length and no square root is ever needed. Winding
+; decides which side is the front: a wall is only drawn from the side that
+; projects it left to right.
+r2wall	.macro	rec, x1, y1, x2, y2, tex, light, u1, u2, flags=0
+	lda #<(\x1)
+	sta \rec+0
+	lda #>(\x1)
+	sta \rec+1
+	lda #<(\y1)
+	sta \rec+2
+	lda #>(\y1)
+	sta \rec+3
+	lda #<(\x2)
+	sta \rec+4
+	lda #>(\x2)
+	sta \rec+5
+	lda #<(\y2)
+	sta \rec+6
+	lda #>(\y2)
+	sta \rec+7
+	lda #\tex
+	sta \rec+8
+	lda #\light
+	sta \rec+9
+	lda #<(\u1)
+	sta \rec+10
+	lda #>(\u1)
+	sta \rec+11
+	lda #<(\u2)
+	sta \rec+12
+	lda #>(\u2)
+	sta \rec+13
+	lda #\flags
+	sta \rec+14
 	lda #0
-	jsr palLoadHalf
-	jsr logSetup
+	sta \rec+15
+	.endm
 
-	lda #128
-	jsr palLoadHalf
-	jsr logSetup
+; --- DRAW_SECTORS -----------------------------------------------------
+; A level with steps in it. Heights come from a sector table instead of from
+; the camera, and a wall may be two-sided: it then draws a band above the far
+; ceiling and a band below the far floor and leaves the middle see-through.
+;
+; These two emit DATA, not stores, because a level does not change. Build it
+; once at assembly time, upload it once, and a frame costs the camera alone.
+;
+; For DRAW_SECTORS the camera's eye height is an ABSOLUTE world height, not
+; a height above a floor -- a level with steps has no one floor to measure
+; from. SET_CAMERA still validates eye > 0 and ceil > eye, so send the
+; level's tallest ceiling as ceil; DRAW_SECTORS does not read it.
+r2secd	.macro	floor, ceil, floorc, ceilc, light, flags=0
+	.word	\floor, \ceil
+	.byte	\floorc, \ceilc, \light, \flags
+	.endm
 
-	; viewport 256x160, centred
-	lda #32
-	sta ARG+0
-	lda #0
-	sta ARG+1
-	lda #20
-	sta ARG+2
-	lda #0
-	sta ARG+3
-	lda #<256
-	sta ARG+4
-	lda #>256
-	sta ARG+5
-	lda #<160
-	sta ARG+6
-	lda #>160
-	sta ARG+7
-	lda #OP_SET_VIEWPORT
-	jsr cmd1
-	jsr logSetup
+; One wall. front/back are sector ids, back = R2_NO_SECTOR for a solid wall.
+; texm/texu/texl are the middle, upper and lower textures, 0 for "the flat
+; colour in colm/colu/coll instead". Winding decides the front face, exactly
+; as in DRAW_WALLS.
+r2walld	.macro	x1, y1, x2, y2, u1, u2, front, back, light, flags=0, texm=0, texu=0, texl=0, colm=0, colu=0, coll=0
+	.word	\x1, \y1, \x2, \y2, \u1, \u2
+	.byte	\front, \back, \light, \flags
+	.byte	\texm, \texu, \texl
+	.byte	\colm, \colu, \coll
+	.byte	0, 0
+	.fill	8, 0			; reserved -- must be zero
+	.endm
 
-	; perspective: fov $2AAB (60 degrees), near 1.0, far 120.0 (8.8)
-	lda #$AB
-	sta ARG+0
-	lda #$2A
-	sta ARG+1
-	lda #$00
-	sta ARG+2
-	lda #$01
-	sta ARG+3
-	lda #$00
-	sta ARG+4
-	lda #$78
-	sta ARG+5
-	lda #OP_SET_PERSPECTIVE
-	jsr cmd1
-	jsr logSetup
+; SET_SECTORS: where the sector table is and how many sectors it holds.
+; count = 0 drops the table.
+r2sectors .macro addr, count
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_SEC
+	#argw 6, \count
+	.endm
 
-	; light: direction (-5, 7, -6) in 8.8, ambient 3 of 15
-	lda #<-1280
-	sta ARG+0
-	lda #>-1280
-	sta ARG+1
-	lda #<1792
-	sta ARG+2
-	lda #>1792
-	sta ARG+3
-	lda #<-1536
-	sta ARG+4
-	lda #>-1536
-	sta ARG+5
-	lda #3
-	sta ARG+6
-	lda #OP_SET_LIGHT
-	jsr cmd1
-	jsr logSetup
+; One thing: a billboard at a world position, depth-tested against whatever
+; DRAW_SECTORS left in the depth buffer -- which is what puts a monster
+; behind a wall. Send this batch AFTER the DRAW_SECTORS for the same frame.
+;
+; x,y are world 8.8 and base is the ABSOLUTE height of the sprite's bottom,
+; the same measure the sector table's floor heights use -- so a thing
+; standing on the floor of sector n has base = that sector's floor. w and h
+; are its size in world units, 8.8: the card always faces the camera, so w is
+; measured straight across the view and there is no rotation to send.
+;
+; A thing is always textured; tex = 0 is a rejected record.
+;
+; With R2_THING_DIR, tex is the first of EIGHT consecutive texture ids -- the
+; thing seen from the front, then every 45 degrees round it -- and face is the
+; direction the thing itself is pointing, in the same 256-to-the-circle units
+; the camera's angles use. gpu64 works out which of the eight you are looking
+; at. Without the flag, face is ignored and the one texture is drawn from
+; every side.
+r2thingd .macro	x, y, base, w, h, tex, light, flags=0, face=0
+	.word	(\x) & $ffff, (\y) & $ffff, (\base) & $ffff, \h, \w
+	.byte	\tex, \light, \flags
+	.byte	\face			; facing, R2_THING_DIR only
+	.byte	0, 0			; reserved -- must be zero
+	.endm
 
-	lda #0
-	sta ARG+0
-	lda #OP_SET_BACKGROUND
-	jsr cmd1
-	jsr logSetup
-
-	lda #OP_BUILD_COLORMAP
-	jsr cmd1
-	jsr logSetup
-
-	; texture
-	lda #<TEX_ID
+; UPLOAD_TEXTURE, for the several-in-a-row case. Folds its ERRCODE into the
+; accumulator, so a run of uploads is one result line rather than four.
+uptex	.macro	id, addr, w, h, rowmajor=0
+	lda #<(\id)
 	sta ID_LO
-	lda #>TEX_ID
+	lda #>(\id)
 	sta ID_HI
-	lda #0
-	sta ARG+0
-	lda #<TEXBUF
-	sta ARG+1
-	lda #>TEXBUF
-	sta ARG+2
-	lda #0
-	sta ARG+3
-	lda #<4096
-	sta ARG+4
-	lda #>4096
-	sta ARG+5
-	lda #6
-	sta ARG+6
-	lda #6
-	sta ARG+7
-	lda #OP_UPLOAD_TEXTURE
-	jsr cmd1
-	jsr logSetup
+	#argblob 0, SPACE_C64, \addr, (\w)*(\h)
+	#argw 6, \w
+	#argw 8, \h
+	#argb 10, \rowmajor
+	lda #R2_UPLOAD_TEX
+	jsr cmd2
+	#accOk
+	.endm
 
-	; mesh -- the box, unchanged from gpu64_3d_cube.a
-	lda #<MESH_ID
-	sta ID_LO
-	lda #>MESH_ID
-	sta ID_HI
-	lda #0
-	sta ARG+0
-	lda #<vertBlob
-	sta ARG+1
-	lda #>vertBlob
-	sta ARG+2
-	lda #0
-	sta ARG+3
-	lda #48
-	sta ARG+4
-	lda #0
-	sta ARG+5
-	lda #0
-	sta ARG+6
-	lda #<faceBlob
-	sta ARG+7
-	lda #>faceBlob
-	sta ARG+8
-	lda #0
-	sta ARG+9
-	lda #144
-	sta ARG+10
-	lda #0
-	sta ARG+11
-	lda #OP_UPLOAD_MESH
-	jsr cmd1
-	jsr logSetup
+; DRAW_SECTORS' batch, which is r2batch with the other stride.
+r2batch2 .macro	addr, count, flags=0, key=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_WALL2+((\flags)&1)*2
+	#argw 6, \count
+	#argb 8, \flags
+	#argb 9, \key
+	.endm
 
-	rts
-
-; A = first palette index; loads 128 entries from PALBUF + A*3.
-palLoadHalf
-	sta palFirst
-
-	sta $fb
-	lda #0
-	sta $fc
-	asl $fb
-	rol $fc				; x2
-	clc
-	lda $fb
-	adc palFirst
-	sta $fb
-	lda $fc
-	adc #0
-	sta $fc				; x3
-
-	clc
-	lda $fb
-	adc #<PALBUF
-	sta ARG+1
-	lda $fc
-	adc #>PALBUF
-	sta ARG+2
-
-	lda #0
-	sta ARG+0
-	sta ARG+3
-	lda #<384
-	sta ARG+4
-	lda #>384
-	sta ARG+5
-	lda palFirst
-	sta ARG+6
-	lda #128
-	sta ARG+7
-
-	lda #OP_PAL_LOAD
-	jmp cmd0
+r2batch	.macro	addr, count, flags=0, key=0
+	#argblob 0, SPACE_C64, \addr, (\count)*R2_REC+((\flags)&1)*2
+	#argw 6, \count
+	#argb 8, \flags
+	#argb 9, \key
+	.endm
 
 ; ----------------------------------------------------------------------
-; Scene-graph setup: CREATE_CAMERA, the deliberate premature LOOP_START,
-; SET_ACTIVE_CAMERA, CREATE_OBJECT/SET_POSITION, then the real LOOP_START
-; and the two BUSY preconditions. Eight steps, sceneErr+0 .. sceneErr+7.
+; Judging. Each of these leaves the fail code in X, ready for #check.
 ; ----------------------------------------------------------------------
 
-doSceneSetup
-	lda #0
-	sta sceneIdx
+; A = ERRCODE. Pass if OK; otherwise the fail code IS the errcode.
+wantOk	.macro
+	tax
+	.endm
 
-	; step 0: CREATE_CAMERA -- expect OK
-	lda #<CAM_ID
-	sta ID_LO
-	lda #>CAM_ID
-	sta ID_HI
-	lda #OP_CREATE_CAMERA
-	jsr cmd1
-	jsr logScene
+; A = ERRCODE. Pass only if it equals \err -- and a command that answered
+; OK where an error was demanded fails as $FE, never silently as 0.
+wantErr	.macro	err
+	ldy #\err
+	jsr kitExpect
+	.endm
 
-	; step 1: LOOP_START with no active camera yet -- expect NO_CAMERA
-	lda #0
-	sta ARG+0
-	lda #OP_LOOP_START
-	jsr cmd1
-	jsr logScene
-
-	; step 2: SET_ACTIVE_CAMERA -- expect OK
-	lda #<CAM_ID
-	sta ID_LO
-	lda #>CAM_ID
-	sta ID_HI
-	lda #OP_SET_ACTIVE_CAMERA
-	jsr cmd1
-	jsr logScene
-
-	; step 3: CREATE_OBJECT, mesh id 2 -- expect OK
-	lda #<OBJ_ID
-	sta ID_LO
-	lda #>OBJ_ID
-	sta ID_HI
-	lda #<MESH_ID
-	sta ARG+0
-	lda #>MESH_ID
-	sta ARG+1
-	lda #OP_CREATE_OBJECT
-	jsr cmd1
-	jsr logScene
-
-	; step 4: SET_POSITION (0, 0, 70.0), s32 16.16 -- expect OK. The
-	; camera stays at its CREATE_CAMERA default (origin, identity
-	; rotation), same convention tools/hostsim's setCamera() and
-	; gpu64_3dSceneApplyCamera() share -- so the box sits the same 70
-	; units in front of it that gpu64_3d_cube.a places it in front of
-	; the implicit immediate-mode camera.
-	lda #<OBJ_ID
-	sta ID_LO
-	lda #>OBJ_ID
-	sta ID_HI
-	lda #0
-	sta ARG+0
-	sta ARG+1
-	sta ARG+2
-	sta ARG+3
-	sta ARG+4
-	sta ARG+5
-	sta ARG+6
-	sta ARG+7
-	sta ARG+8
-	sta ARG+9
-	lda #$46			; 70 << 16, low mid byte
-	sta ARG+10
-	lda #0
-	sta ARG+11
-	lda #OP_SET_POSITION
-	jsr cmd1
-	jsr logScene
-
-	; step 5: LOOP_START for real -- expect OK
-	lda #0
-	sta ARG+0
-	lda #OP_LOOP_START
-	jsr cmd1
-	jsr logScene
-
-	; step 6: LOOP_START again while running -- expect BUSY
-	lda #0
-	sta ARG+0
-	lda #OP_LOOP_START
-	jsr cmd1
-	jsr logScene
-
-	; step 7: CLEAR_VIEWPORT (immediate mode) while running -- expect BUSY
-	lda #OP_CLEAR_VIEWPORT
-	jsr cmd1
-	jsr logScene
-
-	rts
+; X = fail code already set by hand.
+raw	.macro
+	.endm
 
 ; ----------------------------------------------------------------------
-; The animation: ROTATE_LOCAL (shadow-redirected, returns at once) then
-; SCENE_COMMIT (publishes the shadow, arms the flip, queues the next
-; frame -- draining any frame already in flight first, so this never
-; needs a BUSY retry loop of its own; see gpu64_3d_class1.cpp's
-; SCENE_COMMIT case for why). Runs until RUN/STOP.
+; Reporting. The name is stored inline after the JSR, so a test needs no
+; string table and the name sits where the test is.
 ; ----------------------------------------------------------------------
 
-animLoop
+check	.macro	name
+	jsr kitCheck
+	.text \name
+	.byte 0
+	.endm
+
+title	.macro	name
+	jsr kitTitle
+	.text \name
+	.byte 0
+	.endm
+
+; A bare note line in the results area -- for a value that is reported
+; rather than judged, e.g. the measured frame period.
+note	.macro	name
+	jsr kitNote
+	.text \name
+	.byte 0
+	.endm
+
+; ----------------------------------------------------------------------
+; Checking data.
+;
+; Most of what this suite asserts is not an error code but a byte that came
+; back from the framebuffer or from a math result. A test opens with
+; #clracc, makes as many #expectb assertions as it likes, and closes with
+; #useacc -- so one result line can stand for a whole shape, and the fail
+; code is the first byte that was actually wrong.
+; ----------------------------------------------------------------------
+
+clracc	.macro
 	lda #0
-	sta commitIdx
-	sta missed
-	sta missed+1
-	sta okFrames
-	sta okFrames+1
-	sta firstErrSet
-	lda #1
-	sta seqCounter
+	sta accFail
+	.endm
 
-animFrame
-	jsr spin
+useacc	.macro
+	ldx accFail
+	.endm
 
-	lda #$10
-	jsr setStage
-
-	lda #<OBJ_ID
-	sta ID_LO
-	lda #>OBJ_ID
-	sta ID_HI
-	lda #<$0200			; ~2.8 degrees/frame, same step as
-	sta ARG+0			; gpu64_3d_cube.a's angle
-	lda #>$0200
-	sta ARG+1
-	lda #0				; pitch, roll unchanged
-	sta ARG+2
-	sta ARG+3
-	sta ARG+4
-	sta ARG+5
-	lda #OP_ROTATE_LOCAL
-	jsr cmdSeq1
-	sta lastRotErr
-
-	lda #$11
-	jsr setStage
-	lda #$20
-	jsr setStage
-
-	lda #OP_SCENE_COMMIT
-	jsr cmdSeq1
-	sta lastCommitErr
-	lda RESULT
-	sta lastPage
-	lda STATUS
-	sta lastStatus
-
-	lda #$21
-	jsr setStage
-
-	; Attempted and accepted are counted separately: a run in which every
-	; commit is refused still advances FRAME, and the single counter this
-	; replaced could not tell that from a healthy run at a glance.
-	lda lastCommitErr
-	bne cmtBad
-	inc okFrames
-	bne cmtDone
-	inc okFrames+1
-	jmp cmtDone
-cmtBad
-	; Sticky, because COMMIT ERR shows only the most recent one and a
-	; single good frame afterwards erases the evidence.
-	ldx firstErrSet
-	bne cmtDone
-	sta firstErr
-	lda frames
-	sta firstErrFrame
-	lda frames+1
-	sta firstErrFrame+1
-	inc firstErrSet
-cmtDone
-
-	ldx commitIdx
-	cpx #COMMIT_LOG_COUNT
-	bcs animNoLog
-	lda lastRotErr
-	sta commitRotErr,x
-	lda lastCommitErr
-	sta commitErr,x
-	lda lastPage
-	sta commitPage,x
-	lda lastStatus
-	sta commitStatus,x
-	inc commitIdx
-animNoLog
-
-	inc frames
-	bne +
-	inc frames+1
+expectb	.macro	addr, val
+	lda \addr
+	cmp #\val
+	beq +
+	jsr kitBad
 +
-	jsr showAnim
+	.endm
 
-	lda #$30
-	jsr setStage
+; The same, for a value that must NOT be a particular byte -- used where
+; the assertion is "this pixel was left alone", and the interesting failure
+; is that something painted over it.
+rejectb	.macro	addr, val
+	lda \addr
+	cmp #\val
+	bne +
+	jsr kitBad
++
+	.endm
 
-	; RUN/STOP, read the way the KERNAL does.
-	lda $91
-	cmp #$7f
-	beq animDone
+; A little-endian 16-bit field, which is how every multi-byte value in this
+; API crosses -- info block entries, 8.8 matrix elements, coordinates.
+expectw	.macro	addr, val
+	lda \addr
+	cmp #<(\val)
+	beq +
+	jsr kitBad
++
+	lda \addr+1
+	cmp #>(\val)
+	beq +
+	jsr kitBad
++
+	.endm
 
-	; ...and the deadline, so a run nobody is watching still reaches the
-	; POST checks and the verdict.
-	lda frames+1
-	cmp #>AUTO_STOP_FRAMES
-	bcc animAgain
-	bne animDone
-	lda frames
-	cmp #<AUTO_STOP_FRAMES
-	bcs animDone
-animAgain
-	jmp animFrame
+; Length for the kitFill / kitSeq / kitCmp / kitChkFill helpers.
+setlen	.macro	n
+	lda #<(\n)
+	sta kitLen
+	lda #>(\n)
+	sta kitLen+1
+	.endm
 
-animDone
-	rts
+setptr	.macro	p, addr
+	lda #<(\addr)
+	sta \p
+	lda #>(\addr)
+	sta \p+1
+	.endm
 
-; ----------------------------------------------------------------------
-; Post-stop checks: LOOP_STOP, then SCENE_COMMIT and CLEAR_VIEWPORT
-; against the now-stopped loop. postErr+0 .. postErr+2.
-; ----------------------------------------------------------------------
+; A slot that shows a 16-bit measurement rather than a verdict.
+; After a failed #check on a kitCmp, this reports what actually differed:
+; the offset of the first mismatching byte, and the two bytes themselves
+; as "wantgot" -- expected (from P1) in the high nibble pair, actual (from
+; P2) in the low. Two extra result lines that turn $E1 into a diagnosis.
+cmpdiff	.macro	name, name2, name3
+	#showw kitOff, \name
+	#showw kitDiffN, \name3
+	lda kitDiffB
+	sta kitVal16
+	lda kitDiffA
+	sta kitVal16+1
+	jsr kitShow
+	.text \name2
+	.byte 0
+	.endm
 
-doPostChecks
-	lda #0
-	sta postIdx
+; The second and third mismatches from the same kitCmp: their offsets, and
+; their two actual bytes packed into one word (2nd high, 3rd low). Together
+; with #cmpdiff this is three offsets and three got-values from a single
+; run, which is what it takes to tell scattered damage from one bad byte.
+cmpmore	.macro	name2, name3, namegot
+	#showw kitOff2, \name2
+	#showw kitOff3, \name3
+	lda kitGot3
+	sta kitVal16
+	lda kitGot2
+	sta kitVal16+1
+	jsr kitShow
+	.text \namegot
+	.byte 0
+	.endm
 
-	; LOOP_STOP -- always OK, even if LOOP_START never actually ran
-	lda #OP_LOOP_STOP
-	jsr cmd1
-	jsr logPost
+; The offsets alone, for a pass whose want/got values are already known from
+; another pass. Four slots instead of six -- the screen has exactly 21 rows
+; per column and three transfer passes do not otherwise fit.
+cmpwhere .macro	nameat, namen, name2, name3
+	#showw kitOff, \nameat
+	#showw kitDiffN, \namen
+	#showw kitOff2, \name2
+	#showw kitOff3, \name3
+	.endm
 
-	; SCENE_COMMIT with no loop running -- expect UNSUPPORTED
-	lda #OP_SCENE_COMMIT
-	jsr cmd1
-	jsr logPost
-
-	; CLEAR_VIEWPORT -- immediate mode restored, expect OK
-	lda #OP_CLEAR_VIEWPORT
-	jsr cmd1
-	jsr logPost
-
-	rts
-
-; ----------------------------------------------------------------------
-; Verdict.
-; ----------------------------------------------------------------------
-
-verdict
-	; A BRK or an NMI is a failure on its own, whatever the logs say --
-	; and it is the first thing to check, because everything below it was
-	; recorded by a program that may have been derailed at the time.
-	lda trapKind
-	beq vNoTrap
-	jmp vFail
-vNoTrap
-
-	; SETUP: all nine must be OK.
-	ldx #0
-vSetupLoop
-	lda setupErr,x
-	bne vFail
-	inx
-	cpx #9
-	bne vSetupLoop
-
-	; SCENE: fixed expected sequence.
-	ldx #0
-vSceneLoop
-	lda sceneErr,x
-	cmp sceneExpect,x
-	bne vFail
-	inx
-	cpx #8
-	bne vSceneLoop
-
-	; POST: fixed expected sequence.
-	ldx #0
-vPostLoop
-	lda postErr,x
-	cmp postExpect,x
-	bne vFail
-	inx
-	cpx #3
-	bne vPostLoop
-
-	; The logged commits: ERRCODE must be OK, RESULT (page) must be one
-	; of the three flip pages, and STATUS read right after must not
-	; already show FRAME_READY -- SCENE_COMMIT just armed a new frame,
-	; it cannot have finished by the time this instruction runs.
-	ldx #0
-vCommitLoop
-	cpx commitIdx
-	bcs vCommitDone
-	lda commitRotErr,x
-	bne vFail
-	lda commitErr,x
-	beq vCommitOk
-	; BUSY is a legal answer, not a defect: it means a frame was still in
-	; flight, which is a scheduling outcome rather than a broken commit.
-	; Anything else is. RESULT and STATUS are only meaningful for a commit
-	; that was actually accepted, so a BUSY skips the rest of the row.
-	cmp #ERR_BUSY
-	bne vFail
-	jmp vCommitNext
-vCommitOk
-	lda commitPage,x
-	cmp #3
-	bcs vFail
-	lda commitStatus,x
-	and #STATUS_FRAME_READY
-	bne vFail
-vCommitNext
-	inx
-	jmp vCommitLoop
-vCommitDone
-
-	; If the loop did start, at least one commit has to have been accepted.
-	; Six BUSY answers in a row would otherwise pass every check above
-	; while nothing was ever rendered.
-	lda sceneErr+5
-	bne vNoLoop
-	lda okFrames
-	ora okFrames+1
-	beq vFail
-vNoLoop
-
-	lda #<txtPass
-	ldy #>txtPass
-	ldx #ROW_VERDICT
-	jmp printAt
-vFail
-	lda #<txtFail
-	ldy #>txtFail
-	ldx #ROW_VERDICT
-	jmp printAt
-
-sceneExpect
-	.byte $00, $0B, $00, $00, $00, $00, $07, $07
-postExpect
-	.byte $00, $06, $00
+showw	.macro	addr, name
+	lda \addr
+	sta kitVal16
+	lda \addr+1
+	sta kitVal16+1
+	jsr kitShow
+	.text \name
+	.byte 0
+	.endm
 
 ; ----------------------------------------------------------------------
-; Screen output.
+; Staging the drawing opcodes.
+;
+; These only lay out ARG bytes -- they never dispatch. Keeping the two
+; apart is deliberate: a test that stages a shape and then fires the wrong
+; opcode is a bug the suite must be able to express, because that is what a
+; real program's bug looks like.
 ; ----------------------------------------------------------------------
 
-showSetup
-	lda #<txtSetup
-	ldy #>txtSetup
-	ldx #2
-	jsr printAt
+stgPixel .macro	x, y, c
+	#argw 0, \x
+	#argw 2, \y
+	#argb 4, \c
+	.endm
 
-	lda #2
-	jsr rowAddr
-	ldy #8
-	ldx #0
-ssLoop
-	lda setupErr,x
-	jsr putHex
-	iny
-	inx
-	cpx #9
-	bne ssLoop
-	rts
+stgLine	.macro	x0, y0, x1, y1, c
+	#argw 0, \x0
+	#argw 2, \y0
+	#argw 4, \x1
+	#argw 6, \y1
+	#argb 8, \c
+	.endm
 
-showScene
-	lda #<txtScene
-	ldy #>txtScene
-	ldx #3
-	jsr printAt
+; Serves RECT and RECT_FILL, which take the same nine bytes.
+stgRect	.macro	x, y, w, h, c
+	#argw 0, \x
+	#argw 2, \y
+	#argw 4, \w
+	#argw 6, \h
+	#argb 8, \c
+	.endm
 
-	lda #3
-	jsr rowAddr
-	ldy #8
-	ldx #0
-scLoop
-	lda sceneErr,x
-	jsr putHex
-	iny
-	inx
-	cpx #8
-	bne scLoop
-	rts
+; BLIT and BLIT_KEYED; the key byte is ARG14 and is staged separately, so
+; a keyed blit reads as "the same blit, plus a key".
+stgBlit	.macro	src, x, y, w, h
+	#argblob 0, SPACE_C64, \src, (\w)*(\h)
+	#argw 6, \x
+	#argw 8, \y
+	#argw 10, \w
+	#argw 12, \h
+	.endm
 
-showPost
-	lda #<txtPost
-	ldy #>txtPost
-	ldx #4
-	jsr printAt
+stgRead	.macro	dst, x, y, w, h
+	#argblob 0, SPACE_C64, \dst, (\w)*(\h)
+	#argw 6, \x
+	#argw 8, \y
+	#argw 10, \w
+	#argw 12, \h
+	.endm
 
-	lda #4
-	jsr rowAddr
-	ldy #8
-	ldx #0
-poLoop
-	lda postErr,x
-	jsr putHex
-	iny
-	inx
-	cpx #3
-	bne poLoop
-	rts
+; Fill a readback buffer with a byte no test ever expects, so a READ_RECT
+; that quietly wrote nothing cannot pass on leftovers. $AA is chosen for
+; being outside every colour index the suite draws with.
+; Fills a destination with a byte that is not a plausible result, so a
+; command that wrote nothing at all cannot be mistaken for one that wrote
+; the right thing. When two buffers are filled and then compared against
+; each other, they MUST be given different bytes -- otherwise "nothing
+; happened" compares equal and the check passes vacuously.
+poison	.macro	addr, len, val=$aa
+	#setptr P1, \addr
+	#setlen \len
+	lda #\val
+	sta kitVal
+	jsr kitFill
+	.endm
 
-; Labels for the live rows, shown once before the animation starts.
-showLabels
-	lda #<txtFrame
-	ldy #>txtFrame
-	ldx #ROW_FRAME
-	jsr printAt
-	lda #<txtRot
-	ldy #>txtRot
-	ldx #ROW_ROT
-	jsr printAt
-	lda #<txtCommit
-	ldy #>txtCommit
-	ldx #ROW_COMMIT
-	jsr printAt
-	lda #<txtPage
-	ldy #>txtPage
-	ldx #ROW_PAGE
-	jsr printAt
-	lda #<txtMissed
-	ldy #>txtMissed
-	ldx #ROW_MISSED
-	jsr printAt
-	lda #<txtFirstErr
-	ldy #>txtFirstErr
-	ldx #ROW_FIRSTERR
-	jsr printAt
-	lda #<txtPhase
-	ldy #>txtPhase
-	ldx #ROW_PHASE
-	jsr printAt
-	lda #<txtAlive
-	ldy #>txtAlive
-	ldx #ROW_ALIVE
-	jmp printAt
+; Fold a dispatch's ERRCODE into the accumulated fail code, for a test that
+; fires several commands and judges them as one line. Must follow a cmd0 /
+; cmd1 directly, whose Z flag still reflects the ERRCODE it returned.
+accOk	.macro
+	beq +
+	jsr kitBad
++
+	.endm
 
-showAnim
-	lda #ROW_FRAME
-	jsr rowAddr
-	ldy #COL_VAL
-	lda frames+1
-	jsr putHex
-	lda frames
-	jsr putHex
-	lda #$2f			; '/'
-	sta (DST),y
-	iny
-	lda okFrames+1
-	jsr putHex
-	lda okFrames
-	jsr putHex
-
-	lda #ROW_ROT
-	jsr rowAddr
-	ldy #COL_VAL
-	lda lastRotErr
-	jsr putHex
-
-	lda #ROW_COMMIT
-	jsr rowAddr
-	ldy #COL_VAL
-	lda lastCommitErr
-	jsr putHex
-
-	lda #ROW_PAGE
-	jsr rowAddr
-	ldy #COL_VAL
-	lda lastPage
-	jsr putHex
-
-	lda #ROW_MISSED
-	jsr rowAddr
-	ldy #COL_VAL
-	lda missed+1
-	jsr putHex
-	lda missed
-	jsr putHex
-
-	lda #ROW_FIRSTERR
-	jsr rowAddr
-	ldy #COL_VAL
-	lda firstErr
-	jsr putHex
-	iny
-	lda #$00			; '@' is screen code $00
-	sta (DST),y
-	iny
-	iny
-	lda firstErrFrame+1
-	jsr putHex
-	lda firstErrFrame
-	jsr putHex
-	rts
-
-; ----------------------------------------------------------------------
-; The palette: 32 hues x 8 brightnesses. Identical to gpu64_3d_cube.a.
-; ----------------------------------------------------------------------
-
-buildPalette
-	lda #<PALBUF
-	sta DST
-	lda #>PALBUF
-	sta DST+1
-
-	lda #<hueTable
-	sta SRC
-	lda #>hueTable
-	sta SRC+1
-
-	lda #0
-	sta hueIdx
-
-palHue
-	lda #0
-	sta briIdx
-
-palBri
-	ldy #0
-palChan
-	lda (SRC),y
-	sta mulA
-	lda #0
-	sta mulL
-	sta mulH
-	ldx briIdx
-	inx
-palMulLoop
-	clc
-	lda mulL
-	adc mulA
-	sta mulL
-	lda mulH
-	adc #0
-	sta mulH
-	dex
-	bne palMulLoop
-
-	lsr mulH
-	ror mulL
-	lsr mulH
-	ror mulL
-	lsr mulH
-	ror mulL
-
-	lda mulL
-	sta (DST),y
-	iny
-	cpy #3
-	bne palChan
-
-	clc
-	lda DST
-	adc #3
-	sta DST
-	lda DST+1
-	adc #0
-	sta DST+1
-
-	inc briIdx
-	lda briIdx
-	cmp #8
-	bne palBri
-
-	clc
-	lda SRC
-	adc #3
-	sta SRC
-	lda SRC+1
-	adc #0
-	sta SRC+1
-
-	inc hueIdx
-	lda hueIdx
-	cmp #32
-	bne palHue
-
-	lda #16
-	sta PALBUF+0
-	sta PALBUF+1
-	sta PALBUF+2
-	lda #255
-	sta PALBUF+765
-	sta PALBUF+766
-	sta PALBUF+767
-	rts
-
-; ----------------------------------------------------------------------
-; The texture: a 64x64 checker with one off-centre marker block.
-; Identical to gpu64_3d_cube.a.
-; ----------------------------------------------------------------------
-
-buildTexture
-	lda #<TEXBUF
-	sta DST
-	lda #>TEXBUF
-	sta DST+1
-
-	lda #0
-	sta texY
-
-texRow
-	ldy #0
-texCol
-	tya
-	lsr
-	lsr
-	lsr
-	sta texTmp
-	lda texY
-	lsr
-	lsr
-	lsr
-	eor texTmp
-	and #1
-	beq texB
-
-	lda #(10*8)+7
-	jmp texStore
-texB
-	lda #(13*8)+4
-
-texStore
-	sta texPix
-
-	lda texY
-	cmp #4
-	bcc texPut
-	cmp #10
-	bcs texPut
-	cpy #4
-	bcc texPut
-	cpy #16
-	bcs texPut
-	lda #(3*8)+7
-	sta texPix
-
-texPut
-	lda texPix
-	sta (DST),y
-	iny
-	cpy #64
-	bne texCol
-
-	clc
-	lda DST
-	adc #64
-	sta DST
-	lda DST+1
-	adc #0
-	sta DST+1
-
-	inc texY
-	lda texY
-	cmp #64
-	bne texRow
-	rts
-
-; ----------------------------------------------------------------------
-; Screen output helpers. Identical to gpu64_3d_cube.a's.
-; ----------------------------------------------------------------------
-
-clearScreen
-	ldx #0
-	lda #$20
-cls1
-	sta SCREEN,x
-	sta SCREEN+$100,x
-	sta SCREEN+$200,x
-	sta SCREEN+$300,x
-	inx
-	bne cls1
-	rts
-
-; A/Y = string pointer (zero-terminated PETSCII), X = row.
-printAt
-	sta SRC
-	sty SRC+1
-	txa
-	jsr rowAddr
-	ldy #0
-prLoop
-	lda (SRC),y
-	beq prDone
-	cmp #$41
-	bcc prPut
-	cmp #$5b
-	bcs prPut
-	sec
-	sbc #$40
-prPut
-	sta (DST),y
-	iny
-	bne prLoop
-prDone
-	rts
-
-; A = row; leaves the row's screen address in DST.
-rowAddr
-	sta rowTmp
-	lda #<SCREEN
-	sta DST
-	lda #>SCREEN
-	sta DST+1
-	ldx rowTmp
-	beq rowDone
-rowAdd
-	clc
-	lda DST
-	adc #40
-	sta DST
-	lda DST+1
-	adc #0
-	sta DST+1
-	dex
-	bne rowAdd
-rowDone
-	rts
-
-; A = byte, Y = column offset within the row DST already points at.
-putHex
-	pha
-	lsr
-	lsr
-	lsr
-	lsr
-	jsr hexDigit
-	sta (DST),y
-	iny
-	pla
-	and #$0f
-	jsr hexDigit
-	sta (DST),y
-	iny
-	rts
-
-hexDigit
-	cmp #10
-	bcs hexAlpha
-	clc
-	adc #$30
-	rts
-hexAlpha
-	sec
-	sbc #9
-	rts
-
-; ----------------------------------------------------------------------
-; Data.
-; ----------------------------------------------------------------------
-
-txtTitle	.text "GPU64 LOOP TEST"
-		.byte 0
-txtSetup	.text "SETUP"
-		.byte 0
-txtScene	.text "SCENE"
-		.byte 0
-txtPost		.text "POST"
-		.byte 0
-txtFrame	.text "FRAME"
-		.byte 0
-txtRot		.text "ROT ERR"
-		.byte 0
-txtCommit	.text "COMMIT ERR"
-		.byte 0
-txtPage		.text "PAGE"
-		.byte 0
-txtMissed	.text "MISSED"
-		.byte 0
-txtFirstErr	.text "FIRST ERR"
-		.byte 0
-txtPhase	.text "PHASE"
-		.byte 0
-txtAlive	.text "ALIVE"
-		.byte 0
-txtTrap		.text "TRAP"
-		.byte 0
-
-; Screen codes, not PETSCII: these go straight to the screen. $2d/$4e/$5d/
-; $4d are - / | \ in the uppercase/graphics character set.
-spinTable	.byte $2d, $4e, $5d, $4d
-txtPass		.text "VERDICT PASS"
-		.byte 0
-txtFail		.text "VERDICT FAIL"
-		.byte 0
-
-hueTable
-	.byte 255,  64,  64
-	.byte 255, 112,  48
-	.byte 255, 160,  32
-	.byte 255, 208,  32
-	.byte 240, 255,  32
-	.byte 176, 255,  32
-	.byte 112, 255,  48
-	.byte  48, 255,  64
-	.byte  32, 255, 128
-	.byte  32, 255, 192
-	.byte  32, 240, 255
-	.byte  32, 192, 255
-	.byte  48, 144, 255
-	.byte  64,  96, 255
-	.byte  96,  64, 255
-	.byte 144,  48, 255
-	.byte 192,  32, 255
-	.byte 240,  32, 255
-	.byte 255,  32, 192
-	.byte 255,  48, 128
-	.byte 176, 112,  80
-	.byte 208, 144, 104
-	.byte 128,  96,  64
-	.byte  96, 128,  96
-	.byte 255, 255, 255
-	.byte 224, 224, 224
-	.byte 192, 192, 192
-	.byte 160, 160, 160
-	.byte 128, 128, 128
-	.byte  96,  96,  96
-	.byte  64,  64,  64
-	.byte  32,  32,  32
-
-; The box, unchanged from gpu64_3d_cube.a -- see there for why it is
-; asymmetric and clockwise-from-outside wound.
-
-vertBlob
-	.byte $00, $e8, $00, $f2, $00, $ec, $00, $18, $00, $f2, $00, $ec
-	.byte $00, $18, $00, $f2, $00, $14, $00, $e8, $00, $f2, $00, $14
-	.byte $00, $ef, $00, $0e, $00, $ec, $00, $1f, $00, $0e, $00, $ec
-	.byte $00, $1f, $00, $0e, $00, $14, $00, $ef, $00, $0e, $00, $14
-
-faceBlob
-	.byte $00, $01, $02, $00, $00, $3f, $00, $3f, $3f, $01, $00, $00
-	.byte $00, $02, $03, $00, $00, $3f, $3f, $00, $3f, $01, $00, $00
-	.byte $07, $06, $05, $00, $00, $3f, $00, $3f, $3f, $01, $00, $00
-	.byte $07, $05, $04, $00, $00, $3f, $3f, $00, $3f, $01, $00, $00
-	.byte $00, $04, $05, $00, $00, $3f, $00, $3f, $3f, $01, $00, $00
-	.byte $00, $05, $01, $00, $00, $3f, $3f, $00, $3f, $01, $00, $00
-	.byte $02, $06, $07, $00, $00, $3f, $00, $3f, $3f, $01, $00, $00
-	.byte $02, $07, $03, $00, $00, $3f, $3f, $00, $3f, $01, $00, $00
-	.byte $03, $07, $04, $00, $00, $3f, $00, $3f, $3f, $01, $00, $00
-	.byte $03, $04, $00, $00, $00, $3f, $3f, $00, $3f, $01, $00, $00
-	.byte $01, $05, $06, $00, $00, $3f, $00, $3f, $3f, $01, $00, $00
-	.byte $01, $06, $02, $00, $00, $3f, $3f, $00, $3f, $01, $00, $00
-
-; ----------------------------------------------------------------------
-; Variables.
-; ----------------------------------------------------------------------
-
-setupIdx	.byte 0
-setupErr	.fill 9, $ff
-sceneIdx	.byte 0
-sceneErr	.fill 8, $ff
-postIdx		.byte 0
-postErr		.fill 3, $ff
-
-palFirst	.byte 0
-hueIdx		.byte 0
-briIdx		.byte 0
-mulA		.byte 0
-mulL		.byte 0
-mulH		.byte 0
-texY		.byte 0
-texTmp		.byte 0
-texPix		.byte 0
-rowTmp		.byte 0
-
-frames		.word 0
-commitIdx	.byte 0
-seqCounter	.byte 1
-missed		.word 0
-lastRotErr	.byte 0
-lastCommitErr	.byte 0
-lastPage	.byte 0
-lastStatus	.byte 0
-commitRotErr	.fill COMMIT_LOG_COUNT, $ff
-commitErr	.fill COMMIT_LOG_COUNT, $ff
-commitPage	.fill COMMIT_LOG_COUNT, $ff
-commitStatus	.fill COMMIT_LOG_COUNT, $ff
-
-okFrames	.word 0
-firstErr	.byte 0
-firstErrFrame	.word 0
-firstErrSet	.byte 0
-
-entrySP		.byte 0
-phaseIdx	.byte 0
-spinIdx		.byte 0
-stageVal	.byte 0
-trapKind	.byte 0
-trapPC		.word 0
-oldBrk		.word 0
-oldNmi		.word 0
-nmiZp		.fill 5, 0
+; A little-endian 32-bit field -- an IEEE 754 single, for the $9x math set.
+expectd	.macro	addr, val
+	lda \addr
+	cmp #<(\val)
+	beq +
+	jsr kitBad
++
+	lda \addr+1
+	cmp #>(\val)
+	beq +
+	jsr kitBad
++
+	lda \addr+2
+	cmp #`(\val)
+	beq +
+	jsr kitBad
++
+	lda \addr+3
+	cmp #((\val) >> 24) & $ff
+	beq +
+	jsr kitBad
++
+	.endm

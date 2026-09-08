@@ -201,6 +201,8 @@ ROW_FIRSTERR = 11
 ROW_PHASE    = 13
 ROW_ALIVE    = 14
 ROW_TRAP     = 16
+ROW_LOG1     = 15
+ROW_LOG2     = 17
 ROW_VERDICT  = 18
 ROW_CURSOR   = 20
 
@@ -213,6 +215,17 @@ PH_ANIM    = $01		; A
 PH_SKIP    = $0b		; K -- the loop never started, animation skipped
 PH_POST    = $10		; P
 PH_VERDICT = $16		; V
+
+; Verdict reason codes: what failed, printed beside the word FAIL.
+WHY_TRAP    = $01		; a BRK or an NMI happened
+WHY_SETUP   = $02		; a setup command returned an error
+WHY_SCENE   = $03		; the scene/loop sequence answered unexpectedly
+WHY_POST    = $04		; a post-stop check answered unexpectedly
+WHY_ROT     = $05		; a logged frame's ROTATE_LOCAL failed
+WHY_COMMIT  = $06		; a logged commit answered neither OK nor BUSY
+WHY_PAGE    = $07		; an accepted commit reported a page outside 0-2
+WHY_READY   = $08		; FRAME_READY was already set right after a commit
+WHY_NOFRAME = $09		; the loop ran and not one commit was ever accepted
 
 ; Trap markers.
 TRAP_BRK = $01
@@ -286,6 +299,8 @@ skipAnim
 	jsr phase
 	jsr doPostChecks
 	jsr showPost
+
+	jsr showLog
 
 	lda #PH_VERDICT
 	jsr phase
@@ -547,12 +562,30 @@ logSetup
 logScene
 	ldx sceneIdx
 	sta sceneErr,x
+	lda #0
+	sta sceneMiss,x
+	lda missed
+	cmp scMissSnap
+	beq lsSame
+	sta scMissSnap
+	lda #1
+	sta sceneMiss,x
+lsSame
 	inc sceneIdx
 	rts
 
 logPost
 	ldx postIdx
 	sta postErr,x
+	lda #0
+	sta postMiss,x
+	lda missed
+	cmp scMissSnap
+	beq lpSame
+	sta scMissSnap
+	lda #1
+	sta postMiss,x
+lpSame
 	inc postIdx
 	rts
 
@@ -592,7 +625,7 @@ doSetup
 	lda #>160
 	sta ARG+7
 	lda #OP_SET_VIEWPORT
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logSetup
 
 	; perspective: fov $2AAB (60 degrees), near 1.0, far 120.0 (8.8)
@@ -609,7 +642,7 @@ doSetup
 	lda #$78
 	sta ARG+5
 	lda #OP_SET_PERSPECTIVE
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logSetup
 
 	; light: direction (-5, 7, -6) in 8.8, ambient 3 of 15
@@ -628,17 +661,17 @@ doSetup
 	lda #3
 	sta ARG+6
 	lda #OP_SET_LIGHT
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logSetup
 
 	lda #0
 	sta ARG+0
 	lda #OP_SET_BACKGROUND
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logSetup
 
 	lda #OP_BUILD_COLORMAP
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logSetup
 
 	; texture
@@ -663,7 +696,7 @@ doSetup
 	lda #6
 	sta ARG+7
 	lda #OP_UPLOAD_TEXTURE
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logSetup
 
 	; mesh -- the box, unchanged from gpu64_3d_cube.a
@@ -696,7 +729,7 @@ doSetup
 	lda #0
 	sta ARG+11
 	lda #OP_UPLOAD_MESH
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logSetup
 
 	rts
@@ -750,6 +783,15 @@ palLoadHalf
 doSceneSetup
 	lda #0
 	sta sceneIdx
+	; Every step below now goes through cmdSeq1, so a step whose dispatch
+	; the bus never sampled is identifiable instead of being read as an
+	; answer. It matters most here: the eight steps are a fixed expected
+	; sequence, and a dropped write leaves ERRCODE holding the PREVIOUS
+	; step's answer -- which for step 6 (a second LOOP_START, expected
+	; BUSY) is indistinguishable from the OK that step 5 just returned.
+	; That is exactly the shape of the 2026-09-08 bench FAIL.
+	lda missed
+	sta scMissSnap
 
 	; step 0: CREATE_CAMERA -- expect OK
 	lda #<CAM_ID
@@ -757,14 +799,14 @@ doSceneSetup
 	lda #>CAM_ID
 	sta ID_HI
 	lda #OP_CREATE_CAMERA
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	; step 1: LOOP_START with no active camera yet -- expect NO_CAMERA
 	lda #0
 	sta ARG+0
 	lda #OP_LOOP_START
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	; step 2: SET_ACTIVE_CAMERA -- expect OK
@@ -773,7 +815,7 @@ doSceneSetup
 	lda #>CAM_ID
 	sta ID_HI
 	lda #OP_SET_ACTIVE_CAMERA
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	; step 3: CREATE_OBJECT, mesh id 2 -- expect OK
@@ -786,7 +828,7 @@ doSceneSetup
 	lda #>MESH_ID
 	sta ARG+1
 	lda #OP_CREATE_OBJECT
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	; step 4: SET_POSITION (0, 0, 70.0), s32 16.16 -- expect OK. The
@@ -815,26 +857,26 @@ doSceneSetup
 	lda #0
 	sta ARG+11
 	lda #OP_SET_POSITION
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	; step 5: LOOP_START for real -- expect OK
 	lda #0
 	sta ARG+0
 	lda #OP_LOOP_START
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	; step 6: LOOP_START again while running -- expect BUSY
 	lda #0
 	sta ARG+0
 	lda #OP_LOOP_START
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	; step 7: CLEAR_VIEWPORT (immediate mode) while running -- expect BUSY
 	lda #OP_CLEAR_VIEWPORT
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logScene
 
 	rts
@@ -877,9 +919,22 @@ animFrame
 	sta ARG+3
 	sta ARG+4
 	sta ARG+5
+	lda missed			; miss flags for this frame's two
+	sta missSnap			; dispatches -- see commitMiss
+
 	lda #OP_ROTATE_LOCAL
 	jsr cmdSeq1
 	sta lastRotErr
+
+	lda #0
+	sta frMiss
+	lda missed
+	cmp missSnap
+	beq +
+	lda #1
+	sta frMiss
++	lda missed
+	sta missSnap
 
 	lda #$11
 	jsr setStage
@@ -894,6 +949,13 @@ animFrame
 	lda STATUS
 	sta lastStatus
 
+	lda missed
+	cmp missSnap
+	beq +
+	lda frMiss
+	ora #2
+	sta frMiss
++
 	lda #$21
 	jsr setStage
 
@@ -930,6 +992,8 @@ cmtDone
 	sta commitPage,x
 	lda lastStatus
 	sta commitStatus,x
+	lda frMiss
+	sta commitMiss,x
 	inc commitIdx
 animNoLog
 
@@ -970,20 +1034,22 @@ animDone
 doPostChecks
 	lda #0
 	sta postIdx
+	lda missed
+	sta scMissSnap
 
 	; LOOP_STOP -- always OK, even if LOOP_START never actually ran
 	lda #OP_LOOP_STOP
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logPost
 
 	; SCENE_COMMIT with no loop running -- expect UNSUPPORTED
 	lda #OP_SCENE_COMMIT
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logPost
 
 	; CLEAR_VIEWPORT -- immediate mode restored, expect OK
 	lda #OP_CLEAR_VIEWPORT
-	jsr cmd1
+	jsr cmdSeq1
 	jsr logPost
 
 	rts
@@ -998,6 +1064,8 @@ verdict
 	; recorded by a program that may have been derailed at the time.
 	lda trapKind
 	beq vNoTrap
+	ldx #0
+	lda #WHY_TRAP
 	jmp vFail
 vNoTrap
 
@@ -1005,27 +1073,48 @@ vNoTrap
 	ldx #0
 vSetupLoop
 	lda setupErr,x
-	bne vFail
-	inx
+	beq +
+	lda #WHY_SETUP
+	jmp vFail
++	inx
 	cpx #9
 	bne vSetupLoop
 
-	; SCENE: fixed expected sequence.
+	; SCENE: fixed expected sequence, minus any step whose dispatch the bus
+	; never sampled -- that step's ERRCODE is the step before it, so testing
+	; it reports a firmware defect that is not there. Same reasoning as
+	; vRowLive below, and the reason every step now goes through cmdSeq1.
 	ldx #0
 vSceneLoop
+	lda sceneMiss,x
+	beq vSceneLive
+	inc vSkipped
+	jmp vSceneNext
+vSceneLive
 	lda sceneErr,x
 	cmp sceneExpect,x
-	bne vFail
+	beq vSceneNext
+	lda #WHY_SCENE
+	jmp vFail
+vSceneNext
 	inx
 	cpx #8
 	bne vSceneLoop
 
-	; POST: fixed expected sequence.
+	; POST: fixed expected sequence, same skip.
 	ldx #0
 vPostLoop
+	lda postMiss,x
+	beq vPostLive
+	inc vSkipped
+	jmp vPostNext
+vPostLive
 	lda postErr,x
 	cmp postExpect,x
-	bne vFail
+	beq vPostNext
+	lda #WHY_POST
+	jmp vFail
+vPostNext
 	inx
 	cpx #3
 	bne vPostLoop
@@ -1038,24 +1127,46 @@ vPostLoop
 vCommitLoop
 	cpx commitIdx
 	bcs vCommitDone
+
+	; A frame whose ROTATE_LOCAL or SCENE_COMMIT was not sampled by the
+	; polling loop is not evidence about anything: the ERRCODE, RESULT and
+	; STATUS this row holds were read after a dispatch that never happened,
+	; so they belong to the frame before it. That is the documented bus
+	; defect (CLAUDE.md, "The bus is not reliable"), one write in 180000,
+	; and failing the whole run on it reports a firmware defect that is not
+	; there. Skipped, and counted, so the verdict row still says how much
+	; of the log it had to ignore.
+	lda commitMiss,x
+	beq vRowLive
+	inc vSkipped
+	jmp vCommitNext
+vRowLive
+
 	lda commitRotErr,x
-	bne vFail
-	lda commitErr,x
+	beq +
+	lda #WHY_ROT
+	jmp vFail
++	lda commitErr,x
 	beq vCommitOk
 	; BUSY is a legal answer, not a defect: it means a frame was still in
 	; flight, which is a scheduling outcome rather than a broken commit.
 	; Anything else is. RESULT and STATUS are only meaningful for a commit
 	; that was actually accepted, so a BUSY skips the rest of the row.
 	cmp #ERR_BUSY
-	bne vFail
-	jmp vCommitNext
+	beq vCommitNext
+	lda #WHY_COMMIT
+	jmp vFail
 vCommitOk
 	lda commitPage,x
 	cmp #3
-	bcs vFail
-	lda commitStatus,x
+	bcc +
+	lda #WHY_PAGE
+	jmp vFail
++	lda commitStatus,x
 	and #STATUS_FRAME_READY
-	bne vFail
+	beq vCommitNext
+	lda #WHY_READY
+	jmp vFail
 vCommitNext
 	inx
 	jmp vCommitLoop
@@ -1068,18 +1179,121 @@ vCommitDone
 	bne vNoLoop
 	lda okFrames
 	ora okFrames+1
-	beq vFail
+	bne vNoLoop
+	ldx #0
+	lda #WHY_NOFRAME
+	jmp vFail
 vNoLoop
 
 	lda #<txtPass
 	ldy #>txtPass
 	ldx #ROW_VERDICT
-	jmp printAt
+	jsr printAt
+	jmp vSkipShow
+
+; A = the reason code, X = the log index it was found at. Both are printed
+; after the word FAIL: "which check" is the whole difference between a bench
+; run that localises a defect and one that only says something is wrong --
+; the first FAIL this program ever produced on hardware (2026-09-08) cost a
+; whole run precisely because the verdict was one bit wide.
 vFail
+	sta failWhy
+	stx failIdx
 	lda #<txtFail
 	ldy #>txtFail
 	ldx #ROW_VERDICT
-	jmp printAt
+	jsr printAt
+	lda #ROW_VERDICT
+	jsr rowAddr
+	ldy #13
+	lda failWhy
+	jsr putHex
+	iny
+	lda failIdx
+	jsr putHex
+
+vSkipShow
+	lda #ROW_VERDICT
+	jsr rowAddr
+	ldy #19
+	lda #$13			; S
+	sta (DST),y
+	iny
+	lda #$0b			; K
+	sta (DST),y
+	iny
+	lda #$09			; I
+	sta (DST),y
+	iny
+	lda #$10			; P
+	sta (DST),y
+	iny
+	iny
+	lda vSkipped
+	jsr putHex
+	rts
+
+; The six logged commits, in full: rot ERRCODE, commit ERRCODE, RESULT
+; (page), STATUS, and the miss flags (bit 0 the rotate, bit 1 the commit).
+; Printed whatever the verdict says, because a PASS with a skipped row is
+; worth as much to read as a FAIL.
+showLog
+	lda #<txtLog1
+	ldy #>txtLog1
+	ldx #ROW_LOG1
+	jsr printAt
+	lda #<txtLog2
+	ldy #>txtLog2
+	ldx #ROW_LOG2
+	jsr printAt
+
+	; The index lives in memory, not in X: rowAddr uses X as its own row
+	; counter and returns with it clobbered.
+	lda #0
+	sta logIdx
+slNext
+	lda logIdx
+	cmp #3
+	bcs slRow2
+	lda #ROW_LOG1
+	jsr rowAddr
+	lda logIdx
+	jmp slCol
+slRow2
+	lda #ROW_LOG2
+	jsr rowAddr
+	lda logIdx
+	sec
+	sbc #3
+slCol
+	; column = 7 + n * 11, which is the eight hex digits of a row plus the
+	; two of the miss flags plus one space.
+	sta logTmp
+	clc
+	asl
+	asl
+	asl
+	adc logTmp
+	adc logTmp
+	adc logTmp
+	adc #7
+	tay
+	ldx logIdx
+	lda commitRotErr,x
+	jsr putHex
+	lda commitErr,x
+	jsr putHex
+	lda commitPage,x
+	jsr putHex
+	lda commitStatus,x
+	jsr putHex
+	lda commitMiss,x
+	jsr putHex
+	inc logIdx
+	lda logIdx
+	cmp #COMMIT_LOG_COUNT
+	bne slNext
+	rts
 
 sceneExpect
 	.byte $00, $0B, $00, $00, $00, $00, $07, $07
@@ -1126,6 +1340,21 @@ scLoop
 	inx
 	cpx #8
 	bne scLoop
+
+	; One digit per step at the row's right-hand end: 1 means the bus did
+	; not sample that step's dispatch, so its ERRCODE above belongs to the
+	; step before it. Eight columns, no separator -- there is exactly room.
+	ldy #32
+	ldx #0
+scMissLoop
+	lda sceneMiss,x
+	clc
+	adc #$30
+	sta (DST),y
+	iny
+	inx
+	cpx #8
+	bne scMissLoop
 	rts
 
 showPost
@@ -1145,6 +1374,18 @@ poLoop
 	inx
 	cpx #3
 	bne poLoop
+
+	ldy #32
+	ldx #0
+poMissLoop
+	lda postMiss,x
+	clc
+	adc #$30
+	sta (DST),y
+	iny
+	inx
+	cpx #3
+	bne poMissLoop
 	rts
 
 ; Labels for the live rows, shown once before the animation starts.
@@ -1526,6 +1767,10 @@ txtTrap		.text "TRAP"
 ; Screen codes, not PETSCII: these go straight to the screen. $2d/$4e/$5d/
 ; $4d are - / | \ in the uppercase/graphics character set.
 spinTable	.byte $2d, $4e, $5d, $4d
+txtLog1		.text "LOG0-2"
+		.byte 0
+txtLog2		.text "LOG3-5"
+		.byte 0
 txtPass		.text "VERDICT PASS"
 		.byte 0
 txtFail		.text "VERDICT FAIL"
@@ -1596,6 +1841,9 @@ setupIdx	.byte 0
 setupErr	.fill 9, $ff
 sceneIdx	.byte 0
 sceneErr	.fill 8, $ff
+sceneMiss	.fill 8, 0
+postMiss	.fill 3, 0
+scMissSnap	.byte 0
 postIdx		.byte 0
 postErr		.fill 3, $ff
 
@@ -1622,6 +1870,17 @@ commitRotErr	.fill COMMIT_LOG_COUNT, $ff
 commitErr	.fill COMMIT_LOG_COUNT, $ff
 commitPage	.fill COMMIT_LOG_COUNT, $ff
 commitStatus	.fill COMMIT_LOG_COUNT, $ff
+; Bit 0: this frame's ROTATE_LOCAL was not sampled. Bit 1: its SCENE_COMMIT
+; was not. Either way the row's ERRCODE/RESULT/STATUS describe the dispatch
+; before it, so the verdict skips the row -- see vRowLive.
+commitMiss	.fill COMMIT_LOG_COUNT, $ff
+missSnap	.byte 0
+frMiss		.byte 0
+failWhy		.byte 0
+failIdx		.byte 0
+vSkipped	.byte 0
+logIdx		.byte 0
+logTmp		.byte 0
 
 okFrames	.word 0
 firstErr	.byte 0

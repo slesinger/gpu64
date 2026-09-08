@@ -14,7 +14,7 @@ instead of RGB, the store-burst budget) and the phase-1 build history, and
 [project/gap_filling_plan.md](../project/gap_filling_plan.md) for what is
 staged next to close the gap between this section and "Status" below.
 
-## Status: retained scene graph, real core-1 overlap, handshake loop unstable
+## Status: retained scene graph, real core-1 overlap, handshake loop live
 
 **Read this before the opcode table below — it changes what several rows
 actually do today.**
@@ -34,17 +34,19 @@ stage 16 (2026-08-29), that is live for **handshake mode**:
   with `BUSY` while the autonomous loop is running** — see "Frame lifecycle"
   below for why, and use `DRAW_NODE`'s scene-graph siblings instead.
 - `LOOP_START`/`LOOP_STOP`/`SCENE_COMMIT` ($06-$08) are implemented for
-  **handshake mode** (`LOOP_START`'s `ARG0` = 0) but are **not yet stable on
-  hardware — do not build on them yet.** They pass on the PC oracle and have
-  produced one clean 600-commit bench run, but most bench runs derail the C64
-  outright (a wild 6510, a collapsed IO2 interface, or a stopped machine)
-  after a few hundred commits. This is an open firmware defect, not a
-  mistake a calling program can avoid; see
-  [project/progress_tracker.md](../project/progress_tracker.md) § 16b.
-  Everything else on this page is unaffected — issue `DRAW_NODE` per frame
-  and flip yourself, the way stages 14/15 do. Free-running mode (`ARG0` = 1,
-  vsync-driven rather than `SCENE_COMMIT`-driven) answers `UNSUPPORTED` —
-  staged after the above is fixed, in
+  **handshake mode** (`LOOP_START`'s `ARG0` = 0) and are **hardware-verified
+  as of 2026-09-08** — a full `gpu64_loop_test` run (setup, 600 animation
+  frames, teardown, `VERDICT PASS`) with the C64 alive at the end. The
+  derails that made earlier builds unusable were an async DMA hold, not the
+  protocol; see [project/progress_tracker.md](../project/progress_tracker.md)
+  § 16b and § 16c. Two things that run teaches a calling program:
+  **commit once per ready frame, not flat out** (poll `STATUS` bit4 —
+  committing flat out is refused `BUSY` about 80% of the time, by
+  construction, since the loop runs at the frame clock), and **check
+  `SEQACK`**: at roughly 0.13 lost writes per accepted flip, a per-frame
+  command is dropped every several frames, so re-issue on a mismatch rather
+  than assuming it landed. Free-running mode (`ARG0` = 1, vsync-driven
+  rather than `SCENE_COMMIT`-driven) answers `UNSUPPORTED` — staged in
   [project/gap_filling_plan.md](../project/gap_filling_plan.md).
 - Scene-node and transform opcodes, **$20-$24 and $30-$36**, are **live**:
   a node created with `CREATE_OBJECT`/`CREATE_CAMERA` persists in a 256-node
@@ -113,13 +115,24 @@ class 0, and every opcode reads exactly the byte count in its row.
 | $22 | `DESTROY_NODE` | 0 | — | Destroys the staged `ID`. `BAD_ID` if it does not exist. Destroying the active camera clears it — a later node reusing that same numeric `ID` is not silently treated as the camera again. |
 | $23 | `SET_ACTIVE_CAMERA` | 0 | — | The staged `ID` becomes the camera `DRAW_NODE` and the loop render from. `BAD_ID` unless it names a live camera node. |
 | $24 | `SET_VISIBLE` | 1 | `ARG0` 0 or 1 | Skips the node without destroying it. Any other `ARG0` value is `BAD_ARGS`. |
+| $25 | `CREATE_SPRITE` | 2 | `ARG0-1` texture resource ID | Creates a billboard node under the staged `ID`. Starts one world unit square, masked and screen-upright, so a sprite you never call `SET_SPRITE` on is still a sprite you can see. Same replace-on-live-`ID` and `OUT_OF_MEMORY` behaviour as `CREATE_OBJECT`. |
+| $26 | `CREATE_LIGHT` | 0 | — | Creates a point-light node under the staged `ID`, **off**: strength and radius both start at zero and it lights nothing until `SET_POINT_LIGHT` gives it both. Position it with the ordinary transform opcodes — it is a node like any other. |
+| $27 | `SET_SPRITE` | 5 | `ARG0-1` width, `ARG2-3` height (8.8 world units), `ARG4` flags | `BAD_ID` unless the staged `ID` is a live sprite node. Flags: bit0 directional (`ARG0` of `CREATE_SPRITE` then names the **first of eight** consecutive texture IDs and the view drawn follows the camera, exactly as class 2's `DRAW_THINGS` does), bit1 depth-test but do not write, bit2 opaque (index 0 is a colour, not a hole), bit3 unlit. |
+| $28 | `SET_POINT_LIGHT` | 3 | `ARG0` strength, `ARG1-2` radius (8.8 world units) | `BAD_ID` unless the staged `ID` is a live light node. Strength is in colormap levels added at the light's centre, falling off to nothing at `radius`. **Either being zero turns the light off** without destroying the node — which, with `SET_VISIBLE`, is the cheap way to switch one. |
 
 ### Transforms — $30-$3F
 
-All act on the staged node `ID` (object or camera — both carry a
-position/orientation), and all write into the retained node table, not a
-shadow copy — an immediate-mode `DRAW_NODE` sees the change on its very next
-call.
+All act on the staged node `ID`. Every node type carries a
+position/orientation, so these are how a camera is aimed, a sprite is put
+somewhere and turned to face a direction (its yaw is what the directional
+flag reads), and a light is moved — there is no separate "set light
+position" opcode. `SET_SCALE` is the exception: it is used only by object
+nodes, since a sprite is sized by `SET_SPRITE` and a light has no size.
+
+Outside the loop these write into the retained node table, not a shadow copy
+— an immediate-mode `DRAW_NODE` sees the change on its very next call. While
+the loop is running they are redirected to the shadow scene and take effect
+at the next `SCENE_COMMIT`; see Frame lifecycle.
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
@@ -133,8 +146,9 @@ call.
 
 ### Immediate mode — $40-$4F
 
-Legal only with the loop stopped — which today means always, since the loop
-cannot be started. Otherwise `BUSY`.
+Legal only with the loop stopped. While the autonomous loop runs, all three
+answer `BUSY` — it owns the framebuffer and the scene for as long as it is
+running.
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
@@ -188,15 +202,25 @@ useful way to wait.
 
 The autonomous loop (handshake mode, `LOOP_START ARG0=0`, live as of
 stage 16) is the model the whole class 1 design has been building toward:
-core 1 renders a whole frame — clear, every visible `OBJECT` node under the
-active camera, in scene order — on its own, every commit, instead of the C64
-issuing each draw itself.
+core 1 renders a whole frame on its own, every commit, instead of the C64
+issuing each draw itself. The frame is, in order:
+
+1. clear the viewport (colour and z-buffer),
+2. apply the active camera,
+3. apply the live point lights,
+4. every visible `OBJECT` node, in scene order,
+5. every visible `SPRITE` node, in scene order.
+
+Objects before sprites, and not one interleaved pass, because sprites are
+depth-tested against geometry that is by then already in the z-buffer. A
+node whose mesh or texture ID does not resolve is skipped, not an error —
+one stale ID must not blank an otherwise-good frame.
 
 **Starting it.** `LOOP_START` snapshots the live scene/render state into a
 shadow copy and queues the first frame. From that point on, every opcode
 that would normally mutate the live scene graph or per-frame render state
 (`SET_VIEWPORT`/`SET_PERSPECTIVE`/`SET_LIGHT`/`BUILD_COLORMAP`/
-`SET_BACKGROUND`, every $20-$24/$30-$36 scene-node opcode) instead writes the
+`SET_BACKGROUND`, every $20-$28/$30-$36 scene-node opcode) instead writes the
 **shadow** copy and returns immediately, without waiting on the ring at
 all — that's what makes moving ten objects between two commits cheap: none
 of those ten calls can race the frame core 1 is currently rendering, because
@@ -214,14 +238,37 @@ without the C64 waiting for that next frame to actually finish rendering.
 `RESULT` after `SCENE_COMMIT` returns is the page the frame just flipped to
 was rendered into.
 
-**Polling for the next one.** `STATUS` bit4 (`GPU64_STATUS_FRAME_READY`)
-goes high the moment core 1 finishes a frame — checked on every dispatch, not
-only when `SCENE_COMMIT` happens to run, so a program that polls `STATUS`
-between commits sees it as soon as it's true. A `SCENE_COMMIT` issued before
-the previous frame is actually ready answers `BUSY` rather than committing
-against a still-in-flight render — in practice this should not happen, since
-`SCENE_COMMIT` itself already waits for the previous frame to drain before
-it does anything else, but it is checked rather than assumed.
+**Polling for the next one — wait on two bits, not one.** The predicate a
+frame loop must poll is `FRAME_READY` **set and `BUSY` clear**:
+
+```asm
+    lda STATUS
+    and #$11                ; FRAME_READY | BUSY
+    cmp #$10
+    bne poll                ; not ready, or a flip is still pending
+```
+
+`STATUS` bit4 (`GPU64_STATUS_FRAME_READY`) goes high once core 1 has finished
+a frame. Both bits are updated on the **frame clock**, inside the same vblank
+handler that retires the flip — not only when the C64 happens to send a
+command — so a read-only poll loop is enough and no command traffic is needed
+to make progress. (Before 2026-09-08 the bit really was raised only on a
+dispatch, which made this loop stall for its whole timeout on any frame where
+core 1 finished after the last command of the frame; if you are running older
+firmware, that is the symptom.) Bit4 says nothing about the page flip the
+*previous*
+`SCENE_COMMIT` armed: that flip only retires at the next vblank, and until it
+does, `SCENE_COMMIT` answers `BUSY` rather than arming a second flip over an
+un-presented one. Bit0 (`GPU64_STATUS_BUSY`) is cleared by the same vsync
+handler that clears the pending flip, so the two-bit test is exactly the
+question "may I commit now?".
+
+Polling `FRAME_READY` alone is not incorrect — it never commits against a
+still-in-flight render — it is just wasteful: the loop spins issuing commits
+that are refused, and each refusal costs a DMA hold that stops the 6510. At
+the bench on 2026-09-08 the Quake demo drew 6099 accepted frames against
+15838 `BUSY` answers, 72% of its commit traffic thrown away, while still
+rendering at the full 60 Hz the flip rate allows.
 
 **Stopping it.** `LOOP_STOP` always succeeds. A frame already queued when it
 arrives still finishes on core 1 — there is no way to cancel a frame in
@@ -229,11 +276,78 @@ flight — but nothing further reads its result once the loop is stopped.
 `SCENE_RESET` also stops the loop (and drops the shadow copy) as part of
 destroying every node, per its own row above.
 
+**No 2D overlay while the loop runs.** The loop owns the framebuffer, and
+in handshake mode there is no moment between its frames at which the C64 may
+draw into the page that is about to be shown: a class 0 framebuffer op
+issued against a running loop is racing core 1's render of that same page.
+So a HUD, a weapon sprite, a status bar — anything that used to be drawn
+over a finished 3D view with class 0 — cannot be done this way. Either put
+it in the scene (a `SPRITE` node with the unlit flag, positioned in front of
+the camera) or keep it on the C64's own screen, which is where the class-1
+Quake demo puts its report. This is a real limitation of the stage-16 loop,
+not an oversight; immediate mode (`DRAW_MESH`/`DRAW_NODE` with the loop
+stopped) has no such restriction and can still be overlaid freely.
+
 **What free-running mode (`LOOP_START ARG0=1`) will add**, once built: the
 same loop driven by vblank instead of by `SCENE_COMMIT` — the C64 never
 calls anything per frame at all, it just edits the shadow state whenever it
 likes and the loop picks up whatever was last written each vsync. Not yet
 implemented; `ARG0=1` is `UNSUPPORTED`.
+
+## What retaining the scene actually costs
+
+`Source/Demos/gpu64_demo_quake.a` and `Source/Demos/gpu64_demo_quake3d.a`
+are the same room, the same monsters and the same controls, written twice:
+once in class 2's immediate mode, once as a retained class 1 scene driven
+by the handshake loop. The second is the port stage 17 asked for, and it
+exists so that "retained is cheaper on the bus" is a measurement rather
+than an argument.
+
+The figures below come from `tools/prgsim`, which counts every dispatch and
+every write into the `$DF0B-$DF23` window. They are **marginal** per-frame
+costs — a 400-frame run subtracted from an 800-frame one — so one-time
+start-up traffic is out of them. That start-up is smaller than it sounds:
+about 60 dispatches and 570 register writes for class 1 (against class 2's
+45 and 450) to create every node and upload the mesh, ten textures and the
+colormap, because bulk data moves by REU DMA — the C64 writes a blob
+descriptor, never the bytes. "Moving" holds two keys down so the camera
+changes on every frame; "standing still" touches nothing.
+
+| Per frame | class 2, immediate | class 1, retained |
+|---|---|---|
+| moving — dispatches | 11 | 6 |
+| moving — register writes | 102 | 70 |
+| standing still — dispatches | 11 | 4 |
+| standing still — register writes | 102 | 42 |
+
+Class 2 pays the same on every frame because it redraws: camera, two
+lights, `FILL_VIEW`, `DRAW_WORLD`, `DRAW_THINGS`, `STATS`, the weapon
+sprite, the status bar and the flip go out whether or not anything moved.
+Class 1's six are the camera's position and orientation, the orientation of
+the monster that turns, the position and orientation of the monster that
+walks, and `SCENE_COMMIT`. Everything else — thirty triangles, ten
+textures, the directional light, the torch, and every transform that did
+not change — is resident and is never sent again.
+
+**Read the table honestly in two places.**
+
+*It is not a like-for-like comparison of 3D work.* Part of class 2's
+per-frame total is class 0: the status bar and HUD text it draws onto the
+HDMI view, which class 1 cannot do at all while the loop owns the
+framebuffer (see above). Split by class, class 2's frame is **7 dispatches
+and 74 register writes of class 2 rendering, plus 4 and 28 of class 0
+overlay**; class 1's is class 1 throughout. So against the rendering half
+alone the retained scene is only slightly ahead while the player is moving
+(6 / 70 against 7 / 74) and properly ahead when he is not (4 / 42) — the
+headline 11 → 6 is in large part the HUD moving to the C64's own screen
+rather than traffic that vanished. Say it that way round.
+
+*The number that matters most is not in the table.* The C64 is DMA-halted
+for the whole of every dispatch, and only for a dispatch: `waitReady`'s
+poll of `STATUS` bit 4 is a plain read that costs nothing. So the dispatch
+column is also the count of times per frame the C64 stops dead — and the
+frame those six commands describe is rendered on core 1 while the C64 keeps
+running, which is the part immediate mode cannot do at any price.
 
 ## Mesh format
 
@@ -323,6 +437,31 @@ Face `flags` bit2 (unlit) skips this entirely for that face and draws its
 texture (or flat colour, if bit1 is also set) at full brightness — useful
 for UI-ish geometry rendered through the 3D pipeline, e.g. a cockpit panel
 that shouldn't dim when the scene does.
+
+### Point lights
+
+On top of the directional light, up to **eight** point lights, each a
+`CREATE_LIGHT` node placed by the ordinary transform opcodes and given a
+strength and a radius by `SET_POINT_LIGHT`. Their contribution is added to
+the level the directional light produced, so a scene with a low `ambient`
+and no directional light at all is lit only where the point lights reach.
+
+- Meshes are lit **per pixel**: the view-space position is interpolated
+  across the triangle the same affine way `u`/`v` are. A wall crossing a
+  light's radius gets a gradient, not one flat step.
+- Sprites are lit **per record**, once at the billboard's own position —
+  a billboard has no interior geometry for a gradient to live on.
+- The cap is eight *live* lights: a light node is skipped when it is hidden
+  (`SET_VISIBLE 0`) or inert (strength or radius zero), so a scene may hold
+  many more than eight as long as no more than eight are lit at once. Past
+  eight, the **first eight in scene order** win — scene order is node-table
+  slot order, which is the order the IDs were created in.
+- The whole lit path sits behind one branch outside the pixel loop, so a
+  frame with no live lights costs exactly what it did before lights existed.
+
+Switching a light is therefore `SET_VISIBLE`, not create/destroy: a muzzle
+flash is one node created at start-up, moved to the player each frame, and
+made visible for as long as the shot lasts.
 
 ## Depth buffer
 

@@ -104,6 +104,22 @@ OP_BLIT		= $40
 OP_BLIT_KEYED	= $41
 OP_READ_RECT	= $42
 
+; The 80x50 character screen. TEXT_MODE is a DISPLAY mode, not a drawing
+; op: while it is up there is no framebuffer page, so PAGE_FLIP and every
+; class 1 and class 2 command answer UNSUPPORTED. The plane ops are legal
+; in either mode -- with the graphics display up they update the planes and
+; paint nothing, which is how a program stages a whole screen and has it
+; appear complete at the switch. $59-$5F are undefined.
+OP_TEXT_MODE	= $50
+OP_TEXT_CLEAR	= $51
+OP_TEXT_PUT	= $52
+OP_TEXT_WRITE	= $53
+OP_TEXT_UPLOAD	= $54
+OP_TEXT_CHARSET	= $55
+OP_TEXT_SCROLL	= $56
+OP_TEXT_FILL	= $57
+OP_TEXT_REFRESH	= $58
+
 ; Fixed point 8.8 ($8x) and IEEE float32 ($9x) share a low nibble.
 OP_MAT_MUL	= $80
 OP_MAT_ADD	= $81
@@ -217,6 +233,7 @@ ERR_OUT_OF_MEM	= $08
 ERR_QUEUE_FULL	= $09
 ERR_BAD_ID	= $0a
 ERR_NO_CAMERA	= $0b
+ERR_WORKER_TIME	= $0c
 
 ; --- harness fail codes ------------------------------------------------
 F_CMP		= $e1
@@ -231,6 +248,38 @@ FB_H		= 200
 FB_PAGES	= 3
 BORDER_W	= 32
 BORDER_H	= 36
+
+; --- text mode geometry ------------------------------------------------
+; A second display geometry, not a window: 640x400 inside a 64x72 border,
+; which is exactly twice the graphics figures so the framing looks the same
+; on the same display. GET_INFO reports these while text mode is up, and
+; that is how a program confirms the switch really happened.
+TXT_COLS	= 80
+TXT_ROWS	= 50
+TXT_CELLS	= TXT_COLS * TXT_ROWS		; 4000
+TXT_W		= 640
+TXT_H		= 400
+TXT_PAGES	= 1
+TXT_BORDER_W	= 64
+TXT_BORDER_H	= 72
+
+; The three parallel planes TEXT_UPLOAD writes, one byte per cell, indexed
+; row-major as cell = row * 80 + col.
+TXT_PLANE_SCREEN = 0
+TXT_PLANE_FG	= 1
+TXT_PLANE_BG	= 2
+
+; TEXT_WRITE flags: take the payload as ASCII and translate it to screen
+; codes for the character set currently up. Clear it to pass screen codes
+; through untouched, which is the only way to reach the graphics half of
+; the ROM or to set bit 7.
+TXT_ASCII	= $01
+
+; Screen code bit 7 is reverse video, exactly as at $0400.
+TXT_REVERSE	= $80
+
+TXT_SET_UPPER	= 0			; upper case and graphics
+TXT_SET_LOWER	= 1			; lower case and upper case
 
 SPACE_C64	= 0
 SPACE_REU	= 1

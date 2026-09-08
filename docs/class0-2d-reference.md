@@ -23,7 +23,7 @@ opcode below can return.
 | $07 | `LOG_ENABLE` | 1: 0/1 | Turns firmware-side debug logging on or off. Has no effect on drawing. |
 | $08 | `SET_BORDER` | 1: colour | Sets the HDMI border colour. Overridden automatically by the sticky under-voltage indicator — see the health block below. |
 | $09 | `VBLANK_SYNC` | none | Blocks until the next vblank. May halt up to a full frame. `UNSUPPORTED` if the boot-time frame period measurement failed. |
-| $0A | `GET_HEALTH` | 0-5: dest descriptor | Writes the 12-byte health block (below) to the given destination. |
+| $0A | `GET_HEALTH` | 0-5: dest descriptor | Writes the health block (below) to the given destination — 12 bytes, or up to 48 with the diagnostic counters. |
 
 ## Whole surface — $10–$1F
 
@@ -124,15 +124,22 @@ Written by `GET_INFO` ($06), 16 bytes:
 
 ## Health block
 
-Written by `GET_HEALTH` ($0A), 12 bytes. The Pi reports its own
-throttle/temperature state; a sticky under-voltage condition survives even
-a hang, because it's read out of hardware state, not firmware state.
+Written by `GET_HEALTH` ($0A). The Pi reports its own throttle/temperature
+state; a sticky under-voltage condition survives even a hang, because it's
+read out of hardware state, not firmware state.
+
+Ask for 12 bytes and you get the block below. Ask for 20, 36 or 48 and you
+additionally get the diagnostic counters described under "Diagnostic
+extension"; any other `len` ≥ 12 is rounded *down* to the next of those four
+sizes, so a program written against the 12-byte block keeps working
+unchanged.
 
 | Offset | Size | Contents |
 |---|---|---|
-| 0 | 4 | Throttle word — see bit table below |
-| 4 | 4 | Core temperature, millidegrees C |
-| 8 | 4 | Reserved |
+| 0 | 4 | Throttle word, current and sticky bits — see bit table below |
+| 4 | 4 | Throttle word as latched since boot (sticky bits only) |
+| 8 | 2 | Core temperature, tenths of a degree C |
+| 10 | 2 | Highest core temperature seen this session, tenths of a degree C |
 
 Throttle word bits:
 
@@ -155,6 +162,29 @@ anything else. gpu64 automatically forces the HDMI border red for the rest
 of the session the first time bit 16 latches, independent of whatever
 `SET_BORDER` last asked for — this is deliberate and is not a bug in
 `SET_BORDER`.
+
+### Diagnostic extension
+
+Everything past byte 12 is an instrument, not a feature: 16-bit saturating
+counters that exist so a bench program can read the firmware's own view of
+itself without turning the log on and changing what it is measuring. They
+are stable enough to write a test against and are not part of the drawing
+contract.
+
+| Offset | Size | Contents |
+|---|---|---|
+| 12 | 8 | Flip path: drain timeouts, post-full timeouts, slow flips, flips posted |
+| 20 | 6 | DMA hold spacing: smallest gap, smallest dispatch→commit gap, ARM cycles per C64 cycle — all in raw ARM cycles |
+| 26 | 10 | Hold-gap histogram buckets 0-2, dispatch→commit asserts under 4 C64 cycles, holds opened |
+| 36 | 4 | Hold gate: gates armed, gates fired. Equal is the healthy steady state |
+| 40 | 2 | Hold gate: worst wait from arm to hold, in C64 cycles |
+| 42 | 2 | Hold gate: passes an armed gate could not fire on |
+| 44 | 4 | Hold gate: `CMD_LO` writes deferred as read-modify-write, and deferred dispatches that ran |
+
+Bytes 44-47 are 0 for every program that writes `CMD_LO` with a plain `sta`,
+which is every program in this tree. A non-zero value there means something
+is doing `inc $DF0C` or an indexed store whose dummy read lands in `$DFxx` —
+safe, and handled, but worth knowing about.
 
 ## Matrix and vector ops — $80–$9F
 

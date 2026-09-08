@@ -70,6 +70,10 @@
 #define GPU64_3D_OP_DESTROY_NODE	0x22
 #define GPU64_3D_OP_SET_ACTIVE_CAMERA	0x23
 #define GPU64_3D_OP_SET_VISIBLE		0x24
+#define GPU64_3D_OP_CREATE_SPRITE	0x25
+#define GPU64_3D_OP_CREATE_LIGHT	0x26
+#define GPU64_3D_OP_SET_SPRITE		0x27
+#define GPU64_3D_OP_SET_POINT_LIGHT	0x28
 
 // Transforms -- $30-$3F
 #define GPU64_3D_OP_SET_POSITION	0x30
@@ -136,6 +140,31 @@ void gpu64_3dWorker( void );
 // this -- including just the next DRAW_NODE -- and then reading RESULT gets
 // it. See docs/class1-3d-mesh-reference.md's "Deferred RESULT" note.
 boolean gpu64_3dSync( void );
+
+// gpu64 (2026-09-08): harvest a finished loop frame from OUTSIDE a dispatch.
+//
+// GPU64_STATUS_FRAME_READY is raised by pollLoopFrame(), and until now
+// pollLoopFrame() ran only from gpu64_3dDispatch() -- i.e. only when the C64
+// wrote CMD_LO. A read of STATUS is not a dispatch, so a program that sat in
+// a read-only poll loop waiting for the bit could never see it rise:
+// SCENE_COMMIT clears FRAME_READY on its way out, and nothing short of the
+// next command put it back. docs/class1-3d-mesh-reference.md promised the
+// opposite ("a program that polls STATUS between commits sees it as soon as
+// it's true") and tools/prgsim modelled the promise rather than the code,
+// which is why every desk check passed. On the bench 2026-09-08 the Quake
+// demo froze for its full 8000-poll budget (~133 ms, eight displayed frames)
+// on 162 of 8173 frames -- once a second, and exactly the judder the user
+// reported. Every one of those stalls ended in an ACCEPTED commit, which is
+// the fingerprint: the loop was never busy, the bit was simply orphaned.
+//
+// gpu64_vsyncCommitFlip() calls this from inside its DMA hold. That is the
+// only safe home for it: it reads gpu64_3dRing.tail, a line core 1 writes,
+// which reuUsingPolling() must never touch while the C64 is free-running --
+// but with the bus held there is no per-C64-cycle deadline, the same
+// shipped-and-verified exemption logGpu64_3dStats() already relies on. It
+// also means the harvest happens once a frame on the frame clock, regardless
+// of whether the C64 sends anything at all.
+void gpu64_3dPollLoopFrame( void );
 
 // Formats the subsystem's counters for the on-screen log (bring-up aid,
 // phase 0's only output). Returns the end pointer.
