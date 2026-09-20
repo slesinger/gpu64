@@ -119,6 +119,8 @@ public:
 	boolean CommitFlip( void );
 	// Back to the reset arrangement: page 0 drawn and visible.
 	void ResetPages( void );
+	// Every page to black, border band included, and cleaned out to DRAM.
+	void ClearAllPages( void );
 
 	// Blocks until the display's next vertical sync. A mailbox round-trip
 	// to the VideoCore, so this is boot- and setup-time only -- see
@@ -166,11 +168,23 @@ public:
 	// --- palette --------------------------------------------------------
 	void SetPaletteEntry( u8 nIndex, u8 r, u8 g, u8 b );
 	boolean CommitPalette( void );
+	// The boot palette: the C64 16 in 0-15, black through 254, white at
+	// GPU64_LOG_INK. Commits it unless the display is not up yet.
+	void ResetPalette( void );
 	// gpu64: the palette as the ARM last set it, 3 bytes an entry. Circle's
 	// CBcmFrameBuffer takes palette writes and never gives them back, and
 	// milestone 6's BUILD_COLORMAP has to search the palette for nearest
 	// matches -- so this class keeps a shadow copy. Always 256 entries.
 	const u8 *GetPaletteRGB( void ) const	{ return m_Palette; }
+
+	// --- firmware-drawn text --------------------------------------------
+	// 8x8 glyphs from the C64 character ROM onto the draw page, addressed in
+	// 40x25 character cells and clipped to that grid.
+	void DrawC64Text( unsigned nCol, unsigned nRow, const char *pString,
+			  u8 nInk, u8 nPaper );
+	// What HDMI shows while the C64 has no clock -- see gpu64_deadClockEnter()
+	// in rad_reu.cpp.
+	void ShowHoldingScreen( void );
 
 	// --- on-screen log overlay -----------------------------------------
 	void LogWrite( const char *pString, unsigned nLength );

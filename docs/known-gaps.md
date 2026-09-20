@@ -41,6 +41,14 @@ programs. It does not yet walk through:
   exist (`SET_LIGHT` slots 0-7); a 9th call is `BAD_ARGS`, not queued. A
   real level needs a strategy for which 8 lights are live near the camera
   at any moment, and that strategy isn't demonstrated anywhere yet.
+- **Class-1 point lights are still positioned affinely** — a mesh's
+  texture coordinates are perspective correct, but the view-space position
+  the point lights are evaluated at is interpolated affinely across the
+  triangle (`px`/`py`/`pz` in `gpu64_3dRasterTriangle()`). The lit patch is
+  in the right place on a face seen roughly head-on and drifts by a few
+  pixels on a large one at a grazing angle; `tools/hostsim`'s "point light
+  orbit" checks print that error directly. Class 2 already corrects it, the
+  same way and in the same place it corrects `s`/`t`.
 - **`THING_DIRECTIONAL`'s eight-consecutive-texture-id requirement** — a
   directional thing's texture id is the *first* of eight ids that must all
   be live and consecutive; there's no worked example of uploading and

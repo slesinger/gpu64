@@ -8,6 +8,8 @@
 #include "gpu64_flip.h"
 #include "gpu64_holdgap.h"
 #include "gpu64_holdgate.h"
+#include "gpu64_busstats.h"
+#include "gpu64_apidiag.h"
 #include "gpu64_ladder.h"
 #include "gpu64_3d.h"
 #include "gpu64_raster.h"
@@ -25,6 +27,9 @@ extern u8 gpu64ApiActive;
 // comment on GPU64REGS in gpu64_api.h for why. The short aliases keep the
 // rest of this file reading the way it did.
 GPU64REGS gpu64Regs = { 0, 0, GPU64_ERR_OK, { 0, 0 }, 0, { 0 } };
+
+u16 gpu64DmaWinBase = 0;
+u16 gpu64DmaWinLen  = 0;			// 0 = the whole 64K, the compatible default
 
 #define sCmdHi	gpu64Regs.cmdHi
 #define sStatus	gpu64Regs.status
@@ -47,6 +52,32 @@ static u8 sBlobC[ 65536 ];
 #define GPU64_MAX_INVERSE_N	64
 static double sInvWork[ GPU64_MAX_INVERSE_N * GPU64_MAX_INVERSE_N * 2 ];
 
+GPU64APIDIAG gpu64ApiDiag;
+
+// gpu64 (2026-09-10): the one-shot key's holding place -- gpu64_api.h has the
+// contract. Written once per dispatch, read by whichever class the dispatch
+// belongs to.
+u8 gpu64ApiKey = 0;
+
+// gpu64: the seven-flag snapshot behind GET_HEALTH byte 86 -- see
+// gpu64_apidiag.h. Cheap enough to call on every refusal: four loads and a
+// virtual call that only happens on a path that has already decided to fail.
+u8 gpu64_apiDiagStateByte( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	u8 st = 0;
+#ifdef GPU64_3D_ENABLED
+	if ( gpu64_3dLoopRunning() )				st |= GPU64_DIAG_LOOP_RUNNING;
+#endif
+	if ( gpu64Vsync.calibrated )				st |= GPU64_DIAG_CALIBRATED;
+	if ( pFB && pFB->GetMode() == GPU64_MODE_GRAPHICS )	st |= GPU64_DIAG_MODE_GRAPHICS;
+	if ( gpu64Vsync.flipPending )				st |= GPU64_DIAG_FLIP_PENDING;
+	if ( gpu64Regs.status & GPU64_STATUS_FRAME_READY )	st |= GPU64_DIAG_FRAME_READY;
+	if ( gpu64Regs.status & GPU64_STATUS_BUSY )		st |= GPU64_DIAG_BUSY;
+	if ( pFB && pFB->IsInitialized() )			st |= GPU64_DIAG_HAVE_FB;
+	return st;
+}
+
 void gpu64_apiReset( void )
 {
 	sCmdHi  = 0;
@@ -57,6 +88,13 @@ void gpu64_apiReset( void )
 	for ( unsigned i = 0; i < GPU64_ARG_COUNT; i++ )
 		sArg[ i ] = 0;
 	sSeq = sSeqAck = 0;
+	// Back to unrestricted. A C64 reset means a new program owns the
+	// machine and the window the last one declared describes a memory map
+	// that no longer exists -- and leaving it set would make every readback
+	// the new program tries answer OUT_OF_RANGE for reasons nothing on its
+	// side could explain.
+	gpu64DmaWinBase = 0;
+	gpu64DmaWinLen  = 0;
 	// The frame clock's calibration survives -- it describes the display,
 	// not the session -- but nothing else about the vblank state does.
 	gpu64_vsyncResetState();
@@ -334,6 +372,16 @@ struct GPU64HEALTH
 };
 static GPU64HEALTH s_Health = { 0, 0, 0, 0, 0, 0 };
 
+// gpu64: the latched half of GET_THROTTLED as it stood at the last session
+// reset. The VideoCore's *_EVER bits latch until the *Pi* reboots, and the
+// Pi now outlives the C64 -- so simply zeroing s_Health on a C64 reset
+// achieves nothing: the very next GET_HEALTH reads the same latched word
+// back and re-reddens the border for an under-voltage that belongs to a
+// previous session. Masking this baseline out of the alarm test is what
+// makes the sticky flags session-scoped, while an event that happens after
+// the reset still shows through.
+static u32 s_HealthEverBase = 0;
+
 // Little-endian 16-bit, clamped -- these counters are diagnostics, and a
 // wrapped one would read as healthy.
 static inline void saturate16( u8 *p, u32 v )
@@ -387,12 +435,82 @@ static void readHealth( void )
 	// without the C64's help and goes on saying it after everything else has
 	// stopped: red the moment the VideoCore admits to an under-voltage.
 	if ( !s_Health.flagged
-	     && ( s_Health.sticky & ( GPU64_THR_UNDERVOLT_NOW | GPU64_THR_UNDERVOLT_EVER ) ) )
+	     && ( s_Health.sticky & ~s_HealthEverBase
+		  & ( GPU64_THR_UNDERVOLT_NOW | GPU64_THR_UNDERVOLT_EVER ) ) )
 	{
 		s_Health.flagged = 1;
 		if ( g_pGpu64FB )
 			g_pGpu64FB->SetBorder( GPU64_HEALTH_BORDER_ALARM );
 	}
+}
+
+// gpu64: back to the health state the Pi boots with, as far as the hardware
+// permits. Refreshing first is deliberate: s_Health.throttled would otherwise
+// hold whatever the last GET_HEALTH saw, which in a session that never issued
+// one is zero -- and a zero baseline masks nothing.
+static void healthReset( void )
+{
+	readHealth();
+	s_HealthEverBase = s_Health.throttled & 0xffff0000;
+	s_Health.sticky = 0;
+	s_Health.flagged = 0;
+	s_Health.tempMax10 = 0;
+	s_Health.samples = 0;
+}
+
+// gpu64: everything a C64 reset must undo that gpu64_apiReset() above does
+// not -- which is the whole of the display.
+//
+// gpu64_apiReset() has always cleared the register file and both drawing
+// classes, but nothing ever reset CGpu64FrameBuffer: mode, palette, border,
+// draw/visible page and the 80x50 text planes all survived a reset and a
+// whole change of program. The sharpest consequence was that a program which
+// left the display in text mode killed the screen mirror outright --
+// CRAD::showMirror() blits into PageBuffer( GetDrawPage() ), the *graphics*
+// page, with no mode check, so every snapshot after the reset painted
+// somewhere the VideoCore was not scanning out and HDMI stayed frozen on the
+// old text screen for good.
+//
+// Deliberately does NOT touch gpu64Regs. Both bus loops call this right
+// after resetREU(), which already calls gpu64_apiReset() and owns the
+// register file; FULL_RESET ($0B) calls it from inside a dispatch, where
+// clearing sSeq/sSeqAck would break the sequence-gap detector the whole
+// command protocol rests on.
+//
+// It is called from the reset branch rather than from resetREU() itself on
+// purpose: resetREU() also runs on every fresh entry into REU emulation, and
+// blanking the display there would wipe the mirror the moment the user
+// switches the RAD menu to REU.
+void gpu64_apiFullReset( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+
+	gpu64_vsyncResetState();
+
+	// Stage 15b observation point, and the strongest reason this cannot be
+	// a plain memset: a class 1 render may still be queued on core 1 with
+	// one of the pages below as its target. Drain before mutating.
+#ifdef GPU64_3D_ENABLED
+	gpu64_3dSync();
+#endif
+	gpu64_flipDrain();
+
+	if ( pFB )
+	{
+		// A no-op unless a program actually left text mode; when it did,
+		// this reprograms the VideoCore, which is the expensive path and
+		// the reason the callers below are all edge-triggered.
+		pFB->SetMode( GPU64_MODE_GRAPHICS );
+		pFB->ResetPalette();
+		pFB->ResetPages();
+		// ClearAllPages() memsets the border band too, so SetBorder() has
+		// to follow it -- the same order SetMode() uses.
+		pFB->ClearAllPages();
+		pFB->SetBorder( 0 );
+	}
+
+	gpu64_textReset();
+	healthReset();
 }
 
 static u8 doSystem( u8 op )
@@ -431,6 +549,38 @@ static u8 doSystem( u8 op )
 		gpu64_textReset();
 		if ( pFB && pFB->GetMode() == GPU64_MODE_TEXT )
 			gpu64_textRenderRows( 0, GPU64_TXT_ROWS );
+		return GPU64_ERR_OK;
+
+	case 0x0B:					// FULL_RESET
+		// The whole display back to the state it has one instruction after
+		// the Pi boots -- graphics mode, C64 palette, border 0, page 0
+		// drawn and visible, every page black, text planes cleared. This is
+		// what a C64 reset now runs by itself (resetREU(), rad_reu.cpp); the
+		// opcode exists so a program can get there without one, which until
+		// now every demo had to approximate with an unconditional
+		// TEXT_MODE 0 at start-up.
+		//
+		// A setup-time command, never a per-frame one: leaving text mode
+		// reprograms the VideoCore, and the C64 is halted for all of it.
+		//
+		// Deliberately leaves gpu64ApiActive set and the mirror latched
+		// off. A program issuing this still owns the screen; only a real
+		// C64 reset means BASIC has the machine back.
+		//
+		// STATUS is cleared AFTER the reset, not before. gpu64_apiFullReset()
+		// runs gpu64_3dSync() as its Stage 15b observation point, and
+		// pollLoopFrame() inside it can harvest a loop frame that core 1
+		// finished while this command was being assembled -- setting
+		// FRAME_READY and stamping RESULT. Clearing first let that land on
+		// top of the clear, so a FULL_RESET could answer with FRAME_READY set
+		// and a previous frame's page number in RESULT. The /RESET path never
+		// showed it: resetREU() calls gpu64_apiReset() first, which drains
+		// the loop frame, so its gpu64_apiFullReset() has nothing to harvest.
+		// The opcode is the only caller with a render possibly still in
+		// flight.
+		gpu64_apiFullReset();
+		sStatus = 0;
+		sResult = 0;
 		return GPU64_ERR_OK;
 
 	case 0x02:					// VBLANK_ARM
@@ -585,6 +735,33 @@ static u8 doSystem( u8 op )
 		return gpu64_blobWrite( space, addr, 16, info );
 	}
 
+	case 0x0C:					// SET_DMA_WINDOW
+	{
+		// ARG0-1 base, ARG2-3 length, both little-endian, C64 space. A
+		// length of 0 restores the default and means "anywhere".
+		//
+		// This is the one guard a client can put between a lost ARG byte
+		// and the Pi writing over its code. It does not make the
+		// destination correct -- nothing can, the address arrives over the
+		// same unprotected registers -- it makes a wrong one land inside a
+		// buffer the program has already written off, or fail outright.
+		//
+		// RESULT gets a checksum of what was stored, because a client
+		// cannot read ARG back: the register file answers $FF for
+		// everything except STATUS/ERRCODE/RESULT/SEQACK. Verifying the
+		// window therefore has to go through RESULT, and the same
+		// range-then-retry rule as every other readback applies
+		// (docs/error-codes.md).
+		const u16 base = (u16)( sArg[ 0 ] | ( sArg[ 1 ] << 8 ) );
+		const u16 len  = (u16)( sArg[ 2 ] | ( sArg[ 3 ] << 8 ) );
+		if ( len != 0 && (u32)base + (u32)len > 65536 )
+			return GPU64_ERR_OUT_OF_RANGE;
+		gpu64DmaWinBase = base;
+		gpu64DmaWinLen  = len;
+		sResult = (u8)( sArg[ 0 ] ^ sArg[ 1 ] ^ sArg[ 2 ] ^ sArg[ 3 ] ^ 0xA5 );
+		return GPU64_ERR_OK;
+	}
+
 	case 0x0A:					// GET_HEALTH
 	{
 		u8 space; u32 addr, len;
@@ -594,7 +771,7 @@ static u8 doSystem( u8 op )
 
 		readHealth();
 
-		u8 h[ 48 ];
+		u8 h[ 132 ];
 		memset( h, 0, sizeof h );
 		h[ 0 ] = (u8)( s_Health.throttled & 0xff );
 		h[ 1 ] = (u8)( ( s_Health.throttled >> 8 ) & 0xff );
@@ -657,10 +834,247 @@ static u8 doSystem( u8 op )
 		saturate16( h + 44, gpu64HoldGate.dispatchDeferred );
 		saturate16( h + 46, gpu64HoldGate.dispatchFired );
 
-		// Length-compatible with the 12-, 20- and 36-byte contracts: a caller
-		// that asks for any of them still gets exactly what it always got.
+		// gpu64: bytes 48-63, added 2026-09-09, are the bus-sampling
+		// instrument (gpu64_busstats.h) -- how many IO2 accesses to the
+		// gpu64 window the polling loop actually serviced, and how many of
+		// those carried an address no gpu64 register occupies. Riding
+		// GET_HEALTH for the same reason as the three blocks above.
+		//
+		// reads and writes are full 32-bit little-endian, not saturated:
+		// they are denominators, and a saturated denominator is useless.
+		// The counts a caller wants are always *differences* between two
+		// GET_HEALTH calls, so wrap-around at 2^32 costs nothing.
+		//
+		// How to read the block is in gpu64_busstats.h; the short version
+		// is that readsBad > 0 means an address was mis-sampled, while
+		// reads falling short of what the C64 issued means the access never
+		// arrived at all. orBadAddr and andBadAddr name the address bits
+		// that moved -- expect them in the high nibble, A4-A7, which are the
+		// pins the LVC257 multiplexes.
+		h[ 48 ] = (u8)( gpu64BusStats.reads & 0xff );
+		h[ 49 ] = (u8)( ( gpu64BusStats.reads >> 8 ) & 0xff );
+		h[ 50 ] = (u8)( ( gpu64BusStats.reads >> 16 ) & 0xff );
+		h[ 51 ] = (u8)( ( gpu64BusStats.reads >> 24 ) & 0xff );
+		h[ 52 ] = (u8)( gpu64BusStats.writes & 0xff );
+		h[ 53 ] = (u8)( ( gpu64BusStats.writes >> 8 ) & 0xff );
+		h[ 54 ] = (u8)( ( gpu64BusStats.writes >> 16 ) & 0xff );
+		h[ 55 ] = (u8)( ( gpu64BusStats.writes >> 24 ) & 0xff );
+		saturate16( h + 56, gpu64BusStats.readsBad );
+		saturate16( h + 58, gpu64BusStats.writesBad );
+		h[ 60 ] = gpu64BusStats.lastBadAddr;
+		h[ 61 ] = gpu64BusStats.orBadAddr;
+		h[ 62 ] = gpu64BusStats.andBadAddr;
+		h[ 63 ] = gpu64BusStats.lastBadWrite;
+
+		// gpu64: bytes 64-79, added 2026-09-09, are the two dispatch-side
+		// counters (gpu64_busstats.h). Full 32-bit and unsaturated for the
+		// same reason as reads/writes above: dispatches is a denominator.
+		//
+		// The pair answers the question the 2026-09-09 quake3d run left
+		// open -- 1284 SEQACK mismatches in 7703 SCENE_COMMITs, against a
+		// bus the probe had just measured as clean over 111000 accesses.
+		// Three readings, and they do not overlap:
+		//
+		//   dispatches short by the mismatch count -> the CMD_LO writes
+		//     were lost and the commands never ran.
+		//   dispatches match, seqRepeat == the mismatch count -> the
+		//     commands all ran; the SEQ writes were lost.
+		//   dispatches match, seqRepeat == 0 -> nothing was lost at all
+		//     and the mismatch is in the C64's *read* of SEQACK.
+		h[ 64 ] = (u8)( gpu64BusStats.dispatches & 0xff );
+		h[ 65 ] = (u8)( ( gpu64BusStats.dispatches >> 8 ) & 0xff );
+		h[ 66 ] = (u8)( ( gpu64BusStats.dispatches >> 16 ) & 0xff );
+		h[ 67 ] = (u8)( ( gpu64BusStats.dispatches >> 24 ) & 0xff );
+		h[ 68 ] = (u8)( gpu64BusStats.seqRepeat & 0xff );
+		h[ 69 ] = (u8)( ( gpu64BusStats.seqRepeat >> 8 ) & 0xff );
+		h[ 70 ] = (u8)( ( gpu64BusStats.seqRepeat >> 16 ) & 0xff );
+		h[ 71 ] = (u8)( ( gpu64BusStats.seqRepeat >> 24 ) & 0xff );
+
+		// 72-75: the `sta ARG,y` dummy reads readsBad used to swallow.
+		// Not a fault count -- it is here so the reader can see that the
+		// read side's big number has a boring explanation, and so that
+		// readsBad above can be trusted as a fault counter.
+		h[ 72 ] = (u8)( gpu64BusStats.argDummyReads & 0xff );
+		h[ 73 ] = (u8)( ( gpu64BusStats.argDummyReads >> 8 ) & 0xff );
+		h[ 74 ] = (u8)( ( gpu64BusStats.argDummyReads >> 16 ) & 0xff );
+		h[ 75 ] = (u8)( ( gpu64BusStats.argDummyReads >> 24 ) & 0xff );
+
+		// gpu64: bytes 76-79, added 2026-09-10 out of bench run 14, are
+		// the destructive-opcode key's instrument -- gpu64_api.h for the
+		// contract, gpu64_apidiag.h for what run 14 showed. 77 is the one
+		// that names a phantom: the opcode of the last destructive command
+		// refused for want of a key. 78 and 79 count the damage that still
+		// got through, so "prevented" and "never happened" stay apart.
+		h[ 76 ] = (u8)( gpu64ApiDiag.keyRefused > 255 ? 255 : gpu64ApiDiag.keyRefused );
+		h[ 77 ] = gpu64ApiDiag.keyRefusedOp;
+		h[ 78 ] = (u8)( gpu64ApiDiag.camLost > 255 ? 255 : gpu64ApiDiag.camLost );
+		h[ 79 ] = (u8)( gpu64ApiDiag.sceneWipes > 255 ? 255 : gpu64ApiDiag.sceneWipes );
+
+		// gpu64: bytes 80-95, added 2026-09-10, say WHICH of the four
+		// producers of GPU64_ERR_UNSUPPORTED a class 1 program is stuck
+		// on -- gpu64_apidiag.h has the whole reasoning.
+		//
+		// How to read it: with CMT 06 large on the C64's screen, exactly
+		// one of the three counters below is large too. commitNoLoop
+		// large means loopStopCause names what stopped the loop;
+		// classRefusedMode large means the display left graphics mode and
+		// the node updates were being refused as well, not just the
+		// commit. lastRefuseState is the seven-flag snapshot taken at the
+		// most recent refusal, which is the state the run actually died
+		// in -- not the state at GET_HEALTH time, by which point LOOP_STOP
+		// has legitimately cleared the loop flag anyway.
+		saturate16( h + 80, gpu64ApiDiag.commitNoLoop );
+		saturate16( h + 82, gpu64ApiDiag.classRefusedMode );
+		saturate16( h + 84, gpu64ApiDiag.commitNoClock );
+		h[ 86 ] = gpu64ApiDiag.lastRefuseState;
+		h[ 87 ] = gpu64ApiDiag.loopStopCause;
+		saturate16( h + 88, gpu64ApiDiag.loopStops );
+		h[ 90 ] = gpu64ApiDiag.lastRefuseOp;
+		h[ 91 ] = gpu64ApiDiag.lastRefuseClass;
+		h[ 92 ] = gpu64_apiDiagStateByte();
+
+		// 96-97: the write-side twin of bytes 61-62. Added 2026-09-11
+		// because runs 16 and 17 both reported byte 62 (andBadAddr) as
+		// $80 -- A7 set in every bad READ address -- and there was no way
+		// to ask the same question of writes, which is where the core-1
+		// A/B effect overwhelmingly lives. Same fingerprint means one
+		// mechanism in the address mux; different means two problems.
+		h[ 96 ] = gpu64BusStats.orBadWrite;
+		h[ 97 ] = gpu64BusStats.andBadWrite;
+
+		// 98-113: bad write addresses by high nibble, the discriminator
+		// bytes 96-97 could not give. See gpu64_busstats.h for what the two
+		// shapes mean.
+		for ( unsigned i = 0; i < 16; i++ )
+			h[ 98 + i ] = gpu64BusStats.badWriteNib[ i ];
+
+		// 114-121: the multiplexer-phase counters. muxMiss is how many
+		// sampled IO2 accesses came back wearing the signal nibble, muxFixed
+		// how many of those the re-read repaired. See gpu64_busstats.h.
+		h[ 114 ] = (u8)( gpu64BusStats.muxMiss & 0xff );
+		h[ 115 ] = (u8)( ( gpu64BusStats.muxMiss >> 8 ) & 0xff );
+		h[ 116 ] = (u8)( ( gpu64BusStats.muxMiss >> 16 ) & 0xff );
+		h[ 117 ] = (u8)( ( gpu64BusStats.muxMiss >> 24 ) & 0xff );
+		// 118-119: of the late reads, how many were in a pass that paid for a
+		// mux re-read. Overwrites what used to be muxFixed, which stopped
+		// being printed in run 25 -- BUS A/BUS B reading 0000 0000 is the
+		// direct proof the repair works, so the derived counter was spending
+		// four bytes to say it again. Saturating u16.
+		{
+			u32 em = gpu64ReadSlack.expiredMux;
+			if ( em > 65535 ) em = 65535;
+			h[ 118 ] = (u8)( em & 0xff );
+			h[ 119 ] = (u8)( em >> 8 );
+		}
+
+		// 120-121: muxUnfixed, wide. h[122] has always carried it clamped
+		// to 255, on the reasoning that the expected value is zero and BUS
+		// A/BUS B reading 0000 0000 was the direct proof of the repair.
+		// Run 28 (2026-09-20) killed that reasoning both ways: BUS A/BUS B
+		// were lost to a poisoned health sample, and BUS BAD came back with
+		// 12252 bad accesses against a muxMiss of 14607 -- which says the
+		// re-read repaired about a sixth of them, not all of them, and says
+		// it only by inference because the direct counter was saturated at
+		// 255. The repair rate is the whole question now, so publish it.
+		{
+			u32 uf = gpu64BusStats.muxUnfixed;
+			if ( uf > 65535 ) uf = 65535;
+			h[ 120 ] = (u8)( uf & 0xff );
+			h[ 121 ] = (u8)( uf >> 8 );
+		}
+
+		// 122: the mux canary, one byte. Expected zero; nonzero means one
+		// re-read did not suffice and the access was discarded.
+		h[ 122 ] = gpu64BusStats.muxUnfixed > 255 ? 255
+					: (u8)gpu64BusStats.muxUnfixed;
+
+		// 123-125: the read-window overshoot. Run 24's h[126] clamped the
+		// minimum at zero, which answered "is the margin gone" (it is) and
+		// destroyed "by how much" -- and how much is the whole question,
+		// because WAIT_CYCLE_READ2 is RAD's conservative target and not the
+		// C64's hard limit. A few cycles past it is nothing; a few hundred
+		// is a quarter of a C64 cycle. So publish the WORST overshoot as a
+		// positive number, and count the events wide enough to have a rate
+		// against BUS RW's read total instead of saturating at 255.
+		{
+			s32 ms = gpu64ReadSlack.minSlack;
+			s32 over = ms < 0 ? -ms : 0;
+			if ( over > 255 ) over = 255;
+			h[ 123 ] = (u8)over;
+
+			u32 ex = gpu64ReadSlack.expired;
+			if ( ex > 65535 ) ex = 65535;
+			h[ 124 ] = (u8)( ex & 0xff );
+			h[ 125 ] = (u8)( ex >> 8 );
+		}
+
+		// 126: the positive side of the same minimum, for the run where
+		// the overshoot finally reads zero. Only meaningful then.
+		// 127: how many overshoots were big enough to matter -- 64 ARM
+		// cycles, ~46ns, about 4.5% of a C64 cycle. A max on its own cannot
+		// tell one freak pass from a systematic one; this pair can.
+		{
+			s32 ms = gpu64ReadSlack.minSlack;
+			if ( ms < 0 ) ms = 0;
+			if ( ms > 255 ) ms = 255;
+			h[ 126 ] = (u8)ms;
+			h[ 127 ] = gpu64ReadSlack.expiredBig > 255 ? 255
+						: (u8)gpu64ReadSlack.expiredBig;
+		}
+
+		// 93-95: where the command that stopped the loop came from. Only
+		// meaningful when byte 87 reads GPU64_LOOPSTOP_OPCODE; the reading
+		// is (93 - 94), the distance the sequence number moved for that
+		// dispatch -- 0 means no command arrived and the CMD_LO write was
+		// a phantom, 1 means a real command's opcode byte was corrupted.
+		// gpu64_apidiag.h has the full case analysis.
+		h[ 93 ] = gpu64ApiDiag.loopStopSeq;
+		h[ 94 ] = gpu64ApiDiag.loopStopSeqPrev;
+		h[ 95 ] = gpu64ApiDiag.loopStopPrevOp;
+
+		// 128-131: the trailer that makes the block self-verifying, and the
+		// reason a caller would ever ask for more than 128 bytes.
+		//
+		// Every other readback in gpu64 can be checked. This one could not:
+		// all 128 bytes are allocated, so the only test a client had was
+		// "poison the buffer and see whether the poison is gone", which
+		// passes on a block that arrived only in PART. Run 29 (2026-09-20)
+		// is what that costs -- the A/B experiment's 32-bit columns came
+		// back at 3.4 million against a run total of 190 thousand, because
+		// poison surviving in one 4-byte field gives one huge positive
+		// delta and one huge negative one and the poison check never saw
+		// it. The blob path is the one CLAUDE.md rule 3 names outright: any
+		// bulk transfer through REU DMA needs a checksum or a length
+		// readback. The health block is a bulk transfer and had neither.
+		//
+		// A magic plus two independent check bytes: XOR catches any single
+		// wrong byte, the additive sum catches a transposition XOR is blind
+		// to. Both cover 0-129, so the magic is checked by them too.
+		//
+		// Purely additive. A caller asking for 128 gets the same 128 bytes
+		// it always did; the trailer exists only for one that asks for 132.
+		{
+			h[ 128 ] = 'G';
+			h[ 129 ] = '6';
+			u8 x = 0, a = 0;
+			for ( unsigned i = 0; i < 130; i++ )
+			{
+				x = (u8)( x ^ h[ i ] );
+				a = (u8)( a + h[ i ] );
+			}
+			h[ 130 ] = x;
+			h[ 131 ] = a;
+		}
+
+		// Length-compatible with the 12-, 20-, 36-, 48-, 64-, 80- and
+		// 128-byte contracts: a caller that asks for any of them still gets
+		// exactly what it always got.
 		return gpu64_blobWrite( space, addr,
-				len >= 48 ? 48 : ( len >= 36 ? 36 : ( len >= 20 ? 20 : 12 ) ), h );
+				len >= 132 ? 132 : ( len >= 128 ? 128 : ( len >= 112 ? 112
+						: ( len >= 96 ? 96 : ( len >= 80 ? 80
+						: ( len >= 64 ? 64 : ( len >= 48 ? 48
+						: ( len >= 36 ? 36
+						: ( len >= 20 ? 20 : 12 ) ) ) ) ) ) ) ), h );
 	}
 
 	case 0x08:					// SET_BORDER
@@ -1216,7 +1630,34 @@ void gpu64_apiDispatch( u8 op )
 	// behaviour, it just gives the C64 something reliable-by-construction to
 	// compare its own SEQ against (SEQACK is read-only, so a mismatch can
 	// only mean the CMD_LO/ARG/SEQ write sequence was not what the C64 sent).
+	// gpu64: two counters, added 2026-09-09, that turn that detector from a
+	// numerator into a measurement (gpu64_busstats.h). seqRepeat has to be
+	// sampled *before* the publication below, because the publication is
+	// what destroys the evidence: a caller that increments SEQ before every
+	// command and still arrives with sSeq == sSeqAck lost the SEQ write, not
+	// the command.
+	if ( sSeq == sSeqAck )
+		gpu64BusStats.seqRepeat++;
+	gpu64BusStats.dispatches++;
+
+	// gpu64 (2026-09-10): remember this dispatch and the one before it, so
+	// that if something in it stops the class 1 loop, loopStop() can freeze
+	// the provenance of the command that did it -- gpu64_apidiag.h. Four
+	// byte stores at dispatch time, with the bus already held.
+	gpu64ApiDiag.dispSeqPrev = gpu64ApiDiag.dispSeq;
+	gpu64ApiDiag.dispSeq     = sSeq;
+	gpu64ApiDiag.dispOpPrev  = gpu64ApiDiag.dispOp;
+	gpu64ApiDiag.dispOp      = op;
+
 	sSeqAck = sSeq;
+
+	// gpu64 (2026-09-10, bench run 14): spend the destructive-opcode key --
+	// gpu64_api.h. Here, ahead of every early return and for every class, so
+	// that the key a command staged cannot survive into the command after it.
+	// A dispatch that wanted the key has already had it latched; a dispatch
+	// that did not has just disarmed ARG15 for the phantom that may follow.
+	gpu64ApiKey = sArg[ GPU64_REG_KEY ];
+	sArg[ GPU64_REG_KEY ] = 0;
 
 	// gpu64: finish any page flip still in flight before anything else runs
 	// (gpu64_flip.h). Two reasons, and both are correctness, not tidiness:
@@ -1235,6 +1676,12 @@ void gpu64_apiDispatch( u8 op )
 	// a null pointer and report OK.
 	if ( sCmdHi != 0 && g_pGpu64FB && g_pGpu64FB->GetMode() != GPU64_MODE_GRAPHICS )
 	{
+		// gpu64 (2026-09-10): one of the four producers of the $06 that
+		// both bench runs of that day ended stuck in -- gpu64_apidiag.h.
+		gpu64_apiDiagBump( &gpu64ApiDiag.classRefusedMode );
+		gpu64ApiDiag.lastRefuseState = gpu64_apiDiagStateByte();
+		gpu64ApiDiag.lastRefuseOp    = op;
+		gpu64ApiDiag.lastRefuseClass = sCmdHi;
 		sErr = GPU64_ERR_UNSUPPORTED;
 		sStatus |= GPU64_STATUS_ERROR;
 		return;

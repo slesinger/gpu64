@@ -265,19 +265,26 @@ struct Gpu64_3dRasterVert
 {
 	s32	sx, sy;				// 16.16 surface coordinates
 	s32	invZ;				// 16.16, near/z -- 1.0 at the near plane
-	s32	u, v;				// 16.16 texel coordinates
+	// Texel coordinates times invZ, 16.16. u and v themselves are NOT
+	// linear in screen space and interpolating them directly is what made
+	// every large face crease along its quad's diagonal; u/z and v/z are,
+	// so those are what travel here and the rasteriser divides them back
+	// out. Same 16.16 magnitude as the bare texel coordinate had (invZ is
+	// at most 1.0), so gradient()'s headroom is unchanged.
+	s32	uz, vz;
 
 	// View-space position, 16.16, carried through only for the point
-	// lights: interpolated across the triangle the same affine way u and v
-	// are, and read per pixel by lightAdjust(). Costs nothing when no light
-	// is live -- the whole lit path is behind one branch outside the pixel
-	// loop -- and is left uninitialised by callers that set no lights.
+	// lights: interpolated across the triangle affinely -- unlike u and v,
+	// which are not -- and read per pixel by lightAdjust(). Costs nothing
+	// when no light is live -- the whole lit path is behind one branch
+	// outside the pixel loop -- and is left uninitialised by callers that
+	// set no lights.
 	s32	px, py, pz;
 };
 
-// Affine-mapped, z-tested, single light level for the whole triangle (flat
-// shading, per the design's chosen look). pTex == 0 means flat colour, and
-// nFlat is then the palette index.
+// Perspective-correct, z-tested, single light level for the whole triangle
+// (flat shading, per the design's chosen look). pTex == 0 means flat colour,
+// and nFlat is then the palette index.
 void gpu64_3dRasterTriangle( const Gpu64_3dState *pState,
 			     Gpu64_3dTarget *pTarget,
 			     const Gpu64_3dRasterVert *pV,	// 3 of them

@@ -32,6 +32,7 @@
 #include "gpu64_api.h"
 #include "gpu64_fb.h"
 #include "gpu64_vsync.h"
+#include "gpu64_apidiag.h"
 #include "lowlevel_arm64.h"
 #include <circle/util.h>
 
@@ -106,6 +107,29 @@ static Gpu64_3dScene	s_ShadowScene;
 static Gpu64_3dState	s_ShadowState;
 
 static boolean s_LoopRunning;
+
+// gpu64 (2026-09-10): the loop stopping is one of the four things that makes
+// SCENE_COMMIT answer UNSUPPORTED for the rest of a run, and it is the only
+// one a command stream can trigger by accident. Every clear goes through
+// here so the cause is recorded with it -- gpu64_apidiag.h.
+static void loopStop( u8 cause )
+{
+	if ( s_LoopRunning )
+		gpu64_apiDiagBump( &gpu64ApiDiag.loopStops );
+	gpu64ApiDiag.loopStopCause = cause;
+
+	// gpu64 (2026-09-10, bench run 11): freeze the command stream around
+	// this stop. Bench run 11 proved a LOOP_STOP opcode executes in runs
+	// where the C64 never sends one; (loopStopSeq - loopStopSeqPrev) says
+	// whether a command arrived at all -- gpu64_apidiag.h. Latched for
+	// every cause, not just the opcode, because a SESSION or SCENE_RESET
+	// stop wants the same context if it ever turns up unexplained.
+	gpu64ApiDiag.loopStopSeq     = gpu64ApiDiag.dispSeq;
+	gpu64ApiDiag.loopStopSeqPrev = gpu64ApiDiag.dispSeqPrev;
+	gpu64ApiDiag.loopStopPrevOp  = gpu64ApiDiag.dispOpPrev;
+
+	s_LoopRunning = FALSE;
+}
 
 // Bookkeeping for the one frame the autonomous loop may have in flight --
 // same shape as s_LastRenderSlot/s_LastRenderPending below, deliberately
@@ -303,8 +327,13 @@ void gpu64_3dInit( void )
 	gpu64_3dSceneReset( &s_Scene );
 	gpu64_3dStateDefaults( &s_ShadowState );
 	gpu64_3dSceneReset( &s_ShadowScene );
-	s_LoopRunning = FALSE;
+	loopStop( GPU64_LOOPSTOP_INIT );
 	s_LoopFramePending = FALSE;
+}
+
+boolean gpu64_3dLoopRunning( void )
+{
+	return s_LoopRunning;
 }
 
 void gpu64_3dReset( void )
@@ -352,7 +381,7 @@ void gpu64_3dReset( void )
 	// already proved core 1 is idle (or the timeout backstop already
 	// decided to proceed regardless), so it is safe to declare the loop
 	// stopped and its shadow copy gone here.
-	s_LoopRunning = FALSE;
+	loopStop( GPU64_LOOPSTOP_SESSION );
 	s_LoopFramePending = FALSE;
 	gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
 	gpu64_3dStateDefaults( &s_ShadowState );
@@ -653,7 +682,19 @@ static u8 opSetPointLight( void )
 
 static u8 opDestroyNode( void )
 {
-	return gpu64_3dSceneDestroyNode( sceneTarget(), stagedId() );
+	// gpu64 (2026-09-10, bench run 14): count the one outcome of this opcode
+	// that a session cannot recover from on its own. The live scene losing
+	// its active camera is what makes LOOP_START and the SCENE_COMMIT re-arm
+	// answer NO_CAMERA forever, and run 14 spent a whole 4096-frame run in
+	// that state without being able to say whether DESTROY_NODE or
+	// SCENE_RESET had put it there. Only the live scene is watched: the
+	// shadow's copy is reseeded from it at the next re-arm anyway.
+	Gpu64_3dScene *pScene = sceneTarget();
+	const boolean bHadCamera = s_Scene.bHaveActiveCamera;
+	const u8 res = gpu64_3dSceneDestroyNode( pScene, stagedId() );
+	if ( bHadCamera && !s_Scene.bHaveActiveCamera )
+		gpu64_apiDiagBump( &gpu64ApiDiag.camLost );
+	return res;
 }
 
 static u8 opSetActiveCamera( void )
@@ -800,6 +841,22 @@ static u8 precheckDrawNode( boolean *pNeedsDraw )
 // DRAW_MESH's warm is new for the same reason: before 15a, opDrawMesh() had
 // been kept warm by continuous use on core 0 since milestone 6, but that
 // history is core-0 silicon and does not carry over to core 1's cache.
+// gpu64 (2026-09-10, bench run 13): the i-cache warms that used to open this
+// function and gpu64_3dExecuteRenderScene() below are GONE, and must not come
+// back. Each CACHE_PRELOAD_INSTRUCTION_CACHE + FORCE_READ_LINEARa pair is 32
+// PLI plus 2048 *volatile* byte loads that the compiler may not coalesce or
+// elide -- and RENDER_SCENE ran three pairs, ~6100 unbroken memory accesses,
+// at the top of every frame with no GPU64_3D_YIELD() anywhere in them. That
+// is the longest unbroken run of bus traffic left on core 1, and it is the
+// standing suspect for run 13's finding: 442 mis-sampled C64 writes with this
+// loop rendering against exactly 0 with it stopped, matched denominators.
+//
+// CLAUDE.md's rule 4 ("cycle-critical code reachable from a command must warm
+// its own i-cache") is about core 0, which has a per-C64-cycle deadline. Core
+// 1 has none: a cold first frame here is slower and nothing observes it, and
+// in the autonomous loop this code runs 50x a second and stays warm by use.
+// The warms were paying core 0's insurance premium out of core 0's own
+// timing budget.
 void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 {
 	Gpu64_3dTarget target;
@@ -820,9 +877,6 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 
 	case GPU64_3D_OP_DRAW_MESH:
 	{
-		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dExecuteRender, 1024 * 2 );
-		FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRender, 1024 * 2, 1024 * 2 );
-
 		const Gpu64_3dResource *pR = resFind( pCmd->id, GPU64_3D_RES_MESH );
 		if ( pR == 0 || !makeTarget( &target, pCmd->page ) )
 		{
@@ -858,13 +912,6 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 
 	case GPU64_3D_OP_DRAW_NODE:
 	{
-		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dExecuteRender, 1024 * 2 );
-		FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRender, 1024 * 2, 1024 * 2 );
-		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneFind, 1024 * 2 );
-		FORCE_READ_LINEARa( (void*)gpu64_3dSceneFind, 1024 * 2, 1024 * 2 );
-		CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneApplyCamera, 1024 * 2 );
-		FORCE_READ_LINEARa( (void*)gpu64_3dSceneApplyCamera, 1024 * 2, 1024 * 2 );
-
 		// Re-resolved by id rather than carried as a pointer from precheck:
 		// precheck ran on core 0 before the push, this runs on core 1 after
 		// the drain, and nothing about the node or the resource table is
@@ -940,13 +987,6 @@ void gpu64_3dExecuteRender( Gpu64_3dCmd *pCmd )
 // DRAW_NODE, which the C64 can see failed and retry.
 void gpu64_3dExecuteRenderScene( Gpu64_3dCmd *pCmd )
 {
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dExecuteRenderScene, 1024 * 2 );
-	FORCE_READ_LINEARa( (void*)gpu64_3dExecuteRenderScene, 1024 * 2, 1024 * 2 );
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneRender, 1024 * 2 );
-	FORCE_READ_LINEARa( (void*)gpu64_3dSceneRender, 1024 * 2, 1024 * 2 );
-	CACHE_PRELOAD_INSTRUCTION_CACHE( (void*)gpu64_3dSceneApplyCamera, 1024 * 2 );
-	FORCE_READ_LINEARa( (void*)gpu64_3dSceneApplyCamera, 1024 * 2, 1024 * 2 );
-
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
 	Gpu64_3dTarget target;
 	if ( pFB == 0 || !makeTarget( &target, pCmd->page ) )
@@ -973,11 +1013,88 @@ void gpu64_3dExecuteRenderScene( Gpu64_3dCmd *pCmd )
 
 // --- dispatch -----------------------------------------------------------
 
+// gpu64 (2026-09-10): everything LOOP_START does once its mode argument has
+// been accepted. Factored out because SCENE_COMMIT now calls it too -- see
+// its own case below for why a commit against a stopped loop re-arms the
+// loop instead of refusing for the rest of the session.
+static u8 loopStartArmed( void )
+{
+	if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
+		return GPU64_ERR_UNSUPPORTED;
+	// Enforced here, once, at the moment a render is actually asked for --
+	// not per frame inside gpu64_3dExecuteRenderScene(), which (like
+	// gpu64_3dSceneApplyCamera() it calls) has no precedent anywhere else in
+	// this file for failing a render outright over a missing camera; it falls
+	// back to the identity view instead. A camera destroyed mid-loop by a
+	// later, shadow-redirected DESTROY_NODE is deliberately not re-checked
+	// per commit for the same reason.
+	if ( !s_Scene.bHaveActiveCamera )
+		return GPU64_ERR_NO_CAMERA;
+
+	// The shadow starts as a copy of the live session: the loop's first
+	// frame, and every isShadowRedirectable() edit up to the first
+	// SCENE_COMMIT, must still see whatever the C64 already set up before
+	// LOOP_START. Correct for a re-arm too: while the loop was stopped,
+	// sceneForEdit() was handing out the live scene, so the shadow is the
+	// stale copy of the pair and reseeding it is what makes them agree.
+	s_ShadowScene = s_Scene;
+	s_ShadowState = s_State;
+
+	gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
+
+	if ( !pushLoopFrame() )
+		return GPU64_ERR_QUEUE_FULL;
+
+	s_LoopRunning = TRUE;
+	return GPU64_ERR_OK;
+}
+
 static u8 execute( u8 op )
 {
+	// gpu64 (2026-09-10, bench run 14): one gate, in front of every class 1
+	// opcode that destroys state the session cannot rebuild from the next
+	// frame's commands. gpu64_api.h has the contract and why it exists; the
+	// short version is that two bench runs have caught an opcode executing
+	// that the C64 never sent, and on a destructive one that ends the
+	// session with nothing to show for it.
+	//
+	// All four, not just the two the 2026-09-10 morning's version gated, and
+	// unconditionally rather than only while the loop runs. A DESTROY_NODE
+	// on the active camera is as fatal as a SCENE_RESET -- run 14 could not
+	// say which of the two had fired, and that ambiguity is itself the
+	// argument for treating them alike. The cost is one ARG write per call
+	// at eleven call sites in the whole tree.
 	switch ( op )
 	{
 	case GPU64_3D_OP_SCENE_RESET:
+	case GPU64_3D_OP_LOOP_STOP:
+	case GPU64_3D_OP_DESTROY_NODE:
+	case GPU64_3D_OP_FREE_RESOURCE:
+		if ( !gpu64_apiKeyed() )
+		{
+			// BAD_ARGS and not a silent OK: a caller whose ARG15 write was
+			// lost to the sampling defect has to be able to find out and
+			// retry, and ERRCODE is the only channel it has. The opcode is
+			// latched because that is the reading run 14 needed and did not
+			// have -- a phantom names itself here.
+			gpu64_apiDiagBump( &gpu64ApiDiag.keyRefused );
+			gpu64ApiDiag.keyRefusedOp = op;
+			return GPU64_ERR_BAD_ARGS;
+		}
+		break;
+	default:
+		break;
+	}
+
+	switch ( op )
+	{
+	case GPU64_3D_OP_SCENE_RESET:
+		// gpu64 (2026-09-10): count the wipes that get through, so a run
+		// can tell "the key prevented it" from "it never happened". Only
+		// the ones that had something to destroy: the setup-time reset
+		// every program opens with is not an event.
+		if ( s_Scene.bHaveActiveCamera )
+			gpu64_apiDiagBump( &gpu64ApiDiag.sceneWipes );
 		// "Destroys every node, stops the loop, leaves uploaded resources
 		// alone" -- docs/class1-3d-mesh-reference.md. Stage 16: the loop
 		// now exists, so this must actually stop it and drop its shadow
@@ -987,7 +1104,7 @@ static u8 execute( u8 op )
 		// gpu64_3dSceneReset() just produced.
 		gpu64_3dStateDefaults( &s_State );
 		gpu64_3dSceneReset( &s_Scene );
-		s_LoopRunning = FALSE;
+		loopStop( GPU64_LOOPSTOP_SCENE_RESET );
 		s_LoopFramePending = FALSE;
 		gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
 		gpu64_3dStateDefaults( &s_ShadowState );
@@ -1016,6 +1133,8 @@ static u8 execute( u8 op )
 	}
 
 	case GPU64_3D_OP_LOOP_STOP:
+		// Keyed by the gate at the top of this function.
+		//
 		// Always succeeds, even against a loop that was not running --
 		// answering an error instead would make a correctly written
 		// program's teardown call fail. Deliberately leaves
@@ -1025,7 +1144,7 @@ static u8 execute( u8 op )
 		// building one just to discard the result), and a later
 		// pollLoopFrame() still harvests it -- harmlessly, since nothing
 		// reads GPU64_STATUS_FRAME_READY once the loop is not running.
-		s_LoopRunning = FALSE;
+		loopStop( GPU64_LOOPSTOP_OPCODE );
 		return GPU64_ERR_OK;
 
 	case GPU64_3D_OP_UPLOAD_MESH:		return opUploadMesh();
@@ -1058,7 +1177,6 @@ static u8 execute( u8 op )
 	// which should not happen.
 
 	case GPU64_3D_OP_LOOP_START:
-	{
 		if ( s_LoopRunning )
 			return GPU64_ERR_BUSY;
 		// ARG[0] selects the mode: 0 is handshake (SCENE_COMMIT-driven,
@@ -1069,39 +1187,35 @@ static u8 execute( u8 op )
 		// running the wrong protocol against an old one without noticing.
 		if ( sArg[ 0 ] != 0 )
 			return GPU64_ERR_UNSUPPORTED;
-		if ( g_pGpu64FB == 0 || !g_pGpu64FB->IsInitialized() )
-			return GPU64_ERR_UNSUPPORTED;
-		// Enforced here, once, at the moment a render is actually asked
-		// for -- not per frame inside gpu64_3dExecuteRenderScene(), which
-		// (like gpu64_3dSceneApplyCamera() it calls) has no precedent
-		// anywhere else in this file for failing a render outright over a
-		// missing camera; it falls back to the identity view instead. A
-		// camera destroyed mid-loop by a later, shadow-redirected
-		// DESTROY_NODE is deliberately not re-checked per commit for the
-		// same reason.
-		if ( !s_Scene.bHaveActiveCamera )
-			return GPU64_ERR_NO_CAMERA;
-
-		// The shadow starts as a copy of the live session: the loop's
-		// first frame, and every isShadowRedirectable() edit up to the
-		// first SCENE_COMMIT, must still see whatever the C64 already set
-		// up before LOOP_START.
-		s_ShadowScene = s_Scene;
-		s_ShadowState = s_State;
-
-		gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
-
-		if ( !pushLoopFrame() )
-			return GPU64_ERR_QUEUE_FULL;
-
-		s_LoopRunning = TRUE;
-		return GPU64_ERR_OK;
-	}
+		return loopStartArmed();
 
 	case GPU64_3D_OP_SCENE_COMMIT:
 	{
 		if ( !s_LoopRunning )
-			return GPU64_ERR_UNSUPPORTED;
+		{
+			// gpu64 (2026-09-10): this used to answer UNSUPPORTED, and it
+			// is the refusal both bench runs of that day spent most of
+			// their frames in -- a stopped loop was permanent, the HDMI
+			// picture froze, and the C64 had no way to tell that from a
+			// busy frame. The loop is now what the C64 side always
+			// assumed it was: running for as long as commits keep
+			// arriving. A commit against a stopped loop re-arms it and
+			// reports the re-arm as OK, which makes every spurious stop
+			// self-healing within one frame instead of fatal.
+			//
+			// A deliberate teardown is unaffected: LOOP_STOP is followed
+			// by the program exiting, so no commit arrives to undo it.
+			// The counter still climbs, so GET_HEALTH 80-83 (commitNoLoop)
+			// remains the measure of how often this happened -- it is now
+			// a repair count rather than a failure count, and paired with
+			// loopStops (88-91) and loopStopCause (87) it still says what
+			// stopped the loop each time.
+			gpu64_apiDiagBump( &gpu64ApiDiag.commitNoLoop );
+			gpu64ApiDiag.lastRefuseState = gpu64_apiDiagStateByte();
+			gpu64ApiDiag.lastRefuseOp    = GPU64_3D_OP_SCENE_COMMIT;
+			gpu64ApiDiag.lastRefuseClass = 1;
+			return loopStartArmed();
+		}
 
 		// gpu64_3dDispatch()'s generic branch already drained the ring
 		// unconditionally before calling execute() -- SCENE_COMMIT is
@@ -1121,12 +1235,23 @@ static u8 execute( u8 op )
 		// driven by the loop instead of by the C64 calling PAGE_FLIP
 		// itself.
 		if ( !gpu64Vsync.calibrated )
+		{
+			gpu64_apiDiagBump( &gpu64ApiDiag.commitNoClock );
+			gpu64ApiDiag.lastRefuseState = gpu64_apiDiagStateByte();
+			gpu64ApiDiag.lastRefuseOp    = GPU64_3D_OP_SCENE_COMMIT;
+			gpu64ApiDiag.lastRefuseClass = 1;
 			return GPU64_ERR_UNSUPPORTED;
+		}
 		if ( gpu64Vsync.flipPending )
 			return GPU64_ERR_BUSY;
 		CGpu64FrameBuffer *pFB = g_pGpu64FB;
 		if ( pFB == 0 )
+		{
+			gpu64ApiDiag.lastRefuseState = gpu64_apiDiagStateByte();
+			gpu64ApiDiag.lastRefuseOp    = GPU64_3D_OP_SCENE_COMMIT;
+			gpu64ApiDiag.lastRefuseClass = 1;
 			return GPU64_ERR_UNSUPPORTED;
+		}
 
 		// Publish: everything isShadowRedirectable() redirected since
 		// LOOP_START (or the last commit) becomes what the *next* frame

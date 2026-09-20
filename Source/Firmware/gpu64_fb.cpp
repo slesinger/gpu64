@@ -89,11 +89,7 @@ boolean CGpu64FrameBuffer::Initialize( void )
 	if ( m_pFB == 0 )
 		return FALSE;
 
-	for ( unsigned i = 0; i < 16; i++ )
-		SetPaletteEntry( (u8)i, c64Palette[ i ][ 0 ], c64Palette[ i ][ 1 ], c64Palette[ i ][ 2 ] );
-	for ( unsigned i = 16; i < 255; i++ )
-		SetPaletteEntry( (u8)i, 0, 0, 0 );
-	SetPaletteEntry( GPU64_LOG_INK, 255, 255, 255 );
+	ResetPalette();
 
 	if ( !ActivateGraphics() )
 		return FALSE;
@@ -101,13 +97,9 @@ boolean CGpu64FrameBuffer::Initialize( void )
 	m_bInitialized = TRUE;
 
 	// Contents of a fresh allocation are undefined; the API says so too, but
-	// a screenful of noise at boot looks like a fault, so start both pages
+	// a screenful of noise at boot looks like a fault, so start every page
 	// black.
-	for ( unsigned p = 0; p < GPU64_FB_PAGES; p++ )
-	{
-		memset( PageBase( p ), 0, m_nPitch * GPU64_FB_TOTAL_H );
-		CleanPage( p );
-	}
+	ClearAllPages();
 
 	// Not fatal if it fails: CommitFlip() just keeps using the blocking
 	// mailbox call the way milestone 4b shipped it.
@@ -215,12 +207,7 @@ boolean CGpu64FrameBuffer::SetMode( u8 nMode )
 	// so their contents mean nothing. Repaint the border from the colour the
 	// display already had, put the paging state back to page 0 drawn and
 	// visible, and restore the log overlay if it is still on.
-	for ( unsigned n = 0; n < GPU64_FB_PAGES; n++ )
-	{
-		u8 *pBase = PageBase( n );
-		if ( pBase )
-			memset( pBase, 0, (size_t)GPU64_FB_TOTAL_H * m_nPitch );
-	}
+	ClearAllPages();
 	m_nDrawPage = m_nVisiblePage = m_nPendingVisible = 0;
 	SetBorder( m_nBorder );
 	DrawLogOverlay( 0 );
@@ -471,6 +458,76 @@ void CGpu64FrameBuffer::ResetPages( void )
 	m_pFB->SetVirtualOffset( 0, 0 );
 }
 
+// gpu64: every graphics page to black, border band included, and pushed out
+// to DRAM. Three callers want exactly this -- Initialize() on a fresh and
+// therefore undefined allocation, SetMode() on a freshly reallocated one,
+// and gpu64_apiFullReset() putting a C64 reset's display back to boot state.
+void CGpu64FrameBuffer::ClearAllPages( void )
+{
+	if ( m_nMode != GPU64_MODE_GRAPHICS )
+		return;
+
+	for ( unsigned n = 0; n < GPU64_FB_PAGES; n++ )
+	{
+		u8 *pBase = PageBase( n );
+		if ( pBase == 0 )
+			continue;
+		memset( pBase, 0, (size_t)GPU64_FB_TOTAL_H * m_nPitch );
+		CleanPage( n );
+	}
+}
+
+// gpu64: 8x8 glyphs from the real 901225-01 ROM onto the draw page, in
+// character cells, clipped to the 40x25 grid the surface holds. showMirror()
+// in rad_main.cpp open-codes the same blit against a screen-code array; this
+// takes a C string, which is what a firmware-side message actually has.
+void CGpu64FrameBuffer::DrawC64Text( unsigned nCol, unsigned nRow,
+				     const char *pString, u8 nInk, u8 nPaper )
+{
+	u8 *p = PageBuffer( m_nDrawPage );
+	if ( p == 0 || pString == 0 || nRow >= GPU64_LOG_ROWS )
+		return;
+
+	const u8 ( *font )[ 8 ] = gpu64C64Font[ GPU64_CHARSET_UPPER ];
+
+	for ( ; *pString != '\0' && nCol < GPU64_LOG_COLS; pString++, nCol++ )
+	{
+		const u8 *glyph = font[ gpu64_c64ScreenCode( *pString, GPU64_CHARSET_UPPER ) ];
+
+		for ( unsigned gy = 0; gy < 8; gy++ )
+		{
+			u8 rowBits = glyph[ gy ];
+			u8 *pDst = p + (size_t)( nRow * 8 + gy ) * m_nPitch + nCol * 8;
+			for ( unsigned gx = 0; gx < 8; gx++ )
+				pDst[ gx ] = ( rowBits & ( 0x80 >> gx ) ) ? nInk : nPaper;
+		}
+	}
+}
+
+// gpu64: what HDMI shows while the C64 has no clock -- i.e. while it is
+// powered off, with the Pi still running on its own supply. Without this the
+// display simply holds whatever was last scanned out, which is
+// indistinguishable from a hung cartridge.
+//
+// Always called straight after gpu64_apiFullReset(), so graphics mode and
+// page 0 are already guaranteed and the palette is the C64 one.
+void CGpu64FrameBuffer::ShowHoldingScreen( void )
+{
+	if ( !m_bInitialized || m_nMode != GPU64_MODE_GRAPHICS )
+		return;
+
+	static const char *lines[] = { "GPU64", "WAITING FOR C64" };
+
+	Clear( 6 );					// C64 blue, as at the BASIC prompt
+	for ( unsigned i = 0; i < 2; i++ )
+	{
+		unsigned len = strlen( lines[ i ] );
+		DrawC64Text( ( GPU64_LOG_COLS - len ) / 2, 11 + i * 2,
+			     lines[ i ], 14, 6 );	// light blue on blue
+	}
+	CleanPage( m_nDrawPage );
+}
+
 void CGpu64FrameBuffer::Clear( u8 nColor )
 {
 	u8 *p = PageBuffer( m_nDrawPage );
@@ -627,6 +684,27 @@ void CGpu64FrameBuffer::SetPaletteEntry( u8 nIndex, u8 r, u8 g, u8 b )
 		m_pFB->SetPalette32( nIndex, nRGBA );
 	if ( m_pFBText )
 		m_pFBText->SetPalette32( nIndex, nRGBA );
+}
+
+// gpu64: the palette as it is one instruction after the Pi boots -- the C64
+// 16 in 0-15, black through 254, and white at GPU64_LOG_INK. Factored out of
+// Initialize() so a C64 reset can restore it without reallocating anything.
+void CGpu64FrameBuffer::ResetPalette( void )
+{
+	for ( unsigned i = 0; i < 16; i++ )
+		SetPaletteEntry( (u8)i, c64Palette[ i ][ 0 ], c64Palette[ i ][ 1 ], c64Palette[ i ][ 2 ] );
+	for ( unsigned i = 16; i < 255; i++ )
+		SetPaletteEntry( (u8)i, 0, 0, 0 );
+	SetPaletteEntry( GPU64_LOG_INK, 255, 255, 255 );
+
+	// Initialize() calls this before the VideoCore has been programmed at
+	// all, and ActivateGraphics() then re-sends the whole tag block with the
+	// palette in it -- there is nothing to push there, and UpdatePalette()
+	// on a framebuffer that has never been initialised is not something to
+	// find out about on hardware. Every other caller needs the entries to
+	// reach the display now.
+	if ( m_bInitialized )
+		CommitPalette();
 }
 
 boolean CGpu64FrameBuffer::CommitPalette( void )

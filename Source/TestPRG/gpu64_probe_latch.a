@@ -779,6 +779,9 @@ rendLoop
 	beq rendLoop
 	jsr finishPhase
 
+	; LOOP_STOP carries the one-shot key in ARG15 -- gpu64_api.h.
+	lda #$a5
+	sta ARG+15
 	lda #OP_LOOP_STOP
 	jmp cmd1
 

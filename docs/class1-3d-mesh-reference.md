@@ -1,7 +1,7 @@
 # Class 1 — 3D mesh reference
 
 This is what a byte means for `CMD_HI = 1`, gpu64's retained/immediate-mode
-3D mesh pipeline: textured, affine-mapped triangles, flat-lit per face,
+3D mesh pipeline: textured, perspective-correct triangles, flat-lit per face,
 over a real z-buffer. **This is gpu64's general-purpose 3D layer — the
 "OpenGL for the C64" one** — not a pipeline scoped to any one game genre;
 a Doom/Quake-style first-person renderer is one thing it can draw, not
@@ -87,15 +87,15 @@ class 0, and every opcode reads exactly the byte count in its row.
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
-| $00 | `SCENE_RESET` | 0 | — | Destroys every node, stops the loop, leaves uploaded resources alone. |
+| $00 | `SCENE_RESET` | 0 or 1 | `ARG15` = `$A5` | Destroys every node, stops the loop, leaves uploaded resources alone. `ARG15` must be `$A5` on this dispatch or the call is `BAD_ARGS` and nothing is destroyed — see "The key byte". |
 | $01 | `SET_VIEWPORT` | 8 | x, y, w, h (16-bit each) | Places the 3D viewport in the page. `w*h*3 > GPU64_3D_BUDGET` (196608, provisional) is `OUT_OF_RANGE`; a viewport not wholly inside 320x200 is `BAD_ARGS`. |
 | $02 | `SET_PERSPECTIVE` | 6 | `ARG0-1` fov (binary angle), `ARG2-3` near, `ARG4-5` far (8.8) | Projection for the active camera. |
 | $03 | `SET_LIGHT` | 7 | `ARG0-5` direction x,y,z (8.8), `ARG6` ambient level 0-15 | The single directional light. Face shade = ambient + N.L, clamped to 0-15, indexing the colormap. |
 | $04 | `BUILD_COLORMAP` | 0 | — | Regenerates the 16-level colormap from the current palette. Needed after a palette change; costs milliseconds — never call it per frame. |
 | $05 | `SET_BACKGROUND` | 1 | `ARG0` palette index | What the viewport is cleared to. |
-| $06 | `LOOP_START` | 1 | `ARG0` 0 = handshake, 1 = free-running | Starts the autonomous render loop. `ARG0` must be 0 — free-running is `UNSUPPORTED`, staged next. `BUSY` if the loop is already running; `NO_CAMERA` if no camera is active at the moment of the call (checked once, here — not re-checked per frame after). Queues the loop's first frame and returns immediately; see "Frame lifecycle". |
-| $07 | `LOOP_STOP` | 0 | — | Stops the loop. Always answers `OK`, even if no loop was running — a teardown call must not fail. A frame already queued when this arrives still finishes on core 1; it is discarded, not cancelled. |
-| $08 | `SCENE_COMMIT` | 0 | — | Publishes every shadow-redirected edit made since `LOOP_START`/the last commit, arms the next vblank flip the same way `PAGE_FLIP` does, and queues the loop's next frame. `RESULT` = the page the just-finished frame is in — the same page the flip this call just armed is about to show. `UNSUPPORTED` if the loop is not running or the flip subsystem is not calibrated yet; `BUSY` if a `PAGE_FLIP` is already pending. See "Frame lifecycle". |
+| $06 | `LOOP_START` | 1 | `ARG0` 0 = handshake, 1 = free-running | Starts the autonomous render loop. `ARG0` must be 0 — free-running is `UNSUPPORTED`, staged next. `BUSY` if the loop is already running; `NO_CAMERA` if no camera is active at the moment of the call (checked once, here — not re-checked per frame after). Queues the loop's first frame and returns immediately; see "Frame lifecycle". **Optional** in handshake mode — `SCENE_COMMIT` starts a stopped loop by itself, so this opcode's lasting purpose is selecting the mode. |
+| $07 | `LOOP_STOP` | 0 or 1 | `ARG15` = `$A5` | Stops the loop. `ARG15` must be `$A5` on this dispatch or the call is `BAD_ARGS` and the loop keeps running — see "The key byte". Keyed, it answers `OK` even against a loop that is already stopped, so a teardown retry never fails. A frame already queued when this arrives still finishes on core 1; it is discarded, not cancelled. |
+| $08 | `SCENE_COMMIT` | 0 | — | Publishes every shadow-redirected edit made since `LOOP_START`/the last commit, arms the next vblank flip the same way `PAGE_FLIP` does, and queues the loop's next frame. `RESULT` = the page the just-finished frame is in — the same page the flip this call just armed is about to show. If the loop is **not** running, this re-starts it (same checks as `LOOP_START`) and answers `OK` without committing — see "A stopped loop repairs itself". `UNSUPPORTED` if the flip subsystem is not calibrated yet; `BUSY` if a `PAGE_FLIP` is already pending. See "Frame lifecycle". |
 | $09 | `ARENA_STATUS` | 0 | — | `RESULT` = free resource RAM in 128 KB units (0..256 for the 32 MB phase-1 arena). Not in the original design; added because "you get `OUT_OF_MEMORY` eventually" is truthful and undebuggable without it. |
 
 ### Resources — $10-$1F
@@ -104,7 +104,7 @@ class 0, and every opcode reads exactly the byte count in its row.
 |---|---|---|---|---|
 | $10 | `UPLOAD_MESH` | 12 | `ARG0-5` vertex blob descriptor, `ARG6-11` face blob descriptor | Uploads into resource RAM under the staged `ID`. Re-upload to a live ID replaces it in place — see Resource lifecycle below. `RESULT` = face count. |
 | $11 | `UPLOAD_TEXTURE` | 8 | `ARG0-5` blob descriptor, `ARG6` w shift, `ARG7` h shift | Dimensions are `1 << shift`, 3..8 (8 to 256 px, power of two). `len` must equal `w*h`; anything else is `BAD_ARGS`. |
-| $12 | `FREE_RESOURCE` | 0 | — | Frees the staged `ID`'s table slot. In phase 1 this does not reclaim arena bytes — see Resource lifecycle. |
+| $12 | `FREE_RESOURCE` | 0 | `ARG15` = `$A5` | Frees the staged `ID`'s table slot. Keyed — see "The key byte"; `BAD_ARGS` without it, and nothing is freed. In phase 1 this does not reclaim arena bytes — see Resource lifecycle. |
 
 ### Scene nodes — $20-$2F
 
@@ -112,7 +112,7 @@ class 0, and every opcode reads exactly the byte count in its row.
 |---|---|---|---|---|
 | $20 | `CREATE_OBJECT` | 2 | `ARG0-1` mesh resource ID | Creates a node instancing that mesh, under the staged node `ID`. Re-creating over a live `ID` replaces it — same convention as the resource table's re-upload. `OUT_OF_MEMORY` if the 256-node table is full. |
 | $21 | `CREATE_CAMERA` | 0 | — | Creates a camera node under the staged `ID`. Same replace-on-live-ID and `OUT_OF_MEMORY` behaviour as `CREATE_OBJECT`. |
-| $22 | `DESTROY_NODE` | 0 | — | Destroys the staged `ID`. `BAD_ID` if it does not exist. Destroying the active camera clears it — a later node reusing that same numeric `ID` is not silently treated as the camera again. |
+| $22 | `DESTROY_NODE` | 0 | `ARG15` = `$A5` | Destroys the staged `ID`. Keyed — see "The key byte"; `BAD_ARGS` without it, and nothing is destroyed. `BAD_ID` if it does not exist. Destroying the active camera clears it — a later node reusing that same numeric `ID` is not silently treated as the camera again. |
 | $23 | `SET_ACTIVE_CAMERA` | 0 | — | The staged `ID` becomes the camera `DRAW_NODE` and the loop render from. `BAD_ID` unless it names a live camera node. |
 | $24 | `SET_VISIBLE` | 1 | `ARG0` 0 or 1 | Skips the node without destroying it. Any other `ARG0` value is `BAD_ARGS`. |
 | $25 | `CREATE_SPRITE` | 2 | `ARG0-1` texture resource ID | Creates a billboard node under the staged `ID`. Starts one world unit square, masked and screen-upright, so a sprite you never call `SET_SPRITE` on is still a sprite you can see. Same replace-on-live-`ID` and `OUT_OF_MEMORY` behaviour as `CREATE_OBJECT`. |
@@ -216,6 +216,17 @@ depth-tested against geometry that is by then already in the z-buffer. A
 node whose mesh or texture ID does not resolve is skipped, not an error —
 one stale ID must not blank an otherwise-good frame.
 
+**`LOOP_START` is optional.** In handshake mode you never have to send it:
+`SCENE_COMMIT` against a stopped loop starts it, with the same checks, and
+answers `OK` without committing (see "A stopped loop repairs itself"). So the
+opcode survives only as a **mode selector** — the place where you will one day
+ask for free-running instead of handshake. The practical rule that falls out
+of this: **never branch on whether the loop is running.** There is no register
+that tells you, `SEQACK` does not cover the argument bytes that would carry
+the answer, and a program that decides "the loop must already be started, so
+I will not commit" simply stops drawing. Send `SCENE_COMMIT` every frame and
+let it sort itself out.
+
 **Starting it.** `LOOP_START` snapshots the live scene/render state into a
 shadow copy and queues the first frame. From that point on, every opcode
 that would normally mutate the live scene graph or per-frame render state
@@ -270,11 +281,77 @@ the bench on 2026-09-08 the Quake demo drew 6099 accepted frames against
 15838 `BUSY` answers, 72% of its commit traffic thrown away, while still
 rendering at the full 60 Hz the flip rate allows.
 
-**Stopping it.** `LOOP_STOP` always succeeds. A frame already queued when it
-arrives still finishes on core 1 — there is no way to cancel a frame in
-flight — but nothing further reads its result once the loop is stopped.
-`SCENE_RESET` also stops the loop (and drops the shadow copy) as part of
-destroying every node, per its own row above.
+**Stopping it.** `LOOP_STOP` with `ARG15` = `$A5` stops the loop. A frame
+already queued when it arrives still finishes on core 1 — there is no way
+to cancel a frame in flight — but nothing further reads its result once the
+loop is stopped. `SCENE_RESET` also stops the loop (and drops the shadow
+copy) as part of destroying every node, and takes the same key.
+
+**The key byte.** Four opcodes are *destructive* — they throw away something
+the firmware cannot reconstruct — and all four demand `ARG15` = `$A5` on the
+same dispatch, answering `BAD_ARGS` and changing nothing without it:
+
+| Opcode | What an unwanted one destroys |
+|---|---|
+| `$00 SCENE_RESET` | every node, every transform, the shadow copy, the loop |
+| `$07 LOOP_STOP` | the loop, i.e. the picture |
+| `$22 DESTROY_NODE` | one node — and if it is the active camera, the ability to render at all |
+| `$12 FREE_RESOURCE` | an uploaded mesh or texture |
+
+This is not ceremony. Register writes from the C64 are occasionally
+mis-sampled, and a corrupted `CMD_LO` is the one way an opcode your program
+never sent can reach the firmware. It has happened twice at the bench, both
+on 2026-09-10: a `$07` nobody sent ended one session, and in the next run
+the live scene's active camera disappeared and every `LOOP_START` after it
+answered `NO_CAMERA` for the rest of the run. Requiring a second, specific
+byte means a single bad sample can no longer do either.
+
+The key is **one-shot**. Every dispatch of every class reads `ARG15` and
+immediately clears it, so it authorises exactly the command it was written
+for; the next command starts with it at `$00` again. Write it as part of
+staging the arguments, in the same place you write `ARG0`:
+
+```asm
+        lda #$a5
+        sta $df20               ; ARG15 -- the key
+        lda #$07                ; LOOP_STOP
+        sta $df0c               ; CMD_LO -- and it is spent here
+```
+
+`ARG15` is read by no opcode for anything else, which is what makes it the
+right register: `ARG0` is not, because the per-frame node stream writes it
+constantly and a phantom arriving mid-frame could find a coordinate byte
+that happens to be `$A5` already sitting there. The key applies whether or
+not the loop is running, so scene setup needs it too.
+
+`GET_HEALTH` bytes 76-79 report what the gate caught: 76 counts refusals,
+**77 is the opcode of the last one** — the name of the phantom — and 78/79
+count the damaging events that did get through (active camera lost, scene
+wiped while built).
+
+**A stopped loop repairs itself.** If a `SCENE_COMMIT` arrives while the
+loop is not running, it re-starts the loop — the same checks `LOOP_START`
+makes, the same shadow reseed — and answers `OK`. It does not commit that
+frame; poll `FRAME_READY` and commit again as usual. The loop is therefore
+running for exactly as long as commits keep arriving, and a stop your
+program did not ask for costs one frame instead of the session. A deliberate
+teardown is unaffected, because a program that has sent `LOOP_STOP` sends no
+more commits. `GET_HEALTH` bytes 80-83 count the repairs.
+
+**Confirm that it landed.** `LOOP_STOP` succeeds *if it arrives with its
+key*, and
+the write that carries it is subject to the same sampling defect as every
+other — measured at roughly one command in a few hundred, and once at one in
+64. A lost `LOOP_STOP` leaves the loop running after your program has exited,
+still rendering its scene over whatever runs next, and nothing reports it.
+Send it with a sequence number and re-send until `SEQACK` confirms: unlike
+`SCENE_COMMIT`, `LOOP_STOP` is idempotent, so a retry that follows one that
+did land costs nothing — but **re-write `ARG15` inside the retry loop**: the
+key is spent by the attempt that failed, as well as being as droppable as
+any other write, so a retry that does not re-stage it reads back as
+`BAD_ARGS`. Check both answers, too: `SEQACK` says the command was *seen*,
+and `ERRCODE` says it was *obeyed*. `GET_HEALTH` byte 87 reads back `1` once
+a `LOOP_STOP` opcode has actually executed, which is the independent check.
 
 **No 2D overlay while the loop runs.** The loop owns the framebuffer, and
 in handshake mode there is no moment between its frames at which the C64 may
@@ -447,8 +524,10 @@ the level the directional light produced, so a scene with a low `ambient`
 and no directional light at all is lit only where the point lights reach.
 
 - Meshes are lit **per pixel**: the view-space position is interpolated
-  across the triangle the same affine way `u`/`v` are. A wall crossing a
-  light's radius gets a gradient, not one flat step.
+  across the triangle affinely — unlike `u`/`v`, which are perspective
+  correct. A wall crossing a light's radius gets a gradient, not one flat
+  step; on a large face at a grazing angle that gradient's *centre* can sit
+  a few pixels off where the light really is.
 - Sprites are lit **per record**, once at the billboard's own position —
   a billboard has no interior geometry for a gradient to live on.
 - The cap is eight *live* lights: a light node is skipped when it is hidden
@@ -487,6 +566,13 @@ far out as the closest thing the camera will ever actually get to.
   `DRAW_MESH`'s `RESULT` is a triangle count: check it.
 - **Positive pitch tips a node's own +z towards -y** — a camera with
   positive pitch looks *down*.
+- **Yaw, pitch and roll compose in that order, each about the node's own
+  axes** (`R = Ry * Rx * Rz`): yaw turns about the world's +y, then pitch
+  tips about the node's already-yawed +x, then roll spins about its own +z.
+  So a camera keeps pitching up and down whatever direction it faces, and its
+  horizon stays level — pitch is not a rotation about world x. A model given
+  both a yaw and a pitch carries its pitch with it as it turns, the way an
+  aircraft's nose does.
 - Angles are a 16-bit binary angle (65536 = 360°): add a turn rate and let
   it wrap, no clamp or degrees/radians conversion needed. Positions are
   signed 16.16 (±32768 units at 1/65536 — a whole level, not just one

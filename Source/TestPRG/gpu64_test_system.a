@@ -189,13 +189,67 @@ start
 	#check "ADDR LIMIT"
 
 ; ----------------------------------------------------------------------
+; The readback fence (SET_DMA_WINDOW, $0C).
+;
+; A readback's destination arrives in ARG bytes that SEQACK does not cover,
+; so a dropped store aims the transfer at whatever address the last command
+; left behind -- and that is the one direction in which a lost write makes
+; the Pi write into C64 memory. The window is what turns that into an error
+; code. Three things to assert: the echo, that a destination outside the
+; window is refused, and that length 0 puts it back the way it was.
+; ----------------------------------------------------------------------
+
+	#argw 0, INFO
+	#argw 2, 32
+	lda #OP_SET_DMA_WINDOW
+	jsr cmd0
+	#wantOk
+	#check "DMAWIN SET"
+
+	; RESULT is the only readback there is for an ARG block: the register
+	; file answers $FF for ARG itself.
+	#clracc
+	#expectb RESULT, ( ( <INFO ) ^ ( >INFO ) ^ 32 ^ 0 ^ $a5 )
+	#useacc
+	#check "DMAWIN ECHO"
+
+	; Inside the window and big enough: GET_INFO needs 16 and has 32.
+	#argblob 0, SPACE_C64, INFO, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "DMAWIN INSIDE"
+
+	; One byte past the end of the window. Refused, and nothing written.
+	#argblob 0, SPACE_C64, INFO+17, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantErr ERR_OUT_OF_RANGE
+	#check "DMAWIN OUTSIDE"
+
+	; Length 0 is "anywhere", and every later test in this file depends on
+	; it -- they all read back into buffers this window does not cover.
+	#argw 0, 0
+	#argw 2, 0
+	lda #OP_SET_DMA_WINDOW
+	jsr cmd0
+	#wantOk
+	#check "DMAWIN OFF"
+
+	#argblob 0, SPACE_C64, INFO, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	#wantOk
+	#check "DMAWIN ANY"
+
+; ----------------------------------------------------------------------
 ; Opcode and class validation.
 ; ----------------------------------------------------------------------
 
-	lda #$0b				; gap between GET_HEALTH and CLEAR
+	lda #$0d				; gap between SET_DMA_WINDOW and CLEAR
 	jsr cmd0
 	#wantErr ERR_BAD_OPCODE
-	#check "BAD OP 0B"
+	#check "BAD OP 0D"
 
 	lda #$6f				; gap between READ_RECT and the math set
 	jsr cmd0

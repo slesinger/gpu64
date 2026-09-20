@@ -53,6 +53,19 @@
 #define GPU64_3D_OP_LOOP_START		0x06
 #define GPU64_3D_OP_LOOP_STOP		0x07
 #define GPU64_3D_OP_SCENE_COMMIT	0x08
+
+// gpu64 (2026-09-10): LOOP_STOP, SCENE_RESET, DESTROY_NODE and FREE_RESOURCE
+// all carry the one-shot key in ARG15 and refuse with BAD_ARGS without it --
+// GPU64_KEY_DESTRUCTIVE in gpu64_api.h, which has the whole reasoning. It
+// started here, on 2026-09-10 morning, as an ARG[0] key on LOOP_STOP alone,
+// out of bench run 11's $07-nobody-sent; run 14 the same afternoon found the
+// same mechanism reaching something that destroyed the live scene's active
+// camera, and ARG[0] turned out to be the wrong register anyway -- the
+// per-frame node stream writes it constantly, so a phantom arriving
+// mid-frame stands a real chance of finding a coordinate byte that happens
+// to be $A5 already sitting there. ARG15 is read by no opcode and is spent
+// by every dispatch.
+
 // gpu64: not in the design doc's original table -- added in phase 1 because
 // "you get OUT_OF_MEMORY eventually" is truthful and undebuggable against a
 // 32 MB arena. RESULT is the free arena in 128 KB units, which is exactly
@@ -102,6 +115,10 @@ void gpu64_3dInit( void );
 // where every resource of the session is freed, so RUN/STOP+RESTORE cannot
 // leave the next program running against stale IDs.
 void gpu64_3dReset( void );
+
+// gpu64 (2026-09-10): is the handshake-mode loop running? Only
+// gpu64_apiDiagStateByte() needs this -- see gpu64_apidiag.h.
+boolean gpu64_3dLoopRunning( void );
 
 // Executes one class 1 command from core 0, exactly as doSystem()/doDraw()
 // do for class 0: returns a GPU64_ERR_* code, having already pushed

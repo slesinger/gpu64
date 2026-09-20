@@ -61,9 +61,12 @@ u32 gpu64_3dSqrt64( u64 v );
 
 void gpu64_3dMatIdentity( Gpu64_3dMat *pOut );
 
-// Yaw about Y, then pitch about X, then roll about Z -- applied to the
-// model in that order, which is the order the opcode's arguments are listed
-// in. Left-handed: +x right, +y up, +z into the screen.
+// Intrinsic yaw, then pitch, then roll -- the order the opcode's arguments
+// are listed in: yaw about the world's y axis, then pitch about the node's
+// own (already yawed) x axis, then roll about its own z. R = Ry * Rx * Rz.
+// Pitch is about the node's own axis and not about world x, which is what
+// keeps a yawed camera pitching instead of rolling.
+// Left-handed: +x right, +y up, +z into the screen.
 void gpu64_3dMatFromEuler( Gpu64_3dMat *pOut, u16 nYaw, u16 nPitch, u16 nRoll );
 
 // pOut = a * b. Safe to alias either input.

@@ -34,6 +34,7 @@
 #include "gpu64_ladder.h"
 #include "gpu64_holdgap.h"
 #include "gpu64_holdgate.h"
+#include "gpu64_busstats.h"
 
 // gpu64: reaching CGpu64FrameBuffer::CommitFlip() from the bus-watch loop
 // without including gpu64_fb.h, which pulls in Circle's framebuffer and
@@ -50,6 +51,7 @@ class CRAD;
 extern CRAD *g_pRAD;
 void gpu64_showTestPattern( CRAD *pRAD );
 void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border, u8 background, u8 d018 );
+void gpu64_showHoldingScreen( void );
 
 // gpu64: set once a C64 program engages the gpu64 API -- currently that's
 // just milestone 2's test-pattern trigger at $DF0B (and, since IO_ADDRESS is
@@ -118,6 +120,70 @@ GPU64HOLDGAP gpu64HoldGap __attribute__( ( aligned( 64 ) ) );
 // reason as gpu64HoldGap above: one line of its own, warmed by both paths.
 GPU64HOLDGATE gpu64HoldGate __attribute__( ( aligned( 64 ) ) );
 
+// gpu64: the bus-sampling instrument (gpu64_busstats.h). Third line of the
+// same shape, warmed by both paths for the same reason.
+GPU64BUSSTATS gpu64BusStats __attribute__( ( aligned( 64 ) ) );
+GPU64READSLACK gpu64ReadSlack __attribute__( ( aligned( 64 ) ) );
+
+// Called after the read has already been answered -- after WAIT_CYCLE_READ2
+// and the transceiver turn-around -- so none of this is inside the read's
+// deadline. The good path is one increment; the rest is under a branch a
+// correct access never takes.
+//
+// "Readable" here must stay identical to gpu64_apiReadReg()'s four cases
+// (gpu64_api.h), because "bad" is defined as "that function returned its
+// 0xFF default". If a register is ever added there, add it here too or the
+// instrument will report a working read as a mis-sample.
+__attribute__( ( always_inline ) ) inline void gpu64_busStatsRead( u8 addr )
+{
+	GPU64BUSSTATS *b = &gpu64BusStats;
+	b->reads++;
+
+	if ( addr == GPU64_REG_STATUS || addr == GPU64_REG_ERRCODE ||
+			addr == GPU64_REG_RESULT || addr == GPU64_REG_SEQACK )
+		return;
+
+	// The 6502's dummy read from `sta ARG,y`, not a fault -- see
+	// argDummyReads in gpu64_busstats.h. Nothing legitimately *reads*
+	// an ARG register, so the whole range is that idiom.
+	if ( addr >= GPU64_REG_ARG0 && addr <= GPU64_REG_ARG15 )
+	{
+		b->argDummyReads++;
+		return;
+	}
+
+	b->readsBad++;
+	b->lastBadAddr = addr;
+	b->orBadAddr |= addr;
+	b->andBadAddr &= addr;
+}
+
+// Same, for writes. "Writable" mirrors gpu64_apiWriteReg()'s cases plus
+// CMD_LO, which never reaches that function because the caller dispatches it
+// directly. A write outside the set is silently discarded there, so it is
+// exactly the write-side equivalent of a $FF read.
+__attribute__( ( always_inline ) ) inline void gpu64_busStatsWrite( u8 addr )
+{
+	GPU64BUSSTATS *b = &gpu64BusStats;
+	b->writes++;
+
+	if ( addr == GPU64_REG_CMD_HI || addr == GPU64_REG_CMD_LO ||
+			addr == GPU64_REG_ID_LO || addr == GPU64_REG_ID_HI ||
+			addr == GPU64_REG_SEQ ||
+			( addr >= GPU64_REG_ARG0 && addr <= GPU64_REG_ARG15 ) )
+		return;
+
+	b->writesBad++;
+	b->lastBadWrite = addr;
+	b->orBadWrite |= addr;
+	b->andBadWrite &= addr;
+
+	// Saturating, and still on the branch a correct access never takes.
+	u8 *n = &b->badWriteNib[ addr >> 4 ];
+	if ( *n < 0xff )
+		( *n )++;
+}
+
 // Called immediately after CLR_GPIO( bDMA_OUT ), i.e. with the bus already
 // held, so this has no cycle budget to blow. stamp is armCycleCounter, which
 // the caller's RESTART_CYCLE_COUNTER anchored at the start of the VIC
@@ -167,6 +233,28 @@ __attribute__( ( always_inline ) ) inline void gpu64_holdGapAssert( u64 stamp, u
 
 // Called immediately after SET_GPIO( bDMA_OUT ). Two stores to a line that
 // both warm paths keep resident; see the cost note in gpu64_holdgap.h.
+//
+// gpu64 2026-09-11, run 23: a GPLEV0 read was added here as a posted-write
+// barrier and REVERTED after one bench run. It made everything worse --
+// MISSED 158 -> 232, phantoms +7 -> +53, two phantom LOOP_STOPs caught by
+// the key gate, and the GET_HEALTH readback itself came back corrupted
+// (muxFixed > muxMiss, 26879 "bad writes" with every nibble bucket zero and
+// the AND accumulators untouched).
+//
+// The reason is rule 6, and it was predictable: a peripheral read here sits
+// between SET_GPIO( bDMA_OUT ) and the loop's return to sampling, so it
+// delays the first sample after the C64 restarts -- the least forgiving
+// moment there is. "The C64 has only just restarted, so there is slack" was
+// exactly backwards; that is when the loop has the least of it.
+//
+// The underlying hypothesis is untouched by this: serving a C64 read is
+// three posted GPIO writes against a hard deadline, and the failure still
+// concentrates 55x on the instruction just after a hold release. What is
+// disproven is this *placement*. The next candidate is inside the read
+// service itself, before WAIT_UP_TO_CYCLE( WAIT_CYCLE_READ2 ), where a
+// barrier would consume slack the loop was going to spin away anyway -- but
+// only if that slack exists, which is what gpu64BusStats' readSlack pair now
+// measures before anything is spent on it.
 __attribute__( ( always_inline ) ) inline void gpu64_holdGapRelease( u64 stamp, u8 kind )
 {
 	gpu64HoldGap.lastRelease = stamp;
@@ -211,6 +299,15 @@ void resetREU()
 	gpu64HoldGap.minGapD2C = 0xffffffff;
 
 	memset( &gpu64HoldGate, 0, sizeof( gpu64HoldGate ) );
+
+	memset( &gpu64BusStats, 0, sizeof( gpu64BusStats ) );
+	memset( &gpu64ReadSlack, 0, sizeof( gpu64ReadSlack ) );
+	gpu64ReadSlack.minSlack = 0x7fffffff;
+	// andBadAddr accumulates by AND, so it starts all-ones. With no bad
+	// samples it reads back 0xFF, which the probe reports as "no data"
+	// rather than as "every address bit was set".
+	gpu64BusStats.andBadAddr = 0xff;
+	gpu64BusStats.andBadWrite = 0xff;
 
 	reu.irqRelease = 0;
 
@@ -448,6 +545,51 @@ static u8 gpu64MirrorD018 = 0x15;
 // RAM test at ~200ms, which is where the error came from.
 #define GPU64_MIRROR_IRQ_TIMEOUT 1000000
 
+// gpu64: GPIO samples without a PHI2 edge before the loops below conclude the
+// C64 has no clock -- i.e. that it is switched off, with the Pi still running
+// on its own supply. Each iteration is one MMIO read, so this is ~30-60ms
+// against a half-cycle of ~500ns: three orders of magnitude of margin, which
+// is what makes a false positive on a live machine unreachable. Same value
+// gpu64_mirrorIdleLoop() has always used for its own bounded wait.
+#define GPU64_NOCLOCK_TIMEOUT 1000000
+
+// gpu64: consecutive polling-loop passes that must all read the cartridge
+// button as pressed before reuUsingPolling() hands the machine back to the
+// RAD menu. See the debounced test near the bottom of the loop for why a
+// single sample is not trustworthy. A pass is roughly one C64 cycle, so this
+// is ~1ms -- two orders of magnitude below the ~50ms a finger holds a button,
+// and far above any settling transient on the multiplexed pin.
+#define GPU64_BUTTON_DEBOUNCE 1000
+
+// gpu64 2026-09-10: DO NOT add a settling delay between SET_GPIO( bMPLEX_SEL )
+// and the g3 read below. It was tried, at the bench, and it killed the bus
+// outright -- first command BAD_ARGS, no frame clock, GET_HEALTH's DMA never
+// delivering a byte through eight retries.
+//
+// The reasoning that led there is still correct as far as it goes.
+// WAIT_UP_TO_CYCLE is a do-while against PMCCNTR_EL0 and armCycleCounter, an
+// ABSOLUTE deadline anchored once per pass by RESTART_CYCLE_COUNTER, so a
+// target already passed runs its body once and returns. Right for a deadline,
+// wrong for a settling time -- and the multiplexer wait is a settling time.
+// The patch was one MRS after the SET_GPIO plus WAIT_UP_TO_CYCLE_AFTER( 100,
+// stamp ), sized to be a no-op on a punctual pass: the nominal gap is
+// WAIT_CYCLE_MULTIPLEXER - WAIT_FOR_SIGNALS - TIMING_OFFSET_CBTD =
+// 235 - 80 - 40 = 115 cycles with the shipped rad.cfg.
+//
+// What that assumed, and what the bench disproved, is that the pass is ever
+// punctual here. It is not. Between the g2 read and this point sit two
+// peripheral-bus accesses whose latency is not in anybody's cycle budget, so
+// WAIT_UP_TO_CYCLE( WAIT_CYCLE_MULTIPLEXER ) is already falling through --
+// the mux's settling time is whatever those accesses happen to cost, not
+// what the constant says. A floor that only bites "when the pass was late"
+// therefore bit on every pass, and 100 cycles of added spin per C64 cycle is
+// past what the loop has.
+//
+// Two things follow. Raising WAIT_CYCLE_MULTIPLEXER in rad.cfg is equally
+// useless -- same anchor, already passed. And the real settling margin here
+// is unknown and unmeasured: it is a side effect, not a design. Measure it
+// before touching it again.
+
 // gpu64: the two C64 zero-page bytes the snapshot probes before it commits
 // to the 2ms burst.
 //
@@ -652,6 +794,37 @@ void gpu64_mirrorSnapshot()
 	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground, gpu64MirrorD018 );
 }
 
+// gpu64: the C64 has stopped clocking the bus. With the Pi on its own supply
+// the cartridge outlives the machine, so this is the ordinary consequence of
+// switching the C64 off -- not a fault -- and it used to leave HDMI holding
+// whatever was last scanned out, which is indistinguishable from a hung
+// cartridge.
+//
+// Both bus loops call this from inside their bounded half-cycle wait, which
+// is the one place in either of them with no deadline at all: there is no
+// C64 to serve, so the mailbox round-trips below cost nothing that anything
+// is waiting for.
+//
+// gpu64_apiFullReset() runs here as well as on the reset line because the
+// holding screen needs a graphics-mode page 0 to be painted into, and the
+// display may well have been left in 80x50 text mode by whatever was running
+// when the power went off.
+void gpu64_deadClockEnter( void )
+{
+	gpu64_apiFullReset();
+	gpu64_showHoldingScreen();
+}
+
+// gpu64: ...and the C64 is back. Unconditionally re-running the full reset
+// covers the case the reset line does not: a clock interruption that never
+// pulses /RESET would otherwise strand the display on the holding screen
+// forever. On a real power-cycle /RESET is asserted at this moment anyway,
+// and the reset branch's own one-shot will simply find nothing left to do.
+void gpu64_deadClockLeave( void )
+{
+	gpu64_apiFullReset();
+}
+
 // gpu64: the boot-phase mirror. RAD spends everything between "the C64 is
 // running" and "the user pressed the button" in rad_main.cpp's radIsWaiting
 // spin, which used to be a bare 1250-cycle button poll -- so HDMI showed
@@ -689,6 +862,7 @@ void gpu64_mirrorIdleLoop( void )
 	register u16 resetCount = 0;
 	register u32 ipl = 0;
 	register u32 noClock = 0;
+	register u32 noClockLatched = 0;
 
 	// gpu64: warm both this loop and the snapshot it calls. warmCache() runs
 	// on the way into REU emulation, which is *after* this -- nothing has
@@ -716,12 +890,13 @@ mirrorIdleLoop:
 
 	while ( 1 )
 	{
-		// gpu64: bounded form of WAIT_FOR_VIC_HALFCYCLE. The REU loop can use
-		// the unbounded macro because by then the machine is committed; here
-		// the RAD button still has to work, and a C64 whose clock stopped
-		// while we were watching would otherwise strand the user in a spin
-		// with no exit. On timeout we simply fall through with whatever g2
-		// held: the button test below is all that still matters.
+		// gpu64: bounded form of WAIT_FOR_VIC_HALFCYCLE, the same as the REU
+		// loop's. The reason differs, and it is why the button test below
+		// comes first here and last there: at this point the RAD button still
+		// has to work, and a C64 whose clock stopped while we were watching
+		// would otherwise strand the user in a spin with no exit. On timeout
+		// we simply fall through with whatever g2 held: the button test below
+		// is all that still matters.
 		noClock = 0;
 		{
 			register u32 timeout = 0;
@@ -738,7 +913,19 @@ mirrorIdleLoop:
 			return;
 
 		if ( noClock )
+		{
+			if ( !noClockLatched )
+			{
+				noClockLatched = 1;
+				gpu64_deadClockEnter();
+			}
 			continue;
+		}
+		if ( noClockLatched )
+		{
+			noClockLatched = 0;
+			gpu64_deadClockLeave();
+		}
 
 		// gpu64: same incremental i-cache refresh the REU loop does. The
 		// snapshot's showMirror() paints 40x25 cells into the framebuffer and
@@ -777,6 +964,12 @@ mirrorIdleLoop:
 			gpu64MirrorIrqWatchdog = 0;
 			gpu64MirrorAwaitIrq = 1;
 			gpu64MirrorJiffy = 0;
+			// gpu64: and the display back to its post-boot state, so a
+			// reset taken at the menu-idle mirror behaves exactly like one
+			// taken during REU emulation. Free here -- nothing is being
+			// emulated at radIsWaiting, so the VideoCore work this may do
+			// has nobody waiting on it.
+			gpu64_apiFullReset();
 		}
 
 		// gpu64: the liveness timer, same as the REU loop's. Without the
@@ -964,6 +1157,8 @@ void gpu64_vsyncWarmCommit( void )
 	FORCE_READ_LINEAR32a( &gpu64HoldGap, sizeof( gpu64HoldGap ), sizeof( gpu64HoldGap ) * 8 );
 	CACHE_PRELOAD_DATA_CACHE( &gpu64HoldGate, sizeof( gpu64HoldGate ), CACHE_PRELOADL1KEEP )
 	FORCE_READ_LINEAR32a( &gpu64HoldGate, sizeof( gpu64HoldGate ), sizeof( gpu64HoldGate ) * 8 );
+	CACHE_PRELOAD_DATA_CACHE( &gpu64BusStats, sizeof( gpu64BusStats ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64BusStats, sizeof( gpu64BusStats ), sizeof( gpu64BusStats ) * 8 );
 }
 
 // gpu64: forces every cache line of a buffer resident before a DMA burst
@@ -1090,6 +1285,19 @@ u8 gpu64_blobWrite( u8 space, u32 addr, u32 len, const u8 *pSrc )
 	if ( addr + len > 65536 )
 		return GPU64_ERR_OUT_OF_RANGE;
 
+	// The destination window (SET_DMA_WINDOW, $0C). Every readback opcode
+	// takes its destination in ARG bytes that SEQ/SEQACK does not cover, so
+	// one dropped store aims this burst somewhere the client never named --
+	// and this is the only direction in which a dropped byte makes the Pi
+	// write into C64 memory. A client that declares a window gets a refused
+	// transfer instead of its own code overwritten; length 0 is the default
+	// and means unrestricted, so this costs nothing for anyone who has not
+	// opted in. Two comparisons, dispatch-time, bus already held.
+	if ( gpu64DmaWinLen != 0 &&
+	     ( addr < (u32)gpu64DmaWinBase ||
+	       addr + len > (u32)gpu64DmaWinBase + (u32)gpu64DmaWinLen ) )
+		return GPU64_ERR_OUT_OF_RANGE;
+
 	// Write direction: same cycle-stealing burst as the read above, using the
 	// macros REU's own Stash transfer uses (handle_transfer.h). This is the
 	// first time gpu64 pushes data *back* to the C64 rather than reading it.
@@ -1205,6 +1413,8 @@ void gpu64_apiWarmPollingLoop( void )
 	FORCE_READ_LINEAR32a( &gpu64HoldGap, sizeof( gpu64HoldGap ), sizeof( gpu64HoldGap ) * 8 );
 	CACHE_PRELOAD_DATA_CACHE( &gpu64HoldGate, sizeof( gpu64HoldGate ), CACHE_PRELOADL1KEEP )
 	FORCE_READ_LINEAR32a( &gpu64HoldGate, sizeof( gpu64HoldGate ), sizeof( gpu64HoldGate ) * 8 );
+	CACHE_PRELOAD_DATA_CACHE( &gpu64BusStats, sizeof( gpu64BusStats ), CACHE_PRELOADL1KEEP )
+	FORCE_READ_LINEAR32a( &gpu64BusStats, sizeof( gpu64BusStats ), sizeof( gpu64BusStats ) * 8 );
 }
 
 // gpu64: this and the other four functions sharing the ".text.section_polling"
@@ -1234,7 +1444,16 @@ __attribute__( ( section( ".text.section_polling" ) ) )
 u8 reuUsingPolling( int step )
 {
 	register u32 g2 = bBUTTON, g3;
+	register u32 muxRetried = 0;
 	register u16 resetCount = 0;
+
+	// gpu64: consecutive passes that have read the button as pressed.
+	register u16 buttonCount = 0;
+
+	// gpu64: the dead-clock detector's two flags -- one per pass, one across
+	// passes. See the bounded wait at the top of the loop body below.
+	register u32 noClock = 0;
+	register u32 noClockLatched = 0;
 
 	// gpu64: milestone 6's load-ladder instrumentation (gpu64_ladder.h).
 	// Expands to nothing unless GPU64_LADDER_ENABLED is defined.
@@ -1316,7 +1535,45 @@ reuEmulationMainLoop:
 
 	while ( 1 )
 	{
-		WAIT_FOR_VIC_HALFCYCLE
+		// gpu64: bounded form of WAIT_FOR_VIC_HALFCYCLE, so a C64 that has
+		// been switched off is detected instead of stranding this loop in a
+		// spin forever. The Pi now runs from its own supply and outlives the
+		// machine, which makes a stopped clock an ordinary event rather than
+		// a fault.
+		//
+		// This is the wait it is safe to bound, and the distinction matters:
+		// it is not the precision anchor. The anchor is the
+		// SET_GPIO(bDIR_Dx) / WAIT_FOR_CPU_HALFCYCLE / RESTART_CYCLE_COUNTER
+		// sequence further down, which re-syncs from scratch and is what
+		// every sample timing is measured from. The added increment and
+		// compare sit inside a spin already dominated by an MMIO read, and
+		// on the timeout path the pass is abandoned before the bus sample
+		// rather than taken late -- so a false positive would cost a lost
+		// sample, never a mistimed one. (It cannot happen anyway: see
+		// GPU64_NOCLOCK_TIMEOUT.)
+		noClock = 0;
+		{
+			register u32 timeout = 0;
+			do {
+				g2 = read32( ARM_GPIO_GPLEV0 );
+				if ( ++timeout > GPU64_NOCLOCK_TIMEOUT ) { noClock = 1; break; }
+			} while ( CPU_HALF_CYCLE );
+		}
+
+		if ( noClock )
+		{
+			if ( !noClockLatched )
+			{
+				noClockLatched = 1;
+				gpu64_deadClockEnter();
+			}
+			continue;
+		}
+		if ( noClockLatched )
+		{
+			noClockLatched = 0;
+			gpu64_deadClockLeave();
+		}
 
 		GPU64_LADDER_SAMPLE
 
@@ -1326,8 +1583,15 @@ reuEmulationMainLoop:
 
 		if ( CPU_RESET )
 		{
-			resetCount ++;
-			if ( resetCount > 1000 )
+			// gpu64: saturate rather than wrap. The test below used to be
+			// "> 1000", so resetREU() ran on every pass for as long as the
+			// line stayed low -- and then again after each 65536-pass wrap
+			// of this u16. Harmless for a block of memsets; not harmless for
+			// gpu64_apiFullReset(), which can reprogram the VideoCore. One
+			// shot per reset episode.
+			if ( resetCount <= 1001 )
+				resetCount ++;
+			if ( resetCount == 1001 )
 			{
 				// gpu64: the C64 has derailed and taken the REU with it.
 				// That is the run whose ladder numbers matter most, and
@@ -1337,15 +1601,59 @@ reuEmulationMainLoop:
 				// nothing is being timed any more.
 				GPU64_LADDER_DUMP
 				resetREU();
+				// gpu64: and the display half of the same reset -- mode,
+				// palette, border, pages and text planes, none of which
+				// resetREU() has ever touched. Without it a program that
+				// left the display in 80x50 text mode kills the screen
+				// mirror for good: showMirror() blits into the graphics
+				// draw page with no mode check, so every snapshot after the
+				// reset lands somewhere the VideoCore is not scanning out.
+				//
+				// Heavy work is safe at this exact point and nowhere near
+				// it. /RESET is still asserted -- this fires ~1ms into a
+				// pulse that lasts far longer -- so the 6510 is held halted
+				// by the C64's own reset circuit. There is no bus deadline
+				// to miss, nothing to serve, and no rule-7 exposure,
+				// because there is no cycle in flight to corrupt.
+				gpu64_apiFullReset();
 			}
 		} else
 			resetCount = 0;
 
+		// gpu64 (2026-09-09): debounced, because this is the ONLY path by
+		// which reuUsingPolling() ever hands the machine back to the RAD
+		// menu -- CPU_RESET above deliberately does not -- and it used to
+		// act on a single unfiltered sample of a pin that does not always
+		// mean what the macro's name says.
+		//
+		// bBUTTON is GPIO 3. So is A7_IN (gpio_defs.h): the LVC257 carries
+		// the control lines and the low address byte on the same four pins,
+		// told apart only by MPLEX_SEL. The g2 this test reads is the one
+		// sampled at the top of the pass, NOT the settled sample at
+		// WAIT_FOR_SIGNALS that IO2_ACCESS uses -- and the button is active
+		// low, so any pass on which bit 3 does not read as the button reads
+		// as a press. A7 is 0 for every gpu64 register ($DF0B-$DF0E), which
+		// is what a class-1 program polls flat out.
+		//
+		// Reported from the bench 2026-09-08: the Quake demo "switched to
+		// the RAD menu after a while", mid-run, with nobody touching the
+		// button. Which of the ways bit 3 can lie was responsible is not
+		// established; requiring the press to persist closes all of them at
+		// once. A finger holds the button for tens of milliseconds, i.e.
+		// tens of thousands of passes, so the threshold below is invisible
+		// to a real press and unreachable by a transient.
+		//
+		// Cost on the common path is one store, the same shape as
+		// resetCount above.
 		if ( BUTTON_PRESSED )
 		{
-			GPU64_LADDER_DUMP
-			return 2;
-		}
+			if ( ++buttonCount >= GPU64_BUTTON_DEBOUNCE )
+			{
+				GPU64_LADDER_DUMP
+				return 2;
+			}
+		} else
+			buttonCount = 0;
 
 		// gpu64: default-state screen mirror (milestone 3), watchdog half.
 		// The snapshot itself is NOT taken here any more -- this point is
@@ -1398,6 +1706,17 @@ reuEmulationMainLoop:
 		SET_GPIO( bDIR_Dx );
 		WAIT_FOR_CPU_HALFCYCLE
 		RESTART_CYCLE_COUNTER
+
+		// gpu64 2026-09-12: did THIS pass pay for a mux re-read? Run 26
+		// proved the drive really is late sometimes (SLK -CF, 218 reads past
+		// the target, 157 of them badly past), and the re-read is the one
+		// conditional MMIO access ahead of the drive -- so it is the first
+		// thing to convict or exonerate, and this splits the late reads by
+		// whether it fired. A register zeroed once per pass is the whole
+		// cost: one instruction, no memory, no peripheral bus. Deliberately
+		// not the kind of addition that broke run 23.
+		muxRetried = 0;
+
 		WAIT_UP_TO_CYCLE( reu.WAIT_FOR_SIGNALS + reu.TIMING_OFFSET_CBTD );
 		g2 = read32( ARM_GPIO_GPLEV0 );
 
@@ -1405,6 +1724,65 @@ reuEmulationMainLoop:
 
 		WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_MULTIPLEXER );
 		g3 = read32( ARM_GPIO_GPLEV0 );
+
+		// gpu64 2026-09-11, run 20: catch the multiplexer in the wrong phase.
+		//
+		// IO_ADDRESS takes A0-A3 from GPIO10-13, which are wired straight to
+		// the address lines, and A4-A7 from GPIO0-3, which are the LVC257's
+		// outputs. With MPLEX_SEL low those four pins are NMI, ROMH, IO1 and
+		// BUTTON instead. SET_GPIO above is a posted write to the peripheral
+		// bus; when it lands late the '257 has not switched by the time this
+		// read returns, and the high nibble of every address sampled in that
+		// pass is the signal nibble.
+		//
+		// It is identifiable because during an IO2 access IO1 is inactive-
+		// high by definition and BUTTON is high unless a finger is on it, so
+		// the signal nibble is always $C-$F -- and gpu64 has no register up
+		// there, nor does the REU. Run 20 measured 249 such writes and 333
+		// such reads in 89662 writes, every one of them in the half of the
+		// run where core 1 was rendering and none in the half where it was
+		// not. See gpu64_busstats.h.
+		//
+		// The repair is one more GPLEV0 read. A peripheral read is ordered
+		// behind the posted write and costs the full peripheral latency, so
+		// by the time it returns the '257 has certainly switched -- which is
+		// why this is a barrier and not the settling delay that killed the
+		// bus on 2026-09-10 (see the note above WAIT_CYCLE_MULTIPLEXER). It
+		// is gated on IO2_ACCESS, a test of g2 the next few lines make
+		// anyway, so a pass that is not ours pays nothing: on any other
+		// address the high nibble is genuinely $C-$F a quarter of the time.
+		//
+		// g3 feeds IO_ADDRESS and nothing else -- IO2_ACCESS, ADDRESS_FFxx
+		// and the R/W decode all read g2 -- so re-reading it can only change
+		// the sampled address, which is the thing being repaired.
+		// Run 21 tightened the test from "is it in the signal range" to "is
+		// it a nibble a real access could have produced". The REU decodes
+		// $DF00-$DF0A and the API $DF0B-$DF23, so the high nibble of any
+		// access either of them cares about is $0, $1 or $2 and never more.
+		// The old >= $C let a half-switched $9 through as repaired, which is
+		// why run 21's muxFixed read exactly equal to muxMiss while 37 bad
+		// writes survived, every one of them in $90-$9F. The second re-read
+		// says whether those settle or are stably wrong.
+		// Run 24 dropped the second re-read. It had fired zero times in
+		// every uncorrupted run since it shipped, and it is an MMIO read on
+		// a path that run 24 proved has no margin left: SLK came back
+		// 00/FF, i.e. the loop was already past WAIT_CYCLE_READ2 by the time
+		// it reached the wait, at least 255 times. muxUnfixed keeps the same
+		// information -- did one re-read suffice? -- without spending a
+		// second bus access to learn it. If it is ever nonzero the access is
+		// discarded and BUS A/BUS B will show it as a bad read or write.
+		if ( IO2_ACCESS && ( g3 & 15 ) >= 3 )
+		{
+			gpu64BusStats.muxMiss++;
+			muxRetried = 1;
+			g3 = read32( ARM_GPIO_GPLEV0 );
+
+			if ( ( g3 & 15 ) < 3 )
+				gpu64BusStats.muxFixed++;
+			else
+				gpu64BusStats.muxUnfixed++;
+		}
+
 		CLR_GPIO( bMPLEX_SEL );
 
 		register u8 D = 0;
@@ -1500,6 +1878,10 @@ reuEmulationMainLoop:
 							gateAge = 0;
 							gpu64HoldGate.armed++;
 							gpu64HoldGate.dispatchDeferred++;
+							// Counted at the point the write was *sampled*,
+							// which is what the denominator means, not at
+							// the point the deferred dispatch later fires.
+							gpu64_busStatsWrite( addr );
 							GPU64_LADDER_SKIP
 						} else
 						{
@@ -1556,15 +1938,19 @@ reuEmulationMainLoop:
 						RESTART_CYCLE_COUNTER
 						SET_GPIO( bDMA_OUT );
 						gpu64_holdGapRelease( armCycleCounter, GPU64_HOLD_KIND_DISPATCH );
+						gpu64_busStatsWrite( addr );
 						GPU64_LADDER_SKIP
 						}
 					} else
+					{
 						// Inlined (gpu64_api.h): a cross-TU call here has to
 						// finish before the loop's next sample, and an
 						// i-cache miss on it loses the C64's next IO2 access
 						// outright -- which showed up as commands running on
 						// half-written argument blocks.
 						gpu64_apiWriteReg( addr, D );
+						gpu64_busStatsWrite( addr );
+					}
 				} else
 				{
 					switch ( addr )
@@ -1640,6 +2026,7 @@ reuEmulationMainLoop:
 				register u8 addr = IO_ADDRESS;
 
 				register u8 disableIRQ = 0;
+				u64 ccArrived = 0;
 				// this is how this looks like in readable form:
 				/*				switch ( addr )
 							{
@@ -1662,11 +2049,31 @@ reuEmulationMainLoop:
 				if ( addr >= GPU64_REG_CMD_HI )
 				{
 					// Inlined (gpu64_api.h) -- this runs against a hard
-					// deadline: D has to be on the bus by WAIT_CYCLE_READ2
-					// below, so a call with a cold i-cache means the C64
+					// deadline: D has to be on the bus by WAIT_CYCLE_READ
+					// (the drive-by target; WAIT_CYCLE_READ2 below only
+					// gates the release), so a cold i-cache means the C64
 					// latches whatever was on the bus instead of the
 					// register. That was the intermittently wrong ERRCODE.
 					D = gpu64_apiReadReg( addr );
+
+					// gpu64 2026-09-12: stamp the SETUP edge, not the
+					// release edge. Run 25 measured against
+					// WAIT_CYCLE_READ2 from below the drive, which is the
+					// point the transceiver is turned OFF -- so it scored
+					// how long the Pi over-HELD the bus, a number that says
+					// nothing about whether the C64 latched the right byte.
+					// What decides a wrong ERRCODE is whether D reached the
+					// pins before the C64's latch, and D reaches them on the
+					// GPCLR0/GPSET0 pair immediately below. So the stamp
+					// belongs here, and the deadline it is compared against
+					// is WAIT_CYCLE_READ -- RAD's drive-by target, which
+					// nothing in this path actually waits for.
+					//
+					// Costs nothing new: it is the same single MRS the run
+					// 25 build already spent, moved up inside a branch that
+					// had already been taken. The REU path (addr < 0x0B)
+					// never reaches it.
+					READ_CYCLE_COUNTER( ccArrived );
 				} else
 				{
 					D = ( (u8 *)&reu.status )[ addr ];
@@ -1695,6 +2102,18 @@ reuEmulationMainLoop:
 
 				WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_READ2 );
 				SET_GPIO( bOE_Dx | bDIR_Dx );
+
+				// gpu64: bus-sampling instrument (gpu64_busstats.h).
+				// Deliberately here and not up beside the decode: the C64
+				// has latched D and the transceiver has turned around, so
+				// this is outside the read's hard deadline and only inside
+				// the loop's next-sample window -- the same handful of ARM
+				// cycles gpu64_holdGapRelease() already spends there.
+				if ( addr >= GPU64_REG_CMD_HI )
+				{
+					gpu64_busStatsRead( addr );
+					gpu64_readSlackNote( reu.WAIT_CYCLE_READ + armCycleCounter, ccArrived, muxRetried );
+				}
 			}
 
 		// gpu64: the deferred flip commit fires here, and only here.

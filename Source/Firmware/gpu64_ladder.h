@@ -270,6 +270,16 @@
 	// 0x2608 -- it is the compiler rearranging a loop body that now carries
 	// five more live registers. Either way the whole function is inside the
 	// window again, which it had not been since the ladder rounds.
+	//
+	// 2026-09-08, the C64-reset state restore: 0x24d4 -> 0x2558, still ~680
+	// bytes clear. The bounded no-clock wait costs a subs+b.eq per spin
+	// iteration and a cbnz per pass, with no new stack spills in the hot
+	// path -- the timeout became a countdown register and `noClock` folded
+	// away entirely.
+	//
+	// 2026-09-09, the bus-sampling instrument (gpu64_busstats.h): 0x2558 ->
+	// 0x2684, still ~380 bytes clear. Two inlined counter helpers at four
+	// call sites, all of them off the deadline path.
 	// Re-measure with the nm -S command above after any further change.
 	#define GPU64_POLL_IPL_WINDOW	0x2800
 	#define GPU64_POLL_PRELOAD_SIZE	( 1024 * 10 )

@@ -49,6 +49,9 @@
 ;        BAD ID ERR   0A        DESTROY_NODE on an id that was never created
 ;        BAD ARG1 ERR 04        SET_VISIBLE with a value that isn't 0 or 1
 ;        BAD ARG2 ERR 04        SET_SCALE with a scale of zero
+;        NO KEY ERR   04        DESTROY_NODE without the one-shot key in
+;                                ARG15 -- refused, and DESTROY ERR above
+;                                proves the node survived the refusal
 ;
 ;        VERDICT PASS
 ;
@@ -77,6 +80,13 @@ ARG      = $df11
 
 OP_CREATE_OBJECT = $20
 OP_DESTROY_NODE  = $22
+
+; The one-shot key DESTROY_NODE (and SCENE_RESET, LOOP_STOP, FREE_RESOURCE)
+; carry in ARG15 -- gpu64_api.h. The firmware spends ARG15 on every dispatch,
+; so it is staged immediately before each destructive command and never once
+; up front.
+KEY      = $a5
+ARG_KEY  = 15
 OP_SET_VISIBLE   = $24
 OP_SET_SCALE     = $35
 
@@ -155,11 +165,26 @@ fillLoop
 	jsr cmd1
 	sta replaceErr
 
+	; --- the one-shot key: an UNKEYED destroy must be refused -----------
+	; ARG15 is spent by every dispatch (gpu64_api.h), so the
+	; CREATE_OBJECT above has already cleared whatever was there. This
+	; must answer BAD_ARGS, and node 1 must survive it -- which the keyed
+	; destroy immediately below proves by answering OK.
+	lda #1
+	sta ID_LO
+	lda #0
+	sta ID_HI
+	lda #OP_DESTROY_NODE
+	jsr cmd1
+	sta noKeyErr
+
 	; --- destroy that node, freeing its slot ---------------------------
 	lda #1
 	sta ID_LO
 	lda #0
 	sta ID_HI
+	lda #KEY
+	sta ARG+ARG_KEY
 	lda #OP_DESTROY_NODE
 	jsr cmd1
 	sta destroyErr
@@ -197,6 +222,8 @@ fillLoop
 	sta ID_LO
 	lda #BAD_ID_HI
 	sta ID_HI
+	lda #KEY
+	sta ARG+ARG_KEY
 	lda #OP_DESTROY_NODE
 	jsr cmd1
 	sta badIdErr
@@ -256,6 +283,9 @@ verdict
 	bne vFail
 	lda replaceErr
 	cmp #ERR_OK
+	bne vFail
+	lda noKeyErr
+	cmp #ERR_BAD_ARGS
 	bne vFail
 	lda destroyErr
 	cmp #ERR_OK
@@ -342,6 +372,12 @@ showAll
 	ldy #13
 	lda badArgs2Err
 	jsr putHex
+
+	lda #11
+	jsr rowAddr
+	ldy #13
+	lda noKeyErr
+	jsr putHex
 	rts
 
 ; ----------------------------------------------------------------------
@@ -396,6 +432,10 @@ showLabels
 	lda #<txtBadArgs2Err
 	ldy #>txtBadArgs2Err
 	ldx #10
+	jsr printAt
+	lda #<txtNoKeyErr
+	ldy #>txtNoKeyErr
+	ldx #11
 	jmp printAt
 
 printAt
@@ -490,6 +530,8 @@ txtBadArgs1Err	.text "BAD ARG1 ERR"
 		.byte 0
 txtBadArgs2Err	.text "BAD ARG2 ERR"
 		.byte 0
+txtNoKeyErr	.text "NO KEY ERR"
+		.byte 0
 txtPass		.text "VERDICT PASS"
 		.byte 0
 txtFail		.text "VERDICT FAIL"
@@ -500,6 +542,7 @@ filled		.word 0
 fillErr		.byte 0
 replaceErr	.byte 0
 destroyErr	.byte 0
+noKeyErr	.byte 0
 reclaimErr	.byte 0
 refullErr	.byte 0
 badIdErr	.byte 0

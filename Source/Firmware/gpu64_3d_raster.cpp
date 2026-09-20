@@ -1,6 +1,6 @@
 /*
- gpu64 milestone 6 -- the affine, z-tested triangle rasteriser, and the
- viewport clear. See gpu64_3d_render.h.
+ gpu64 milestone 6 -- the perspective-correct, z-tested triangle rasteriser,
+ and the viewport clear. See gpu64_3d_render.h.
 
  Portable: compiled unchanged by the firmware and by tools/hostsim.
 */
@@ -11,6 +11,14 @@
 // yield sits inside the span loop rather than at the end of a scanline
 // because a full-width span is 960 bytes, nearly four times the budget.
 #define GPU64_3D_SPAN_PIXELS	( GPU64_3D_SPAN_BYTES / 3 )
+
+// Pixels between the divides that recover u and v from u/z and v/z. Quake's
+// own number, for Quake's own reason: the error a linear step accumulates
+// over sixteen pixels is far below a texel, and a divide per pixel is not
+// worth paying for it. Class 2's gpu64_rasterPolys() does divide per pixel,
+// but only because tools/rastercheck diffs it texel-for-texel against a
+// Python model; class 1 has no such model and is free to subdivide.
+#define GPU64_3D_PERSP_RUN	16
 
 typedef __int128 s128;
 
@@ -159,7 +167,19 @@ void gpu64_3dClearViewport( const Gpu64_3dState *pState, Gpu64_3dTarget *pTarget
 
 struct Gpu64_3dGrad
 {
-	s32	dx, dy;				// attribute change per pixel, 16.16
+	// Attribute change per pixel, at 16.32 -- sixteen fractional bits MORE
+	// than the attribute itself carries. That surplus is not luxury, it is
+	// the whole correctness of the plane: the span setup below reaches its
+	// starting value by extrapolating from vertex 0, and vertex 0 of a wall
+	// seen edge-on sits hundreds of pixels off the side of the screen. At
+	// 16.16 the gradient of 1/z along such a wall is a number like 58.85
+	// truncated to 58, and 0.85 lost per pixel across a 520-pixel
+	// extrapolation is a 442-unit error in a value whose whole range at the
+	// far plane is 1927 -- a 20% depth error, and, because u/z rides the
+	// same plane, a texture that slides along the wall as the camera walks
+	// past it. Measured with the oracle in the milestone-17 notes; do not
+	// narrow these back to s32.
+	s64	dx, dy;				// attribute change per pixel, 16.32
 };
 
 // Plane gradients of one attribute over the triangle. Done in 128-bit
@@ -175,11 +195,11 @@ static void gradient( Gpu64_3dGrad *pG, s64 d,
 	const s64 da1 = a1 - a0;
 	const s64 da2 = a2 - a0;
 
-	const s128 numX = ( (s128)da1 * dy2 - (s128)da2 * dy1 ) << 16;
-	const s128 numY = ( (s128)da2 * dx1 - (s128)da1 * dx2 ) << 16;
+	const s128 numX = ( (s128)da1 * dy2 - (s128)da2 * dy1 ) << 32;
+	const s128 numY = ( (s128)da2 * dx1 - (s128)da1 * dx2 ) << 32;
 
-	pG->dx = (s32)( numX / d );
-	pG->dy = (s32)( numY / d );
+	pG->dx = (s64)( numX / d );
+	pG->dy = (s64)( numY / d );
 }
 
 void gpu64_3dRasterTriangle( const Gpu64_3dState *pState,
@@ -200,8 +220,8 @@ void gpu64_3dRasterTriangle( const Gpu64_3dState *pState,
 
 	Gpu64_3dGrad gz, gu, gv;
 	gradient( &gz, d, pV[ 0 ].invZ, pV[ 1 ].invZ, pV[ 2 ].invZ, dx1, dy1, dx2, dy2 );
-	gradient( &gu, d, pV[ 0 ].u, pV[ 1 ].u, pV[ 2 ].u, dx1, dy1, dx2, dy2 );
-	gradient( &gv, d, pV[ 0 ].v, pV[ 1 ].v, pV[ 2 ].v, dx1, dy1, dx2, dy2 );
+	gradient( &gu, d, pV[ 0 ].uz, pV[ 1 ].uz, pV[ 2 ].uz, dx1, dy1, dx2, dy2 );
+	gradient( &gv, d, pV[ 0 ].vz, pV[ 1 ].vz, pV[ 2 ].vz, dx1, dy1, dx2, dy2 );
 
 	// The lights that reach this triangle, and -- only if there are any --
 	// the three extra plane gradients that carry view-space position across
@@ -287,23 +307,36 @@ void gpu64_3dRasterTriangle( const Gpu64_3dState *pState,
 			continue;
 
 		// Attribute values at the centre of the span's first pixel, then a
-		// plain add per pixel. This is the affine mapping the design chose:
-		// no per-pixel divide, and the price is the texture swimming on
-		// near-parallel surfaces, which boxy low-poly geometry does not show.
+		// plain add per pixel. All three of these ARE linear in screen
+		// space -- that is the whole point of carrying u/z and v/z
+		// rather than u and v, which are not, and whose affine
+		// interpolation creased every large face along its quad's
+		// diagonal. The divide that turns uz/vz back into texels is
+		// paid once per GPU64_3D_PERSP_RUN pixels, below.
 		const s64 fx = ( ( (s64)x0 << 16 ) + 32768 ) - pV[ 0 ].sx;
 		const s64 fy = yc - pV[ 0 ].sy;
 
-		s32 z = (s32)( pV[ 0 ].invZ + ( ( (s64)gz.dx * fx + (s64)gz.dy * fy ) >> 16 ) );
-		s32 u = (s32)( pV[ 0 ].u    + ( ( (s64)gu.dx * fx + (s64)gu.dy * fy ) >> 16 ) );
-		s32 v = (s32)( pV[ 0 ].v    + ( ( (s64)gv.dx * fx + (s64)gv.dy * fy ) >> 16 ) );
+		// The accumulators are 16.32, matching the gradients: fx is a
+		// pixel count in 16.16 and the product is taken in 128 bits
+		// because a steep gradient times a long extrapolation passes
+		// s64 on its own.
+		#define AT0( a0, g ) \
+			( ( (s64)(a0) << 16 ) + \
+			  (s64)( ( (s128)(g).dx * fx + (s128)(g).dy * fy ) >> 16 ) )
 
-		s32 px = 0, py = 0, pz = 0;
+		s64 z  = AT0( pV[ 0 ].invZ, gz );
+		s64 uz = AT0( pV[ 0 ].uz,   gu );
+		s64 vz = AT0( pV[ 0 ].vz,   gv );
+
+		s64 px = 0, py = 0, pz = 0;
 		if ( lit.n )
 		{
-			px = (s32)( pV[ 0 ].px + ( ( (s64)gpx.dx * fx + (s64)gpx.dy * fy ) >> 16 ) );
-			py = (s32)( pV[ 0 ].py + ( ( (s64)gpy.dx * fx + (s64)gpy.dy * fy ) >> 16 ) );
-			pz = (s32)( pV[ 0 ].pz + ( ( (s64)gpz.dx * fx + (s64)gpz.dy * fy ) >> 16 ) );
+			px = AT0( pV[ 0 ].px, gpx );
+			py = AT0( pV[ 0 ].py, gpy );
+			pz = AT0( pV[ 0 ].pz, gpz );
 		}
+
+		#undef AT0
 
 		u8  *pRow = pTarget->pPixels + (size_t)y * pTarget->pitch;
 		u16 *pZ   = pTarget->pDepth + (size_t)( y - vpY0 ) * pState->vpW - vpX0;
@@ -315,69 +348,121 @@ void gpu64_3dRasterTriangle( const Gpu64_3dState *pState,
 			if ( n > GPU64_3D_SPAN_PIXELS )
 				n = GPU64_3D_SPAN_PIXELS;
 
-			// Two loop bodies, not an `if` per pixel: the unlit one is
-			// what every program before Stage 17 runs and it is the same
-			// loop it has always been -- the light test is hoisted out
-			// here, where it costs one branch per 85-pixel chunk.
-			if ( lit.n == 0 )
+			const int xChunk = x + n;
+
+			// The perspective runs sit INSIDE the burst chunk rather
+			// than replacing it. GPU64_3D_SPAN_PIXELS is milestone
+			// 6a's store-burst budget and nothing else may set it;
+			// yielding every sixteen pixels instead would multiply
+			// the DSBs by five and buy nothing.
+			while ( x < xChunk )
 			{
-				for ( int i = 0; i < n; i++, x++ )
+				int m = xChunk - x;
+				if ( m > GPU64_3D_PERSP_RUN )
+					m = GPU64_3D_PERSP_RUN;
+
+				// u and v exact at both ends of the run, a plain
+				// add between. Both ends come down from the 16.32
+				// the accumulators carry to the 16.16 the divides
+				// want. z is positive everywhere inside a
+				// near-clipped triangle, but the run's far end is
+				// one past the last covered pixel and the plane
+				// extrapolates freely there -- hence the clamps,
+				// which cost a handful of compares per sixteen
+				// pixels and remove a divide-by-zero that would
+				// otherwise depend on the geometry. The low clamp
+				// is on the SHIFTED value: a z of a few hundred is
+				// a legitimate 16.16 depth and a zero 16.16 one.
+				const s64 z0 = z >> 16;
+				const s64 z1 = ( z + gz.dx * m ) >> 16;
+
+				const s32 zNear = z0 > 0
+					? (s32)( z0 < 0x7fffffff ? z0 : 0x7fffffff ) : 1;
+				const s32 zEnd = z1 > 0
+					? (s32)( z1 < 0x7fffffff ? z1 : 0x7fffffff ) : 1;
+
+				// uz is 16.32 and zNear 16.16, so the quotient is
+				// already the 16.16 texel coordinate -- the shift
+				// the old s32 form needed is now the format.
+				s32 u = (s32)( uz / zNear );
+				s32 v = (s32)( vz / zNear );
+
+				const s64 uEnd = ( uz + gu.dx * m ) / zEnd;
+				const s64 vEnd = ( vz + gv.dx * m ) / zEnd;
+
+				const s32 du = (s32)( ( uEnd - u ) / m );
+				const s32 dv = (s32)( ( vEnd - v ) / m );
+
+				// Two loop bodies, not an `if` per pixel: the unlit one is
+				// what every program before Stage 17 runs and it is the same
+				// loop it has always been -- the light test is hoisted out
+				// here, where it costs one branch per run.
+				if ( lit.n == 0 )
 				{
-					// invZ is 1.0 at the near plane and falls off with distance,
-					// so the test is >, not <, and an untouched pixel (0) always
-					// loses.
-					u32 depth = (u32)( z < 0 ? 0 : z );
-					if ( depth > 65535 ) depth = 65535;
-
-					if ( depth > pZ[ x ] )
+					for ( int i = 0; i < m; i++, x++ )
 					{
-						if ( pTex )
+						// invZ is 1.0 at the near plane and falls off with distance,
+						// so the test is >, not <, and an untouched pixel (0) always
+						// loses.
+						const s64 zi = z >> 16;
+						const u32 depth = zi <= 0 ? 0
+							: ( zi > 65535 ? 65535 : (u32)zi );
+
+						if ( depth > pZ[ x ] )
 						{
-							const u32 tu = ( (u32)( u >> 16 ) ) & uMask;
-							const u32 tv = ( (u32)( v >> 16 ) ) & vMask;
-							pRow[ x ] = pColormap[ pTex->pTexels[ ( tv << wShift ) | tu ] ];
-						} else
-							pRow[ x ] = flatIndex;
+							if ( pTex )
+							{
+								const u32 tu = ( (u32)( u >> 16 ) ) & uMask;
+								const u32 tv = ( (u32)( v >> 16 ) ) & vMask;
+								pRow[ x ] = pColormap[ pTex->pTexels[ ( tv << wShift ) | tu ] ];
+							} else
+								pRow[ x ] = flatIndex;
 
-						pZ[ x ] = (u16)depth;
+							pZ[ x ] = (u16)depth;
+						}
+
+						z  += gz.dx;
+						uz += gu.dx;
+						vz += gv.dx;
+						u  += du;
+						v  += dv;
 					}
-
-					z += gz.dx;
-					u += gu.dx;
-					v += gv.dx;
-				}
-			} else
-			{
-				for ( int i = 0; i < n; i++, x++ )
+				} else
 				{
-					u32 depth = (u32)( z < 0 ? 0 : z );
-					if ( depth > 65535 ) depth = 65535;
-
-					if ( depth > pZ[ x ] )
+					for ( int i = 0; i < m; i++, x++ )
 					{
-						// The interpolated position is 16.16 view space and
-						// the lights are 8.8: one shift, per pixel, rather
-						// than eight lights held in the wider format.
-						const u8 lvl = lightAdd( &lit, nLight, px >> 8, py >> 8, pz >> 8 );
-						const u8 *pRowMap = pState->colormap + (size_t)lvl * 256;
+						const s64 zi = z >> 16;
+						const u32 depth = zi <= 0 ? 0
+							: ( zi > 65535 ? 65535 : (u32)zi );
 
-						if ( pTex )
+						if ( depth > pZ[ x ] )
 						{
-							const u32 tu = ( (u32)( u >> 16 ) ) & uMask;
-							const u32 tv = ( (u32)( v >> 16 ) ) & vMask;
-							pRow[ x ] = pRowMap[ pTex->pTexels[ ( tv << wShift ) | tu ] ];
-						} else
-							pRow[ x ] = pRowMap[ nFlat ];
+							// The interpolated position is 16.16 view space and
+							// the lights are 8.8: one shift, per pixel, rather
+							// than eight lights held in the wider format.
+							const u8 lvl = lightAdd( &lit, nLight, (s32)( px >> 24 ), (s32)( py >> 24 ), (s32)( pz >> 24 ) );
+							const u8 *pRowMap = pState->colormap + (size_t)lvl * 256;
 
-						pZ[ x ] = (u16)depth;
+							if ( pTex )
+							{
+								const u32 tu = ( (u32)( u >> 16 ) ) & uMask;
+								const u32 tv = ( (u32)( v >> 16 ) ) & vMask;
+								pRow[ x ] = pRowMap[ pTex->pTexels[ ( tv << wShift ) | tu ] ];
+							} else
+								pRow[ x ] = pRowMap[ nFlat ];
+
+							pZ[ x ] = (u16)depth;
+						}
+
+						z  += gz.dx;
+						uz += gu.dx;
+						vz += gv.dx;
+						u  += du;
+						v  += dv;
+						px += gpx.dx;
+						py += gpy.dx;
+						pz += gpz.dx;
 					}
-
-					z += gz.dx;
-					u += gu.dx;
-					v += gv.dx;
-					px += gpx.dx;
-					py += gpy.dx;
-					pz += gpz.dx;
 				}
 			}
 

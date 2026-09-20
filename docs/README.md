@@ -21,6 +21,31 @@ Opcodes are grouped into **classes**, selected by `CMD_HI`:
   things, per-frame polygon batches). Frozen but still working; superseded
   by class 1 for new work.
 
+## The v1 surface
+
+As of 2026-09-11 the API below is **frozen for v1**: opcodes, argument
+layouts and error codes will not change meaning, and anything added later
+takes a new opcode number rather than a new argument on an existing one.
+Three things are deliberately outside that freeze, and a program should not
+be written as if they were settled:
+
+- **Free-running mode** (`LOOP_START` with `ARG0` = 1) answers `UNSUPPORTED`
+  and is staged. Handshake mode is the whole of v1's loop. `LOOP_START`
+  itself is optional in handshake mode — `SCENE_COMMIT` starts a stopped
+  loop — so it survives v1 only as the place you will eventually ask for
+  free-running.
+- **Class 2** is frozen, not removed. It still works; it gets no new
+  opcodes.
+- **Visibility** (PVS, frustum culling) is not in v1 at all. Size levels
+  accordingly — see [known-gaps.md](known-gaps.md) and
+  [level-scale-visibility.md](level-scale-visibility.md).
+
+Two v1 rules are not optional for a program that runs for more than a few
+seconds, because the IO2 bus drops roughly one register write in tens of
+thousands and a retained scene remembers every one of them: refresh your
+node state on a rotation ([state-refresh.md](state-refresh.md)), and fence
+every readback with `SET_DMA_WINDOW` before you use one.
+
 ## Reading order
 
 1. **[getting-started.md](getting-started.md)** — register map, what a
@@ -39,9 +64,12 @@ Opcodes are grouped into **classes**, selected by `CMD_HI`:
 6. **[vblank-and-animation.md](vblank-and-animation.md)** — syncing to the
    frame and the tear-free double-buffering idiom.
 7. **[error-codes.md](error-codes.md)** — the shared `ERRCODE` table.
-8. **[examples.md](examples.md)** — three complete, short programs covering
+8. **[state-refresh.md](state-refresh.md)** — keeping a retained scene
+   correct: why a lost argument write is permanent, and the bounded-lifetime
+   refresh ring that closes it. Read this before shipping a game.
+9. **[examples.md](examples.md)** — three complete, short programs covering
    the common shapes a gpu64 program takes.
-9. **[known-gaps.md](known-gaps.md)** — a usability audit from the
+10. **[known-gaps.md](known-gaps.md)** — a usability audit from the
    perspective of someone shipping a real game: what's missing, what's easy
    to get wrong, what to size a level around.
 

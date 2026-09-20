@@ -51,6 +51,7 @@ ERRCODE  = $df0e		; result of the last dispatch
 ID_LO    = $df0f
 ID_HI    = $df10
 ARG      = $df11		; ARG0..ARG15 = $df11..$df20
+RESULT   = $df21		; readable; the only way to check an ARG landed
 
 ST_BUSY		= $01
 ST_ERROR	= $02
@@ -69,6 +70,8 @@ OP_LOG_ENABLE	= $07
 OP_SET_BORDER	= $08
 OP_VBLANK_SYNC	= $09
 OP_GET_HEALTH	= $0a
+OP_FULL_RESET	= $0b
+OP_SET_DMA_WINDOW = $0c	; where a readback is allowed to write
 OP_CLEAR	= $10
 OP_SET_PIXEL	= $20
 OP_LINE		= $21
@@ -206,6 +209,8 @@ ERR_BUSY	= $07
 ERR_OUT_OF_MEMORY = $08		; class 2: the texture arena is full
 ERR_QUEUE_FULL	= $09
 ERR_BAD_ID	= $0a		; class 2: a texture id of 0, past 255, or dead
+ERR_NO_CAMERA	= $0b		; class 1: the scene has no active camera
+ERR_WORKER_TIMEOUT = $0c
 
 ; --- geometry and spaces -----------------------------------------------
 FB_W		= 320

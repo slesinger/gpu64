@@ -30,9 +30,15 @@
 ;           immediately after must have FRAME_READY (bit 4) clear -- a
 ;           commit that just armed a new frame has, by construction, not
 ;           finished it yet.
-;        5. LOOP_STOP always answers OK. After it, SCENE_COMMIT answers
-;           UNSUPPORTED (there is no loop to commit) and CLEAR_VIEWPORT is
-;           accepted again -- immediate mode restored.
+;        5. LOOP_STOP (keyed) always answers OK, and CLEAR_VIEWPORT is
+;           accepted straight after it -- immediate mode restored. A
+;           SCENE_COMMIT then answers OK too, because since 2026-09-10 a
+;           commit against a stopped loop RE-ARMS it rather than refusing
+;           with UNSUPPORTED, so one mis-sampled byte cannot end a session
+;           (see SCENE_COMMIT in Source/Firmware/gpu64_3d_class1.cpp). The
+;           fourth check is CLEAR_VIEWPORT again, now expected to answer
+;           BUSY: that is what proves the re-arm was real rather than the
+;           commit merely being ignored.
 ;
 ;      HOW TO READ THE RESULT
 ;
@@ -43,9 +49,11 @@
 ;                                              nine steps as gpu64_3d_cube.a)
 ;        SCENE  00 0B 00 00 00 00 07 07        the five checks above, in
 ;                                              order -- see EXPECTED below
-;        POST   00 06 00                       LOOP_STOP, SCENE_COMMIT-
-;                                              after-stop, CLEAR_VIEWPORT-
-;                                              after-stop
+;        POST   00 00 00 07                    LOOP_STOP, CLEAR_VIEWPORT-
+;                                              after-stop, SCENE_COMMIT
+;                                              (re-arms, so OK), then
+;                                              CLEAR_VIEWPORT again, now
+;                                              BUSY because of that re-arm
 ;        FRAME  nnnn/mmmm                      commits attempted / commits
 ;                                              that answered OK. The two
 ;                                              are separate because a run
@@ -1037,17 +1045,32 @@ doPostChecks
 	lda missed
 	sta scMissSnap
 
-	; LOOP_STOP -- always OK, even if LOOP_START never actually ran
+	; LOOP_STOP -- always OK, even if LOOP_START never actually ran.
+	; The one-shot key in ARG15 is what makes it OK rather than BAD_ARGS
+	; (gpu64_api.h); without it this check would be measuring the key.
+	lda #$a5
+	sta ARG+15
 	lda #OP_LOOP_STOP
 	jsr cmdSeq1
 	jsr logPost
 
-	; SCENE_COMMIT with no loop running -- expect UNSUPPORTED
+	; CLEAR_VIEWPORT -- immediate mode restored, expect OK. This has to
+	; come BEFORE the commit below, not after it: since the self-healing
+	; commit landed (2026-09-10) a SCENE_COMMIT against a stopped loop
+	; restarts the loop, and immediate mode is refused with BUSY while the
+	; loop runs (precheckClearViewport()).
+	lda #OP_CLEAR_VIEWPORT
+	jsr cmdSeq1
+	jsr logPost
+
+	; SCENE_COMMIT with no loop running -- expect OK: it re-arms the loop.
 	lda #OP_SCENE_COMMIT
 	jsr cmdSeq1
 	jsr logPost
 
-	; CLEAR_VIEWPORT -- immediate mode restored, expect OK
+	; CLEAR_VIEWPORT again -- expect BUSY. This is the assertion that the
+	; re-arm above really happened; without it "SCENE_COMMIT answered OK"
+	; would be satisfied by a firmware that simply ignored the commit.
 	lda #OP_CLEAR_VIEWPORT
 	jsr cmdSeq1
 	jsr logPost
@@ -1116,7 +1139,7 @@ vPostLive
 	jmp vFail
 vPostNext
 	inx
-	cpx #3
+	cpx #4
 	bne vPostLoop
 
 	; The logged commits: ERRCODE must be OK, RESULT (page) must be one
@@ -1298,7 +1321,10 @@ slCol
 sceneExpect
 	.byte $00, $0B, $00, $00, $00, $00, $07, $07
 postExpect
-	.byte $00, $06, $00
+	; LOOP_STOP OK, CLEAR_VIEWPORT OK (immediate mode is back),
+	; SCENE_COMMIT OK (it re-arms the loop it found stopped), then
+	; CLEAR_VIEWPORT BUSY because that re-arm took effect.
+	.byte $00, $00, $00, $07
 
 ; ----------------------------------------------------------------------
 ; Screen output.
@@ -1372,7 +1398,7 @@ poLoop
 	jsr putHex
 	iny
 	inx
-	cpx #3
+	cpx #4
 	bne poLoop
 
 	ldy #32
@@ -1384,7 +1410,7 @@ poMissLoop
 	sta (DST),y
 	iny
 	inx
-	cpx #3
+	cpx #4
 	bne poMissLoop
 	rts
 
@@ -1842,10 +1868,10 @@ setupErr	.fill 9, $ff
 sceneIdx	.byte 0
 sceneErr	.fill 8, $ff
 sceneMiss	.fill 8, 0
-postMiss	.fill 3, 0
+postMiss	.fill 4, 0
 scMissSnap	.byte 0
 postIdx		.byte 0
-postErr		.fill 3, $ff
+postErr		.fill 4, $ff
 
 palFirst	.byte 0
 hueIdx		.byte 0

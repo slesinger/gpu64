@@ -228,11 +228,21 @@ static void project( Gpu64_3dRasterVert *pOut, const ClipVert *pIn,
 
 	// near/z, so the value is 1.0 (65536) at the near plane and falls off
 	// with distance. Linear in screen space, which is what makes it
-	// interpolable by the affine rasteriser.
+	// interpolable at all -- and what u/z and v/z below are divided by.
 	pOut->invZ = (s32)( ( (s64)pState->nearZ << 16 ) / z );
 
-	pOut->u = pIn->u;
-	pOut->v = pIn->v;
+	// u/z and v/z -- what is linear in SCREEN space, and so what the plane
+	// gradients may legitimately be taken of. invZ is near/z, a positive
+	// multiple of 1/z, and the rasteriser's divide undoes that same
+	// constant, so no scale factor has to travel alongside.
+	//
+	// The shift keeps these in the 16.16 magnitude the bare texel
+	// coordinate had (a texcoord byte is at most 255.0 and invZ at most
+	// 1.0). Do not widen it to buy precision at the far plane: gradient()
+	// truncates its result to s32 and a one-pixel-wide triangle would
+	// overflow it.
+	pOut->uz = (s32)( ( (s64)pIn->u * pOut->invZ ) >> 16 );
+	pOut->vz = (s32)( ( (s64)pIn->v * pOut->invZ ) >> 16 );
 
 	// View-space position, for the point lights. Carried, not recomputed:
 	// this is the value the vertex has had since the model transform and

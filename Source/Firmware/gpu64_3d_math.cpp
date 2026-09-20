@@ -65,30 +65,40 @@ void gpu64_3dMatFromEuler( Gpu64_3dMat *pOut, u16 nYaw, u16 nPitch, u16 nRoll )
 	const s32 sp = gpu64_3dSin( nPitch ), cp = gpu64_3dCos( nPitch );
 	const s32 sr = gpu64_3dSin( nRoll ),  cr = gpu64_3dCos( nRoll );
 
-	// R = Rz(roll) * Rx(pitch) * Ry(yaw), written out rather than composed
+	// R = Ry(yaw) * Rx(pitch) * Rz(roll), written out rather than composed
 	// from three matrix multiplies: two of the three are mostly zeros, and
 	// multiplying through them would cost 54 multiplies and two extra
 	// roundings to 1.15 for a result this reaches in 16.
 	#define M15( a, b )	(s16)( ( (s32)(a) * (s32)(b) ) >> GPU64_FX15_SHIFT )
 	#define M15_3( a, b, c ) (s16)( ( ( ( (s32)(a) * (s32)(b) ) >> GPU64_FX15_SHIFT ) * (s32)(c) ) >> GPU64_FX15_SHIFT )
 
-	// R = Rz(roll) * Rx(pitch) * Ry(yaw), multiplied out. The four terms
-	// carrying both sr/cr and sp are the ones whose signs are easy to get
-	// wrong, and a wrong sign here does not look like a wrong sign: it makes
-	// the matrix non-orthogonal, so the model *shears* as it turns, which
-	// reads as a perspective artefact rather than as a maths bug. Caught by
-	// tools/hostsim, on a face that should have been visible and was not.
-	pOut->m[ 0 ] = (s16)( M15( cr, cy ) - M15_3( sr, sp, sy ) );
-	pOut->m[ 1 ] = (s16)( -M15( sr, cp ) );
-	pOut->m[ 2 ] = (s16)( M15( cr, sy ) + M15_3( sr, sp, cy ) );
+	// R = Ry(yaw) * Rx(pitch) * Rz(roll), multiplied out. Yaw is the OUTER
+	// factor, so pitch turns about the node's own already-yawed x axis. It
+	// used to be the inner one (R = Rz * Rx * Ry, every axis a world axis),
+	// and that is exactly the bug this replaced: a camera's pitch was then
+	// scaled by cos(yaw) and degenerated into pure roll at a quarter turn.
+	// A rotation about one axis alone is the same rotation either way --
+	// only which of the two sp terms carries it exactly and which picks up
+	// the extra 1.15 truncation swapped over, worth 2 parts in 32768. It is
+	// combinations of two axes that genuinely moved.
+	//
+	// The four terms carrying both sr/cr and sp are the ones whose signs are
+	// easy to get wrong, and a wrong sign here does not look like a wrong
+	// sign: it makes the matrix non-orthogonal, so the model *shears* as it
+	// turns, which reads as a perspective artefact rather than as a maths
+	// bug. Caught by tools/hostsim, on a face that should have been visible
+	// and was not.
+	pOut->m[ 0 ] = (s16)( M15( cy, cr ) + M15_3( sy, sp, sr ) );
+	pOut->m[ 1 ] = (s16)( -M15( cy, sr ) + M15_3( sy, sp, cr ) );
+	pOut->m[ 2 ] = (s16)( M15( sy, cp ) );
 
-	pOut->m[ 3 ] = (s16)( M15( sr, cy ) + M15_3( cr, sp, sy ) );
-	pOut->m[ 4 ] = (s16)( M15( cr, cp ) );
-	pOut->m[ 5 ] = (s16)( M15( sr, sy ) - M15_3( cr, sp, cy ) );
+	pOut->m[ 3 ] = (s16)( M15( cp, sr ) );
+	pOut->m[ 4 ] = (s16)( M15( cp, cr ) );
+	pOut->m[ 5 ] = (s16)( -sp );
 
-	pOut->m[ 6 ] = (s16)( -M15( cp, sy ) );
-	pOut->m[ 7 ] = (s16)( sp );
-	pOut->m[ 8 ] = (s16)( M15( cp, cy ) );
+	pOut->m[ 6 ] = (s16)( -M15( sy, cr ) + M15_3( cy, sp, sr ) );
+	pOut->m[ 7 ] = (s16)( M15( sy, sr ) + M15_3( cy, sp, cr ) );
+	pOut->m[ 8 ] = (s16)( M15( cy, cp ) );
 
 	#undef M15
 	#undef M15_3

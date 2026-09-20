@@ -496,6 +496,16 @@ void gpu64_showMirror( CRAD *pRAD, const u8 *screen, const u8 *color, u8 border,
 		pRAD->showMirror( screen, color, border, background, d018 );
 }
 
+// gpu64: and the same indirection for the dead-clock holding screen, which
+// rad_reu.cpp paints when the C64 stops clocking the bus. Goes through
+// g_pGpu64FB rather than CRAD because the framebuffer is the only thing it
+// needs -- see gpu64_deadClockEnter().
+void gpu64_showHoldingScreen( void )
+{
+	if ( g_pGpu64FB )
+		g_pGpu64FB->ShowHoldingScreen();
+}
+
 // gpu64: the menu's charset for rows 0-3. Same extern-not-#include reasoning
 // as font_bin above: rad_hijack.cpp owns the storage.
 //

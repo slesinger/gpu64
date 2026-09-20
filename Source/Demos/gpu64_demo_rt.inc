@@ -54,6 +54,38 @@ dmiCls
 	lda #0
 	sta CMD_HI
 
+	; EVERYTHING gpu64 holds is sticky across a program launch. The Pi is
+	; not reset when the C64 loads a new .prg -- only a C64 /RESET
+	; re-baselines it -- so a demo started from the RAD menu inherits the
+	; previous demo's palette, its draw/visible page pairing, its border,
+	; its display mode and the pixels it left in every page. Two of those
+	; were seen at the bench on 2026-09-09 and both are reproducible on a
+	; PC with runsim.py's --chain:
+	;
+	;   bounce after palette   -- wrong colours. bounce assumes the C64
+	;                             palette; palette had loaded a 256-entry
+	;                             ramp over it.
+	;   palette after bounce   -- palette's own rings never appear and
+	;                             bounce's rectangles cycle instead.
+	;                             bounce ends with draw page != visible
+	;                             page, so palette's CLEAR and its rings
+	;                             land on a page nobody is looking at,
+	;                             while its PAL_LOAD recolours the page
+	;                             that IS visible -- which still holds
+	;                             bounce's last frame.
+	;
+	; FULL_RESET is exactly the "as if the Pi had just booted" this needs:
+	; graphics mode, the C64 palette, border 0, page 0 both drawn and
+	; visible, every page black. It is a setup-time command -- it can halt
+	; the C64 for up to ~20 ms when it has to leave text mode -- which is
+	; why it belongs here, once, and never in a frame loop. It also
+	; subsumes the TEXT_MODE 0 this used to issue.
+	;
+	; A firmware too old to have $0B answers BAD_OPCODE and changes
+	; nothing, so the TEXT_MODE 0 below stays as the fallback rather than
+	; being deleted.
+	#cmd OP_FULL_RESET
+
 	; Text mode is sticky in the same way, and it is a DISPLAY mode: a
 	; program that left the 80x50 character screen up would otherwise have
 	; every drawing command here land in a framebuffer that is not on the
@@ -66,8 +98,74 @@ dmiCls
 	; GET_INFO does not answer through a register: it DMA-writes the
 	; 16-byte info block into memory you nominate. Bytes 14-15 are the
 	; measured frame period in microseconds, and 0 means "no frame clock".
+	;
+	; This is a writeback, so it needs the same two guards every other
+	; readback has, and until 2026-09-20 it had neither -- it was the
+	; first thing every demo did, and it ran completely unprotected.
+	;
+	;   The fence.  The destination travels in ARG1-ARG3, which SEQACK
+	;   does not cover. One dropped store and the Pi writes sixteen bytes
+	;   over whatever address the previous command left behind, with this
+	;   program halted while it happens. quake3d's own SET_DMA_WINDOW was
+	;   added for exactly this, but it ran AFTER dmInit -- its comment
+	;   said "before anything that can write back into C64 memory" and
+	;   one thing already had.
+	;
+	;   The check.  Nothing verified the block arrived. Run 29 came back
+	;   with CLOCK 0000 while the firmware was demonstrably clocked (4078
+	;   SCENE_COMMITs succeeded, and a commit hard-requires a calibrated
+	;   frame clock), so that readback did not land in dmInfo -- and the
+	;   run ended in a hang. An unfenced writeback that missed its
+	;   destination is the one failure that explains both.
+	;
+	; The check is a real magic, not a poison: bytes 0-2 are 'G','6','4'
+	; unconditionally, so "did the block arrive" needs no assumption about
+	; what plausible data looks like.
+	jsr dmSetWin
+	lda #8
+	sta dmInfoTry
+dmiAgain
+	lda #$5a
+	ldx #15
+-	sta dmInfo,x
+	dex
+	bpl -
+
 	#argblob 0, SPACE_C64, dmInfo, 16
 	#cmd OP_GET_INFO
+
+	lda dmInfo+0
+	cmp #71				; 'G'
+	bne dmiRetry
+	lda dmInfo+1
+	cmp #54				; '6'
+	bne dmiRetry
+	lda dmInfo+2
+	cmp #52				; '4'
+	beq dmiGot
+dmiRetry
+	dec dmInfoTry
+	bne dmiAgain
+	; Eight tries and no info block. Leave dmInfo as poison -- the frame
+	; period test below then reads $5a5a, which is a *plausible* period,
+	; so zero it rather than letting garbage claim a frame clock.
+	lda #0
+	ldx #15
+-	sta dmInfo,x
+	dex
+	bpl -
+dmiGot
+
+	; And hand the window back. A program that wants its own fence sets
+	; one (quake3d does); one that does not is left exactly as permissive
+	; as it was before this routine existed, rather than silently confined
+	; to dmInfo for the rest of its life.
+	lda #0
+	sta CMD_HI
+	#argw 0, 0
+	#argw 2, 0
+	lda #OP_SET_DMA_WINDOW
+	sta CMD_LO
 
 	lda #0
 	sta dmVbOk
@@ -78,6 +176,34 @@ dmiCls
 	sta dmVbOk
 dmiNoVb
 	rts
+
+; ----------------------------------------------------------------------
+; Fence the info-block readback.
+;
+; RESULT is checked rather than trusted: ARG registers read back as $FF, so
+; gpu64's one-byte XOR echo is the only evidence the window landed. Four
+; tries, then carry on regardless -- refusing to start because a fence
+; could not be confirmed is the run-27 mistake, and an unfenced GET_INFO is
+; exactly as safe as it was for the whole project before today.
+; ----------------------------------------------------------------------
+DMINFO_CK = ( <dmInfo ) ^ ( >dmInfo ) ^ 16 ^ 0 ^ $a5
+
+dmSetWin
+	lda #4
+	sta dmWinTry
+dmwAgain
+	lda #0
+	sta CMD_HI
+	#argw 0, dmInfo
+	#argw 2, 16
+	lda #OP_SET_DMA_WINDOW
+	sta CMD_LO
+	lda RESULT
+	cmp #DMINFO_CK
+	beq dmwOk
+	dec dmWinTry
+	bne dmwAgain
+dmwOk	rts
 
 ; ----------------------------------------------------------------------
 ; Frame pacing.
@@ -318,3 +444,5 @@ dmrZero
 dmVbOk	.byte 0				; 1 = this display has a frame clock
 dmSeed	.byte $a5
 dmInfo	.fill 16, 0			; the info block GET_INFO wrote
+dmInfoTry .byte 0			; GET_INFO attempts left when it landed
+dmWinTry .byte 0			; SET_DMA_WINDOW attempts left

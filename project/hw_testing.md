@@ -153,13 +153,39 @@ frame N. This is what a demo that misbehaves only after a while looks like on
 a PC, and `vice-validation-run-length` is the note about why four frames was
 never going to find one.
 
+**Run a demo after another demo, too.** The Pi is not reset when the C64
+loads a `.prg`; only a C64 `/RESET` calls `gpu64_apiReset()`. So a demo
+launched from the RAD menu inherits the previous one's palette, border,
+display mode, framebuffer contents and draw/visible page pairing -- and a
+demo that is correct on its own can be wrong purely because of what ran
+before it. That is not hypothetical: it produced two bench reports on
+2026-09-09, `bounce` in the wrong colours and `palette` recolouring
+`bounce`'s leftover rectangles instead of drawing its own rings. `dmInit`
+now issues `$0B FULL_RESET`, and the regression is:
+
+```
+tools/demos.sh --chain      # every class-0 demo rendered twice, once clean
+                            # and once launched on top of another demo's
+                            # leftover gpu64 state; the two must match
+```
+
+Underneath it is `runsim.py --chain=PRG`, which runs one program and then
+another **on the same model** -- the thing the menu does and a single-program
+desk run structurally cannot see. Off by default in `demos.sh` because it
+doubles the run.
+
 Deploy by copying the `.prg` files into `RAD_PRG/` on the card. RAD reads
-those at launch time, so unlike the kernel image they never go stale.
+those at launch time, so unlike the kernel image they never go stale --
+but the card *accumulates*, and it has collected renamed and abandoned
+copies across the campaign. `SDCARD=<mountpoint> tools/deploy_prg.sh` copies
+everything this tree builds and removes any gpu64-named `.prg` on the card
+that it does not, leaving the user's own C64 software alone; `--dry-run`
+shows what it would do first.
 
 ## The API conformance suite
 
-`Source/TestPRG/gpu64_test_*.a` is a ten-program suite that checks class 0
-and class 2 against [api_design.md](api_design.md) and prints its own
+`Source/TestPRG/gpu64_test_*.a` is a thirteen-program suite that checks
+class 0 and class 2 against [api_design.md](api_design.md) and prints its own
 verdict. It exists
 so that a bench session starts from a known-good baseline instead of from a
 demo that looks about right.
@@ -176,6 +202,9 @@ demo that looks about right.
 | `gpu64_test_walls` | `SET_CAMERA`'s three refusals, and `DRAW_WALLS` against geometry worked out by hand: a flat-on wall at a known distance, each of its four edges asserted from both sides, a back face and a wall behind the camera counted as rejections, and `CAM_PAINT` filling the ceiling and floor of the columns a wall covers and no others |
 | `gpu64_test_sectors` | `SET_SECTORS`' three refusals, and `DRAW_SECTORS` against geometry worked out by hand: a one-sided wall's four edges from both sides, a portal's upper band, window and lower band at their exact rows, and four assertions on the **per-pixel** depth buffer -- a far wall visible through the window, losing to the near wall's lower band in the rows they share, at its own width, and unchanged when the two records are sent in the other order. Those four are the ones a per-column depth buffer would fail |
 | `gpu64_test_things` | `DRAW_THINGS` against the same hand-worked geometry: a billboard's four screen edges at a known distance, the five malformed records that are rejected and the well-formed one that clips away and is not, a thing behind a wall and a thing in front of one, two things in either order, `THING_NODEPTH`, and the four quadrants of a 2x2 texture plus `FLIPX` and the mask key. The wall assertions are the ones that matter: they only pass if `DRAW_SECTORS` and `DRAW_THINGS` really share one depth buffer |
+| `gpu64_test_polys` | `DRAW_POLYS` against geometry worked out by hand — the arithmetic is `tools/rastercheck`'s job; this checks what only hardware shows, that the vertex pool, the texinfo table and the face records the C64 wrote are the ones the core was handed, and that the depth buffer really is the one `DRAW_SECTORS` and `DRAW_THINGS` use |
+| `gpu64_test_world` | `UPLOAD_POLYS`/`DRAW_WORLD`, the resident world: that a record uploaded in one command is still that record several commands later, that a chunked upload lands where its index said, and that a range past the end of the pool is refused rather than read. Same geometry as `gpu64_test_polys` |
+| `gpu64_test_reset` | `$0B FULL_RESET`: into 80x50 text mode, `GET_INFO` agrees, reset, and the framebuffer is demanded back — mode, page count, border geometry, all three pages black, the draw page drawable, and `PAGE_FLIP` legal again. The same firmware path a `/RESET` takes, reached through an opcode because a reset line cannot be desk-checked |
 
 Each prints one line per assertion — a name and either `OK` or `F<hex>` — and
 a verdict line at the bottom. **The fail code is the byte that was wrong**,
@@ -193,7 +222,7 @@ Results stay on screen until RUN/STOP, which also clears it so BASIC's
 ### Desk-check before the bench
 
 ```
-tools/testprg.sh                # assemble all ten and desk-check them
+tools/testprg.sh                # assemble them all and desk-check them
 tools/testprg.sh -v system      # ...and print the screen it produced
 ```
 
@@ -492,6 +521,247 @@ The bench always builds the defaults.
 `tools/prgsim/runsim.py --alias-drop=OFF[,OFF...]` injects a byte-level fault
 at chosen offsets, so the suite's diagnostic lines can be read against a
 known answer on a PC before a bench run is spent on them.
+
+### gpu64_probe_bus -- was the address mis-sampled, or the access dropped?
+
+`Source/TestPRG/gpu64_probe_bus.a`. Written after the 62291-frame Quake run
+of 2026-09-08, which was clean on everything its screen could report except
+135 frames whose commit answered `ERRCODE` **$FF**.
+
+`$FF` is not an errcode -- `GPU64_ERR_*` stops at $0C -- and it has exactly
+two producers that that screen could not tell apart:
+
+- **(a) mis-sampled address.** The loop serviced the read, but `IO_ADDRESS`
+  came out wrong and `gpu64_apiReadReg()` fell through its four cases to
+  `return 0xFF`. `IO_ADDRESS` takes A0-A3 from GPIO 10-13, which are
+  dedicated, and A4-A7 from GPIO 0-3, which the LVC257 multiplexes with NMI,
+  ROMH, IO1 and BUTTON. Every gpu64 register lives at `$DF0B`-`$DF23`, so
+  A4-A7 read 0 when sampled correctly and a mis-sample can only ever *set*
+  bits: `$DF0E` degrades to `$1E`, `$2E`, `$4E` or `$8E`, all still inside
+  the window and all returning `$FF`.
+- **(b) dropped access.** The loop never sampled the read at all -- the
+  ~1-in-180000 floor -- and the C64 latched a floating bus reading `$FF`.
+
+The responses differ, which is why separating them matters. Under (a) the
+firmware's state is intact and only the answer was wrong, so a C64-side
+re-read repairs it and the API can say so. Under (b) a *write* in the same
+position would have vanished silently, which no re-read repairs and which
+only a sequence number can even detect.
+
+**This one does need a firmware change**, unlike `gpu64_probe_latch`, and
+that is the whole point: until now the drop rate had a numerator
+(SEQ/SEQACK mismatches) and no denominator, so "1 in 70 commit dispatches"
+and "1 in 180000 writes" were never comparable numbers.
+`Source/Firmware/gpu64_busstats.h` counts, on core 0 and deliberately *after*
+`WAIT_CYCLE_READ2`/`SET_GPIO` so it is off every deadline path, how many
+gpu64-window reads and writes the polling loop actually serviced and how many
+of those carried an address no gpu64 register occupies. They come out through
+`GET_HEALTH` bytes 48-63 (see
+[../docs/class0-2d-reference.md](../docs/class0-2d-reference.md)). Nothing
+was added to the `$df00`-`$df0a` REU decode path, per CLAUDE.md.
+`reuUsingPolling()` grew 0x2558 -> 0x2684 against the 0x2800 IPL window.
+
+Four columns per rung:
+
+| Column | Meaning |
+|---|---|
+| `ISSD` | what the C64 issued, counted at every single read site |
+| `SAW` | what the loop serviced, minus the fixed cost of the `GET_HEALTH` round trip itself (the `CAL` row) |
+| `BAD` | of those, how many carried an impossible address |
+| `FF` | how many answers came back `$FF` |
+
+and four rungs, all class 0 -- no viewport, no camera, no core 1, because a
+rung that cannot fail for an unrelated reason is worth more here than a
+realistic one:
+
+| Rung | Issues | Isolates |
+|---|---|---|
+| `READ` | `lda ERRCODE` flat out, 8 per iteration | maximum read pressure on an otherwise quiet bus |
+| `DISP` | `sta CMD_LO` (NOP) then `lda ERRCODE` | the shape every command helper in this tree emits: the read lands on the instruction right after a DMA hold released |
+| `FLIP` | the same read, but only while a deferred `PAGE_FLIP` is in flight | races the loop-fired commit hold -- the closest class-0 analogue of the Quake frame |
+| `WRIT` | `sta ARG+0` flat out | the write-side twin; `FF` is meaningless here and prints `----` |
+
+`FLIP` exists because the Quake rate works out at about one event per 460
+commits, two orders of magnitude above the documented write-drop floor. If
+the commit window is what concentrates them, this is the rung that says so.
+
+Reading it:
+
+- `SAW < ISSD` -- **(b)**, and by exactly how much.
+- `BAD > 0` -- **(a)**, and the `BADAD` row names the bits. Expect the low
+  nibble to match the register the rung was reading (`$0E` for `ERRCODE`)
+  and the damage to be in the high nibble; anything else refutes (a).
+- `FF` well above `BAD + (ISSD - SAW)` -- a **third** mechanism, in the data
+  half of the bus rather than the address half. That would be a new finding,
+  and it is the one verdict path never exercised on a PC.
+
+The `CAL` row is the load-bearing part of the arithmetic. It is two
+back-to-back `GET_HEALTH` calls whose delta is the per-round-trip overhead --
+*measured*, not counted, because the firmware counts the triggering `CMD_LO`
+write only after dispatch. It prints `RR WW EE`; `EE` must be `00` or
+`healthBuf` was never filled and every number below it is a difference
+between two copies of nothing. Desk runs give `CAL 01 07 00`, which is what
+was predicted by hand, and that agreement is what keeps a systematic
+accounting error from reaching the bench disguised as `DROPPED ACCESS`.
+
+Desk-checked against `tools/prgsim/runsim.py`, which grew a fault injector
+for it: `--bus-fault=drop:N`, `addr:N` or `both:N` corrupts every Nth access
+in the gpu64 window, so the verdict tree can be shown to fire before a bench
+run is spent on it. Confirmed on a PC: `drop:401` shortens `SAW` by exactly
+the `FF` count and prints `DROPPED ACCESS`; `addr:401` leaves `SAW == ISSD`
+with `BAD == FF` and prints `MIS-SAMPLED ADDRESS`; `both:401` prints
+`MIS-SAMPLED AND DROPPED`; an uninjected run prints `CLEAN - NO EVENT`.
+Budgets are `.weak` (`N_READ`, `N_DISP`, `N_FLIP`, `N_WRIT`, `N_BURST`), so
+a desk run can shrink them; the bench builds the defaults. Desk runs need
+`--stop-after=100000 --demo`, because the default `--stop-after=4` aborts any
+probe whose iteration loop polls `$91`.
+
+A clean run is not a pass. The defect is rare; a clean run bounds its rate
+from above and nothing more.
+
+### Bench run-sheet -- round of 2026-09-09, RUN, and what it said
+
+Ran on build `743dfa5c-dirty src:29172d5e`. **`VERDICT CLEAN - NO EVENT`**,
+`PHASE CRDFWV`, every column zero across ~111000 gpu64-window accesses, `CAL`
+matching the desk value to the byte. The counters work on hardware and the
+polling-loop change is safe; `FLIP`, the leading suspect, produced nothing in
+27439 reads. What it does *not* do is disprove anything -- against a
+~1-in-180000 floor a run this size predicts well under one event, exactly as
+step 4 below warned. Full reading in
+[progress_tracker.md](progress_tracker.md) § 19.
+
+**The next move is not a bigger `probe_bus` run.** It is to read the same
+health-block counters from **`gpu64_demo_quake3d`**, the class-1 demo, which
+is the only workload known to produce the events -- its `SCENE_COMMIT` is
+what answered `$FF`, and it is sent without the retry the demo's node updates
+get. `gpu64_demo_quake` is the class-2 raster port and is not the subject.
+The sheet below is kept as the procedure.
+
+Everything below was built and desk-verified before the round. In priority
+order, because the first item is the one the round exists for.
+
+1. **Deploy.** `SDCARD=<mountpoint> tools/build.sh`, then copy
+   `Source/TestPRG/gpu64_probe_bus.prg` to the card. Check the boot log's
+   build id -- a stale-firmware deploy has silently wasted whole rounds. The
+   id moves off `src:a3c2943e`.
+2. **RAD menu: press T until it reads REU.** Without it `reuUsingPolling()`
+   never runs and none of gpu64 executes.
+3. **Run `gpu64_probe_bus`.** Power-cycle first; a re-launch from the RAD
+   menu inherits firmware state from its predecessor. It is a single screen
+   and a short run. Photograph the whole screen -- `CAL`, all four rungs,
+   `BADAD`, `VERDICT`, `PHASE`. `PHASE` should read `CRDFWV`; if it stops
+   short, that rung is where the machine died and the photograph is still
+   the finding.
+4. **If `VERDICT` is `CLEAN - NO EVENT`**, run it two or three more times
+   rather than concluding anything -- the Quake rate would put roughly one
+   event in a run of this size, so a single clean screen is expected under
+   *either* hypothesis. If it stays clean across repeats, re-run the Quake
+   demo and read `ERRCODE $FF` frames against the same health-block counters,
+   which now exist there too.
+5. **Then re-run the Stage 16 loop test and the Quake demo** as the regression
+   check on the firmware change itself: the bus-stats counters sit in the
+   polling loop, and the loop staying inside its IPL window on a PC is not
+   the same as the C64 staying alive.
+
+What the answer buys, so the round is not spent twice:
+
+- **MIS-SAMPLED ADDRESS** -- the fix is C64-side and cheap. Re-read a
+  register that answers `$FF`; document it as the contract (already written
+  up in [../docs/error-codes.md](../docs/error-codes.md)) and add the re-read
+  to `Source/Demos/gpu64_demo_quake3d.a`. That mitigation is deliberately
+  *not* in the tree yet -- it is speculative until this measurement lands.
+- **DROPPED ACCESS** -- no re-read helps a dropped write, so the answer is
+  the sequence number, and the useful output is the measured rate with a
+  denominator: the first number that makes the read and write drop floors
+  comparable.
+- **UNEXPLAINED FF** -- stop and redesign. The fault is in the data half of
+  the bus and nothing in the tree currently measures that.
+
+### Bench run-sheet -- attributing MISSED: RUN, and what it said
+
+Run 2026-09-09. **Verdict: some of each, and mostly neither.** 3895 frames,
+quit with RUN/STOP. `DISP` 17147 firmware vs 17184 C64 -- short by 39 against
+a +2 baseline, so 39 `CMD_LO` writes were lost. `SEQREP` 85 against a
+baseline of 2, so 83 `SEQ` writes were lost. Together 122 of `MISSED`'s 198.
+`MISSRD` 561 -- three times `MISSED` -- so the dominant failure is a
+**`SEQACK` read that is wrong once and correct on an immediate re-read**, and
+`lastSeqAck` `$FE` (a stale but plausible value, not `$FF`) says those are
+not all mis-sampled addresses. `CMTMISS` fell to 1 in 85, so the 1-in-6
+`SCENE_COMMIT` concentration that motivated this run is not reproduced.
+
+`readsBad` 50492 of 1171878 was an instrument bug, now fixed: `sta ARG,y`
+makes the 6502 dummy-read the write-only register it is about to write, and
+every one scored as a mis-sample. Those now go to `argDummyReads`, GET_HEALTH
+bytes 72-75, shown as a third column on `BUS RW`. `orBadAddr` `$FF` survives
+the correction -- the `ARG` range only reaches `$3F`, so bits 6 and 7 came
+from real high-nibble mis-samples, and next round's `readsBad` counts exactly
+those. Full write-up: [progress_tracker.md](progress_tracker.md) section 21.
+
+**Run 2 (corrected instrument, 4926 frames): the SEQACK read is the defect.**
+`readsBad` 50492 -> 965 with `argDummyReads` 69675 taking the difference, so
+the fix landed. But `MISSRD` 805 of 22140 sequenced dispatches is **1 in 27**
+for that one read, and those 805 are 83% of all 965 bad reads while SEQACK
+reads are 1.5% of all reads -- a 55x concentration on a single instruction,
+which a bus floor cannot produce. Write side reproduced worse: 1133 bad
+writes in 241368 (1 in 213), `DISP` short by 75, `SEQREP` up by 100.
+`lastBadAddr` and `lastBadWrite` both `$F9` = ARG8 with bits 5-7 set: high
+nibble only, the first check of the LVC257 fingerprint against a real
+address. Section 22 of [progress_tracker.md](progress_tracker.md).
+
+**Next round adds two fields and asks one question:** is that read getting a
+floating `$FF` (mis-sampled address) or a stale-but-valid value (the hold
+gate deferred the dispatch past it)? `SEQREP` row now carries how many of the
+`MISSRD` first-reads were `$FF`, and the `DISP` row carries
+`dispatchDeferred`/`dispatchFired` from GET_HEALTH bytes 44-47. All-`$FF`
+with a zero deferred pair = bus fault; anything else = a race in the gate.
+**Firmware is unchanged from run 2 -- only the PRG needs redeploying.**
+
+The procedure below is unchanged and is the one to repeat.
+
+### Bench run-sheet -- next round: attributing MISSED
+
+Built 2026-09-09, after the quake3d run showed 1284 SEQACK mismatches in
+7703 `SCENE_COMMIT`s -- one commit in six -- against a bus `probe_bus` had
+just measured as clean over 111000 accesses. Those cannot both be about the
+same defect, and until now nothing on the screen could say which access a
+mismatch was even about. See [progress_tracker.md](progress_tracker.md)
+section 20 for the argument; this is the procedure.
+
+**One run, one screen, five minutes.**
+
+1. **Deploy.** `SDCARD=<mountpoint> tools/build.sh`, then
+   `tools/deploy_prg.sh`. The build id moves off `src:29172d5e` -- check the
+   boot log, a stale-firmware deploy has silently wasted whole rounds. The
+   firmware change is the 80-byte `GET_HEALTH` rung and two counters written
+   inside `gpu64_apiDispatch()`; nothing was added to the polling loop.
+2. **RAD menu: press T until it reads REU.**
+3. **Run `gpu64_demo_quake3d`.** Power-cycle first. Walk around for a minute
+   or two -- the events scale with frames, and the commit rate above would
+   put ~1000 of them in that time. Then **quit with RUN/STOP**: the four
+   bottom rows are filled in by `finish` and a run that is switched off
+   instead of quit produces nothing.
+4. **Photograph the whole screen.** The four new rows are `BUS RW`,
+   `BUS BAD`, `DISP`, `SEQREP` on rows 19-22, and they are differences across
+   the run.
+
+Reading it, in this order:
+
+| what the screen says | what it means |
+|---|---|
+| `DISP` firmware **below** `DISP` C64 | the `CMD_LO` writes are being lost -- the real drop defect, now with a denominator in `BUS RW` |
+| `DISP` firmware = C64 + 2, `SEQREP` **above 2** | the commands all ran; the `SEQ` writes are the casualty. Harmless, and the retry the demo sends is unnecessary work |
+| `DISP` firmware = C64 + 2, `SEQREP` = 2 | nothing was lost on the write side at all, and `MISSED` has never been the drop defect |
+| `BUS BAD` non-zero | an access *was* serviced at a mis-sampled address; the OR/AND bytes name the bits, expect them in the high nibble |
+| `MISSRD` (row 22, second field) non-zero | reads of `SEQACK` that were wrong once and right immediately after -- the `$FF` producer, and the C64-side re-read already repairs it |
+
+The +2 on `DISP` and the 2 on `SEQREP` are the baseline, not slack:
+`LOOP_STOP` and the closing `GET_HEALTH` are both dispatches and neither
+carries a sequence number.
+
+All three branches were executed on a PC first, with
+`runsim.py --bus-fault=drop:997 / addr:997 / drop:53` -- the table is in
+section 20. A clean run is still not a pass: it says the write side is
+innocent, which is a finding, not an absence of one.
 
 ## Testing on hardware
 

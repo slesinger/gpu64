@@ -32,6 +32,9 @@
 #   tools/demos.sh                # assemble + run + render everything
 #   tools/demos.sh hello rotate   # just these
 #   tools/demos.sh -v hello       # and print the C64 screen it produced
+#   tools/demos.sh --chain        # also check every class-0 demo renders the
+#                                 # same when launched on top of another
+#                                 # demo's leftover gpu64 state
 
 set -uo pipefail
 
@@ -43,6 +46,23 @@ SCENESIM="$REPO_ROOT/tools/hostsim/scenesim"
 
 verbose=0
 if [ "${1:-}" = "-v" ]; then verbose=1; shift; fi
+
+# --chain: also render every class-0 demo a second time, launched on top of
+# another demo's leftover gpu64 state, and require the two pictures to be
+# identical.
+#
+# The Pi is not reset when the C64 loads a new .prg. Only a C64 /RESET
+# re-baselines gpu64, so a demo started from the RAD menu inherits the
+# previous one's palette, draw/visible page pairing, border, display mode
+# and framebuffer contents. That produced two bench reports on 2026-09-09 --
+# bounce in the wrong colours, and palette recolouring bounce's leftover
+# rectangles instead of showing its own rings -- and dmInit's FULL_RESET is
+# what closes it. This is the regression that keeps it closed.
+#
+# Off by default because it doubles the run: the default pass is the one
+# that has to stay fast enough to run before every commit.
+chain=0
+if [ "${1:-}" = "--chain" ]; then chain=1; shift; fi
 
 if [ $# -gt 0 ]; then
 	names=("$@")
@@ -144,6 +164,31 @@ for n in "${names[@]}"; do
 			[ $verbose -eq 1 ] && echo "$scout"
 			last=$(ls "$OUTDIR/$n.c1"/frame*.ppm 2>/dev/null | tail -1)
 			[ -n "$last" ] && cp "$last" "$OUTDIR/$n.ppm"
+		fi
+	fi
+
+	# The launch-order check. The chained-after program is whichever
+	# class-0 demo is not this one and disturbs the most state: palette
+	# loads a 256-entry ramp and never flips, bounce ends with the draw
+	# page away from the visible one, and between them they cover both
+	# halves of what leaks.
+	if [ $bad -eq 0 ] && [ $chain -eq 1 ] && [ $c1 -eq 0 ]; then
+		prev="$DEMODIR/gpu64_demo_palette.prg"
+		[ "$n" = "palette" ] && prev="$DEMODIR/gpu64_demo_bounce.prg"
+		if chout=$( python3 "$SIM" "$prg" --demo --stop-after=400 \
+				--chain="$prev" --ppm="$OUTDIR/$n.chain.ppm" \
+				"${extra[@]+"${extra[@]}"}" 2>&1 ); then
+			if ! cmp -s "$OUTDIR/$n.ppm" "$OUTDIR/$n.chain.ppm"; then
+				echo "CHAIN DIFF  $n  (differs when launched after $(basename "$prev" .prg))"
+				echo "            out/$n.ppm vs out/$n.chain.ppm"
+				bad=1
+				fail=1
+			fi
+		else
+			echo "CHAIN FAIL  $n"
+			echo "$chout"
+			bad=1
+			fail=1
 		fi
 	fi
 

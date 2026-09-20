@@ -1,0 +1,272 @@
+;
+;       {_______            {_          {______
+;             {__          {_ __               {__
+;             {__         {_  {__               {__
+;          {__           {__   {__               {__
+;      {______          {__     {__              {__
+;            {__       {__       {__            {__
+;              {_________         {______________		Expansion Unit
+;
+;      gpu64 API conformance -- FULL_RESET: the state a C64 reset restores.
+;
+;      WHAT THIS TESTS
+;
+;      $0B FULL_RESET, the opcode form of what a C64 reset now runs by
+;      itself in the firmware. It puts the display back to the state it has
+;      just after the Pi boots: graphics mode, C64 palette, border 0,
+;      page 0 both drawn and visible, every page black, text planes clear.
+;
+;      The reason it is worth its own program is that the firmware path is
+;      the same one a /RESET takes, and a /RESET cannot be desk-checked --
+;      there is no bus and no reset line on a PC. Reaching the same code
+;      through an opcode makes the state restore provable without one, so a
+;      regression in it shows up here rather than as an HDMI screen that
+;      never comes back at the bench.
+;
+;      The load-bearing assertion is the mode. Before this existed, a
+;      program that left gpu64 in 80x50 text mode handed the next session a
+;      display no graphics command could reach, and no amount of resetting
+;      the C64 recovered it -- only a Pi reboot. So the shape of the test is
+;      deliberately: go to text mode, prove GET_INFO agrees, FULL_RESET, and
+;      demand the framebuffer back.
+;
+;      WHAT IT CANNOT ASSERT
+;
+;      The palette and the border have no read-back opcode, so "the palette
+;      went back to the C64 sixteen" and "the border went back to 0" are
+;      verified by eye at the bench, not here. Same for the text planes.
+;      Everything this program prints is something it actually read back.
+;
+;      HOW TO READ THE RESULT
+;
+;      Rows 2-22, two columns: a name and either OK or F<hex>, where the hex
+;      is the byte that was wrong. Row 24 carries the counts and the verdict.
+;
+;      No vblank feature is used -- every flip here is the immediate form --
+;      so this program reaches the same verdict on a display whose frame
+;      clock calibrated at boot and one whose did not.
+;
+;      Requires the RAD menu switched to REU mode with T. Class 0 only.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+	.include "gpu64_testkit.inc"
+
+INFO	= $2000				; 16-byte info block lands here
+RB	= $3000				; READ_RECT single-pixel readback
+
+CDIRT	= 7				; a colour no reset ever leaves behind
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+start
+	jsr kitInit
+	#title "GPU64 API TEST 7 - FULL RESET"
+
+; ----------------------------------------------------------------------
+; The opcode exists and dispatches.
+; ----------------------------------------------------------------------
+
+	lda #OP_FULL_RESET
+	jsr cmd0
+	#wantOk
+	#check "FULL RESET"
+
+	jsr getInfo
+	#wantOk
+	#check "GET INFO"
+
+	#clracc
+	#expectw INFO+5, 320
+	#expectw INFO+7, 200
+	#expectb INFO+10, 3			; three pages -> graphics mode
+	#useacc
+	#check "BOOTS GRAPHICS"
+
+; ----------------------------------------------------------------------
+; Dirty every piece of state the reset is supposed to own, then read the
+; dirt back so the test cannot pass on a command that quietly did nothing.
+;
+; The pages first, because SET_DRAW_PAGE and CLEAR are the only handles
+; this program has on framebuffer contents.
+; ----------------------------------------------------------------------
+
+	ldx #0
+dirtyLoop
+	txa
+	pha
+	stx ARG				; SET_DRAW_PAGE x
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#argb 0, CDIRT
+	lda #OP_CLEAR
+	jsr cmd0
+	pla
+	tax
+	inx
+	cpx #3
+	bne dirtyLoop
+
+	jsr readOne
+	#clracc
+	#expectb RB+0, CDIRT
+	#useacc
+	#check "PAGES DIRTIED"
+
+	; A border colour and a draw page that are not the defaults. Neither
+	; is read back here -- the point is that the reset has something to
+	; undo, and the draw page is checked further down by content.
+	#argb 0, 5
+	lda #OP_SET_BORDER
+	jsr cmd0
+	#wantOk
+	#check "SET BORDER"
+
+	#argb 0, 2
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#wantOk
+	#check "SET DRAW PAGE 2"
+
+; ----------------------------------------------------------------------
+; ...and into text mode, which is the state that used to be unrecoverable.
+; ----------------------------------------------------------------------
+
+	#argb 0, 1
+	lda #OP_TEXT_MODE
+	jsr cmd0
+	#wantOk
+	#check "TEXT MODE ON"
+
+	#clracc
+	jsr getInfo
+	#accOk
+	#expectw INFO+5, 640
+	#expectw INFO+7, 400
+	#expectb INFO+10, 1			; one page -> text mode is live
+	#useacc
+	#check "IS TEXT MODE"
+
+	; And while it is up there is no framebuffer to flip.
+	#argb 0, 0
+	lda #OP_PAGE_FLIP
+	jsr cmd0
+	#wantErr ERR_UNSUPPORTED
+	#check "FLIP UNSUPPORTED"
+
+; ----------------------------------------------------------------------
+; The reset itself.
+; ----------------------------------------------------------------------
+
+	lda #OP_FULL_RESET
+	jsr cmd0
+	#wantOk
+	#check "RESET FROM TEXT"
+
+	#clracc
+	jsr getInfo
+	#accOk
+	#expectw INFO+5, 320
+	#expectw INFO+7, 200
+	#expectb INFO+10, 3
+	#expectb INFO+12, 32			; border width, graphics
+	#expectb INFO+13, 36			; border height, graphics
+	#useacc
+	#check "GRAPHICS BACK"
+
+	; Every page black, and page 0 is the one being drawn into. The first
+	; read is taken without touching SET_DRAW_PAGE, so it is the reset
+	; that chose the page, not this test.
+	jsr readOne
+	#clracc
+	#expectb RB+0, 0
+	#useacc
+	#check "DRAW PAGE CLEAR"
+
+	#clracc
+	ldx #1
+clearLoop
+	txa
+	pha
+	stx ARG
+	lda #OP_SET_DRAW_PAGE
+	jsr cmd0
+	#accOk
+	jsr readOne
+	#accOk
+	#expectb RB+0, 0
+	pla
+	tax
+	inx
+	cpx #3
+	bne clearLoop
+	#useacc
+	#check "ALL PAGES CLEAR"
+
+	; The draw page really was 0: put it back there by resetting again,
+	; and prove the page it hands over is drawable.
+	lda #OP_FULL_RESET
+	jsr cmd0
+	#wantOk
+	#check "RESET IDEMPOTENT"
+
+	#clracc
+	#argb 0, CDIRT
+	lda #OP_CLEAR
+	jsr cmd0
+	#accOk
+	jsr readOne
+	#accOk
+	#expectb RB+0, CDIRT
+	#useacc
+	#check "DRAWS AFTER RESET"
+
+	; ...and the flip that was UNSUPPORTED in text mode works again.
+	#argb 0, 0
+	lda #OP_PAGE_FLIP
+	jsr cmd0
+	#wantOk
+	#check "FLIP WORKS AGAIN"
+
+; ----------------------------------------------------------------------
+; Leave the display in the state a following program expects to find,
+; which is the whole point of the opcode.
+; ----------------------------------------------------------------------
+
+	lda #OP_FULL_RESET
+	jsr cmd0
+	#wantOk
+	#check "RESET AT EXIT"
+
+	jmp kitFinish
+
+; ----------------------------------------------------------------------
+
+getInfo
+	#poison INFO, 16
+	#argblob 0, SPACE_C64, INFO, 16
+	lda #OP_GET_INFO
+	jsr cmd0
+	rts
+
+; One pixel out of the middle of the current draw page. Poisoned first, so
+; a READ_RECT that wrote nothing cannot be mistaken for one that read black.
+readOne
+	#poison RB, 1
+	#stgRead RB, 160, 100, 1, 1
+	lda #OP_READ_RECT
+	jsr cmd0
+	rts
+
+	.include "gpu64_testkit_rt.inc"

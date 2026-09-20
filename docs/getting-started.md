@@ -130,6 +130,20 @@ In the RAD menu, press **T until it reads REU**. Everything gpu64 does
 lives inside the REU polling loop; without that, nothing runs at all and
 the HDMI screen keeps showing the text mirror.
 
+### Resetting
+
+The cartridge does not need to be power-cycled with the C64. Pressing the
+C64's reset button, or power-cycling the C64 with the Pi left running, puts
+gpu64 back to exactly the state it has just after the Pi boots — graphics
+mode, the C64 palette, border 0, page 0, black pages, health alarm cleared —
+and re-arms the screen mirror, so the READY prompt reappears on HDMI without
+waiting for the Pi to boot again. A program can ask for the same thing
+mid-session with `FULL_RESET` ($0B); see
+[class0-2d-reference.md](class0-2d-reference.md).
+
+With the C64 switched off there is no bus clock at all, and HDMI shows a
+holding screen until it comes back.
+
 ### The two include files
 
 - `gpu64_demo.inc` — the register window, the opcode numbers, the error
@@ -151,12 +165,48 @@ A demo's skeleton is then:
 	#basicStub			; "10 SYS 2064", entry at $0810
 
 start
-	jsr dmInit			; clear the screen, class 0, read GET_INFO
+	jsr dmInit			; FULL_RESET, class 0, read GET_INFO
 	#argb 0, BLUE
 	#cmd OP_CLEAR
 	jmp dmHold
 	.include "gpu64_demo_rt.inc"
 ```
+
+## Start your program with `FULL_RESET`
+
+**Everything gpu64 holds survives your program loading.** The Pi is not
+reset when the C64 loads a `.prg` — only a C64 `/RESET` re-baselines it — so
+a program launched from a menu, or after another gpu64 program, inherits
+whatever that program left behind: the palette, the border, the display
+mode, the framebuffer contents, and which page is being drawn into versus
+which page is on screen.
+
+That last one is the least obvious and the most confusing to debug. If the
+previous program ended with the draw page away from the visible page, your
+`CLEAR` and everything you draw after it land on a page nobody is looking
+at, while the screen keeps showing the previous program's last frame —
+recoloured by *your* palette if you loaded one. It looks like your drawing
+commands are being ignored and someone else's are working.
+
+So begin with `FULL_RESET` ($0B), which puts the display back to its
+post-boot state: graphics mode, the C64 palette, border 0, page 0 both drawn
+and visible, every page black.
+
+```asm
+	lda #0
+	sta CMD_HI			; class 0
+	#cmd OP_FULL_RESET
+```
+
+It is a **setup-time** command — leaving text mode reprograms the VideoCore
+and the C64 is halted for all of it, up to ~20 ms — so issue it once at
+start-up and never in a frame loop. `dmInit` in `gpu64_demo_rt.inc` does
+exactly this, which is why the demos are safe to launch in any order.
+
+One thing it does *not* do: class 1 and class 2 resources (meshes, nodes,
+textures) are not freed. Those are released on a C64 `/RESET`. A program
+that uploads resources and might be relaunched without one should keep
+that in mind.
 
 See also: [project/demos_status.md](../project/demos_status.md) for which
 of these have actually run on real hardware, and when.

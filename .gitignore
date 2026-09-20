@@ -16,4 +16,7 @@ tools/rastercheck/.scenario.bin
 __pycache__/
 
 # reference copy of shareware Quake, not part of the project
-/quake/
+/quake/ID1/
+
+# sim output written into the repo root
+/*.ppm

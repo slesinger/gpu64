@@ -61,6 +61,13 @@ ERR_OUT_OF_MEMORY = 0x08
 ERR_QUEUE_FULL = 0x09
 ERR_BAD_ID = 0x0A
 
+# gpu64 (2026-09-10): the one-shot key destructive opcodes carry, and the ARG
+# it rides in. See Source/Firmware/gpu64_api.h -- the firmware spends ARG15 on
+# every dispatch of every class, so the key is valid for exactly the command
+# that staged it.
+KEY_DESTRUCTIVE = 0xA5
+KEY_ARG = 15
+
 # Class 2 -- the raster layer (docs/class2-raster-reference.md, "Class 2 opcodes").
 RASTER_REC_BYTES = 16
 RASTER_WALL2_BYTES = 32
@@ -219,6 +226,11 @@ class Gpu64Model(Class1Mixin):
         self.calibrated = calibrated
 
         self.cmd_hi = 0
+        # SET_DMA_WINDOW ($0C): the C64-space region a readback may write
+        # into. Length 0 means unrestricted, which is the reset default and
+        # what a program written before $0C gets.
+        self.dma_win_base = 0
+        self.dma_win_len = 0
         # The drop detector's pair. The C64 picks a sequence byte and writes
         # it before a dispatch; the firmware echoes it back on every dispatch,
         # so a mismatch means one of the writes was never sampled off the bus.
@@ -227,6 +239,37 @@ class Gpu64Model(Class1Mixin):
         # a nonzero MISSED on hardware is then unambiguously the bus.
         self.seq = 0
         self.seqack = 0
+        self.seq_repeat = 0
+        self.arg_dummy_reads = 0
+        # Source/Firmware/gpu64_apidiag.h: why class 1 stopped accepting
+        # commands. Nothing in this model produces a refusal, so the three
+        # counters it feeds are constant zero; the lifecycle bytes below
+        # are real.
+        self.loop_stop_cause = 4                        # GPU64_LOOPSTOP_INIT
+        self.class_refused_mode = 0
+        self.commit_no_loop = 0
+        self.commit_no_clock = 0
+        self.loop_stops = 0
+        self.last_refuse_state = 0
+        self.last_refuse_op = 0
+        self.last_refuse_class = 0
+        # The command-stream provenance of a loop stop. Real here in the
+        # sense that matters: a correctly written program's teardown makes
+        # (disp_seq - disp_seq_prev) come out 1, which is the reading the
+        # bench compares against.
+        self.disp_seq = 0
+        self.disp_seq_prev = 0
+        self.disp_op = 0
+        self.disp_op_prev = 0
+        self.api_key = 0
+        # The one-shot-key counters, GET_HEALTH bytes 76-79.
+        self.key_refused = 0
+        self.key_refused_op = 0
+        self.cam_lost = 0
+        self.scene_wipes = 0
+        self.loop_stop_seq = 0
+        self.loop_stop_seq_prev = 0
+        self.loop_stop_prev_op = 0
         self.status = 0
         self.err = ERR_OK
         self.result = 0
@@ -287,6 +330,41 @@ class Gpu64Model(Class1Mixin):
         self.flip_pending = False
         self.dispatches = 0
         self.reg_writes = 0
+        # Every read of a gpu64-window register, the read-side twin of
+        # reg_writes. Reported through GET_HEALTH bytes 48-63, the firmware's
+        # bus-sampling instrument (Source/Firmware/gpu64_busstats.h), so a
+        # probe that compares its own count against the firmware's can be
+        # desk-checked here first -- on a bus that never drops anything, the
+        # two must agree exactly.
+        self.reg_reads = 0
+        # The bad-address half of the bus-sampling instrument. A simulated
+        # bus never mis-samples anything on its own; these move only when
+        # runsim.py's --bus-fault injector is asked to move them, which is
+        # how a probe's verdict tree gets exercised on a PC instead of
+        # being first run at the bench.
+        self.reg_reads_bad = 0
+        self.reg_writes_bad = 0
+        self.last_bad_addr = 0
+        self.or_bad_addr = 0
+        self.and_bad_addr = 0xFF
+        self.last_bad_write = 0
+        # The write-side twin of or_/and_bad_addr, GET_HEALTH 96-97.
+        self.or_bad_write = 0
+        self.and_bad_write = 0xFF
+        self.bad_write_nib = [0] * 16
+        # The model has no multiplexer, so these stay zero -- which is the
+        # correct expectation for a host run and makes the demo's MUX row a
+        # pure hardware reading.
+        self.mux_miss = 0
+        self.mux_fixed = 0
+        self.mux_unfixed = 0
+        # The host has no bus and no deadline, so the read window is
+        # unbounded: minSlack saturates at 255 and nothing ever expires.
+        self.read_slack_min = 255
+        self.read_slack_over = 0
+        self.read_slack_expired = 0
+        self.read_slack_expired_big = 0
+        self.read_slack_expired_mux = 0
         # The same two totals split by command class, so a demo's 3D traffic
         # can be told apart from the class 0 text and HUD it also draws --
         # the class 1 loop owns the framebuffer and cannot do the latter at
@@ -413,6 +491,7 @@ class Gpu64Model(Class1Mixin):
     def read_reg(self, off):
         if off <= 0x0A:
             return self.reu_read(off)
+        self.reg_reads += 1
         if off == REG_STATUS:
             return self.status
         if off == REG_ERRCODE:
@@ -422,6 +501,35 @@ class Gpu64Model(Class1Mixin):
         if off == REG_SEQACK:
             return self.seqack
         return 0xFF
+
+    # --- fault injection (runsim.py --bus-fault) ------------------------
+    # An access the polling loop DID service, at an address it sampled
+    # wrongly. Only the high nibble can move on real hardware -- A0-A3 come
+    # off dedicated GPIOs and A4-A7 off the multiplexed ones -- so the
+    # injected damage sets a high-nibble bit and leaves the low nibble
+    # alone, which is the fingerprint a probe is looking for.
+    def read_reg_missampled(self, off):
+        bad = (off | 0x40) & 0xFF
+        self.reg_reads += 1
+        self.reg_reads_bad += 1
+        self.last_bad_addr = bad
+        self.or_bad_addr |= bad
+        self.and_bad_addr &= bad
+        return 0xFF
+
+    def write_reg_missampled(self, off, val):
+        bad = (off | 0x40) & 0xFF
+        self.reg_writes += 1
+        self.pending_writes += 1
+        self.reg_writes_bad += 1
+        self.last_bad_write = bad
+        self.or_bad_write |= bad
+        self.and_bad_write &= bad
+        i = bad >> 4
+        if self.bad_write_nib[i] < 0xFF:
+            self.bad_write_nib[i] += 1
+        # The write itself is discarded, exactly as the firmware discards a
+        # write to an address no register occupies.
 
     def write_reg(self, off, val):
         val &= 0xFF
@@ -491,6 +599,13 @@ class Gpu64Model(Class1Mixin):
             return ERR_OUT_OF_RANGE
         if addr + len(data) > 65536:
             return ERR_OUT_OF_RANGE
+        # SET_DMA_WINDOW. The destination arrives in ARG bytes nothing
+        # covers, so an unwindowed readback is the one way a dropped write
+        # makes gpu64 scribble on the C64's own memory.
+        if self.dma_win_len and (addr < self.dma_win_base or
+                                 addr + len(data) >
+                                 self.dma_win_base + self.dma_win_len):
+            return ERR_OUT_OF_RANGE
         data = bytearray(data)
         for k in ALIAS_DROP[0]:
             if 0 <= k < len(data):
@@ -545,15 +660,34 @@ class Gpu64Model(Class1Mixin):
         self.class_disp[c] += 1
         self.class_writes[c] += self.pending_writes
         self.pending_writes = 0
+        # Sampled before the publication below, as gpu64_apiDispatch() does
+        # it: a caller that increments SEQ before every command and still
+        # arrives with seq == seqack lost the SEQ write, not the command.
+        if self.seq == self.seqack:
+            self.seq_repeat += 1
+        self.disp_seq_prev = self.disp_seq
+        self.disp_seq = self.seq
+        self.disp_op_prev = self.disp_op
+        self.disp_op = op
         # Published before the class check, as gpu64_apiDispatch() does it:
         # the echo has to be class-agnostic or a rejected command would look
         # like a lost write.
         self.seqack = self.seq
+        # gpu64 (2026-09-10, bench run 14): spend the destructive-opcode key.
+        # Here, ahead of every early return and for every class, exactly as
+        # gpu64_apiDispatch() does it -- so the key a command staged cannot
+        # survive into the command after it. gpu64_api.h has the contract.
+        self.api_key = self.arg[KEY_ARG]
+        self.arg[KEY_ARG] = 0
         if self.cmd_hi not in (0, 1, 2):
             self.err = ERR_BAD_CLASS
             self.status |= ST_ERROR
             return
         if self.cmd_hi != 0 and self.mode != MODE_GRAPHICS:
+            self.last_refuse_state = self.diag_state_byte()
+            self.last_refuse_op = op
+            self.last_refuse_class = self.cmd_hi
+            self.class_refused_mode += 1
             # Nothing outside class 0 has a page to draw into while text mode
             # is up.
             self.err = ERR_UNSUPPORTED
@@ -586,6 +720,31 @@ class Gpu64Model(Class1Mixin):
             self.vb_armed = False
             self.flip_pending = False
             self.draw_page = self.visible_page = self.pending_visible = 0
+            self.txt_reset()
+            return ERR_OK
+        if op == 0x0B:                                  # FULL_RESET
+            # The whole display back to its post-boot state. Unlike
+            # RESET_STATE this also drops the display mode, the palette,
+            # the border and the framebuffer contents -- see
+            # gpu64_apiFullReset() in Source/Firmware/gpu64_api.cpp.
+            self.status = 0
+            # RESULT too: the firmware clears both AFTER gpu64_apiFullReset(),
+            # because the sync inside it can harvest a loop frame and stamp
+            # RESULT on the way past. See the case 0x0B comment in
+            # Source/Firmware/gpu64_api.cpp.
+            self.result = 0
+            self.vb_armed = False
+            self.flip_pending = False
+            self.mode = MODE_GRAPHICS
+            for i, rgb in enumerate(C64_PALETTE):
+                self.palette[i * 3:i * 3 + 3] = bytes(rgb)
+            for i in range(len(C64_PALETTE), 255):
+                self.palette[i * 3:i * 3 + 3] = b'\x00\x00\x00'
+            self.palette[255 * 3:256 * 3] = b'\xff\xff\xff'
+            for page in self.pages:
+                page[:] = bytes(len(page))
+            self.draw_page = self.visible_page = self.pending_visible = 0
+            self.border = 0
             self.txt_reset()
             return ERR_OK
         if op == 0x02:                                  # VBLANK_ARM
@@ -661,6 +820,14 @@ class Gpu64Model(Class1Mixin):
             if self.flip_pending:
                 return ERR_BUSY
             return ERR_OK
+        if op == 0x0C:                                  # SET_DMA_WINDOW
+            base = a[0] | (a[1] << 8)
+            length = a[2] | (a[3] << 8)
+            if length and base + length > 65536:
+                return ERR_OUT_OF_RANGE
+            self.dma_win_base, self.dma_win_len = base, length
+            self.result = (a[0] ^ a[1] ^ a[2] ^ a[3] ^ 0xA5) & 0xFF
+            return ERR_OK
         if op == 0x0A:                                  # GET_HEALTH
             # A healthy Pi on a PC: no throttling ever, a plausible
             # temperature. The model cannot know the real thing -- what it
@@ -668,7 +835,12 @@ class Gpu64Model(Class1Mixin):
             space, addr, length = self.a_blob(0)
             if length < 12:
                 return ERR_BAD_ARGS
-            n = 36 if length >= 36 else (20 if length >= 20 else 12)
+            n = (132 if length >= 132
+                 else 128 if length >= 128 else 112 if length >= 112
+                 else 96 if length >= 96
+                 else 80 if length >= 80
+                 else 64 if length >= 64 else 48 if length >= 48
+                 else 36 if length >= 36 else 20 if length >= 20 else 12)
             h = bytearray(n)
             self.health_samples += 1
             t = 452                                     # 45.2 C
@@ -694,6 +866,135 @@ class Gpu64Model(Class1Mixin):
                 w16(30, 0)                              # bucket <4
                 w16(32, 0)                              # dispatch->commit close
                 w16(34, self.dispatches)                # every hold opened
+            if n >= 48:
+                # Bytes 36-47 are the hold gate
+                # (Source/Firmware/gpu64_holdgate.h). Same claim as above:
+                # there is no bus here, so the model reports the shape of a
+                # run in which every arm fired on the very next cycle and
+                # nothing was ever deferred -- armed == fired == dispatches,
+                # ageMax 1, and zero read-modify-writes on CMD_LO.
+                w16(36, self.dispatches)                # armed
+                w16(38, self.dispatches)                # fired
+                w16(40, 1)                              # ageMax, C64 cycles
+                w16(42, 0)                              # declined
+                w16(44, 0)                              # dispatchDeferred
+                w16(46, 0)                              # dispatchFired
+            if n >= 64:
+                # Bytes 48-63 are the bus-sampling instrument
+                # (Source/Firmware/gpu64_busstats.h). Unlike the two blocks
+                # above this one the model CAN answer honestly: every count
+                # here is exact, because the runner routes every register
+                # access through this object and nothing is ever lost on the
+                # way. So a probe's arithmetic is desk-checkable, and with
+                # runsim.py's --bus-fault injector so is its verdict tree --
+                # which is the half that would otherwise reach the bench
+                # having never once been executed.
+                def w32(o, v):
+                    v &= 0xFFFFFFFF
+                    h[o] = v & 0xFF
+                    h[o + 1] = (v >> 8) & 0xFF
+                    h[o + 2] = (v >> 16) & 0xFF
+                    h[o + 3] = (v >> 24) & 0xFF
+                w32(48, self.reg_reads)
+                # Minus one: the firmware counts the CMD_LO write that
+                # triggered this dispatch only *after* the command has run
+                # and the bus is back (see the call to gpu64_busStatsWrite()
+                # under gpu64_holdGapRelease() in rad_reu.cpp), so the block
+                # it builds cannot include it. The model increments before
+                # dispatching -- that ordering is what attributes the write
+                # to the right class -- so it subtracts the difference here
+                # rather than moving the counter.
+                w32(52, self.reg_writes - 1)
+                w16(56, self.reg_reads_bad)
+                w16(58, self.reg_writes_bad)
+                h[60] = self.last_bad_addr
+                h[61] = self.or_bad_addr
+                h[62] = self.and_bad_addr
+                h[63] = self.last_bad_write
+            if n >= 80:
+                # Bytes 64-79 are the dispatch-side pair
+                # (Source/Firmware/gpu64_busstats.h). Exact here for the
+                # same reason the block above is: nothing is lost between
+                # the 6502 and this object unless --bus-fault puts it there.
+                #
+                # dispatches counts this GET_HEALTH itself -- the firmware
+                # increments at the top of gpu64_apiDispatch(), before the
+                # opcode is even looked at -- so a caller differencing two
+                # samples sees its own two calls in the total, exactly as
+                # it does on hardware.
+                w32(64, self.dispatches)
+                w32(68, self.seq_repeat)
+                # 72-75: the `sta ARG,y` dummy reads. runsim's 6502 does not
+                # emit the dead cycle an indexed store spends reading its own
+                # target, so this stays 0 here and is non-zero on hardware --
+                # a difference in the emulator, not in the firmware.
+                w32(72, self.arg_dummy_reads)
+                # The one-shot key on the destructive class 1 opcodes
+                # (Source/Firmware/gpu64_apidiag.h). 77 names the opcode of
+                # the last refusal, which is the byte that identifies a
+                # phantom command at the bench.
+                h[76] = min(self.key_refused, 255)
+                h[77] = self.key_refused_op
+                h[78] = min(self.cam_lost, 255)
+                h[79] = min(self.scene_wipes, 255)
+            if n >= 128:
+                # Bad write addresses by high nibble -- see
+                # Source/Firmware/gpu64_busstats.h.
+                for i in range(16):
+                    h[98 + i] = self.bad_write_nib[i]
+                for i, v in enumerate(
+                        list(self.mux_miss.to_bytes(4, 'little')) +
+                        list(self.mux_fixed.to_bytes(4, 'little'))):
+                    h[114 + i] = v
+                em = min(65535, self.read_slack_expired_mux)
+                h[118] = em & 0xff
+                h[119] = em >> 8
+                uf = min(65535, self.mux_unfixed)
+                h[120] = uf & 0xff
+                h[121] = uf >> 8
+                h[122] = min(255, self.mux_unfixed)
+                h[123] = min(255, self.read_slack_over)
+                ex = min(65535, self.read_slack_expired)
+                h[124] = ex & 0xff
+                h[125] = ex >> 8
+                h[126] = max(0, min(255, self.read_slack_min))
+                h[127] = min(255, self.read_slack_expired_big)
+            if n >= 112:
+                h[96] = self.or_bad_write
+                h[97] = self.and_bad_write
+            if n >= 96:
+                # Bytes 80-95 are the class 1 refusal breakdown
+                # (Source/Firmware/gpu64_apidiag.h). The model can answer
+                # all of it honestly: it refuses in exactly the same four
+                # places the firmware does, so a program that commits after
+                # a LOOP_STOP -- or draws class 1 in text mode -- sees the
+                # same counter move here as it would at the bench. What it
+                # cannot reproduce is a refusal it was not asked for, which
+                # is precisely the case the bench is being asked about.
+                w16(80, self.commit_no_loop)
+                w16(82, self.class_refused_mode)
+                w16(84, self.commit_no_clock)
+                h[86] = self.last_refuse_state
+                h[87] = self.loop_stop_cause
+                w16(88, self.loop_stops)
+                h[90] = self.last_refuse_op
+                h[91] = self.last_refuse_class
+                h[92] = self.diag_state_byte()
+                h[93] = self.loop_stop_seq
+                h[94] = self.loop_stop_seq_prev
+                h[95] = self.loop_stop_prev_op
+            if n >= 132:
+                # The self-verifying trailer: magic, then XOR and additive
+                # sum over 0-129. Mirrors gpu64_api.cpp -- a client that
+                # checks it here is checking the same thing at the bench.
+                h[128] = ord('G')
+                h[129] = ord('6')
+                x = a_ = 0
+                for i in range(130):
+                    x ^= h[i]
+                    a_ = (a_ + h[i]) & 0xff
+                h[130] = x
+                h[131] = a_
             return self.blob_write(space, addr, h)
         if 0x50 <= op < 0x60:                           # text mode
             return self.text(op)

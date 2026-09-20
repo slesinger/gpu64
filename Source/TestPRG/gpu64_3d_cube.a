@@ -398,10 +398,15 @@ mainLoop
 	sta ARG+6			; yaw, binary angle
 	lda angle+1
 	sta ARG+7
-	lda #$00			; pitch -- negative, so the top face
-	sta ARG+8			; tips towards the viewer. A positive
-	lda #$F0			; pitch tips it away and the box reads
-	sta ARG+9			; as flat.
+	lda #$00			; pitch -- a constant tilt about the
+	sta ARG+8			; box's OWN x axis, so it turns with
+	lda #$F0			; the yaw and the box tumbles rather
+	sta ARG+9			; than spinning flat. Any non-zero
+					; value will do; what this is here to
+					; prove is that a second face is
+					; visible, because a cube that renders
+					; as one flat quad is the signature of
+					; a broken transform.
 	lda #0				; roll
 	sta ARG+10
 	sta ARG+11

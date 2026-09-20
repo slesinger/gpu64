@@ -4098,3 +4098,3851 @@ mode can do at any price.
   taking to the bench at all.
 - Free-running mode (`LOOP_START ARG0=1`) is stage 18; this demo drives the
   handshake mode only.
+
+## 18. The cartridge outlives the C64 (2026-09-08)
+
+The Pi now has its own supply and stays on. That makes the C64 the thing that
+gets restarted, and gpu64 had no answer for it: a `/RESET` already ran
+`resetREU()` — clearing `gpu64ApiActive`, re-arming the mirror latch, wiping
+the register file, class 1 and class 2 — but **nothing had ever reset the
+display**. Mode, palette, border, draw/visible page, the text planes and the
+health alarm all survived, and one of those survivals is fatal rather than
+untidy.
+
+### The failure it fixes
+
+`showMirror()` blits into `PageBuffer( GetDrawPage() )` with no mode check. A
+program that left gpu64 in 80x50 text mode therefore hands the *next* session
+a mirror that paints every snapshot into a graphics page the VideoCore is not
+scanning out. HDMI freezes on the old text screen permanently, and no amount
+of resetting the C64 recovers it — only a Pi reboot, which is exactly what the
+always-on supply was meant to stop needing. The same happens more quietly if a
+program leaves `drawPage = 2` while page 1 is visible.
+
+### `gpu64_apiFullReset()`
+
+One function in [gpu64_api.cpp](../Source/Firmware/gpu64_api.cpp) restores the
+state the Pi has one instruction after boot: graphics mode, C64 palette,
+border 0, pages 0/0/0, every page black, text planes cleared, health alarm
+re-baselined. It drains core 1 first (`gpu64_3dSync()`, the Stage 15b
+observation point — `ClearAllPages()` touches pages a queued render still
+targets) and retires any in-flight mailbox flip.
+
+It deliberately does **not** touch `gpu64Regs` — seq/seqAck/status. `$0B`
+calls it from inside a dispatch, and clobbering the sequence counter from an
+opcode handler would break the gap detector that exists because of the bus
+drop floor.
+
+Three new `CGpu64FrameBuffer` methods, two of them factored out of code that
+was already duplicated: `ResetPalette()` and `ClearAllPages()` now serve
+`Initialize()`, `SetMode()` and the reset path alike, and `DrawC64Text()` is
+the 8x8 glyph blit `showMirror()` open-coded.
+
+### The health latch had to be worked around, not cleared
+
+`s_Health.sticky` ORs in every `GET_THROTTLED` word, and the VideoCore's own
+*_EVER* bits latch until the **Pi** reboots. Zeroing `s_Health` alone would
+have achieved nothing: the very next `GET_HEALTH` reads the same latched bits
+and re-reddens the border. So `healthReset()` refreshes first, records
+`s_HealthEverBase = throttled & 0xffff0000`, and the alarm test masks it out.
+A brownout after the reset still reddens the border; one from a previous
+session does not. `GET_HEALTH` offset 4 is now session-scoped and offset 0
+still reports the hardware's ever-latch — documented as such.
+
+### Three triggers
+
+1. **`reuUsingPolling()`'s reset branch**, made one-shot. It previously
+   called `resetREU()` on *every pass* once `resetCount > 1000`, with
+   `resetCount` a `u16` that wraps every ~65 ms of held reset and re-fires.
+   Survivable for memsets, fatal for a VideoCore re-init. Now saturates at
+   1001 and tests `== 1001`. This is the right place for heavy work: ~1 ms
+   into a reset pulse that lasts far longer, the 6510 is held halted by the
+   C64's own reset circuit, so there is no bus deadline and no rule-7
+   exposure — there is nothing to serve.
+2. **`gpu64_mirrorIdleLoop()`'s reset-release edge**, which already existed;
+   nothing is being emulated at `radIsWaiting`, so the mailbox cost is free.
+3. **`$0B FULL_RESET`**, a new class 0 opcode. A new opcode rather than an
+   argument to `RESET_STATE`, deliberately: per the bus-reliability rule a
+   dropped ARG0 write would silently turn a partial reset into a full one,
+   whereas the opcode byte travels in the sequenced CMD write. It leaves
+   `gpu64ApiActive` set and the mirror latched off — a program issuing this
+   still owns the screen.
+
+Along the way the `$01 RESET_STATE` doc row turned out to be wrong: it has
+never reset the palette or the border, which is what it claimed.
+
+### Dead clock
+
+With the C64 off there is no PHI2 and the loop's unbounded half-cycle spins
+strand core 0 on a stale image with no indication why. The **top-of-loop**
+`WAIT_FOR_VIC_HALFCYCLE` is now bounded at 1000000 iterations (~30-60 ms; a
+live half-cycle is ~500 ns, so a false positive is not reachable), latching
+into `gpu64_deadClockEnter()` → full reset + `ShowHoldingScreen()`, and
+leaving via a second full reset so a clock interruption that never pulses
+`/RESET` cannot strand it there either.
+
+That is the safe wait to bound, and the reasoning is rule 6's: it is not the
+precision anchor. The anchor is the later
+`SET_GPIO(bDIR_Dx); WAIT_FOR_CPU_HALFCYCLE; RESTART_CYCLE_COUNTER`, which
+re-syncs from scratch, and the `continue` abandons the pass *before* the bus
+sample — so a false positive costs one lost sample, never a mistimed one.
+**Confirm on the bench, not here.**
+
+### Cost, measured
+
+`reuUsingPolling()` went 0x24d4 → 0x2558, still ~680 bytes inside
+`GPU64_POLL_IPL_WINDOW` (0x2800), so no widening. The disassembly shows no new
+spills in the hot path: `timeout` became a countdown register, `noClock`
+folded away entirely, and `noClockLatched` lives in `w1` behind one `cbnz` per
+pass. Per-pass added cost ahead of the anchor is a `subs`+`b.eq` inside a spin
+already dominated by an MMIO read.
+
+### Open
+
+- **Not run on hardware.** The bench sequence is in the plan; step 9 is the
+  one that matters, because a clean counter is necessary and not sufficient —
+  the C64 staying alive through a long class 1 demo after 5-10 reset cycles is
+  the only proof the bounded wait did not disturb bus timing.
+- The dead-clock path does not release the bus toward the powered-off C64
+  (`SET_GPIO(bDMA_OUT | bOE_Dx)`, `INP_GPIO_RW()`). A hardware-longevity
+  nicety, deliberately cut for now.
+
+## 19. Giving `$FF` a denominator (2026-09-09)
+
+The 62291-frame Quake run of 2026-09-08 (§ 16c) was clean on everything its
+screen could report — `STALLS 00`, zero `BUSY` refusals, no menu drop — except
+**135 frames whose commit answered `ERRCODE $FF`**. That is not an errcode.
+`GPU64_ERR_*` stops at `$0C`, and `$FF` is what the C64 sees when a register
+read is not serviced. It has two producers, and nothing in the tree could tell
+them apart.
+
+### The two producers
+
+- **Mis-sampled address.** The loop *did* service the read, at the wrong
+  address, and `gpu64_apiReadReg()` fell through its four cases to
+  `return 0xFF`. `IO_ADDRESS` (`lowlevel_dma.h:53`) is
+  `(((g3 >> 10) & 15) | ((g3 & 15) << 4))`: A0-A3 come from GPIO 10-13, which
+  are dedicated, and **A4-A7 from GPIO 0-3, which the LVC257 multiplexes with
+  NMI, ROMH, IO1 and BUTTON**. Every gpu64 register is `$DF0B`-`$DF23`, so
+  A4-A7 read 0 when sampled correctly and a mis-sample can only ever *set*
+  bits. `$DF0E` degrades to `$1E`, `$2E`, `$4E`, `$8E` — all still inside the
+  gpu64 window, all returning `$FF`. This is a plausible mechanism, not a
+  hypothesis anyone had tested; it deserves attention because it is a *silent*
+  wrong answer with intact firmware state behind it.
+- **Dropped access.** The loop never sampled it, the C64 latched a floating
+  bus, `$FF`. The documented ~1-in-180000 floor.
+
+They call for different fixes. A mis-sample is repaired by a C64-side re-read
+and costs a few cycles. A drop is not — and a *write* in the same position
+would have vanished with no answer at all to notice.
+
+### What was missing was a denominator
+
+The drop rate has always had a numerator (SEQ/SEQACK mismatches) and nothing
+to divide it by, which is why "1 in 70 commit dispatches" and "1 in 180000
+writes" were never comparable numbers. So the firmware now counts what the
+polling loop actually serviced: `Source/Firmware/gpu64_busstats.h`, four
+counters and four address bytes, incremented at four sites in
+`reuUsingPolling()`.
+
+Placement is the whole cost argument. The bookkeeping sits **after**
+`WAIT_CYCLE_READ2` and `SET_GPIO` — past the transceiver turn-around, off
+every deadline — and the good path is a single increment on a line both warm
+paths now preload. `reuUsingPolling()` grew 0x2558 → 0x2684, still ~380 bytes
+inside `GPU64_POLL_IPL_WINDOW`. Nothing was added to the `$df00`-`$df0a` REU
+decode path; that prohibition in CLAUDE.md stands.
+
+`GET_HEALTH` carries them out in bytes 48-63, extending the length ladder to
+12/20/36/48/**64**. Bytes 48-55 are the two access totals and are the one part
+of the health block that does **not** saturate: they are denominators, they
+wrap at 2^32, and callers use differences between two reads.
+
+One trap found while writing it: the `else` guarding `gpu64_apiWriteReg()` was
+a single-statement `else`, so the added counter call fell outside it and would
+have counted REU-window writes as gpu64-window writes. The compiler's
+misleading-indentation warning was right.
+
+### The instrument
+
+`Source/TestPRG/gpu64_probe_bus.a`. Four class-0 rungs — `READ` (raw reads on
+a quiet bus), `DISP` (dispatch then read, the shape every command helper
+emits), `FLIP` (the read racing a deferred commit hold, the closest analogue
+of the Quake frame), `WRIT` (the write-side twin) — each reporting
+`ISSD`/`SAW`/`BAD`/`FF`. `SAW < ISSD` is a drop with its exact count;
+`BAD > 0` is a mis-sample with `BADAD` naming the bits; `FF` far above their
+sum would be a third mechanism in the *data* half of the bus, which would be a
+new finding.
+
+The `CAL` row is what makes the arithmetic auditable: two back-to-back
+`GET_HEALTH` calls whose delta is the per-round-trip overhead, *measured*
+rather than counted, because the firmware counts the triggering `CMD_LO` write
+only after dispatch. It came out `01 07 00` on the desk — exactly the
+hand-prediction — and that agreement is what stops a systematic accounting
+error reaching the bench disguised as `DROPPED ACCESS`.
+
+`FLIP` had a defect of its own on first desk run: it read `STATUS` without
+checking for `$FF`, so an injected-address run showed `BAD 0x20` against
+`FF 0x1B`. A mis-sampled `STATUS` reads `$FF`, whose `ST_BUSY` bit is set, so
+the unchecked read quietly steered the iteration *and* hid its own event.
+With the check in, `BAD == FF` exactly.
+
+### Verified on a PC, not on hardware
+
+`tools/prgsim/runsim.py` gained `--bus-fault=drop|addr|both:N`, which corrupts
+every Nth gpu64-window access, so the verdict tree can be shown to fire:
+`drop:401` → `DROPPED ACCESS`, `addr:401` → `MIS-SAMPLED ADDRESS` with
+`BADAD 4E 4F 4C 51`, `both:401` → `MIS-SAMPLED AND DROPPED`, uninjected →
+`CLEAN - NO EVENT`. (The injector had to use `off | 0x40`, not `| 0x10`:
+`$DF11`-`$DF20` already have bit 4 set, so the obvious corruption was
+invisible on exactly the registers most worth testing.)
+
+`tools/testprg.sh` 13/13 ok, `tools/demos.sh` 12/12 ok, `gpu64_probe_rmw` and
+`gpu64_probe_latch` unchanged at their documented desk verdicts.
+
+### Verified on hardware 2026-09-09 -- the bus was clean
+
+Build `743dfa5c-dirty src:29172d5e`. Every column zero:
+
+```
+CAL    01 07 00
+       ISSD SAW  BAD  FF
+READ   7D00 7D00 0000 0000
+DISP   4E20 4E20 0000 0000
+FLIP   6B2F 6B2F 0000 0000
+WRIT   7D00 7D00 0000 ----
+BADAD  00 00 FF 00
+VERDICT CLEAN - NO EVENT
+PHASE  CRDFWV
+ALIVE  -
+```
+
+`CAL` matched the desk value exactly (`01 07`), `EE` was `00`, and `PHASE`
+reached `V`. That settles three things and one non-thing:
+
+- **The counters work on hardware.** `SAW` tracked `ISSD` to the access
+  across four different access shapes. The instrument is now a trustworthy
+  denominator, which is the durable part of this work regardless of what it
+  measured today.
+- **The firmware change is safe in the polling loop.** ~111000 gpu64-window
+  accesses, C64 alive throughout, and the user ran roughly ten further demos
+  and tests in the same session without a power cycle.
+- **`FLIP` is not a concentrator.** 27439 reads racing the loop-fired commit
+  hold produced nothing. The commit window was the leading suspect for why
+  the Quake rate sits two orders of magnitude above the write floor, and it
+  is now the least likely explanation.
+- **It does not disprove anything.** ~111000 accesses against a
+  ~1-in-180000 floor predicts well under one event. A clean run bounds the
+  rate from above and no more; the run-sheet said so in advance and the
+  reading has to be held to it.
+
+The next move on `$FF` is therefore not a bigger `probe_bus` run. It is to
+read the same counters from **`gpu64_demo_quake3d`** -- the class-1 demo --
+where the events actually occur, because that is the only workload known to
+produce them. Not `gpu64_demo_quake`: that one is the class-2 raster port and
+has no commit protocol at all. The `$FF` was answered by a `SCENE_COMMIT`,
+which only the class-1 demo issues, and which it deliberately sends *without*
+the retry its node updates get -- so it is the one dispatch in that program
+where a sampling failure is guaranteed to surface instead of being papered
+over. That is exactly the population worth giving a denominator.
+
+### The other bench finding: state leaks between programs
+
+Two reports from the same session, both about launching one demo after
+another without a C64 reset:
+
+- **bounce after palette** -- wrong colours.
+- **palette after bounce** -- the ramp cycles, but bounce's rectangles are
+  what is cycling; palette's own rings never appear.
+
+Not a bus defect and not new firmware: the Pi is not reset when the C64
+loads a `.prg`. Only a C64 `/RESET` calls `gpu64_apiReset()`, so a demo
+started from the RAD menu inherits the previous one's palette, border,
+display mode, framebuffer contents and **draw/visible page pairing**. That
+last one is what makes the second symptom look so strange: bounce ends with
+the draw page away from the visible page, so palette's `CLEAR` and its rings
+land on a page nobody is looking at, while its `PAL_LOAD` recolours the page
+that *is* visible -- which still holds bounce's last frame. The user's
+observation that a reset fixes it is the confirmation, not a workaround.
+
+`dmInit` already de-stickied `CMD_HI` and the display mode; it now issues
+**`$0B FULL_RESET`** instead, which is exactly "as if the Pi had just
+booted": graphics mode, the C64 palette, border 0, page 0 both drawn and
+visible, every page black. The `TEXT_MODE 0` stays as the fallback for a
+firmware too old to have `$0B` (which answers `BAD_OPCODE` and changes
+nothing).
+
+Reproduced and fixed on a PC first. `tools/prgsim/runsim.py` gained
+`--chain=PRG`, which runs one program on the model and then another **on the
+same model**, which is what the RAD menu does. Before the fix, palette
+chained after bounce differed from palette alone; after it, the two are
+byte-identical, and byte-identical to the pre-fix standalone render as well
+-- so nothing about a clean launch changed. `tools/demos.sh --chain` is the
+standing regression, off by default because it doubles the run.
+
+Note the scope: `FULL_RESET` restores the *display*. It does not free class 1
+and class 2 resources -- only `gpu64_apiReset()` on a real `/RESET` does that
+-- so a class-1 program relaunched from the menu still starts against a
+partly-consumed arena. Not observed, and left alone deliberately rather than
+widened into `$0B`'s contract on speculation.
+
+### Open
+
+- `UNEXPLAINED FF` is the one verdict path never exercised on a PC; it would
+  need a data-path fault injector.
+- The `ERRCODE` re-read mitigation is deliberately **not** in
+  `Source/Demos/gpu64_demo_quake3d.a`. It is speculative until the bench says
+  which producer is responsible, and shipping an unvalidated mitigation ahead
+  of the measurement is how an instrument stops being able to measure.
+- **Where `$FF` actually comes from is still unanswered.** `probe_bus` says
+  it is not the commit window and not read pressure; `gpu64_demo_quake3d` is
+  where the events live and where the counters have to be read next.
+- Class 1/2 resource arenas leak across a menu launch. Unmeasured; would show
+  up as `OUT_OF_MEMORY` on a relaunched class-1 program, not as a wrong
+  picture.
+
+## 20. What MISSED was actually counting (2026-09-09)
+
+The quake3d bench run the same evening put two numbers on the screen that
+cannot both describe the same defect:
+
+```
+FRAMES   1E17   (7703)      CMT 06   0000
+OK       1DFF   (7679)      CMT 07   0000
+MISSED   062F   (1583)      CMT XX   0010 FF
+ERR      FF                 CMTMISS  0504   (1284)
+STALLS   00                 FIRST    FF 012E
+CLOCK    411A   (16666us)   STALLAT  0000 1E16 00
+```
+
+Everything the demo can judge says the run was healthy: setup clean, no
+stalls, the frame clock calibrated, not one `UNSUPPORTED` or `BUSY` refusal,
+and the last accepted commit on frame $1E16 -- the very last frame, which is
+what "still walkable after time" means. `CMT XX` at 16 in 7703 is the `$FF`
+rate, ~1 in 481, matching the ~1 in 460 the 2026-09-08 run gave.
+
+`MISSED` is the problem. Split it against its denominators:
+
+| | dispatches | mismatches | rate |
+|---|---|---|---|
+| `SCENE_COMMIT` | 7703 | 1284 | **1 in 6** |
+| everything else | >=23109 | 299 | 1 in 77 |
+
+`sendMonsters` issues three sequenced commands every frame unconditionally,
+so the second row's denominator is a floor, not an estimate. And
+`gpu64_probe_bus`, run on the same machine minutes earlier, measured **zero**
+lost or mis-sampled accesses across ~111000 of them, 32000 of those writes.
+
+Those cannot be reconciled. A bus drop does not know which opcode it is
+carrying, so a 13x concentration on one opcode is not a bus drop; and a rate
+of 1 in 77 dispatches (~1 in 600 writes) would have produced ~50 events in
+`probe_bus`'s write rung, which saw none. **`MISSED` has been measuring
+something other than the documented ~1-in-180000 write-drop floor**, and has
+been reported as that defect since the detector was written.
+
+### What the mismatch could be, and how the three cases are now separated
+
+A `SEQACK` read that does not match the `SEQ` just written has three
+producers, and nothing in the tree could tell them apart:
+
+1. the `CMD_LO` write was lost, so the command never ran;
+2. the `SEQ` write was lost, so the command ran against a stale sequence
+   number -- harmless, and a retry makes it worse, not better;
+3. this *read* of `SEQACK` was the failure, so nothing was lost at all.
+
+Case 3 is now separated on the C64 side, in `csDispatch`: on a mismatch the
+demo reads `SEQACK` once more before believing the first answer. The command
+has already finished and `SEQACK` is a plain register, so a second read that
+agrees proves the first read was the failure -- and no retry is sent, because
+there is nothing to repair. That count is `MISSRD`; `MISSED` now means only
+"the firmware's state really is stale". Six cycles, on a path taken once in a
+few dispatches. `seqCounter` also now skips `$FF` as well as `$00`, so a
+dropped read answering a floating `$FF` can never be mistaken for a match.
+
+Cases 1 and 2 are separated on the firmware side by two counters added to
+`gpu64_busstats.h` and written by `gpu64_apiDispatch()` -- i.e. with the bus
+already held, so neither costs the polling loop anything:
+
+- `dispatches`: commands actually executed. This is the denominator the
+  SEQ/SEQACK numerator has never had.
+- `seqRepeat`: dispatches that arrived with `SEQ` unchanged since the
+  previous one. Sampled *before* `sSeqAck = sSeq`, because that assignment is
+  what destroys the evidence. For a caller that increments `SEQ` before every
+  command, this is exactly "the `SEQ` write was lost".
+
+They ride `GET_HEALTH` as bytes 64-71, a new 80-byte rung on the
+12/20/36/48/64 ladder, full 32-bit and unsaturated for the same reason
+`reads`/`writes` are: a saturated denominator is useless.
+
+Reading them:
+
+| | |
+|---|---|
+| `DISP` firmware short by `MISSED` | case 1 -- the `CMD_LO` writes were lost |
+| `DISP` matches, `SEQREP` == `MISSED` | case 2 -- the `SEQ` writes were lost |
+| `DISP` matches, `SEQREP` == baseline | neither; it was never a lost write |
+
+### The instrument
+
+`gpu64_demo_quake3d` samples `GET_HEALTH` twice -- once after `LOOP_START`
+and before the first frame, once after `LOOP_STOP` -- and prints the
+differences on four new rows: `BUS RW`, `BUS BAD`, `DISP`, `SEQREP`. The
+C64-side counters are zeroed at the first sample so every number on the
+screen covers exactly the same window; without that, the two sequenced camera
+commands start-up sends before `LOOP_START` happen to cancel the +2 baseline
+and make a wrong reading look right. That was a real reading during
+development, not a hypothetical: the first version printed `DISP` firmware
+and C64 as equal when they should have differed by two.
+
+The +2 baseline is `LOOP_STOP` and the closing `GET_HEALTH` -- both
+dispatches, neither carrying a sequence number, both falling between the two
+samples. Anything above 2 in `SEQREP` is the finding.
+
+### Verified on a PC before the bench
+
+`runsim.py --bus-fault` injects both known producers, so all three branches
+of the diagnosis were executed before deploying rather than at the bench:
+
+| injection | `DISP` fw - C64 | `SEQREP` | `MISSED` | `MISSRD` | `BUS BAD` |
+|---|---|---|---|---|---|
+| none | +2 | 2 | 0 | 0 | 0, AND=$FF sentinel |
+| `drop:997` | +2 | 4 | 2 | 1 | 0 |
+| `addr:997` | +2 | 4 | 2 | 1 | R $94 W $10, AND $40 |
+| `drop:53` | **-25** | 16 | 41 | 27 | 0 |
+
+The first three rows are case 2 with case 3 alongside it: the commands all
+ran, the `SEQ` writes were the casualty, and the recovered reads are counted
+separately. The last row is case 1 -- the injector eating `CMD_LO` writes
+outright -- and it is the only one where the firmware's dispatch count falls
+*below* the C64's. `addr` also puts bit 6 in `andBadAddr`, which is the
+injector's signature and confirms the address columns are wired to the right
+bytes.
+
+The model was extended to match: `Gpu64Model.seq_repeat`, sampled at the same
+point the firmware samples it, and the 80-byte rung.
+
+### What the next bench run answers
+
+One run of `gpu64_demo_quake3d`, quit with RUN/STOP so `finish` executes.
+Read the four bottom rows. `SEQREP` above 2 says the `SEQ` writes are being
+lost; `DISP` below the C64's count says the commands are; both clean says the
+mismatch was never a write at all and the concentration on `SCENE_COMMIT`
+points somewhere else entirely -- most likely at what is unique about that
+dispatch, which is that it is the one command the program issues immediately
+after `waitReady` returns, i.e. immediately after the vsync commit hold has
+had the bus.
+
+### Open
+
+- The `SCENE_COMMIT` concentration is unexplained. The hypothesis above --
+  that the first IO2 access after a DMA hold release is the one at risk -- is
+  a hypothesis, and this run does not test it directly; it only says whether
+  a write was lost at all.
+- `FRAMES - OK` is 24 while `CMT 06 + CMT 07 + CMT XX` is 16. Eight refusals
+  are unaccounted for, out of 7703. Either a misread of the photograph or a
+  bookkeeping gap in the error split; not chased, because it is 0.1% and it
+  is not what the run is about.
+- Everything from section 19's Open list still stands.
+
+## 21. The MISSED attribution run (2026-09-09)
+
+The instrument from section 20 went to the bench. quake3d ran 3895 frames and
+was quit with RUN/STOP so `finish` filled in all four new rows.
+
+```
+FRAMES   0F37     3895        BUS RW   0011E1A6 0002CD33
+OK       0F2E     3886        BUS BAD  C53C 0181 1C FF 00
+MISSED   00C6      198        DISP     000042FB 004320
+ERR      FF                   SEQREP   00000055 0231 FE 00
+STALLS   00
+CMT XX   0009 FF     9
+CMTMISS  002E       46
+FIRST    FF 0237  frame 567
+STALLAT  0000 0F30 00
+```
+
+### What it says
+
+Gameplay side is healthy: SETUP OK, no stalls, clock calibrated, zero BUSY or
+UNSUPPORTED refusals, the last accepted commit on frame $0F30 of $0F37, and
+`FRAMES - OK = 9 = CMT XX`, so the frame accounting closes exactly.
+
+The three-way verdict table resolved as **"some of each, and mostly neither."**
+
+| | measured | clean baseline | attributable loss |
+|---|---|---|---|
+| `DISP` firmware vs C64 | 17147 vs 17184 | firmware +2 | **39 `CMD_LO` writes lost** |
+| `SEQREP` | 85 | 2 | **83 `SEQ` writes lost** |
+| `MISSED` | 198 | 0 | 122 of it explained by the two rows above |
+| `MISSRD` | 561 | 0 | SEQACK reads wrong once, right on re-read |
+
+So the write side is real and measurable for the first time: 122 detected
+lost writes against 183603 window writes the loop serviced. Both halves of
+`writesBad` agree — 385 bad writes, of which the 122 that landed on `CMD_LO`
+or `SEQ` are the only ones this program can see; a mis-sampled `ARG` write
+just corrupts a frame silently. That is **1 lost write in roughly 500**, not
+the 1-in-180000 this project has been quoting since milestone 4.
+
+But the biggest term is not the write side at all. `MISSRD` 561 is nearly
+three times `MISSED`, and `lastSeqAck` is `$FE` rather than `$FF` — a stale
+but *plausible* sequence value, so the failing reads are not all mis-sampled
+addresses either. The dominant failure in this run is a **read of `SEQACK`
+that is wrong once and correct immediately afterwards**, at 561 in 17184
+reads of it, about 1 in 31. Adding the second read to `csDispatch` is what
+made this visible; without it all 561 would have been counted as `MISSED`
+and blamed on the write path.
+
+`CMTMISS` also collapsed: 46 in 3895 commits, 1 in 85, against the 1-in-6
+concentration on `SCENE_COMMIT` that section 20 was written to explain. That
+concentration is not reproduced, which retires it as a lead.
+
+### The read-side number was an instrument bug
+
+`readsBad` came back at 50492 of 1171878 reads, 4.3%, which would have been a
+spectacular finding. It was not one. `sta ARG,y` — the argument-staging idiom
+in `put1616`/`putTab1616` — makes the 6502 spend a dead cycle **reading** the
+address it is about to write. `ARG` registers are write-only, `gpu64_apiReadReg()`
+answers `$FF`, the 6502 discards it, and `gpu64_busStatsRead()` scored every
+one of them as a mis-sample. `lastBadAddr` `$1C` is `ARG11`, the last byte
+`put1616` stages with Y=8 — the fingerprint of the idiom, not of a fault.
+
+Fixed: `gpu64_busStatsRead()` now routes `ARG0..ARG15` reads to a separate
+`argDummyReads` counter, published at GET_HEALTH bytes 72-75 and shown as a
+third column on the demo's `BUS RW` row. `readsBad` is a fault counter again.
+
+One thing survives that correction: `orBadAddr` came back `$FF`. The `ARG`
+range only reaches `$3F`, so bits 6 and 7 were set by something else — at
+least some genuine high-nibble mis-samples happened, which is the fingerprint
+`gpu64_busstats.h` predicts. The next run's `readsBad` counts exactly those.
+
+### The probe_bus contradiction, narrowed
+
+`gpu64_probe_bus` returned `VERDICT CLEAN - NO EVENT` on this machine days
+earlier, over 32000 writes. At 385 bad in 183603 it should have seen about 67.
+The remaining structural difference is that probe_bus is **class 0 only — no
+viewport, no camera, no core 1** (its own header says so), while quake3d runs
+the core-1 render worker and vsync commits throughout. That makes core 1 the
+prime suspect for the difference, and it is directly testable: run probe_bus
+with a class-1 scene rendering underneath it.
+
+### Open after this run
+
+- Whether the 1-in-31 `SEQACK` read failure concentrates in the cycles just
+  after a DMA hold release. Entry into a hold is protected by rule 7; exit
+  from one is not, and the `SEQACK` read sits immediately after `cmd1`
+  returns, i.e. immediately after the dispatch hold opens back up.
+- Whether `probe_bus` still reads CLEAN with core 1 loaded.
+- The 76 mismatches `DISP` and `SEQREP` between them do not account for.
+  Double-bad reads predict roughly 30 of those.
+- The re-read mitigation is no longer speculative: it recovered 561 events in
+  one run. It should move from the demo into the documented calling pattern.
+
+## 22. Class 1 stops being affine (2026-09-09)
+
+The artifact was reported from the outside: the textures in `quake3d` and on
+the rotating cube are "wrongly uv mapped". They were not. Every UV byte in the
+pipeline is correct -- `putQuad()` in hostsim, the face blob in
+`gpu64_3d_cube.a`, `gen_quakemesh.py`'s corner baking, and `lerpVert()`'s
+interpolation through the near clip all agree. What was wrong is that class 1's
+triangle rasteriser took plane gradients of raw `u` and `v` and stepped them
+with a plain add per pixel.
+
+`u` and `v` are not linear in screen space. `u/z` and `v/z` are. The classic
+consequence is a chevron crease along the shared diagonal of every quad, worst
+on a large face at a grazing angle -- which is exactly the room's floor and
+ceiling and the cube's near top face. `invZ` was interpolated correctly right
+beside the texcoords all along, which is why depth was always right and only
+the texture was wrong, and which is why this never showed up as a z-fighting
+or clipping complaint.
+
+The header of `gpu64_3d_raster.cpp`, the span-seed comment, the
+`Gpu64_3dRasterVert` declaration and `docs/class1-3d-mesh-reference.md` all
+documented affine mapping as a deliberate choice, with the stated exemption
+that "boxy low-poly geometry does not show it". The quake3d room is not boxy
+low-poly geometry. The exemption expired when Stage 17 shipped the room.
+
+### Class 2 already had the answer
+
+`gpu64_rasterPolys()` has been perspective correct since milestone 9. It
+carries `w = (1<<30)/z` per screen vertex, premultiplies `s` and `t` by it,
+walks those linearly and divides back out **per pixel**
+(`gpu64_raster_core.cpp` around lines 1852 and 2005). Class 1, the newer
+layer, regressed relative to the older one. The fix is that transformation,
+not a new idea.
+
+### 16-pixel subdivision, not a divide per pixel
+
+Class 2 divides per pixel because `tools/rastercheck` diffs it texel-for-texel
+against `gpu64model.py`, and a subdivided span would not match a Python model
+that does not subdivide identically. Class 1 has no such model -- `scenesim`
+deliberately renders with the real firmware instead -- so it is free to take
+Quake's own bargain: interpolate `u*invZ` and `v*invZ` linearly, divide only
+every `GPU64_3D_PERSP_RUN = 16` pixels, and step linearly between. The error a
+linear step accumulates over sixteen pixels is far below a texel.
+
+The perspective runs sit **inside** the existing burst chunk, not in place of
+it. `GPU64_3D_SPAN_PIXELS` is milestone 6a's store-burst budget
+(`GPU64_3D_SPAN_BYTES / 3` = 85 px) and nothing else may set it; yielding every
+sixteen pixels instead would multiply the `DSB ISH`s by five and buy nothing.
+85 is not a multiple of 16, so the last run of each chunk is short -- one extra
+divide pair per 85 pixels, cheaper than perturbing the budget.
+
+Scale discipline: `uz = (u * invZ) >> 16` keeps the value in the same 16.16
+magnitude the bare texel coordinate had (a texcoord byte is at most 255.0 and
+`invZ` at most 1.0), so `gradient()`'s existing headroom and its `(s32)`
+truncation behave exactly as before. Widening the shift to buy far-plane
+precision would overflow `pG->dx` on a one-pixel-wide triangle. `ClipVert` and
+`lerpVert()` are untouched: they interpolate in **view** space, where `u` and
+`v` are linear and correct.
+
+The run's far end is one pixel past the last covered pixel and the plane
+extrapolates freely there, so `z` at that end is clamped positive -- two
+compares per sixteen pixels, and it removes a divide-by-zero that would
+otherwise depend on the geometry.
+
+### Verified on the host, no bench trip
+
+- `hostsim`: chevron gone from `prgpreview.ppm` and `frame00..07.ppm`; the
+  checker now converges uniformly to a vanishing point. `flatcolour.ppm` and
+  `sprite.ppm` are byte-identical, which is the real invariant -- the plan
+  predicted `zbuffer`/`nearclip`/`scenegraph` would be unchanged too and that
+  was wrong, they are textured mesh renders and correctly changed.
+- Cost: 0.163 ms/frame, no measurable regression. Class 2 ships three divides
+  per *pixel*; this is three per sixteen.
+- The point-light error figures hostsim prints are byte-identical
+  (0.7/0.7/0.7/3.4/6.5/12.1 px), confirming `px`/`py`/`pz` were left alone.
+- `tools/demos.sh quake3d` exit 0, 1500 frames. `frame0200.ppm` is the clearest
+  view: floor grout lines run straight to the horizon, brick courses stay
+  parallel.
+- `tools/testprg.sh` 13/13 ok.
+
+### Left open
+
+Class-1 point-light world position (`px`/`py`/`pz`) is still interpolated
+affinely, so on a large grazing face a light's gradient centre can sit a few
+pixels off. Class 2 already corrects it; class 1's fix is three more divides
+per run and the identical transformation. Recorded in `docs/known-gaps.md`
+rather than done here -- it is a different visual artifact from the one
+reported, and leaving it alone keeps hostsim's light-error assertion, which
+measures the affine limit itself, valid unchanged.
+
+## 22. The SEQACK read is 55x worse than every other read (2026-09-09, run 2)
+
+Same demo, corrected instrument, 4926 frames.
+
+```
+FRAMES   133E    4926        BUS RW   001664B1 0003AED8 0001102B
+OK       1333    4915        BUS BAD  03C5 046D F9 FF 00 F9
+MISSED   0100     256        DISP     00005633 00567C
+CMT XX   000B      11        SEQREP   00000066 0325 FF 00
+CMTMISS  0037      55
+FIRST    FF 000A  frame 10
+STALLAT  0000 1330 00
+```
+
+### The instrument fix landed
+
+`readsBad` went **50492 -> 965** with `argDummyReads` 69675 taking the
+difference, and the per-frame rates all track the previous run (298 reads,
+49 writes, 14.1 ARG dummy reads per frame against 301/47/13). The read side's
+overall fault rate is 965 in 1467569, **1 in 1521**.
+
+### And then the number that matters
+
+`MISSRD` is **805**, against 22140 sequenced dispatches: the SEQACK read
+fails **1 in 27**. Those 805 are 83% of all 965 bad reads, while SEQACK reads
+are 1.5% of all reads -- a **55x concentration on one instruction**. Every
+other read in the program, 1.44 million of them, fails at roughly 1 in 9000.
+
+That is not a bus floor. A floor cannot know which instruction it is under.
+Something about *that read specifically* is wrong, and it is the read that
+sits closest to a DMA hold release: `cmd1` is `stx CMD_HI / sta CMD_LO /
+lda ERRCODE / rts`, so `lda SEQACK` is about eleven C64 cycles after the
+dispatch hold opens back up.
+
+Two hypotheses, and they are distinguishable:
+
+1. **Mis-sampled address.** The read is never decoded to SEQACK, the C64
+   gets a floating `$FF`. Run 2's `lastSeqAck` was `$FF`, consistent.
+2. **The read is early.** The hold gate *deferred* the dispatch past it, so
+   SEQACK legitimately still holds the previous sequence number. Run 1's
+   `lastSeqAck` was `$FE` -- a plausible stale value, not a floating bus --
+   which is consistent with this and *not* with (1).
+
+The two runs disagreed, so it is now counted rather than sampled: `MISSRD`
+gained a second field counting how many of those first reads were `$FF`, and
+the `DISP` row gained `gpu64HoldGate.dispatchDeferred` / `dispatchFired`,
+which GET_HEALTH has published at bytes 44-47 all along and nothing has ever
+displayed. All-`$FF` with a zero deferred pair means (1); anything else means
+(2), and (2) is a race in the gate, not a bus fault.
+
+### The write side reproduces, and is worse
+
+1133 bad writes in 241368, **1 in 213** (run 1: 1 in 477). `DISP` short by 75
+and `SEQREP` up by 100 -- 175 detected losses in 44280 `CMD_LO`+`SEQ` writes,
+1 in 253, which agrees with `writesBad` to within the fraction of mis-samples
+that happen to land on another writable register. Two independent counters,
+same answer.
+
+### First direct evidence of the mis-sample mechanism
+
+`lastBadAddr` and `lastBadWrite` are **both `$F9`**. `$F9` is `$19` (ARG8)
+with bits 5, 6 and 7 set -- high nibble only, exactly the fingerprint the
+LVC257 multiplexing argument in `gpu64_busstats.h` predicts, and the first
+time the prediction has been checked against a real address. The two counters
+holding the *same* address is the other half of it: `sta ARG,y` spends one
+cycle reading `$DF19` and the next writing it, so a mis-sample that spans
+both cycles lands at `$F9` twice. One event, two counters.
+
+### Retired
+
+`CMTMISS` 55 in 4926 is 1 in 90, against run 1's 1 in 85. The 1-in-6
+`SCENE_COMMIT` concentration of section 20 is gone for good. `FIRST` moved
+from frame 567 to frame 10, which is just an earlier draw from a per-command
+rate, not a change of behaviour.
+
+## 23. Class-1 camera pitch was a world-axis rotation (2026-09-09)
+
+Reported from the bench: in `gpu64_demo_quake3d`, F1/F3 looks up and down
+correctly facing one way, and tilts the horizon -- rolls -- after a quarter
+turn.
+
+`gpu64_3dMatFromEuler()` composed `R = Rz(roll) * Rx(pitch) * Ry(yaw)`, all
+three about **fixed world axes** with yaw innermost. Setting roll to zero and
+reading the columns off gives `forward = (sy, -sp*cy, cp*cy)` and
+`up = (0, cp, sp)`: the pitch a camera actually gets is scaled by `cos(yaw)`,
+and at a quarter turn `forward` is `(1,0,0)` for *every* pitch -- the rotation
+has become pure roll about the view axis. The demo hits it immediately,
+because it sends `yaw = (64 - plYaw) << 8`, so its spawn pose is already yaw
+16384.
+
+Class 2 never had this: `SET_CAMERA3D` pitches in the forward/up plane and
+leaves `rgt` alone (`gpu64_raster_core.cpp`), which is camera-space pitch and
+is correct at any heading. This was class 1 only.
+
+The fix is the standard intrinsic order, `R = Ry(yaw) * Rx(pitch) * Rz(roll)`
+-- yaw outermost, so pitch turns about the node's own already-yawed x axis.
+One function, its term-for-term twin in `tools/prgsim/gpu64class1.py`, and the
+convention statements in `gpu64_3d_math.h` and
+`docs/class1-3d-mesh-reference.md`. `tools/hostsim` calls the firmware
+function, so there was no third copy.
+
+Applied to every node and not just to cameras, deliberately: a model given
+both a yaw and a pitch now carries its pitch with it as it turns, the way an
+aircraft's nose does, instead of the whole posed result being tipped about
+world x. Two rotation conventions in one pipeline would have been the worse
+outcome.
+
+### What it changes, measured rather than argued
+
+- A rotation about one axis alone is the same rotation either way. Only which
+  of the two `sp` terms is exact and which picks up the second 1.15
+  truncation swapped over -- 2 parts in 32768.
+- `gpu64class1.py` and the firmware agree entry-for-entry over a 1024-triple
+  sweep of `(yaw, pitch, roll)`.
+- Over the 1503 frames of the `quake3d` desk run, **every frame with camera
+  pitch 0 is bit-identical to before, and every frame with a non-zero pitch
+  changed**. Nothing else in that demo poses a node on two axes at once.
+- With `--key=F1`/`--key=F3` held at yaw 258.8 degrees, `scenesim`'s frames
+  went from a scene rolled through 30-60 degrees to a level horizon that
+  moves up and down.
+- `tools/demos.sh` and `tools/testprg.sh` are green; hostsim's own scene
+  graph, point light and directional sprite self-checks pass. The three
+  hostsim scenes that pose a mesh on two axes (`zbuffer`, `flatcolour`,
+  `prgpreview`) render as closed, correctly shaded boxes at their new
+  orientation.
+- `gpu64_3d_cube.a`'s pitch comment was rewritten: its constant tilt now turns
+  with the yaw, so the box tumbles rather than spinning under a fixed lean.
+  That test's real assertion -- more than one face visible -- is unaffected.
+
+Not yet on the bench.
+
+## 23. The bad SEQACK read is not a floating bus (2026-09-09, run 3)
+
+6479 frames, firmware unchanged from run 2.
+
+```
+FRAMES   194F    6479        BUS RW   001E4D24 000492CA 00014FEB
+OK       191A    6426        BUS BAD  01F0 0130 E3 FF 80 D4
+MISSED   009B     155        DISP     00006D08 006D1C 0000 0000
+ERR      D1                  SEQREP   00000026 03C3 00BC FF 00
+CMT XX   0035 D1   53
+CMTMISS  0052      82
+FIRST    D1 0001  frame 1
+```
+
+### The answer to the question run 3 was built to ask
+
+`MISSRD` 963, of which **only 188 read `$FF`**. The other **775 -- 80% --
+came back with a value that was not a floating bus**, so the address decoded,
+a real register answered, and the byte was simply wrong.
+
+And the hold gate's deferred pair reads **0000 0000**. The dispatch was never
+postponed. So the "the read beat its own dispatch because the gate deferred
+it" branch of section 22 is dead as stated.
+
+That leaves the gate counters not measuring what section 22 assumed they did:
+`dispatchDeferred` counts only the read-modify-write path, and every write in
+this program is a plain `sta`, so 0000 was the *only* value it could ever have
+returned. That test was misdesigned, not passed.
+
+### The rate is the stable number here
+
+| run | MISSRD | sequenced dispatches | rate |
+|---|---|---|---|
+| 1 | 561 | 17184 | 1 in 31 |
+| 2 | 805 | 22140 | 1 in 27 |
+| 3 | 963 | 27932 | 1 in 29 |
+
+Three runs, 1 in 28 ± 2. Meanwhile the write-side faults swing by a factor of
+four across the same runs (`writesBad` 1 in 477, 1 in 213, 1 in 986) and
+`DISP`'s shortfall with them (39, 75, 22). **The read defect is steady; the
+write defect is bursty.** They are not the same mechanism.
+
+### $D1, and the case for reading the bus rather than the address
+
+`ERRCODE` came back **`$D1`** this run, on 53 commands, starting at frame 1.
+`$D1` is not a `GPU64_ERR_*` -- they stop at `$0C`. Run 2's was `$FF`.
+
+Three of this run's four address bytes carry `$C0`: `lastBadAddr` `$E3` =
+`$23` (SEQACK) with bits 6-7 set, `lastBadWrite` `$D4` = `$14` (ARG3) with
+bits 6-7 set, and `$D1` itself is `$11` (ARG0) with bits 6-7 set. And
+`andBadAddr` is **`$80`** -- *every* bad read address this run had A7 set.
+That is a much tighter fingerprint than run 2's, and it is on the high nibble
+exactly as `gpu64_busstats.h` predicts.
+
+But `$D1` arrived as *data*, not as an address, which the mis-sample story
+does not explain by itself. The hypothesis worth testing is that a read
+landing in this window latches the **previous access's data** rather than its
+own -- which for `lda SEQACK` means the `ERRCODE` byte `cmd1` read two
+instructions earlier.
+
+### What run 4 measures
+
+The demo now splits the 775 three ways, on a new `SEQBAD` row:
+
+- **held the previous sequence number** -- the read genuinely beat its
+  dispatch, a race somewhere other than the gate's deferred path;
+- **equal to `seqErr`** -- the ERRCODE value from two instructions earlier,
+  i.e. stale data on the bus;
+- **neither** -- `mrOther` keeps the last such value to look at.
+
+Firmware is unchanged; only the PRG moves. Row 18's "RUN/STOP QUITS" was
+reclaimed for the label -- the STOPPED line already says it.
+
+## 24. The wrong byte is the previous read's byte (2026-09-09, run 4)
+
+8322 frames. `SEQBAD` reads **0001 02CC F9**.
+
+| bucket | count | what it means |
+|---|---|---|
+| held the previous sequence number | **1** | the read beat its dispatch -- essentially never |
+| equalled `seqErr` | **716** | the ERRCODE byte this same command read two instructions earlier |
+| neither | 124 | last such value `$F9` |
+| (`$FF`, from row 22) | 313 | a fully floated bus |
+
+`MISSRD` was 1154 of 35565 dispatches -- **1 in 31**, the fourth run in a row
+at 1 in 28 +/- 3.
+
+**The race is dead and the stale-data reading is confirmed.** Of the 841
+non-`$FF` wrong reads, 716 -- 85% -- returned exactly the byte the previous
+IO2 read had returned. One returned a stale sequence number. The dispatch is
+not late; the *data* is old.
+
+Which points at the simplest mechanism of all: **the access was never
+serviced.** If the polling loop misses the pass, the cartridge never drives
+D, the C64's data bus floats, and a floating bus reads back whatever was last
+on it -- the previous byte if the read is close behind, a decayed `$FF` if it
+is not. That makes `$FF` and "equals `seqErr`" the *same* failure at two
+different distances, which is why they have never separated cleanly, and it
+explains why `readsBad` (which only counts accesses the loop *did* service)
+has always been far smaller than `MISSRD`. It also explains run 3's `ERRCODE`
+of `$D1` and this run's `$FF` as the same thing with different screen
+content behind it.
+
+### The instrument lost its own firmware side
+
+Every firmware-side column on this screen reads `0000`: `BUS RW`, `BUS BAD`,
+`DISP` firmware, `SEQREP`, all zero, with `healthErr` `00`. `hbuf` still held
+the *start* snapshot, so every difference came out zero -- the closing
+`GET_HEALTH`'s `CMD_LO` write was one of the ~1-in-250 that are lost.
+
+A single unverified write threw away a whole bench run's firmware side, in
+the instrument built to measure unverified writes. `doHealth` now poisons the
+buffer with `$5A`, dispatches, checks bytes 0-11 are no longer all poison,
+and retries up to eight times; `healthTry` is displayed at the end of row 22
+and says how many retries it took.
+
+### Run 5 adds one byte
+
+`mrErrVal` -- the shared value at the last "equalled `seqErr`" event, at the
+end of the `SEQBAD` row. If the open-bus reading is right it should be a
+plausible screen or character byte that stays constant while the display
+does, not a valid errcode. `$00` would mean something else again: two reads
+that both answered a legitimate zero.
+
+## 25. Runs 5 and 6 (2026-09-10): the loop stops, and everything after is $06
+
+Two photographs, and the first prose in several turns: *"it hanged the first
+time I touched it. second time it holds for longer time."*
+
+|  | run 5 | run 6 |
+|---|---|---|
+| FRAMES | 2182 | 17326 |
+| OK (commits accepted) | 171 | 5475 |
+| **CMT 06** (UNSUPPORTED) | **2011** | **11832** |
+| CMT 07 (BUSY) | 0 | 0 |
+| CMT XX | 0 | 16, all `$FF` |
+| last accepted commit | frame 171 | frame 5490 |
+| STALLS | 2 | 0 |
+| MISSED / MISSRD | 102 / 44 | 730 / 1040 |
+| dispatches, fw vs C64 | 9312 / 9343 | 70350 / 70567 |
+| writesBad | 422 / 100130 | 3127 / 744036 |
+| `mrErrVal` | `$00` | `$00` |
+| `healthTry` | 0 | 0 |
+
+`CMT 06` was `0000` in every one of runs 1-4. It is the whole story here, and
+it is not a bus-noise story: both runs ran normally, entered a state at a
+definite frame, and **never left it**. Every remaining `SCENE_COMMIT` answered
+`GPU64_ERR_UNSUPPORTED`. That is a frozen HDMI picture behind a C64 program
+that is still counting frames, still dispatching, and — in run 6 — never once
+stalling. It matches the user's description exactly.
+
+`STALLS 00` is not a contradiction, it is a consequence: `SCENE_COMMIT`
+returns before it reaches the line that clears `FRAME_READY`, so the bit stays
+set forever and `waitReady` returns instantly on every subsequent frame.
+
+### What the instrument could not say
+
+`$06` has four unrelated producers and the screen showed one byte:
+
+| where | condition |
+|---|---|
+| `gpu64_apiDispatch()` | class 1/2 issued while the display is not in graphics mode |
+| `SCENE_COMMIT` | `!s_LoopRunning` |
+| `SCENE_COMMIT` | `!gpu64Vsync.calibrated` |
+| `SCENE_COMMIT` | `g_pGpu64FB == 0` |
+
+Ruled out by reading, not by measurement: `calibrated` is only ever *set*
+(`gpu64_vsync.cpp:35`), and `gpu64_apiFullReset()` puts the display *into*
+graphics mode, so neither the dead-clock detector nor the reset line can
+produce the second or third row. `resetREU()` is ruled out too — it zeroes
+`gpu64BusStats`, and both runs' read/write counters are positive and
+plausible, so it never ran.
+
+That leaves `!s_LoopRunning`, which has three producers of its own: the
+`LOOP_STOP` opcode, `SCENE_RESET`, and `gpu64_3dReset()`. The demo issues
+`LOOP_STOP` exactly once, at the end.
+
+### What was built (2026-09-10)
+
+`Source/Firmware/gpu64_apidiag.h`, a dispatch-time counter block — no polling
+loop exposure — behind a new **96-byte GET_HEALTH rung**, bytes 80-95:
+
+- 80/82/84: the three refusal counters, one per producer.
+- 86: a seven-flag state byte sampled **at the last refusal**, not at
+  `GET_HEALTH` time — by then the closing `LOOP_STOP` has legitimately
+  cleared the loop flag.
+- 87: `loopStopCause`. Every `s_LoopRunning = FALSE` in `gpu64_3d_class1.cpp`
+  now goes through one `loopStop( cause )` helper that records it.
+- 88/90/92: stop count, the refused opcode/class, and the live flag byte.
+
+Screen row 21 changes from `DISP` to `DISPWHY` and its last two columns —
+`dispatchDeferred`/`dispatchFired`, which section 23 established are
+structurally always `0000` for this program — become `NOLOOP NOMODE STATE
+WHY`. Nothing else on the screen moves.
+
+The reading is one step: with `CMT 06` large, `WHY 01` says a `LOOP_STOP`
+opcode executed that the program never issued, which puts the freeze back on
+the known corrupted-command defect; `NOMODE` large says a `TEXT_MODE` opcode
+did the same thing to the display; both zero says the frame clock, and
+`STATE` bit 1 confirms it.
+
+### A correction to section 24
+
+`mrErrVal` came back `$00` in both runs, not the "plausible screen byte" the
+open-bus reading predicted. `$00` is also what `ERRCODE` reads after every
+successful command, so the `mrErr` bucket ("the SEQACK read equalled the
+`ERRCODE` read two instructions earlier") and "the read answered zero" are the
+same event, and that split cannot tell them apart. Section 24's 716-of-841
+figure should be read as *the bad read answers one of two rails, `$FF` or
+`$00`* — which is still a floating-bus signature, but the "previous read's
+byte lingered" mechanism is not what was measured.
+
+### Unchanged, and worth noting because it is now a four-run constant
+
+The write-fault rate came out at 1 in 237 and 1 in 238 — identical across two
+runs of very different length. The read-side `MISSRD` rate moved a lot (1 in
+212 and 1 in 68 against 1 in 28 in runs 1-4), but both runs spent most of
+their frames in the refusal state, which changes the instruction mix.
+
+## 26. Run 7 (2026-09-10): the freeze did not reproduce, and the shutdown was lost
+
+First bench run of the 96-byte GET_HEALTH rung built in section 25.
+
+**The `$06` freeze did not happen.** `CMT 06 0000`, OK 4810 of 4853 frames
+(99.1%), `STALLS 00`, `STALLAT 0000 12F4 00` — the last accepted commit was
+frame 4852 of 4853, i.e. the run was healthy right up to the RUN/STOP that
+ended it. So the three decisive new columns never fired: `NOLOOP 0000`,
+`NOMODE 0000`, `STATE 00` (never latched, still its boot value). The
+instrument is correct and armed; the question it was built to answer is still
+open, waiting on a run that hangs again.
+
+**What run 7 did catch is `WHY 02`.** At the end of a clean run that byte must
+read `01` — `finish` issues `LOOP_STOP`, and `LOOP_STOP` is the only thing
+that writes cause 1. `02` is `GPU64_LOOPSTOP_SCENE_RESET`, and this program
+issues `SCENE_RESET` exactly once, at start-up. So the start-up cause was
+still standing at the end of the run: **the closing `LOOP_STOP` never
+dispatched.** Its `CMD_LO` write was lost, it went out through `cmd1` with no
+sequence number and no retry, and nothing on either side noticed. The loop was
+left running after the program exited — which is exactly the sticky state the
+*next* program inherits and cannot see (memory note
+`gpu64-state-sticky-across-launches`).
+
+Fixed the same day: `finish` now sends `LOOP_STOP` through `cmdSeq1` and
+re-sends until SEQACK confirms, up to eight times. `LOOP_STOP` is idempotent —
+it clears a flag and records a cause — so unlike `SCENE_COMMIT` it is safe to
+repeat. Row 21 gained a `STOPTRY` column for the attempt count, and the
+DISPWHY baseline drops from firmware = C64 + 2 to **+ 1**, because the closing
+GET_HEALTH is now the only unsequenced dispatch left in the run.
+
+**The write-side fault rate was five times worse than any previous run.**
+
+| | run 5 | run 6 | run 7 |
+|---|---|---|---|
+| CMD_LO writes lost | — | 217 / 70567 ≈ 1/325 | **344 / 21900 ≈ 1/64** |
+| `writesBad` | 1/237 | 1/238 | **5084 / 236112 ≈ 1/46** |
+| `readsBad` | — | — | 2956 / 1459104 ≈ 1/494 |
+| `MISSRD` | — | — | 963 / 21899 ≈ 1/23 |
+
+Both write-side numbers degraded together and by the same factor, which is
+consistent with mis-sampled address writes and lost commands being one defect
+seen twice rather than two. `MISSED 948` is roughly accounted for by lost
+`CMD_LO` (344) plus lost `SEQ` (`seqRepeat` 391, baseline 2) = 733, leaving
+~215 unattributed — the same order, not an exact close, and retries are
+themselves dispatches so the arithmetic was never going to be exact.
+
+Read rate is back to ~300 per frame (1459104 / 4853), matching the healthy runs
+1-4 against ~113 per frame in the stuck run 6. The instruction mix in the
+refusing state really is different, which is a corroboration of section 25's
+reading rather than a new fact.
+
+**New: a bad read value that is not `$FF`.** `ERR $D0`, and `CMT XX 002A D0` —
+42 commits answered errcode `$D0`, which is not a protocol errcode at all. A
+mis-sampled *address* returns `$FF` by construction, so `$D0` is a read that
+was never serviced and latched whatever was on the bus. `lastBadAddr $DE`,
+`orBadAddr $FF`, `andBadAddr $80`: A7 was set on every bad address in the run,
+which is the multiplexed-nibble signature (a mis-sample can only ever *set*
+high-nibble bits).
+
+`healthTry 00` / `healthErr 00`: the closing GET_HEALTH landed first time; the
+poison/verify/retry loop was not needed.
+
+## 27. Run 8 (2026-09-10): the teardown fix works, and the bus was 30x cleaner
+
+`WHY 01`, `STOPTRY 00` — the closing `LOOP_STOP` landed on its first
+sequenced attempt and the render loop was handed back. Section 26's defect is
+closed on the C64 side.
+
+The freeze still did not reproduce: 10837 frames, OK 10756 (99.25%),
+`CMT 06 0000`, `STALLS 00`, `STALLAT 0000 2A54 00` — last accepted commit at
+frame 10836 of 10837, another clean RUN/STOP exit. `NOLOOP`/`NOMODE`/`STATE`
+all zero again.
+
+**The bus fault rate is wildly variable between runs, and this is the widest
+spread measured so far.**
+
+| | run 7 | run 8 |
+|---|---|---|
+| frames | 4853 | 10837 |
+| CMD_LO writes lost | 344 / 21900 ≈ 1/64 | **32 / 44406 ≈ 1/1388** |
+| `writesBad` | 5084 / 236112 ≈ 1/46 | **309 / 471215 ≈ 1/1525** |
+| `readsBad` | 2956 / 1459104 ≈ 1/494 | **887 / 3414368 ≈ 1/3850** |
+| `seqRepeat` (SEQ writes lost) | 391 | 44 |
+
+Run 8 is more than twice as long as run 7 and took an order of magnitude fewer
+faults in absolute terms. Whatever modulates this is not traffic volume and not
+the code — the two runs are the same program against the same firmware image.
+That leaves the physical layer: temperature, supply, cartridge seating. Worth
+correlating against `GET_HEALTH`'s throttle/temperature bytes on the next few
+runs before theorising further.
+
+`CMT XX 0051 FF` — 81 commits answered a non-protocol code, and this time the
+value was `$FF` (run 7: `$D0`). `$FF` is the floating-bus / mis-sampled-address
+answer, so run 8's bad commit reads are the ordinary kind.
+
+**Layout defect found and fixed the same run.** The `STOPTRY` column added in
+section 26 pushed row 21 to columns 8-41 on a **40-column** screen (the demo's
+telemetry prints to the C64 text screen, `SCREEN + r * 40`, not to HDMI), so
+its two digits wrapped onto row 22 and overwrote the `SE` of `SEQREP` — the
+photograph reads `00REP`. The firmware dispatch count on row 21 now prints as
+24 bits instead of 32 (matching the C64 count beside it), which brings the row
+back to columns 8-39 exactly. New `showHex24` entry point, falling through the
+existing `showHex32`/`showHex16` chain.
+
+## 28. Run 9 (2026-09-10): it hung again, and the evidence was not captured
+
+The user ran the demo twice. **The first run hung** after being left running
+longer than usual. It was not photographed, and the health block that says
+*which* of the four `$06` producers refused is only read at `finish` — so
+whatever it would have said went with it. The photograph is of the **second**
+run, which did not hang.
+
+The second run, for the record: 28847 frames, OK 28612 (99.2%), `CMT 06 0000`,
+`WHY 01`, `STOPTRY 00`, `STALLAT 0001 70AE 04` — last accepted commit at frame
+28846 of 28847, another clean exit. The row-21 layout fix works; `SEQREP`'s
+label is intact.
+
+`STALLS 02` with the STATUS byte `04` = `VBLANK_PENDING` set and `FRAME_READY`
+clear: two `waitReady` timeouts in 28847 frames, which is the ordinary
+occasional missed frame and not the freeze.
+
+**Fault rates, third data point:**
+
+| | run 7 | run 8 | run 9 |
+|---|---|---|---|
+| frames | 4853 | 10837 | 28847 |
+| CMD_LO writes lost | 1/64 | 1/1388 | 235 / 116534 ≈ 1/496 |
+| `writesBad` | 1/46 | 1/1525 | 3539 / 1224980 ≈ 1/346 |
+| `readsBad` | 1/494 | 1/3850 | 2850 / 9206797 ≈ 1/3230 |
+
+Run 9 sits between the other two on every axis. No relation to run length.
+
+A coincidence worth *not* building on: run 9's `CMT XX` (235) is exactly equal
+to its dispatch shortfall (235), which would be a tidy story about a single
+burst losing both a `CMD_LO` write and the `ERRCODE` read that follows it.
+Runs 7 and 8 kill it — 42 against 344, and 81 against 32. Recorded so nobody
+re-derives it.
+
+`FIRST CC 000C`: the first non-`OK` answer came at frame 12 and was `$CC`, and
+`$CC` was still the last one 28835 frames later. Run 7 saw `$D0`, run 8 `$FF`.
+Only `$FF` has an explanation (floating bus / mis-sampled address); `$CC` and
+`$D0` are reads that were serviced by something.
+
+**What was built in response.** `stuckWatch` in the demo: 32 consecutive
+refused commits — about half a second, well past noise — triggers one
+`GET_HEALTH` and paints rows 19-22 immediately, plus `STUCK - HEALTH SNAPSHOT
+ABOVE` on row 23. It fires once per run. A hung screen can now be photographed
+as it stands, with no RUN/STOP and no dependence on the C64 still being
+responsive. That closes the capture gap that cost run 9's first run.
+
+## 29. Run 10 (2026-09-10): the cleanest run yet, and an unreadable number
+
+34644 frames, OK 34545 — **99.71%**, the best ratio measured — `CMT 06 0000`,
+`STALLS 00`, `WHY 01`, `STOPTRY 00`, last accepted commit at frame 34643 of
+34644. Longest run so far and no hang.
+
+The write side was the cleanest yet: `writesBad` 593 / 1459230 ≈ **1/2460**,
+`seqRepeat` 66, against run 7's 1/46. `readsBad` 2796 / 11033585 ≈ 1/3946.
+`CMT XX 0063` = 99, first at frame 460, code `$FF`.
+
+**The DISPWHY pair could not be read from the photograph**, and the two
+readings are opposite findings:
+
+- `021E67` against `021E0F` → firmware **+87 excess** dispatches, i.e. 87
+  commands executed that the C64 never sent. That would be the corrupted
+  command mechanism seen directly, and the obvious candidate for a spurious
+  `LOOP_STOP` producing the `$06` freeze.
+- `021E67` against `021EDF` → a **-121 shortfall**, the ordinary lost-write
+  direction of runs 7-9.
+
+`0` and `D` are exactly the glyph pair this camera-and-CRT combination cannot
+separate. Arguing it out from theory does not settle it either: address
+mis-sampling can only *set* high-nibble bits (A0-A3 are dedicated GPIO,
+A4-A7 go through the LVC257), and `CMD_LO` is `$0C` with a zero high nibble,
+so no other register's write can be mis-sampled *into* `CMD_LO` — which
+argues against +87 but only if that mechanism is the only one that can
+produce a spurious dispatch, and the hold gate re-sampling one access is not
+excluded.
+
+**So the C64 now does the subtraction.** Row 21's second column is the signed
+delta — `+NNNN` or `-NNNN`, with the closing GET_HEALTH already allowed for —
+instead of the raw C64 count. Zero is a clean run. A sign glyph survives a
+photograph in a way that a hex digit does not, and it removes the mental
+arithmetic that has been done by hand for four runs. New `showDelta`, and
+`showSpc` refactored into a `showChr` tail so the sign can be emitted.
+
+Run 10 itself stays unresolved; the next run answers it directly.
+
+## 30. Run 11 (2026-09-10): the freeze caught in the act, and named
+
+`stuckWatch` fired for the first time. The user photographed the screen with
+`STUCK - HEALTH SNAPSHOT ABOVE` on it and the frame counter still climbing —
+so, for the first time, the health block was read *while the run was stuck*
+rather than after a RUN/STOP that a stuck machine may never get.
+
+What it read, row 21: `DISPWHY 000C18 -0057 0020 0000 56 01 00`.
+
+- `NOLOOP 0020` (32) and `NOMODE 0000`. That settles the which-of-four
+  question the whole `gpu64_apidiag.h` block was built for: `SCENE_COMMIT` is
+  answering `$06` because **the class 1 render loop is not running**, not
+  because the display left graphics mode and not because the frame clock lost
+  calibration.
+- `WHY 01` = `GPU64_LOOPSTOP_OPCODE`. **A `LOOP_STOP` opcode executed.** This
+  program issues `LOOP_STOP` in exactly one place, `finish`, which it had not
+  reached — the frame counter was still going up. So class 1 dispatched a
+  class-1 `$07` that the C64 never sent.
+- `STATE 56` — bits 1, 2, 4, 6: calibrated, graphics mode, FRAME_READY,
+  framebuffer up. Bit 0 clear. Everything healthy except the loop.
+- `STOPTRY 00`, and the signed delta column's first outing read `-0057`:
+  87 commands lost, unambiguously a shortfall. By analogy that also settles
+  run 10 as a shortfall, not an excess.
+
+Supporting numbers: FRAMES `AAB3` (43699, still climbing), OK `02AB` (683),
+`CMT 06 A7EE` (42990), `CMT 07 0000`, `CMT XX 00B9 FF`, `ERR 06`,
+`STALLS 03`, `FIRST FF 003B`, `STALLAT 0001 325E 06` — the last accepted
+commit was frame 12894, so the loop had been dead for ~30800 frames.
+`SEQREP 0000007D` (125).
+
+### What it does not say, and the instrument built for it
+
+Address mis-sampling cannot produce this. A4-A7 are multiplexed through the
+LVC257, so a mis-sampled address can only ever *set* high-nibble bits, and
+`CMD_LO` is `$0C` — no other register's write can land in it. So either the
+`CMD_LO` write itself was spurious, or a real write's *data* byte was wrong.
+
+Those two have different fixes and the screen could not tell them apart, so
+GET_HEALTH gained bytes 93-95 (`gpu64_apidiag.h`): the `SEQ` the stopping
+dispatch was acting on, the `SEQ` of the dispatch before it, and that one's
+opcode. The demo prints them on row 23 as `STOPSRC <delta> <prevop>
+<verdict>`:
+
+- `00 ... PHANTOM` — `SEQ` did not move, so no command arrived at all and
+  `CMD_LO` was written by something that was not the program. **Refusing any
+  command whose `SEQ` has not advanced would close the whole class**, and
+  `csDispatch` already copes with a refusal by re-sending.
+- `01 ... REALCMD` (or `03` at the `$FE -> 01` wrap) — a real command
+  arrived and its data byte was mis-sampled, almost certainly a
+  `SCENE_COMMIT`'s `$08` latched as `$07`. No sequence gate can see that;
+  it would take a checksum or an opcode echo.
+
+Two housekeeping changes came with it. `finish` no longer refreshes the
+diagnostic rows once `stuckWatch` has fired — the closing `LOOP_STOP` would
+otherwise overwrite the very bytes that name the intruder with its own
+perfectly ordinary `01 REALCMD`. And the two status messages moved off row
+23: `STOPPED - RUN/STOP AGAIN TO EXIT` to row 1, the stuck marker to row 3.
+
+Desk-checked at 400 frames in `runsim.py`: a clean run reads
+`STOPSRC 01 08 REALCMD`, which is the teardown correctly described — the
+`LOOP_STOP` is a real command and the `SCENE_COMMIT` before it was the last
+thing sent.
+
+## 31. Run 12 (2026-09-10): the dirtiest bus yet, and a mechanism for it
+
+The freeze did **not** reproduce. `CMT 06 0000`, `stuckWatch` never fired,
+and row 23's `STOPSRC 01 08 REALCMD` is only the clean-teardown baseline.
+The instrument from section 30 is armed and has not yet had its event.
+
+What the run did produce is the worst bus reading measured so far and a
+fingerprint sharp enough to name a mechanism.
+
+| | |
+|---|---|
+| frames | 25661, 25458 committed OK |
+| reads / writes serviced | 8127611 / 1148120 |
+| `readsBad` / `writesBad` | 6906 / **7980 — 1 bad write in 144** |
+| `lastBadAddr` / `orBadAddr` / `andBadAddr` | `$F9` / `$FF` / **`$80`** |
+| firmware dispatches | 106969, 611 commands lost (~1 in 175) |
+| stale SEQACK first-reads | 1380, plus 1361 reading `$FF` |
+
+`andBadAddr` is the AND across every bad read address. `$80` means **bit 7
+was wrong in all 6906 of them**, while bits 4-6 were wrong only some of the
+time. The same reading appeared on 2026-09-09. `lastBadAddr $F9` is `$19`
+(ARG8) with its high nibble corrupted to `$F`.
+
+### The mechanism
+
+`WAIT_UP_TO_CYCLE( wc )` (`lowlevel_arm64.h:99`) is a `do { MRS } while (
+cc2 < wc + armCycleCounter )`. `armCycleCounter` is stamped once per pass by
+`RESTART_CYCLE_COUNTER`, so this is an **absolute deadline anchored at the
+start of the pass**, and if the counter has already passed the target it runs
+its body once and returns. Correct for a deadline; wrong for a settling time.
+
+The multiplexer wait is one of these. So any stall between the pass anchor
+and `SET_GPIO( bMPLEX_SEL )` comes straight out of the LVC257's settling
+budget, and a stall of ~115 cycles reduces it to nothing — `g3` is then read
+while GPIO 0-3 still carry the *other* mux input: NMI, ROMH, IO1 and BUTTON,
+every one idle high. That is why a mis-sampled address can only ever have
+high-nibble bits **set**.
+
+And it explains why bit 7 specifically is wrong every time. Bit 7 is BUTTON,
+which unlike NMI/ROMH/IO1 is idle high for the *whole run* and so leaks
+through on every bad sample; the other three leak only when they happen to
+be high at that instant. The `andBadAddr $80` / `orBadAddr $FF` split is
+exactly that shape. (The first reading of this attributed A7's reliability to
+GPIO2/GPIO3's on-board I2C pull-ups. That does not fit: the two pins share
+the same loading, so bit 6 would fail nearly as often as bit 7, and it does
+not. The pull-ups may contribute to the margin being tight at all; they are
+not what shapes the fingerprint.)
+
+### The fix that was tried, and what it disproved
+
+**It broke the bus completely and was reverted the same day.** Read this
+section for the finding, not for the patch.
+
+`rad.cfg`'s `WAIT_CYCLE_MULTIPLEXER` is tunable without a rebuild and raising
+it is the obvious move — but it is measured from the same pass-start anchor,
+so a large enough stall defeats any constant put there.
+
+What went in instead is a settling **floor** measured from the mux toggle
+itself, using the already-present `WAIT_UP_TO_CYCLE_AFTER` macro:
+
+```c
+SET_GPIO( bMPLEX_SEL );
+u64 muxStamp;
+READ_CYCLE_COUNTER( muxStamp );
+WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_MULTIPLEXER );
+WAIT_UP_TO_CYCLE_AFTER( GPU64_MUX_SETTLE, muxStamp );
+g3 = read32( ARM_GPIO_GPLEV0 );
+```
+
+`GPU64_MUX_SETTLE` was 100 against a nominal gap of `235 - 80 - 40 = 115`,
+so on a *punctual* pass the second wait has always already elapsed and costs
+one `MRS` and one compare. It was applied at both sampling sites,
+`reuUsingPolling()` and `gpu64_mirrorIdleLoop()`.
+
+**Bench result: total failure on the first command.** `SETUP FAILED AT STEP
+01 CODE 04`, `CLOCK 0000`, and `GET_HEALTH`'s DMA never delivering a byte
+through eight retries — every byte of the health block still reading
+`doHealth`'s `$5a` poison, which is why every difference on the screen was
+`0000` and every raw byte was `5A`.
+
+The assumption it rests on is the one that is wrong: **the pass is never
+punctual there.** Between the `g2` read and that point sit two peripheral-bus
+accesses whose latency is in nobody's cycle budget, so
+`WAIT_UP_TO_CYCLE( WAIT_CYCLE_MULTIPLEXER )` is *already* falling through. A
+floor that "only bites when the pass was late" bit on every pass, and ~100
+cycles of added spin per C64 cycle is past what the loop has.
+
+Three things follow, and they are the actual result of this run:
+
+1. The LVC257's settling time is **whatever those two peripheral accesses
+   happen to cost**. It is a side effect, not a design, and it has never been
+   measured.
+2. **Raising `WAIT_CYCLE_MULTIPLEXER` in `rad.cfg` is equally useless** —
+   same anchor, already passed. The tuning sweep that looked like the obvious
+   cheap experiment is dead before it is run.
+3. There is no slack at that point in the pass. Anything added between the
+   two GPIO reads must be paid for by removing something else.
+
+The `andBadAddr $80` fingerprint is untouched by any of this and still
+unexplained. The comment left at the constant's old site in `rad_reu.cpp`
+records the whole chain so it is not re-derived.
+
+### The experiment that goes with it
+
+What makes core 0 late is a separate question, and the standing suspect is
+core 1: run 12 measured 1 bad write in 144 with the render loop running, and
+`gpu64_probe_bus` — same registers, core 1 idle — read CLEAN over 111000
+accesses the day before. But the two are different runs, and
+`gpu64-bus-fault-rate-varies-30x` records the same binary on the same day
+producing rates 30x apart, so nothing can be concluded from that pair.
+
+So the demo now runs the comparison **inside one run**: sixteen 256-frame
+windows, alternating between the loop running (core 1 rendering) and the loop
+stopped (core 1 in `WFE`, which costs no bus cycle and no store). Phase B
+issues the identical per-frame command traffic — every `SCENE_COMMIT` is
+refused `UNSUPPORTED`, which is still a dispatch and the same register
+writes. Each window's `writesBad`, `readsBad`, `writes` and `dispatches` are
+banked against its own condition and the pooled totals print on rows 16 and
+17.
+
+Alternating rather than one A followed by one B is the whole point: a single
+split cannot separate "loop running vs stopped" from "early in the run vs
+late in it", and the Pi warms up. Interleaving puts both conditions on both
+sides of any drift.
+
+Desk-checked at 4096 frames: the two conditions came out within 4 writes and
+1 dispatch of each other (`015B9C`/`0020CF` against `015B98`/`0020D0`), so
+the denominators really are equal by construction and the raw counts can be
+read against each other with nothing to subtract.
+
+Reading the result:
+
+- **both ~zero** — the settling floor closed it. Run 12 measured 7980 bad
+  writes in 1148120, so `0000` over a run of this length is not a quiet day.
+- **A large, B small** — core 1's rendering is what makes core 0 late.
+- **A ≈ B, both non-zero** — the second core is not the variable; the stall
+  is core 0's own work.
+- **B larger** — phase B's own shape is the confound. It runs flat out, with
+  no wait on the render loop, deliberately: that makes it the *harder* of the
+  two on the bus, so it biases against the hypothesis rather than for it.
+
+Row 17 ends with two extra bytes: failed `LOOP_START`s and the last code one
+answered. They must read `00 00`, or a window labelled A ran with the loop
+stopped and the pooling is spoilt.
+
+Two fixes came out of the desk check. `showDelta` subtracted a literal 1 for
+"the closing GET_HEALTH" — with a health sample at every phase boundary that
+turned a clean run into `-0016`, sixteen phantom lost commands; it now
+subtracts a counted `healthCt`. And the `jsr showPhases` call had been
+planted in the middle of row 22's rendering, orphaning its trailing
+`healthTry` byte onto row 17. Both are the same class of mistake as the one
+section 30 recorded, which is worth noticing.
+
+The `CMT 06` count is now ~2048 by design — phase B's refusals. `OK` is half
+of `FRAMES` for the same reason.
+
+## 32. Run 13 (2026-09-10): core 1 is the cause, and the loop stops being fatal
+
+The alternating A/B instrument (section 31's design, firmware `src:587612d2`
+with the polling loop identical to HEAD) ran its full 4096 frames. Sixteen
+windows of 256 frames, eight of each condition, so run-position drift and the
+30x run-to-run rate variance cannot produce the split.
+
+```
+BUS  A   01BA  01A2  01602F  002106     loop running, core 1 rendering
+BUS  B   0000  0000  015890  0020D0     loop stopped, core 1 in WFE
+```
+
+- **A**: 442 bad writes, 418 bad reads, 90159 writes, 8454 dispatches.
+- **B**: **0** bad writes, **0** bad reads, 88208 writes, 8400 dispatches.
+
+The whole-run totals on `BUS BAD` read `01A2 01BA` — identical to phase A's
+two numbers. The counters were live throughout and phase B, setup and teardown
+between them contributed nothing at all. Phase B ran flat out with no
+`FRAME_READY` pacing, so it carried *more* command pressure per second and
+still read zero.
+
+**Core 1's rendering is what dirties core 0's IO2 sampling.** The defect is
+ours, not a floor of the RAD hardware, and the framing in the
+`gpu64-io2-sampling-reliability` note — pre-existing, reproduces with 3D
+compiled out — predates core 1 doing render work.
+
+Named confound: phase B also removes page flips, since no commit is accepted.
+Core-1 rendering and flipping are not separated by this run.
+
+Everything else was the designed shape: `CMT 06 0800` = exactly 2048 refusals,
+`FIRST 06 0100` = the first phase boundary at frame 256, `OK 07F8` + 2048 + 8
+= 4096, `STALLS 00`, and `00 00` for failed `LOOP_START`s. `andBadAddr` moved
+from `$80` (run 12) to `$C0`.
+
+### The suspect, and the change made to test it
+
+The longest unbroken run of bus traffic left on core 1 was not in the
+rasteriser — `gpu64_3d_raster.cpp` accounts its span budget in *bytes*
+(`GPU64_3D_SPAN_PIXELS = GPU64_3D_SPAN_BYTES / 3`, three bytes per pixel:
+one colour, two z) and `gpu64_3dClearViewport()`, the triangle rasteriser and
+the sprite path all yield inside the span loop. `cleanViewport()` yields per
+row. The scene loop yields per node.
+
+It was the i-cache warms. `gpu64_3dExecuteRenderScene()` opened every frame
+with three `CACHE_PRELOAD_INSTRUCTION_CACHE` + `FORCE_READ_LINEARa` pairs —
+96 `PLI` plus **6144 volatile byte loads** the compiler may not coalesce or
+elide — with no `GPU64_3D_YIELD()` anywhere in them. `gpu64_3dExecuteRender()`
+had one pair for `DRAW_MESH` and three for `DRAW_NODE`.
+
+CLAUDE.md's rule 4 is about core 0, which has a per-C64-cycle deadline. Core 1
+has none: a cold first frame is slower and nothing observes it, and inside the
+autonomous loop that code runs fifty times a second and stays warm by use. The
+warms were paying core 0's insurance premium out of core 0's own timing
+budget. **All four sites are removed**, with a do-not-restore comment above
+`gpu64_3dExecuteRender()`.
+
+The A/B instrument is unchanged and is the measurement: if phase A's `01BA`
+falls toward phase B's `0000`, this was it.
+
+### The loop protocol, hardened
+
+Independent of the above, and prompted by the user's question — *why does
+`LOOP_STOP` exist at all, when the loop is always running?* Two changes:
+
+- **`LOOP_STOP` and `SCENE_RESET` carry a key byte**, `ARG0` = `$A5`
+  (`GPU64_3D_LOOP_KEY`), **required only while the loop is running** — the
+  only state a spurious stop can damage. *(Superseded the same afternoon by
+  run 14: the register became `ARG15` and the gate unconditional, covering
+  `DESTROY_NODE` and `FREE_RESOURCE` too. Section 33 has why both halves of
+  this were wrong.)* Without it: `BAD_ARGS`, and nothing
+  is stopped or destroyed. Gating on `s_LoopRunning` leaves every setup-time
+  `SCENE_RESET` call site working unchanged; only `sendStop` in
+  `gpu64_demo_quake3d.a` needed updating, and it writes the key *inside* its
+  retry loop because `ARG0`'s write is as droppable as any other.
+  `$08 -> $07` is a four-bit change, not a bit flip, so opcode spacing would
+  not have helped; a second specific byte the per-frame stream never writes
+  does.
+- **`SCENE_COMMIT` against a stopped loop re-arms it** instead of answering
+  `UNSUPPORTED` for the rest of the session. `LOOP_START`'s body is now
+  `loopStartArmed()` and both call it. A spurious stop costs one frame instead
+  of the run. A deliberate teardown is unaffected: a program that has sent
+  `LOOP_STOP` sends no more commits. `commitNoLoop` (GET_HEALTH 80-83) keeps
+  counting and becomes a repair count that should read zero.
+
+`tools/prgsim/gpu64class1.py` mirrors all of it. Six behaviours checked
+against the model before the deploy: keys not required while stopped; an
+unkeyed `LOOP_STOP` and `SCENE_RESET` refused `$04` with the loop still
+running; a stopped loop answering `$00` and running again on the next commit;
+the keyed stop still stopping. All twelve demos re-simulated green.
+
+Deployed as `src:f00c961a`.
+
+
+## 33. Run 14 (2026-09-10): the warms were not it, and the camera was destroyed
+
+Two readings, and they are independent of each other.
+
+```
+FRAMES 1000   OK 0AA0   MISSED 0149
+ERR 0B        STALLS 02  CLOCK 411A
+CMT 06 0001   CMT 07 0000   CMT XX 055E 0B
+CMTMISS 000F  FIRST 0B 0000
+STALLAT 0400 0FFF 06
+BUS  A  0555 0391 0160A26 002103
+BUS  B  0000 0000 015BA0  0020D0  00 00
+SEQBAD  0000 001D CF 00
+BUS  RW 0004E023 0002C5D3 0000C777
+BUS  BAD 0391 0555 DE FF 80 F9
+DISPWHY 004255 -005E 0500 0000 56 01 00
+SEQREP  000000B5 00B6 0064 FF 00 00
+STOPSRC 01 0A REALCMD
+```
+
+### (a) Removing the i-cache warms did not close the bus defect
+
+The criterion was set before the run: *"BUS A's first number is the verdict.
+If it comes back near `0000` with the write count still around `0160xx`, the
+i-cache warms were the cause."* It came back **`0555`** — 1365 bad writes and
+913 bad reads against phase B's **exactly zero of each**, with the
+denominators matched (`0160A26` ≈ 92706 writes in A, `015BA0` ≈ 88992 in B).
+So the warms were not the cause, and the A/B finding from run 13 reproduces
+cleanly in a second run.
+
+Note what cannot be concluded: A went 442 → 1365 between runs 13 and 14, and
+that is **not** "worse". The fault rate varies 30x between runs from the same
+binary (section 31), which is exactly why the instrument alternates sixteen
+windows inside one run. A-vs-B within a run is the only valid comparison.
+
+The next suspect is the **page flip** — the one other thing phase B removes
+along with core 1's rendering.
+
+### (b) The live scene's active camera was destroyed, once, permanently
+
+`ERR 0B` is `NO_CAMERA`, and there is exactly one place in the firmware that
+produces it: `loopStartArmed()`, on `!s_Scene.bHaveActiveCamera`. The arithmetic
+localises it to a single event part-way through phase A:
+
+| | |
+|---|---|
+| `OK 0AA0` = 2720 | 2048 phase-B `ARENA_STATUS` + 672 phase-A commits |
+| `CMT XX 055E` = 1374 | commits that answered something else, all `$0B` |
+| 672 + 1374 = 2046 | ≈ phase A's 2048-frame budget |
+
+So roughly two thirds of the way through phase A's frames, something cleared
+`bHaveActiveCamera`, and from then on every `LOOP_START` and every
+`SCENE_COMMIT` re-arm answered `$0B` for the rest of the run. It never
+recovered, because nothing in the demo re-created the camera.
+
+Three candidates, and two are eliminated:
+
+- **Setup** — exonerated. `SETUP OK` is logged through `cmd1`, which returns
+  real `ERRCODE`s, and `CREATE_CAMERA` and `SET_ACTIVE_CAMERA` both passed.
+- **Session teardown** (`gpu64_3dReset()`) — ruled out. It needs 1001
+  consecutive `CPU_RESET`-low passes and would have killed the program.
+- **A destructive opcode the C64 never sent** — `SCENE_RESET` ($00) or
+  `DESTROY_NODE` ($22) on the camera. `STOPWHY` cannot name which, because
+  the teardown's own `LOOP_STOP` overwrote it.
+
+`DESTROY_NODE` is the more likely of the two, and the demo hands it a clear
+path: it sends `SET_POSITION` ($30) and `SET_ORIENTATION` ($31) with
+`ID = CAM_ID` every single frame, so a mis-sampled `CMD_LO` on one of those
+needs only to land on `$22` to destroy precisely the camera that was already
+staged.
+
+**This is a diagnosis, not a regression.** Before section 32's re-arm change
+the same event presented as a mute `$06 UNSUPPORTED` forever; `$0B` says what
+actually broke.
+
+Attempted on the host and negative: `runsim.py --demo --stop-after=700` ran
+702 frames with `OK 702`, `ERR 00`, and A/B both zero. The cause is a bus
+phantom, not logic — which is the expected result and the reason the fix is a
+gate rather than a bug fix.
+
+### The one-shot key, rebuilt
+
+Section 32's key was wrong in both of its halves, and run 14 showed why:
+
+- **Wrong register.** `ARG0` is written constantly by the per-frame node
+  stream, so a phantom arriving mid-frame stands a real chance of finding a
+  coordinate byte that happens to be `$A5` already sitting there. It is now
+  **`ARG15`** ($DF20), which no opcode reads for anything else.
+- **Wrong scope.** Gating on `s_LoopRunning` covered only the damage a
+  spurious *stop* does. A phantom `DESTROY_NODE` is destructive whether the
+  loop is running or not.
+
+The contract now (`GPU64_KEY_DESTRUCTIVE` in `Source/Firmware/gpu64_api.h`,
+which carries the reasoning):
+
+- `gpu64_apiDispatch()` copies `ARG15` into `gpu64ApiKey` and **clears the
+  register**, for every class, ahead of every early return. The key is
+  therefore valid for exactly one command — spend-on-use, so a key written
+  once cannot authorise a phantom that arrives later.
+- Four opcodes demand it at the top of `execute()`, in one place rather than
+  scattered: `SCENE_RESET`, `LOOP_STOP`, `DESTROY_NODE`, `FREE_RESOURCE`.
+  Without it: `BAD_ARGS`, and nothing happens.
+- The refusal is **counted with its opcode**: `GET_HEALTH` byte 76 counts
+  refusals, **byte 77 names the last one**. That is the reading run 14 did not
+  have — it turns "something destroyed the camera" into "a phantom `$22`
+  arrived, and here it is". Bytes 78/79 count `camLost` and `sceneWipes`, the
+  damage that still gets through, so a run can distinguish *prevented* from
+  *never happened*.
+
+The residue this cannot cover is a *real* keyed command whose own opcode byte
+is mis-sampled into a different destructive opcode. Nothing short of a
+checksum over the whole command closes that, and it is a much smaller target.
+
+### Verified on the host
+
+- `gpu64_3d_scene_test.a` gained a fourth assertion: an **unkeyed**
+  `DESTROY_NODE` on a live node must answer `$04`, and the keyed destroy
+  immediately after it must still answer `$00` — which is what proves the
+  refusal changed nothing. `NO KEY ERR 04`, `VERDICT PASS`.
+- `gpu64_loop_test.a`'s post-stop checks were reordered and a fourth added.
+  `CLEAR_VIEWPORT` now runs *before* the commit, because the self-healing
+  commit restarts the loop and `precheckClearViewport()` refuses immediate
+  mode with `BUSY` while it runs. The new fourth check is `CLEAR_VIEWPORT`
+  again, expected `$07` — which is the assertion that the re-arm was real
+  rather than the commit being quietly ignored. `POST 00 00 00 07`,
+  `VERDICT PASS`.
+- `tools/prgsim/gpu64model.py` spends the key in `dispatch()` and publishes
+  bytes 76-79; `gpu64class1.py` carries the same single up-front gate and
+  counts `camLost` against the **live** scene, as the firmware does.
+- The conformance suite and all twelve demos re-simulated green.
+
+Eleven in-tree assembly call sites were keyed, including the four in
+`gpu64_3d_phase0_test.a` — each staged separately, because the key is
+one-shot. The `SCENE_RESET` at line 478 there is deliberately left unkeyed:
+it is the `BAD_CLASS` test, and the class check runs first.
+
+### What run 15 decides
+
+- **`GET_HEALTH` byte 77** — if a phantom destructive opcode arrives, this
+  names it. Non-zero byte 76 with a zero byte 78 is the gate working.
+- **`REVIVE` on row 14** — the demo now repairs a lost camera itself
+  (`reviveCamera`: `SET_ACTIVE_CAMERA`, and `CREATE_CAMERA` if that fails),
+  triggered both from the per-frame `NO_CAMERA` path and from a failed
+  `LOOP_START`. A non-zero count with the run continuing is the self-heal
+  working; `00 00` with `ERR 0B` absent means it was never needed.
+- **`psToA` now checks `ERRCODE`, not the `SEQACK` verdict.** `csDispatch`
+  returns 0 when the command was *seen*; the command's own error is in
+  `seqErr`. That mislabelling is why run 14's `restartErr` read `00 00` while
+  every commit was answering `$0B` — some windows logged as phase A may have
+  had core 1 idle, which *dilutes* A and therefore strengthens the A≫B
+  finding rather than weakening it.
+- **BUS A vs BUS B** is still the bus verdict, and the page flip is the
+  standing hypothesis for it.
+
+## 34. Run 15 (2026-09-11): the healthiest run yet, and the instrument was lying
+
+The first bench run with the one-shot ARG15 key in place. Firmware
+`src:f18c93ab`, `gpu64_demo_quake3d` with `PHASES = 16`.
+
+Transcribed from the photograph:
+
+```
+FRAMES  1000   OK 0F96   MISSED 0190
+ERR     FF     STALLS 01  CLOCK 411A
+CMT 06  0000   CMT 07 0000   CMT XX (count illegible) FF
+CMTMISS 001D   FIRST FF 0014 0000
+STALLAT 0600 0FFF 06
+BUS A   0630 043C 016C28 002198
+BUS B   0000 0000 015B00 002000 00 00
+SEQBAD  0000 00C6 66 00
+BUS RW  000A2250 0002C7D5 0000C6F3
+BUS BAD 043C 063D DE FF 80 F9
+DISPWHY 00426A -007B 0000 0000 00 01 00
+SEQREP  000000CD 0197 0094 FF 00 00
+STOPSRC 01 0A REALCMD KEY 00 00 00 00
+```
+
+The `CMT XX` count digits are not legible on the CRT photograph and are
+recorded as unknown rather than guessed — see the bench-legibility rule.
+
+### The key gate: a null result, not a pass
+
+`KEY 00 00 00 00` — `keyRefused` 0, `keyRefusedOp` `$00`, `camLost` 0,
+`sceneWipes` 0 — and `REVIVE 0000` agrees from the C64 side. Run 14's
+permanently destroyed camera did not recur, and the gate never had to fire.
+
+That is **not** evidence the gate works on hardware. It is evidence the event
+it guards against did not arrive during this run. Given that the bus fault
+rate varies 30x between runs, a single quiet run is weak evidence in either
+direction. The gate stays hardware-unproven until a run reports a nonzero
+byte 76 with byte 77 naming the opcode.
+
+### The run is the healthiest of the campaign
+
+All 4096 frames completed. `STALLS 01`, `CMT 06 0000`, `CMT 07 0000`, no
+freeze, no `$06` lockup, no `NO_CAMERA`. The self-healing `SCENE_COMMIT` and
+the keyed `LOOP_STOP` cost nothing observable. `STALLAT 0600 0FFF 06` places
+the single stall at frame 1536 with the last frame 4095, so it was a one-off
+and not an onset.
+
+### Core 1 causes the bus faults: third consecutive reproduction
+
+| | bad writes | bad reads | denominator (writes serviced) |
+|---|---|---|---|
+| phase A (core 1 rendering) | 1584 | 1084 | 93224 |
+| phase B (core 1 in WFE) | **0** | **0** | 88832 |
+
+`BUS BAD 043C 063D` — 1084 bad reads, 1597 bad writes for the whole run —
+confirms phases A and B between them account for essentially every fault, so
+there is no third population hiding outside the windows. Runs 13, 14 and 15
+now agree, with the windows interleaved inside each run so the 30x
+between-run variance cannot explain it. The i-cache warms were eliminated in
+run 14. **The page flip is the remaining standing suspect.**
+
+### The finding that changes how the earlier runs read: `ERR FF` is not an errcode
+
+The ERRCODE values run `$00`-`$0C`. `$FF` is what a floating bus answers when
+the access was never decoded to ERRCODE at all. So the 106 non-OK commits
+(4096 - 3990) were commands whose **answer we failed to read** — not commands
+that were refused. `FIRST FF` and the `FF` in the `CMT XX` row are the same
+artefact. The firmware side has no matching evidence of refusals: `CMT 06` and
+`CMT 07` are both zero, and byte 80's `commitNoLoop` repair count is zero.
+
+`csDispatch` has understood this for some time and re-reads SEQACK on a
+mismatch, with the comment *"$FF is what a floating bus answers, so a first
+read of $FF is a mis-sampled address: the access was never decoded to SEQACK
+at all."* `cmd1`, four lines above it, never got the same treatment:
+
+```asm
+cmd1
+	ldx #1
+	stx CMD_HI
+	sta CMD_LO
+	lda ERRCODE
+	rts
+```
+
+Fixed the same day. `cmd1` now re-reads ERRCODE once when the first read
+floats — the command finished long before the read returned and ERRCODE is a
+latch that is not going to change — and counts both the re-read and the
+re-read that *also* floated. Row 7 became `ERR <code> <floated> <floated twice>`,
+and only the third field is a genuinely lost answer.
+
+Every `cmd1` caller was checked to re-test `A` with an explicit `cmp` rather
+than relying on the flags `lda ERRCODE` used to leave, because the added
+`cmp #$ff` changes them. Host-verified: 402 frames, all OK, with the dispatch
+and register-write totals byte-identical to the pre-change run (1700 /
+17914), so the re-read adds no traffic on the clean path.
+
+**The correction this implies for the run log:** every `ERR`, `FIRST` and
+`CMT XX` reading of `$FF` in runs 13-15 was an unreadable answer and not a
+command failure. The A/B bus verdict is unaffected — it comes from
+GET_HEALTH deltas the firmware counts itself, not from anything the C64 read.
+
+### Read-fault correlation
+
+`MISSED 0190` is 400 dispatches where SEQACK was wrong on both reads, against
+`SEQREP`'s `missRd` of `0197` = 407 that recovered on the second read. Roughly
+1:1. So **given that the first read failed, the second fails about half the
+time** — where independent faults at the measured 1-in-27 rate would predict
+about 4%. The read faults are strongly correlated in time, i.e. bursty, which
+is what a retry budget has to be sized against.
+
+> Corrected 2026-09-11. This section first read the 1:1 ratio off `SEQBAD`'s
+> second field, which is `mrErr` and not `missRd` — `SEQBAD` is
+> `mrPrev mrErr mrOther mrErrVal`, and the recovered count lives in `SEQREP`.
+> The mistaken reading (400 failed vs 198 recovered) was reported as an
+> anomaly that needed explaining. It never existed. Run 16 gives the same
+> ~1:1 shape from the correct fields: `MISSED 0146` = 326 against `missRd`
+> `014B` = 331.
+
+## 35. Run 16 (2026-09-11): the key gate fired, and the phantom is DESTROY_NODE
+
+```
+FRAMES  1000   OK 0F7C   MISSED 0146
+ERR     20  0076 000C    STALLS 00   CLOCK 411A
+CMT 06  0000   CMT 07 0000   CMT XX 0024 20
+CMTMISS 001E
+FIRST   D1 0009 0001
+STALLAT 0000 0FFF 00
+BUS A   0515 024D 016884 002193
+BUS B   0003 0001 0158A0 002800 01 CD
+SEQBAD  0000 0063 D1 00
+BUS RW  00090FC4 0002C439 0000C493
+BUS BAD 024E 0518 E3 FF 80 DC
+DISPWHY 004265 -0056 0000 0000 00 01 00
+SEQREP  000000CB 014B 006F A3 00 00
+STOPSRC 01 0A REALCMD KEY 02 22 00 00
+```
+
+### The headline: `KEY 02 22 00 00`
+
+`keyRefused` = **2**. `keyRefusedOp` = **`$22` = DESTROY_NODE**. `camLost` = 0.
+`sceneWipes` = 0.
+
+Two phantom `DESTROY_NODE` commands arrived during the run. Both were refused
+for want of the `$A5` key in ARG15, and **nothing was destroyed**. This is the
+hardware proof the gate works, and it names the phantom that run 14 could only
+infer. Run 14's reasoning picked `$22` over `$00` as the likelier candidate
+because the demo stages `ID = CAM_ID` every frame, leaving a valid node id
+permanently sitting in the ID registers for a stray opcode to land on. That
+was right.
+
+The mechanism is now fully described: a mis-sampled `CMD_LO` write delivers an
+opcode the C64 never sent, it finds live ID registers, and before the key it
+executed. Run 14 lost the camera permanently and the room went black. Run 16
+took two hits and rendered 4096 frames.
+
+`FIRST D1 0009 0001` — the third field is `reviveCt` = 1, so `reviveCamera`
+ran once. With `camLost` = 0 the firmware never actually lost a camera, so
+that was a spurious `$0B` *read* rather than a real `NO_CAMERA`, and the
+revive was a harmless re-assert. Consistent with the read-fault picture below.
+
+### The ERRCODE re-read worked, and was too narrow
+
+`ERR 20 0076 000C`: 118 ERRCODE reads came back `$FF`, **106 of them recovered
+on the second read**, 12 did not. The run-15 fix is doing its job.
+
+But `lastErr` is `$20`, `firstCode` is `$D1`, and `lastSeqAck` is `$A3`. None
+of those is an errcode — the valid codes stop at `$0C`. So an unserviced read
+does *not* reliably return all-ones; it returns whatever was last on the bus.
+`SEQBAD 0000 0063 D1 00` says so directly: of the bad SEQACK reads that were
+not `$FF`, **99 returned the value of the immediately preceding read**, and
+zero returned the previous sequence number.
+
+Fixed the same day by testing the **range** instead of the value: `cmd1` now
+re-reads whenever ERRCODE comes back above `$0C`, counts `errBad` /
+`errBad2`, and records the value the failed second read gave. Row 7 became
+`ERR <code> <bad> <bad twice> <last bad value>`.
+
+That `$20` also explains `CMT XX 0024 20`: 36 commits "answered" `$20`, which
+is not an answer at all. With the range test those become recoveries.
+
+### A/B: fourth consecutive reproduction
+
+| | bad writes | bad reads | denominator (writes serviced) |
+|---|---|---|---|
+| phase A (core 1 rendering) | 1301 | 589 | 92292 |
+| phase B (core 1 in WFE) | **3** | **1** | 88224 |
+
+`BUS BAD 024E 0518` — 590 bad reads and 1304 bad writes for the whole run —
+accounts for A+B exactly (589+1, 1301+3), so again no fault population outside
+the windows. Ratio about 430:1 on matched denominators.
+
+Phase B is no longer exactly zero. Four faults across 88224 serviced writes is
+plausibly window-boundary bleed — core 1 finishing the frame in flight as the
+window flips — rather than a separate mechanism, but it is the first nonzero B
+in four runs and should not be rounded away. **The page flip remains the one
+standing suspect.**
+
+### Health otherwise
+
+`STALLS 00` and `STALLAT 0000 0FFF 00`: not one stall in 4096 frames, better
+than run 15's single one. `CMT 06` and `CMT 07` both zero — no `UNSUPPORTED`
+lockup, no `BUSY` refusal. `OK 0F7C` = 3964 of 4096, and the 132 shortfall is
+now understood to be mostly unreadable answers rather than refused commands.
+
+## 36. Run 17 (2026-09-11): a second phantom, and the bad addresses have a fingerprint
+
+```
+FRAMES  1000   OK 0FEC   MISSED 01A9
+ERR     D1  011F 001C D1    STALLS 04   CLOCK 411A
+CMT 06  0000   CMT 07 0000   CMT XX 0014 D1
+CMTMISS 002D
+FIRST   FF 0032 0000
+STALLAT 0C00 0FFF 04
+BUS A   0600 055D 016B5C 002190
+BUS B   0004 0001 0150AC 0020D2 00 00
+SEQBAD  0002 0053 D1 00
+BUS RW  000A261F 0002C70F 0000C55D
+BUS BAD 055E 06D4 D9 FF 80 F9
+DISPWHY 004271 -007B 0000 0000 00 01 00
+SEQREP  000000EB 016C 000E 3C 00 00
+STOPSRC 01 0A REALCMD KEY 01 07 00 00
+```
+
+### The gate fired again, on a different opcode
+
+`KEY 01 07 00 00`: one refusal, and byte 77 names it as **`$07` LOOP_STOP**.
+`camLost` and `sceneWipes` both zero.
+
+Run 16 caught `$22 DESTROY_NODE`; run 17 caught `$07 LOOP_STOP`. Those are the
+two failure modes this project chased for weeks from opposite ends — the
+permanently destroyed camera of run 14, and the "class 1 stuck on `$06`" freeze
+where `SCENE_COMMIT` refuses forever because a `LOOP_STOP` nobody sent stopped
+the loop. Both are now prevented, and both are named at the moment they happen.
+The key is the single highest-value thing built in this campaign.
+
+### The range test paid immediately
+
+`ERR D1 011F 001C D1`: 287 ERRCODE reads came back out of range, **259 of them
+recovered on the second read**, 28 did not, and the value that survived both
+reads was `$D1`.
+
+`OK` went from `0FEC` = **4076 of 4096**, against run 16's 3964 — and the 20
+non-OK commits are exactly `CMT XX 0014` = 20. So the shortfall is now entirely
+answers that were lost twice, with no misclassified recoveries left in it. Run
+15's `$FF`-only test would have caught 14 of these; the range test caught 287.
+
+`$D1` is not random. It is `lastErr`, `xxCode`, `mrOther` and `lastBadErr` in
+this run and `firstCode`/`mrOther` in run 16.
+
+### The bad *addresses* have a constant bit
+
+`BUS BAD`'s trailing bytes are addresses, not data (`gpu64_busstats.h`):
+`lastBadAddr $D9`, `orBadAddr $FF`, `andBadAddr $80`, `lastBadWrite $F9`.
+
+**`andBadAddr` = `$80` in run 16 and again in run 17.** A7 was set in *every
+single* bad read address — roughly two thousand events across the two runs,
+without one exception. Every gpu64 register lives at `$DF0B-$DF23`, so a
+correct sample has A4-A7 clear. A7 is GPIO 3 in the `g3` phase, which is to
+say the pin the LVC257 multiplexes with `BUTTON` — a line that idles high.
+`orBadAddr $FF` says the other bits move too, so A7 is the constant and the
+rest is noise on top of it.
+
+**This falsifies the premise `gpu64_busstats.h` was built on.** That header
+argues the low nibble A0-A3 comes from dedicated GPIO 10-13 and therefore
+cannot move, so a bad read of ERRCODE (`$0E`) must degrade to `$1E`, `$2E`,
+`$4E` or `$8E` — the low nibble preserved. Observed bad addresses `$D9`, `$E3`,
+and `orBadAddr` `$FF`, do not preserve any register's low nibble. The
+dedicated-nibble assumption should not be relied on again without a direct
+test; it is stated as fact in that comment and is now contradicted by the
+instrument built on it.
+
+### A/B, fifth reproduction — with an accounting gap
+
+| | bad writes | bad reads | writes serviced |
+|---|---|---|---|
+| phase A (core 1 rendering) | 1536 | 1373 | 93020 |
+| phase B (core 1 in WFE) | **4** | **1** | 86188 |
+
+Bad reads account exactly: 1373 + 1 = 1374 = `BUS BAD`'s total. **Bad writes do
+not**: 1536 + 4 = 1540 against a run total of 1748, leaving **208 bad writes
+outside both windows**. Runs 15 and 16 both accounted exactly, so this is new.
+The traffic that lives outside the windows is setup, teardown and the
+phase-transition commands — 16 transitions, so about 13 bad writes each, which
+is a lot for a handful of registers and is consistent with the known 55x
+concentration of read faults just after a hold release. Worth its own reading;
+a misread digit off the photograph cannot be excluded either.
+
+### What was built in response
+
+The read side has had OR/AND address accumulators since the module was
+written. The write side had only `lastBadWrite`, so there was no way to ask
+whether bad writes carry the same `$80` fingerprint — and the A/B effect is
+overwhelmingly a *write* effect (1536 bad writes against 1373 bad reads).
+Added `orBadWrite`/`andBadWrite`, published as GET_HEALTH bytes **96-97** on a
+new 112-byte rung, and printed at the end of the demo's `BUS BAD` row.
+
+The discriminator: if `ANDBW` also reads `$80`, bad reads and bad writes are
+one fault in the address multiplexer and should be chased as one — which would
+make the core-1 correlation a story about sample timing rather than about the
+page flip. If it does not, they are two separate problems and the page flip
+keeps its place as the suspect for the write side.
+
+Cost is two instructions on a branch a correct access never takes, in
+`gpu64_busStatsWrite()`, which already sits after the register write. Nothing
+is added to the `$DF00-$DF0A` REU decode path.
+
+## 37. Run 18 (2026-09-11): a freeze at the first phase boundary, and no verdict
+
+The run the `ANDBW` discriminator was built for did not deliver it. What the
+screen showed:
+
+```
+GPU64 QUAKE3D - A RETAINED SCENE
+                                   <- row 1 BLANK
+SETUP OK
+FRAMES  00FF     OK 00F5     MISSED 0006
+ERR     FF  0003 000B FF
+STALLS  00       CLOCK 411A
+CMT 06  0000     CMT 07 0000  CMT XX 0000 FF
+CMTMISS 0012
+FIRST   FF 0413? 0000
+STALLAT 0000 00FE 00
+BUS A / BUS B / SEQBAD / BUS RW / BUS BAD / DISPWHY / SEQREP / STOPSRC
+                                   <- all BLANK
+```
+
+### What the blanks mean
+
+Rows 16-23 are printed by `showBus`, and row 1's `STOPPED` banner by `finish`.
+Neither ran. `FRAMES 00FF` is the last value `showFrame` painted, so the
+program got through 255 frames and then stopped painting. The next frame would
+have carried `frames` to `$0100`, whose low byte is zero, which is the one
+condition that calls `phaseSwitch` -- **the run died at its very first phase
+boundary**, and took the A/B reading and the `ANDBW` fingerprint with it.
+
+### It is not a software hang
+
+Every loop on that path is bounded, and this was checked rather than assumed:
+
+| routine | bound |
+|---|---|
+| `waitReady` | `READY_WAIT`, and `STALLS 00` says it never once expired |
+| `doHealth` | 8 tries on the `$5a` poison |
+| `sendStop` | 8 tries |
+| `phaseTally` | straight-line plus a 112-byte copy |
+| `phaseSwitch` | the two above, no loop of its own |
+
+With no unbounded loop available, a frozen screen means the 6510 itself is not
+running: either it was derailed, or it is still DMA-halted inside a dispatch
+that never gave the bus back. `phaseSwitch` issues exactly two -- GET_HEALTH
+and LOOP_STOP -- and a phase boundary is the heaviest single moment in the run,
+so a fault concentrating there is what one would expect rather than a
+coincidence.
+
+### The two firmware changes in this build are exonerated
+
+Both were suspected on the grounds that run 17 completed 4096 frames (eight
+LOOP_STOPs, fifteen boundaries) on the previous build, and both were cleared by
+reading the code:
+
+- **`GET_HEALTH` at 112 bytes.** Clean: `h` is `u8 h[ 112 ]`, `memset` over
+  `sizeof h`, the ladder's top rung returns exactly 112, and `gpu64_blobWrite`
+  is never handed more than the array holds. It also already ran once per run
+  *at setup* -- the baseline snapshot -- so the length had been exercised
+  before frame 1 and survived.
+- **`orBadWrite`/`andBadWrite` in `GPU64BUSSTATS`.** The struct grew 60 -> 64
+  bytes, which looked like the documented half-warmed-line hazard until the
+  definition settled it: `gpu64BusStats` carries
+  `__attribute__( ( aligned( 64 ) ) )`, so at exactly 64 bytes it fills one
+  cache line rather than straddling two, and both warm sites preload it with
+  `sizeof`, so they scaled with the change. The two added instructions sit on
+  the bad-write branch, which a correct access never takes.
+
+So run 18 is most likely another draw from the same distribution as runs 13-17,
+whose fault rate is already known to move 30x between runs
+(`gpu64-bus-fault-rate-varies-30x`) -- not a regression this build introduced.
+
+### The row 7 reading is internally inconsistent and should not be used
+
+`ERR FF 0003 000B FF` parses as `lastErr errBad errBad2 lastBadErr`, i.e.
+`errBad` = 3 and `errBad2` = 11. That is impossible by construction: `cmd1`
+can only reach the `errBad2` increment along a path that has already
+incremented `errBad`, so `errBad2 <= errBad` always. One of the two is a
+misread digit off the CRT. Nothing is concluded from this row, and the
+inconsistency is *not* being treated as a second defect until a legible
+photograph disagrees. (`FIRST`'s second field has the same problem from the
+other direction: `0413` is 1043, and `firstFrame` is copied from `frames`,
+which never exceeded 255 in this run.)
+
+### The instrument defect this exposed, and the fix
+
+The real lesson is not about the bus. It is that **every number this campaign
+exists to collect was printed only at `finish`**, so any run that froze, or was
+photographed in flight, cost a whole bench round and returned nothing. Runs 13
+through 17 all happened to complete, which is the only reason this had not
+bitten yet.
+
+Changed in `gpu64_demo_quake3d.a`:
+
+1. **`showBus` now runs every 32nd frame**, not just from `finish` and the
+   stuck detector. It costs the measurement nothing: it reads C64 RAM only
+   (`acc`, `hbuf`, the program's own counters) and issues no command, so it
+   adds no dispatch and no DMA hold.
+2. **One `doHealth` per window, at frame 128 of it.** Without this `hbuf`
+   would stay at the setup baseline for the whole first window and rows 19-20
+   would print zeros -- reading as a clean bus when it is really an unsampled
+   one, which is exactly run 18's dead zone. Frame 128 exactly rather than
+   every 128th, because at a multiple of 256 `phaseTally` has already
+   refreshed it. That is 16 extra dispatches in a 4096-frame run, 8 in A
+   windows and 8 in B: symmetric, which is the only property the A/B
+   comparison needs, and ~1% of the run's ~1700 dispatches.
+3. **Row 1 now reads `RUNNING`** from setup, overwritten by the longer
+   `STOPPED` banner at `finish`. Run 18 had to be diagnosed from the
+   *absence* of a banner; a liveness flag should not have to be inferred from
+   blank space.
+4. **Row 23's three verdicts are padded to one width and all fall through to
+   the key ledger.** `IDLE` was four characters against `PHANTOM`/`REALCMD`'s
+   seven and returned early, which was harmless while the row was printed once
+   and leaves stale characters behind now that it is reprinted.
+
+Both periodic prints honour `stuckDone`, for the same reason `finish` does: a
+stuck run keeps the picture it froze.
+
+### What the next run answers
+
+Unchanged from run 17 -- the `ANDBW` decision table -- with the difference that
+a freeze no longer withholds it:
+
+| `ANDBW` | reading |
+|---|---|
+| `$80` | bad reads and bad writes are one fault in the address mux; the core-1 correlation is about sample timing and the page flip is off the hook |
+| anything else | two separate problems, and the page flip stays the suspect for the write side |
+| `FF` with `ORBW` `00` | no bad writes were sampled at all: not an answer |
+
+And if it freezes again at a boundary, the photograph will now say so in row 1
+and still carry rows 16-23 as of the last 32-frame tick.
+
+## 38. Run 19 (2026-09-11): the instrument held, and the A/B closed to the byte
+
+The first complete run of the campaign to report itself properly. `FRAMES 1000`
+(4096), the `STOPPED` banner present, every row filled:
+
+```
+FRAMES  1000     OK 0FE0      MISSED 004A
+ERR     FF  00EA 001D FF
+STALLS  00       CLOCK 411A
+CMT 06  0001     CMT 07 0000  CMT XX 001F FF
+CMTMISS 0024
+FIRST   FF 0013 0000
+STALLAT 0000 0FFF 00
+BUS A   00C0 0134 015D4C 0020EF
+BUS B   0000 0000 015BE0 0020D8 00 00
+SEQBAD  0000 0050 20 00
+BUS RW  000973BB 0002B939 0000C3F4
+BUS BAD 0134 00C0 F9 FF 00 F9 FF 80
+DISPWHY 0041C9 -0008 0000 0000 00 01 00
+SEQREP  0000003C 0113 0055 FF 00 00
+STOPSRC 01 0A REALCMD KEY 00 00 00 00
+```
+
+### The sixth A/B reproduction, and the first whose books balance
+
+| window | bad writes | bad reads | writes | dispatches |
+|---|---|---|---|---|
+| A (loop running, core 1 rendering) | **192** | **308** | 89932 | 8431 |
+| B (loop stopped, core 1 in WFE) | **0** | **0** | 89568 | 8408 |
+
+`BUS BAD`'s run totals are `0134` bad reads and `00C0` bad writes -- 308 and
+192, i.e. **exactly** `BUS A`'s figures and nothing left over. Denominators
+match to 0.4%. Every single faulty access in 4096 frames happened while core 1
+was rendering; not one happened while it was idle.
+
+Note on reading the photograph: `BUS A`'s first field is taken as `00C0`
+rather than `0000`. The digits are ambiguous on a CRT (the standing hazard in
+`gpu64-bench-photo-legibility`), but `00C0` makes the run's accounting close to
+the byte, while `0000` would require all 192 bad writes to fall in the single
+unbanked window -- see below -- when the seven *banked* B windows recorded
+none at all.
+
+`OK 0FE0` (4064 of 4096) is not evidence the loop kept running through phase
+B: `frOpB` sends `ARENA_STATUS` in that phase, not `SCENE_COMMIT`, so phase B
+is expected to answer OK. `CMT 06 0001` confirms it -- one UNSUPPORTED in the
+whole run, not the ~2048 a phase B that tried to commit would have produced.
+
+### An instrument hole that turned out not to exist
+
+Phase boundaries fall at frames 256 through 3840 -- fifteen boundaries for
+sixteen windows -- and frame 4096 leaves through `fcEnd` rather than through
+`phaseSwitch`, which looked like window 15 going untallied. It does not.
+`finish` calls `phaseTally` itself before the teardown, `phase` is still 1
+there, and `phaseTally` is delta-based (it adds `hbuf - hbufP` and then
+re-snapshots), so window 15 is banked to B exactly as it ran.
+
+Run 19's own arithmetic is the proof: A's 8431 dispatches plus B's 8408 come to
+16839 against `DISPWHY`'s 16841, i.e. every dispatch but the two of the
+teardown is inside a window. A `phaseTally` was briefly added at `fcEnd` on the
+strength of the wrong reading and has been taken back out -- it would only have
+banked a near-zero delta and spent a GET_HEALTH doing it. **Run 17's 208
+unattributed bad writes therefore still have no explanation**; this was not it.
+
+### ANDBW came back $80 -- and the decision table did not survive it
+
+The table this build was made to satisfy asked whether bad writes carry the
+same A7 fingerprint as bad reads. They do not, but not in the direction the
+table anticipated:
+
+- **Writes: `ANDBW 80`.** A7 set in every bad write address.
+- **Reads: `ANDBAD 00`.** No bit set in all of them -- where runs 16 and 17
+  both read `$80`.
+
+The two are not symmetric evidence. Both are AND accumulators running since
+`resetREU()`, so contamination can only *clear* bits: `ANDBW 80` over 192+
+samples is a strong positive, while `ANDBAD 00` needs exactly one
+counterexample and is weak. The honest reading is that the A7 fingerprint is
+now established for writes and that the read side's earlier `$80` did not
+survive more sampling.
+
+"A7 spuriously set, and nothing else" fits `ANDBW` exactly: the writable
+registers are `$0B`, `$0C`, `$0F`, `$10`, `$11-$20` and `$22`, and
+`$8B & $A0 == $80`. It also predicts `ORBW` of `$BF`, and the screen says
+`$FF`. An AND and an OR cannot separate a dominant mode from one outlier --
+and being cumulative since `resetREU()`, a single stray sample at boot poisons
+the OR permanently.
+
+### What was built: a high-nibble histogram
+
+`GPU64BUSSTATS` gains `u8 badWriteNib[ 16 ]`, incremented (saturating) on the
+bad-write branch. It is carved out of the existing `u32 pad[ 7 ]`, so the
+struct stays **exactly 64 bytes and one cache line** -- verified by compiling
+the layout, not by counting. GET_HEALTH publishes it at bytes 98-113 with a
+new 128-byte rung; `gpu64model.py` mirrors it.
+
+The demo reduces it to a verdict on row 3 rather than printing sixteen
+counters nobody can read off a photograph:
+
+```
+NIB tt cc nn
+  tt  the high nibble holding the most bad writes
+  cc  how many it holds, saturating at FF
+  nn  how many of the sixteen buckets are non-zero
+```
+
+| reading | meaning |
+|---|---|
+| `tt` = `09`/`0A`, `nn` small | A7 alone. `$91-$A0` is the ARG block with A7 on, so these are **argument writes the firmware discarded and the C64 was never told about** -- the undetected ARG-drop defect, with a cause |
+| `nn` large | not A7; the address did not fail in one bit, and `ANDBW`'s `$80` was an artifact of which registers this demo writes |
+
+### Other readings
+
+- **`ERR FF 00EA 001D FF`** -- `errBad` 234, `errBad2` 29. Consistent this time
+  (29 < 234), which retrospectively confirms run 18's impossible `0003/000B`
+  was a misread and not a counter defect. The re-read recovers 87% of floating
+  ERRCODE reads.
+- **`DISPWHY ... -0008`** -- the firmware ran 8 fewer commands than the C64
+  sent, i.e. 8 CMD_LO writes were never sampled out of 16841. That is 1 in
+  2105, far above the ~1/180000 drop floor, and consistent with the elevated
+  rates these core-1-loaded runs show.
+- **`KEY 00 00 00 00`** -- no destructive opcode refused, no camera lost, no
+  scene wiped. Runs 16 and 17 each caught a phantom; this one had none.
+- **`STALLAT 0000 0FFF 00`** -- `lastOkFrame` is 4095, so commits were being
+  accepted to the very last frame, and `STALLS 00` means `waitReady` never
+  expired once.
+
+## 39. Run 20 (2026-09-11): the bad addresses are not addresses
+
+`NIB 0F 8F 03` — and that one row ends the campaign's central question.
+
+```
+NIB     0F 8F 03
+FRAMES  1000     OK 0FEB      MISSED 0061
+ERR     FF  00E4 0011 FF
+STALLS  00       CLOCK 411A
+CMT 06  0000     CMT 07 0000  CMT XX 0015 FF
+CMTMISS 0027
+FIRST   FF 004C 0000
+STALLAT 0000 0FFF 00
+BUS A   00F9 014D 015E3E 002102
+BUS B   0000 0000 015BE0 002098 00 00
+SEQBAD  0000 0062 20 00
+BUS RW  000965E4 0002BA2B 0000C40B
+BUS BAD 014D 00F9 F9 FF C0 F9 FF C0
+DISPWHY 0041DC -0009 0000 0000 00 01 00
+SEQREP  00000040 011F 0063 FF 00 00
+STOPSRC 01 0A REALCMD KEY 00 00 00 00
+```
+
+The A/B reproduced a seventh time and again with nothing left over: phase A
+(core 1 rendering) 249 bad writes and 333 bad reads, phase B (core 1 in WFE)
+**0 and 0**, and `BUS BAD`'s run totals `014D`/`00F9` are exactly phase A's.
+
+### What the histogram said
+
+- `tt` = `0F`: the fullest bucket is `$DFF0-$DFFF`.
+- `cc` = `8F`: 143 of the 249 bad writes are in it.
+- `nn` = `03`: only **three** of sixteen buckets are used at all.
+- `ANDBW` = `C0`: bits 7 and 6 set in every bad write address. `ANDBAD` `C0`
+  too — reads and writes now carry the *same* fingerprint.
+
+The A7-alone hypothesis predicted buckets `09`/`0A`. It is dead. But `nn` = 3
+is far too concentrated for "the address did not fail in one bit" either, and
+three buckets all with bits 7 and 6 set is a very specific thing to be.
+
+### It is the multiplexer, caught in the wrong phase
+
+`lowlevel_dma.h`:
+
+```c
+#define IO_ADDRESS  (( ( g3 >> 10 ) & 15 ) | ( ( g3 & 15 ) << 4 ))
+```
+
+A0-A3 come from GPIO 10-13, which `gpio_defs.h` wires straight to the address
+lines. A4-A7 come from **GPIO 0-3, which are the LVC257 multiplexer's
+outputs** — and with `MPLEX_SEL` low those same four pins are `NMI`, `ROMH`,
+`IO1` and `BUTTON`.
+
+The loop does:
+
+```c
+g2 = read32( ARM_GPIO_GPLEV0 );     // MPLEX_SEL low: GPIO0-3 = NMI/ROMH/IO1/BUTTON
+SET_GPIO( bMPLEX_SEL );             // posted write, switches the '257
+WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_MULTIPLEXER );
+g3 = read32( ARM_GPIO_GPLEV0 );     // GPIO0-3 = A4-A7  ... if it switched
+CLR_GPIO( bMPLEX_SEL );
+```
+
+When that posted write lands late, the '257 has not switched and `IO_ADDRESS`'s
+high nibble is the **signal nibble**. During an IO2 access `IO1` is
+inactive-high by definition and `BUTTON` is high unless a finger is on it — so
+the signal nibble always reads `$C-$F`, which is `ANDBW $C0` (bits 3 and 2 of
+the nibble are exactly IO1 and BUTTON) and the pile-up in bucket `$F`. The
+three live buckets are the four ways `NMI` and `ROMH` can sit, and `ROMH` is
+low on every KERNAL and BASIC fetch.
+
+`lastBadWrite $F9` finishes it. The low nibble is *not* multiplexed, so `9` is
+the true A0-A3. The only writable gpu64 register with low nibble 9 is `$DF19`
+— **ARG8**. That "bad write" was a real argument write wearing a signal
+nibble.
+
+So a bad write is not a phantom and not the C64 misbehaving. It is **a real
+C64 register write that the firmware threw away because it misread its own
+address**, and the C64 was never told. That is
+`gpu64-arg-drops-are-undetected`, with a cause, and the cause is ours. Phase A
+rate: 249 in 89662 writes, 1 in 360.
+
+It also explains a finding that never fitted: `gpu64-missed-not-the-drop-defect`
+measured the SEQACK read failing 1 in 27, *55x concentrated on one instruction
+just after a hold release* — which is precisely where a burst of GPIO writes
+queues ahead of `MPLEX_SEL`'s.
+
+The 2026-09-10 note above `WAIT_CYCLE_MULTIPLEXER` ends "the real settling
+margin here is unknown and unmeasured: it is a side effect, not a design.
+Measure it before touching it again." Run 20 measured it. Under core-1 load it
+goes negative ~580 times in 4096 frames.
+
+### The repair: a re-read, not a delay
+
+A settling delay was tried at the bench on 2026-09-10 and killed the bus, for
+a reason still valid — `WAIT_UP_TO_CYCLE` is an absolute deadline that was
+already falling through, so a 100-cycle floor bit on *every* pass. This is a
+different instrument:
+
+```c
+if ( IO2_ACCESS && ( g3 & 15 ) >= 0xc )
+{
+    gpu64BusStats.muxMiss++;
+    g3 = read32( ARM_GPIO_GPLEV0 );
+    if ( ( g3 & 15 ) < 0xc )
+        gpu64BusStats.muxFixed++;
+}
+```
+
+Why this is safe where the delay was not:
+
+- **It costs nothing on the good path.** One test of `g2` the next few lines
+  make anyway, plus a compare on a value already in a register. No spin.
+- **The gate matters.** Without `IO2_ACCESS` the high nibble is genuinely
+  `$C-$F` on a quarter of all addresses and this would re-read a quarter of
+  all passes.
+- **A peripheral read is the barrier.** It is ordered behind the posted write
+  and costs the full peripheral latency, so the '257 has certainly switched by
+  the time it returns — no constant to tune and nothing to get wrong in
+  `rad.cfg`.
+- **`g3` feeds `IO_ADDRESS` and nothing else.** `IO2_ACCESS`, `ADDRESS_FFxx`
+  and the R/W decode all read `g2`, so re-reading `g3` can only change the
+  sampled address, which is the thing being repaired.
+
+`muxMiss`/`muxFixed` are u32 in the last of `GPU64BUSSTATS`'s padding — still
+exactly 64 bytes, verified by compiling the layout — published at GET_HEALTH
+114-121 and printed on demo row 3 as `MUX mmmmmm ffffff`, six digits because
+the ceiling is one per IO2 access.
+
+### How to read run 21
+
+| row 3 | meaning |
+|---|---|
+| `mmmmmm` near zero, bad writes still high | run 20's diagnosis is wrong; the address is corrupted somewhere else |
+| `mmmmmm` large, `ffffff` equal to it, `BUS A` bad counts collapsed | right, and repaired |
+| `mmmmmm` large, `ffffff` well below it | right, but one re-read is not enough of a barrier |
+
+Expect `mmmmmm` near 580 per 4096 frames if the run behaves like run 20 — but
+the fault rate varies 30x between runs (`gpu64-bus-fault-rate-varies-30x`), so
+judge by the A-vs-B split inside the run, never against run 20's absolute
+numbers.
+
+### Other readings
+
+- `MISSED 0061` (97), `CMTMISS 0027` (39), `DISPWHY -0009`: 9 CMD_LO writes
+  never sampled in 16860. All consistent with run 19.
+- `ERR FF 00E4 0011 FF`: `errBad` 228, `errBad2` 17 — the ERRCODE re-read
+  recovers 93%.
+- `KEY 00 00 00 00`, `STALLS 00`, `lastOkFrame 0FFF`: no phantom, no stall, no
+  camera loss, commits accepted to the last frame.
+
+## 40. Run 21 (2026-09-11): the repair worked, and what is left is one bucket
+
+Run 20's multiplexer-phase re-read shipped as `src:5fb10a39` and this is its
+first bench run. It works.
+
+| | run 20 | run 21 |
+|---|---|---|
+| `MUX` caught / repaired | n/a | `0005F3` / `0005F3` (1523 / 1523) |
+| `BUS A` bad writes | 249 | **37** |
+| `BUS A` bad reads | 333 | **11** |
+| `BUS B` bad writes / reads | 0 / 0 | 0 / 0 |
+| `DISPWHY` delta | `-0009` | `+0002` |
+| `NIB` top / count / live | `0F 8F 03` | `09 25 01` |
+| `ANDBW` / `ORBW` | `C0` / `FF` | `90` / `9F` |
+
+Read in order:
+
+- **1523 misses caught in 4096 frames.** The mechanism is real and it is
+  common — roughly one in 60 IO2 accesses sampled an address the LVC257 had
+  not finished presenting.
+- **Bad writes fell 85%, bad reads 97%.** Those writes are C64 register writes
+  that used to be discarded because the firmware misread its own address, i.e.
+  the undetected ARG-drop defect of `gpu64-arg-drops-are-undetected`. Most of
+  them are now delivered.
+- **`DISPWHY` crossed zero**, `-9` to `+2`. No command's CMD_LO write was lost
+  at all this run; the remaining discrepancy is two phantoms, which is the
+  other defect.
+- **`BUS B` is still exactly 0/0** against a matched denominator (`0158E4`
+  writes in B vs `0167AE` in A). The seventh consecutive A/B reproduction:
+  whatever is left still only happens while core 1 renders.
+
+### The residue is a single bucket, and it is A7
+
+`NIB 09 25 01` says all 37 live in **one** high-nibble bucket, `$9`. `ANDBW
+$90` and `ORBW $9F` confirm it to the byte: every residual bad address is
+`$90-$9F` exactly. Strip bit 7 and that is `$10-$1F` — ID_HI and ARG0-ARG14,
+the busiest registers in the whole API.
+
+So the true nibble is `$1` = `0001` and the sampled one is `$9` = `1001`.
+They differ in **bit 3 alone**, which is GPIO3: `A7_IN` once the '257 has
+switched, `BUTTON` before it has. A signal nibble of `$F` collapsing to `$1`
+passes through `$9` if bit 3 is the last bit to arrive. Two readings fit:
+
+1. the '257 was caught *mid*-transition, three bits switched and one not; or
+2. A7 is genuinely wrong — a real hardware fault on that one line.
+
+This also resurrects, in a narrower form, the fingerprint run 20 declared
+dead. `gpu64-bad-address-a7-fingerprint` was right that every bad address has
+A7 set; it was buried under ten times as much whole-nibble mux noise.
+
+### Why `muxFixed == muxMiss` was not a perfect score
+
+Exactly 1523 of 1523 "repaired" looked too good, and it was: the acceptance
+test was `( g3 & 15 ) < 0xc`, so a half-switched `$9` counted as repaired.
+Run 22 tightens both ends:
+
+- **The test is now `>= 3`, not `>= 0xc`.** The REU decodes `$DF00-$DF0A` and
+  the API `$DF0B-$DF23`, so the high nibble of any access either of them cares
+  about is `$0`, `$1` or `$2` and never more. `$9` is now a miss.
+- **A second re-read**, counted as `muxMiss2` (the last of the struct's
+  padding; still exactly 64 bytes, verified by compiling the layout) and
+  published at GET_HEALTH 122-125, printed on demo row 3 as the fourth field:
+  `NIB tt cc nn MUX mmmmmm ffffff ssss`.
+
+### How to read run 22
+
+| row 3 | `BUS A` bad | meaning |
+|---|---|---|
+| `ssss` large | now 0 | the residue was settling; two reads finish it |
+| `ssss` near zero | now 0 | the tighter nibble test caught them on the first re-read |
+| `ssss` ≈ bad counts | unchanged | the value is stably `$9x` — bit 3 is wrong for a reason that is not settling, and the next move is hardware, not code |
+
+### Other readings
+
+- `KEY 03 22` — **three phantom DESTROY_NODEs refused for want of the loop
+  key.** The key gate of `gpu64-loop-key-and-selfheal` did exactly its job
+  three times in 4096 frames; without it this run would have lost nodes.
+- `MISSED 0135` (309) against run 20's 97 — it went *up* while bad reads fell
+  to 11, so the address mux does not explain it. The remaining candidate is
+  the *data* sample, `g2`'s data byte, which the repair does not touch. Open.
+- `ERR 04 00AD 0004 9C`: BAD_ARGS, `errBad` 173, `errBad2` 4 — the ERRCODE
+  re-read recovers 98%.
+- `CMT 06 0001`, `CMT XX 000F 04`, `FIRST 04 0046 0001`: sixteen refused
+  commits in 4096 frames, fifteen of them BAD_ARGS, first at frame 70. Those
+  are the keyed refusals and their knock-on.
+- `SEQREP 0000012E 0106 0000 A9 00 00`, `STALLS 01 07`: no stall in A, one in
+  B, which is where the loop is deliberately stopped.
+
+Built and deployed as `src:682953f1`; suite 13/13, all twelve demos, row 3
+renders `NIB 00 00 00 MUX 000000 000000 0000` on the host as it should.
+
+## 41. Run 22 (2026-09-11): the bus-address defect is closed
+
+`src:682953f1`. The reading is the second row of section 40's table, and it is
+the clean one.
+
+```
+NIB 00 00 00  MUX 000435 000435 0000
+BUS A   0000 0000 016103 002158
+BUS B   0000 0000 015BE0 0020D8 01 FF
+BUS BAD 0000 0000 00 00 FF 00 00 FF
+```
+
+- **1077 multiplexer misses caught, 1077 repaired, and `ssss` is zero** — not
+  one of them needed the second re-read. The tighter `>= 3` nibble test caught
+  the `$9x` residue on the *first* re-read.
+- **Zero bad writes and zero bad reads, in both phases**, over 90,883 writes /
+  8,536 dispatches in A and 89,056 / 8,408 in B.
+- `andBadAddr` and `andBadWrite` are both still `$FF`, their reset value.
+  Those accumulators AND in every bad address seen since `resetREU()`, so `$FF`
+  means **not one bad address in the entire session** — not merely a small
+  number, but none.
+
+So the `$90-$9F` residue was **settling, not a hardware fault**. Section 40
+listed a genuine A7 fault as one of two live possibilities; it is now ruled
+out. What was actually wrong was the instrument's acceptance test: `< 0xc`
+scored a half-switched `$9` as repaired, so run 21 both under-repaired and
+over-reported. The nibble test and the repair were always the same knob.
+
+### The campaign, closed
+
+Eight consecutive A/B runs reproduced it and the last one extinguishes it.
+
+| | |
+|---|---|
+| symptom | writes to gpu64 registers silently discarded, ~1 in 360; phantom commands; failed register reads |
+| false leads | rail sag, i-cache warms, the page flip, a dedicated address nibble, an A7 hardware fault |
+| cause | `IO_ADDRESS` takes A4-A7 from GPIO 0-3, the LVC257's outputs. The posted `SET_GPIO( bMPLEX_SEL )` had not landed, so those pins still read NMI/ROMH/IO1/BUTTON and the firmware misread its own address |
+| why core 1 mattered | core-1 traffic lengthened the posted-write queue; it never touched the bus |
+| fix | an `IO2_ACCESS`-gated re-read of `GPLEV0`, accepted only at a nibble a real access could produce (`$0`-`$2`) |
+| result | 249/333 bad writes/reads → **0/0**; `DISPWHY` `-0009` → `+0007` |
+
+`muxMiss2` stays in the build as a permanent canary. It fires only when a
+first re-read fails, which is now never, so it costs nothing and will say so
+if the margin ever erodes.
+
+### What is left, and it is all the read side
+
+`DISPWHY +0007`, `MISSED 009E` (158), `SEQREP 00000098` (152), `ERR 04 00A8
+0002 9C`, `CMTMISS 001A` (26), `FIRST 9C 0490 0001`.
+
+The demo's own attribution rule settles this: `DISPWHY` is not *short* by
+`MISSED` — it is long — and `SEQREP` (152) is within 4% of `MISSED` (158).
+That is the documented "the commands all ran; it was the SEQACK read that was
+wrong" branch. `lastBadErr 9C` and `FIRST 9C` say the same thing from the
+other end: `$9C` is above `$0C`, so it is not an error code at all, it is
+whatever was last on the bus (`gpu64-errcode-ff-is-the-bus`).
+
+`BUS B`'s trailing `01 FF` is one `LOOP_START` that failed to restart the loop
+and answered `$FF` — again not an answer, the same failed read.
+
+### Run 23: the same mechanism, the other direction
+
+`gpu64-missed-not-the-drop-defect` measured the SEQACK read failing 1 in 27
+with a **55x concentration on the one instruction just after a hold release**.
+That concentration is the posted-write signature again, mirrored. Serving a
+C64 read is `write32( GPCLR0 )`, `write32( GPSET0, DD )`, `SET_BANK2_OUTPUT`,
+then `WAIT_UP_TO_CYCLE( WAIT_CYCLE_READ2 )` and tri-state — three posted
+writes against a hard deadline. Straight after a release they queue behind
+`SET_GPIO( bDMA_OUT )` and behind whatever the dispatch left in the write
+buffer, so the data reaches the bus late or is tri-stated before the C64
+latches it.
+
+Shipped in `gpu64_holdGapRelease()` (`src:741884ed`): **one `GPLEV0` read per
+hold release.** A read of the same peripheral is ordered behind the write and
+cannot return until the queue has drained. It is deliberately *not* a
+per-access barrier inside the read service — that would be per-access work on
+the hot path, which rule 6 says to judge by exposure, not by cost — and it
+sits where there is slack, with the C64 only just restarted and its next IO2
+access several cycles away.
+
+This one is blind: the Pi cannot see what the C64 latched, so the only
+measurement is the C64-side counters against run 22's baseline of MISSED 158 /
+SEQREP 152 / errBad 168 / CMTMISS 26 / `DISPWHY +7` over 16,944 dispatches.
+`MISSED` has read 97, 309 and 158 over runs 20-22, so **one run can confirm a
+collapse but not a modest improvement** — judge only a move to near zero.
+
+Suite 13/13, all twelve demos, kernel md5-verified on the card.
+
+## 42. Run 23 (2026-09-11): the barrier was in the wrong place, and rule 6 said so
+
+`src:741884ed` — one `GPLEV0` read added to `gpu64_holdGapRelease()` as a
+posted-write barrier. It is a regression and it is reverted.
+
+| | run 22 | run 23 |
+|---|---|---|
+| `MISSED` | 158 | **232** |
+| `DISPWHY` phantoms | `+0007` | **`+0035`** (53) |
+| `errBad` / `errBad2` | 168 / 2 | 177 / 4 |
+| `CMT XX` | 7 | 14 |
+| `KEY` | `00 00` | **`02 07`** — two phantom `LOOP_STOP`s |
+
+**And the GET_HEALTH readback itself came back corrupted.** Several fields are
+mutually impossible: `MX 00064E 00068B FF40` has `muxFixed` (1675) exceeding
+`muxMiss` (1614) when it can only increment inside the miss branch, and
+`muxMiss2` at `FF40` when it is bounded by `muxMiss`. `BUS RW`'s third field
+reads `FFF83745`; `SEQREP` reads `00BD7114`.
+
+The clincher is internal to one 128-byte block: `BUS BAD 6900 68FF` claims
+26880 bad reads and 26879 bad writes while, in that same block, **every nibble
+bucket is zero and `andBadAddr`/`andBadWrite` are still `$FF`**. Meanwhile
+`BUS A` and `BUS B`, which accumulate deltas from the mid-run reads, are both
+still `0000 0000`. So the counters were fine all run and the *readback* is
+what broke.
+
+### Why
+
+A peripheral read in `gpu64_holdGapRelease()` sits between
+`SET_GPIO( bDMA_OUT )` and the loop's return to sampling, so it delays the
+first sample after the C64 restarts. Section 41 argued the opposite — "it sits
+where there is slack, with the C64 only just restarted and its next IO2 access
+several cycles away" — and that is exactly backwards: the restart is when the
+loop has the *least* slack, not the most. Polling-loop rule 6 says to judge
+loop additions by exposure and not by cost, and it called this in advance.
+
+Note what the failure looked like: not a crash. 4096 frames completed,
+`lastOkFrame $0FFF`, `STALLS 00`. A quality regression only, which is why the
+rule exists — this class of damage is invisible without the counters.
+
+### What survives
+
+The hypothesis is untouched; the placement is disproven. Serving a C64 read is
+still three posted GPIO writes against a hard deadline, and the failure still
+concentrates 55x on the instruction just after a hold release.
+
+The one remaining placement is *inside* the read service, before
+`WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_READ2 )`, where a barrier would consume
+slack the loop was going to spin away regardless. That is only true if the
+slack exists, and nobody has ever measured it — so run 24 measures it before
+anything is spent on it.
+
+## 43. Run 24 instrument: how much slack does the read window have?
+
+`GPU64READSLACK` (`gpu64_busstats.h`), its own cache line, two fields:
+
+- `minSlack` — the smallest margin seen between arriving at the read's wait
+  and the deadline it waits for, in `PMCCNTR_EL0` cycles.
+- `expired` — how often that margin was already zero or negative.
+
+Only **one instruction** runs ahead of the deadline: an `MRS` of the cycle
+counter, and only for `addr >= GPU64_REG_CMD_HI`. The arithmetic and the
+stores happen after `SET_GPIO( bOE_Dx | bDIR_Dx )`, beside
+`gpu64_busStatsRead()`, which is already documented as outside the read's hard
+window. That is deliberately the opposite of run 23's mistake.
+
+Published at GET_HEALTH 126-127, both **clamped rather than truncated** so the
+demo prints them straight and nothing has to be subtracted off a photograph:
+`h[126]` is `minSlack` clamped to 0..255 (0 meaning "gone"), `h[127]` is
+`expired` saturating at `$FF`.
+
+Demo row 3 becomes `NIB tt nn MX mmmmmm ffffff ss SLK mm ee`, 38 columns.
+`nibBest` is dropped from the print — it is still computed, because it is what
+makes `nibTop` mean the *biggest* bucket, but `BUS BAD`'s `orBadWrite` and
+`andBadWrite` already carry the address fingerprint to the bit, and run 22
+closed that question anyway. `MUX` shortens to `MX` and `muxMiss2` to two
+digits; those three fields are a canary now, not a question, and `NIB 00 00` /
+`ss 00` is the expected reading.
+
+### How to read run 24
+
+| `SLK` | meaning |
+|---|---|
+| `ee` nonzero | the data goes on the bus late by construction. That alone explains the failed reads, no barrier can help, and the fix is to shorten the work before the wait |
+| `ee 00`, `mm` big | there is room to spend; a barrier inside the wait is the next thing to try |
+| `ee 00`, `mm` small | room in principle, none in practice — leave the read path alone |
+
+Baseline to compare the rest of the screen against is run 22, not run 23:
+MISSED 158, SEQREP 152, errBad 168, CMTMISS 26, `DISPWHY +7`, `BUS A`/`BUS B`
+both `0000 0000`.
+
+Reverted and rebuilt as `src:f9cd18ff`; suite 13/13, all twelve demos, host
+row 3 reads `NIB 00 00 MX 000000 000000 00 SLK FF 00` — saturated, because the
+host has no deadline. Kernel and prg md5-verified on the card.
+
+## 44. Run 24 (2026-09-11): the margin is already gone
+
+Bench photograph, 4096-frame A/B, kernel `src:f9cd18ff`:
+
+```
+NIB 00 00 MX 000599 000599 00 SLK 00 FF
+FRAMES  1000      OK      0FF5      MISSED  00C3
+ERR     04 0094 0000 00
+STALLS  00        CLOCK   411A
+CMT 06  0002      CMT 07  0000      CMT XX  0009 04
+CMTMISS 0015      FIRST   04 0005 0000
+STALLAT 0000 0FFF 00
+BUS A   0000 0000 01632A 00217E
+BUS B   0000 0000 015BC0 0020DA 00 00
+SEQBAD  0001 0060 9C 00
+BUS RW  0009533B 0002BF1F 0000C40C
+BUS BAD 0000 0000 00 00 FF 00 00 FF
+DISPWHY 00425A +0003 0000 0000 00 01 00
+SEQREP  000000CB 00DE 0000 83 00 00
+STOPSRC 01 0A REALCMD KEY 05 07 00 00
+```
+
+**The verdict, on the one question the run was built to answer.** `SLK 00 FF`
+is `minSlack` clamped at zero and `expired` saturated at 255: the read
+service reaches `WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_READ2 )` with the deadline
+*already behind it*, at least 255 times in 611,131 gpu64 register reads. The
+"spend the slack on a write barrier inside the wait" idea is dead on arrival —
+there is no slack to spend. Section 43's table said so explicitly: `ee`
+nonzero means shorten the work before the wait, and nothing else.
+
+**The revert is confirmed good.** Against run 22's baseline the whole screen
+is back where it was or better — `BUS A`/`BUS B` both `0000 0000` on matched
+denominators, `BUS BAD` all clean with `andBadAddr`/`andBadWrite` still `FF`
+(not one bad address all session), errBad 148 against run 22's 168 with
+`errBad2` at **0** and `lastBadErr` `00` (every failed read recovered on the
+re-read), `DISPWHY +0003` against `+0007`, SEQREP 203 against 152. Run 23's
+`BUS BAD 6900 68FF` and `SEQREP 00BD7114` are gone. The address defect that
+runs 13-22 chased stays closed.
+
+**The new lead, and it is uncomfortable.** MISSED was **97** in run 20 — the
+last run before the mux re-read shipped — and 309 / 158 / 232 / 195 in runs
+21-24, every one of them after. Roughly doubled, coincident with adding an
+MMIO read to the sampling path. `gpu64_apiReadReg()` was checked and is four
+compares, so the register decode is not the expense; the re-read is the only
+thing that grew. Rule 6 again: judge a loop addition by its exposure, not by
+its cost.
+
+**Caveat that made run 25 necessary.** `reu.WAIT_CYCLE_READ2` is
+`WAIT_CYCLE_READ + 20` (rad_reu.cpp:347) — RAD's *conservative* target, not
+the C64's hard latch deadline. So "past the target" is not the same as "the
+C64 read garbage", and the magnitude is the whole question. Run 24's own
+publish threw that away: `h[126] = max(0, minSlack)` turned *how far past*
+into *past or not*, and a 255-saturating count destroyed the rate against
+611,131 reads. Fixed for run 25.
+
+Still open and untouched: MISSED's residual floor and its attribution to the
+SEQACK read; phantom commands (`DISPWHY +NNNN`, and `KEY 05 07` — five phantom
+LOOP_STOPs the key gate blocked); `CMT XX` / `CMTMISS`; run 17's 208
+unattributed bad writes; the `ADDRESS_FFxx` path's exposure to the same
+mux-phase error, deliberately left alone because it belongs to the forbidden
+`$df00-$df0a` decode path.
+
+## 45. Run 25 instrument: how far past, and one less MMIO read
+
+Two changes, both aimed at the section-44 lead.
+
+**The second mux re-read is gone.** `reuUsingPolling()` used to re-read
+`GPLEV0` twice when the first read still showed a bad nibble. That second read
+fired **zero** times in every uncorrupted run since it shipped, and run 24
+proved the path it sits on has no margin left. `muxUnfixed` (renamed from
+`muxMiss2`) now counts the same event — *did one re-read suffice?* — without
+spending a second bus access to learn it. If it is ever nonzero the access is
+discarded and shows up in `BUS A`/`BUS B` as a bad read or write, so nothing
+is hidden. Net: one MMIO read removed from the pre-deadline work, which is
+precisely what section 44 said to shorten.
+
+**The slack publish now carries magnitude and rate.** `GPU64READSLACK` gained
+`expiredBig` (overshoots worse than 64 ARM cycles), and GET_HEALTH publishes:
+
+| offset | field | meaning |
+|---|---|---|
+| 122 | `H_MUXUNFX` | mux misses one re-read did not repair; expected `00` |
+| 123 | `H_SLKOVER` | worst overshoot as a **positive magnitude**, saturating 255 |
+| 124-125 | `H_SLKEXP` | u16 count of reads that arrived past the deadline |
+| 126 | `H_SLACK` | the surviving positive margin, when there was one |
+| 127 | `H_SLKBIG` | of the overshoots, how many were past 64 cycles |
+
+123 and 126 are mutually exclusive by construction — a minimum is on one side
+of zero, never both — so the demo prints them as **one signed field**, `-1C`
+or `+4A`. That is the bench-photograph rule from run 10's unreadable
+`DISPWHY`: a sign glyph survives a CRT photograph in a way that two adjacent
+hex bytes do not. Row 3 now reads
+
+```
+NIB tt nn MX mmmmmm uu SLK sdd eeee bb
+```
+
+at 38 columns. `muxFixed` was dropped from the print — `BUS A`/`BUS B` reading
+`0000 0000` is the direct proof that the repair worked, and the derived
+counter was spending two columns to say it again.
+
+### How to read run 25
+
+| reading | meaning |
+|---|---|
+| `SLK +nn`, `eeee 0000` | the margin came back when the second re-read went. Then the re-read *was* the cost, and MISSED should have fallen toward run 20's 97 |
+| `SLK -oo` small, `bb 00` | the target is merely tight, never missed by enough to matter. The failed reads are somewhere else and the read path is exonerated |
+| `SLK -oo` large, `bb` large | the data really does go out late, systematically. Keep shortening the work ahead of the wait |
+| `SLK -oo` large, `bb 00` | one freak pass, not a pattern. Do not chase the maximum |
+
+The number to watch alongside it is **MISSED**, against run 20's 97 and runs
+21-24's 309/158/232/195. If removing one MMIO read moves MISSED and `SLK`
+together, the mechanism is settled.
+
+Built as `src:80345dd4` / build `743dfa5c-dirty`; suite 13/13, all twelve
+demos, host row 3 reads `NIB 00 00 MX 000000 00 SLK +FF 0000 00` — saturated
+positive, because the host has no deadline to miss. Kernel and prg
+md5-verified on the card.
+
+## 46. Run 25 (2026-09-12): the instrument was watching the wrong edge
+
+```
+NIB 00 00 MX 0006F9 00 SLK -FF 13AD FF
+FRAMES  1000      OK      0FFE      MISSED  0125
+ERR     06 0037 0000 00
+STALLS  00        CLOCK   411A
+CMT 06  0002      CMT 07  0000      CMT XX  0000 00
+FIRST   06 02?? 0000        STALLAT 0000 0FFF 00
+BUS A   0000 0000 0167B2 0021E5
+BUS B   0000 0000 015BF4 0020D9 00 00
+SEQBAD  0001 00EA 20 00
+BUS RW  00094E19 0002C3A3 0000C4C0
+BUS BAD 0000 0000 00 00 FF 00 00 FF
+DISPWHY 0042C0 +0006 0000 0000 00 01 00
+SEQREP  00000110 012D 0000 57 00 00
+STOPSRC 01 0A REALCMD KEY 03 07 00 00
+```
+
+### The correction
+
+`SLK -FF 13AD FF` is a real measurement of the wrong thing. Reading the read
+service again (rad_reu.cpp ~2065): `D` goes onto the pins at the
+`GPCLR0`/`GPSET0` pair, and **nothing waits before that**. The single
+`WAIT_UP_TO_CYCLE` on the path, `WAIT_CYCLE_READ2`, gates
+`SET_GPIO( bOE_Dx | bDIR_Dx )` — the instant the transceiver is turned *off*.
+Runs 24 and 25 stamped the counter *below* the drive and compared it to that,
+so what they scored is **how long the Pi kept driving the bus after the C64
+had already latched**. That is a contention question. It cannot explain a
+wrong ERRCODE, and sections 43-45 read it as though it could.
+
+So the honest statement of runs 24-25 is narrower: on 5037 of 609,817 gpu64
+reads (0.83%) the Pi released the data bus 255+ ARM cycles late, 255+ of those
+badly late. Nothing is yet known about whether the data arrived on time, which
+is the question the whole thread was about. RAD's drive-by target,
+`WAIT_CYCLE_READ`, has never been waited for on this path and never measured.
+
+Fixed for run 26: the stamp moved to immediately after `gpu64_apiReadReg()`,
+i.e. the drive edge, and the deadline is `WAIT_CYCLE_READ`. It is the same
+single MRS, moved up inside a branch that had already been taken — no new cost
+ahead of the deadline, and the REU path (`addr < 0x0B`) still never reaches it.
+
+### What run 25 did settle
+
+- **`muxUnfixed 00` on 1785 mux misses.** One re-read always suffices. Dropping
+  the second one cost nothing in correctness, and it is staying out.
+- **Address defect closed for the third consecutive run.** `BUS A`/`BUS B` both
+  `0000 0000` on matched denominators, `BUS BAD` all clean,
+  `andBadAddr`/`andBadWrite` still `FF` — not one bad address all session.
+- **The read repair is doing its job.** errBad fell 148 → **55**, with
+  `errBad2` **0** and `lastBadErr` **00**: every failed register read this
+  session was recovered on the re-read. None reached the program.
+- **The "MISSED doubled when the mux re-read shipped" lead is dead as stated.**
+  Removing an MMIO read from the pre-deadline path moved MISSED 195 → **293**,
+  the wrong way. MISSED across runs 20-25 reads 97 / 309 / 158 / 232 / 195 /
+  293 from builds differing by one MMIO read — that is the 30x run-to-run
+  variance, not a signal. Only an in-run A/B can answer this class of question,
+  which is exactly how the address defect was settled and how this should have
+  been attempted.
+
+### How to read run 26
+
+| `SLK` | meaning |
+|---|---|
+| `+nn` | D reached the pins before RAD's own drive-by target, on every read. The firmware is not late; the read path is exonerated and MISSED/errBad live elsewhere |
+| `-oo`, `bb 00` | late past a conservative target, never by much. Treat as exonerated unless MISSED tracks it |
+| `-oo`, `bb` large | the drive really is late and systematically so — a genuine mechanism for every failed read on the screen |
+
+Built as `src:bead90c6` / build `743dfa5c-dirty`; suite 13/13, twelve demos,
+404-frame sim clean, kernel and prg md5-verified on the card. The prg is
+byte-identical to run 25 — only comments changed on that side.
+
+## 47. Run 26 (2026-09-12): the drive really is late
+
+First reading of the correct edge — the stamp at the `GPCLR0`/`GPSET0` pair,
+compared against `WAIT_CYCLE_READ`.
+
+```
+NIB 00 00 MX 0006D5 00 SLK -CF 00DA 9D
+FRAMES  1000      OK      0FFC      MISSED  0186
+ERR     3C 0036 0001 3C
+STALLS  00        CLOCK   411A
+CMT 06  0003      CMT 07  0000      CMT XX  0001 3C
+CMTMISS 0019      FIRST   3C 00E2 0000
+STALLAT 0000 0FFF 00
+BUS A   0000 0000 016AEC 00222F
+BUS B   0000 0000 0158E4 0020D9 00 00
+SEQBAD  0001 00EA 60 00
+BUS RW  0009543E 0002C6DD 0000C4A8
+BUS BAD 0000 0000 00 00 FF 00 00 FF
+DISPWHY 00430A +0002 0000 0000 00 01 00
+SEQREP  00000173 0130 0000 42 00 00
+STOPSRC 01 0A REALCMD KEY 03 12 00 00
+```
+
+**`SLK -CF 00DA 9D`.** The data reaches the pins **after** RAD's drive-by
+target on 218 of 611,390 gpu64 reads — 0.036% — and 157 of those are more than
+64 ARM cycles late, worst case 207. At 1.4 GHz a C64 cycle is about 1400 ARM
+cycles, so the worst case is a seventh of a C64 cycle.
+
+That is the bottom row of section 46's table: **late, and systematically so**.
+It is rare, but it is the same order of magnitude as errBad 54 and MISSED 390,
+which makes it a live mechanism for the read failures rather than noise. Note
+what it is *not* — it is not saturated (`-CF`, not `-FF`), so the distribution
+is real and bounded, not a clipped unknown.
+
+**A bad read got through for the first time.** `ERR 3C 0036 0001 3C`: 54 failed
+ERRCODE reads, and `errBad2` = **1** — one of them the re-read did not repair,
+value `$3C`. `CMT XX 0001 3C` and `FIRST 3C 00E2 0000` are the same event seen
+from the commit side, at frame 226. Runs 22-25 had `errBad2` 0. One event is
+one event, but it is the first time the read-repair strategy has been beaten,
+and it lands in the run that proves the drive is late.
+
+**Everything on the address side is still clean** — `BUS A`/`BUS B` both
+`0000 0000`, `BUS BAD` clean, `andBadAddr`/`andBadWrite` `FF`, `muxUnfixed` 00
+on 1749 misses. Four consecutive runs.
+
+`KEY 03 12` is worth noting: the phantom refused this time was **$12
+FREE_RESOURCE**, where runs 22-25 all refused `$07 LOOP_STOP`. The key gate is
+catching a genuinely random opcode, not one particular corruption.
+
+## 48. Run 27 instrument: convict or exonerate the mux re-read
+
+One question, answered **inside** a single run — which matters, because the
+fault rate varies 30x between runs and section 46 records me drawing opposite
+conclusions from exactly that noise.
+
+The mux re-read is the **only conditional MMIO access ahead of the drive**. It
+fires on ~0.22% of IO2 accesses and costs a full peripheral round trip *by
+construction* — being a barrier is the entire point of it. Late reads are
+0.036%. Those two numbers are compatible with the re-read causing all of the
+lateness, and equally compatible with it causing none.
+
+So each pass is now tagged (`muxRetried`, one register zeroed per pass, set
+inside the branch that was already taken — no memory, no peripheral bus) and
+`gpu64_readSlackNote()` splits the late reads by it. Published as a u16 at
+GET_HEALTH **118-119**, reclaiming the slot `muxFixed` vacated in run 25.
+
+| reading | meaning |
+|---|---|
+| `M` ≈ `eeee` | the re-read is buying address correctness with read lateness. Both defects are ours and the trade has to be made deliberately — the obvious move is to re-read only on **writes**, which have no deadline, and accept the address twice on reads |
+| `M` ≈ `0000` | the re-read is exonerated. The lateness is in the unconditional part of the pass, and trimming the repair will not touch it |
+
+Row 3 is now `MX mmmmmm uu SLK sdd eeee bb M nnnn`, 34 columns. The `NIB`
+bad-nibble histogram was dropped from the print entirely: it was the address
+defect's instrument, that defect closed in run 22, it has read `00 00` for four
+consecutive runs, and `BUS BAD`'s `orBadWrite`/`andBadWrite` still carry the
+same fingerprint to the bit if it ever returns.
+
+Built as `src:e4b39d75` / build `743dfa5c-dirty`; suite 13/13, twelve demos,
+404-frame sim clean (`MX 000000 00 SLK +FF 0000 00 M 0000`), kernel and prg
+md5-verified on the card.
+
+## 49. Run 27 (2026-09-11): the run died in setup, and the abort was the finding
+
+The bench photo is one screen of nothing:
+
+```
+STOPPED - RUN/STOP AGAIN TO EXIT
+SETUP FAILED AT STEP 28 CODE D3
+MX 000000 00 SLK -54 0001 01 M 0000
+FRAMES / OK / MISSED / ERR / STALLS   (blank)
+BUS RW  00000004 00000015 00000000
+```
+
+Twenty-one register writes and four reads in the whole session. `$D3` is not an
+ERRCODE — the ladder stops at `$0C` — so nothing failed. Step 28 is
+`LOOP_START`, and what happened to it is exactly the `errBad2` event run 26 saw
+once: a read of `ERRCODE` that was not serviced, and whose re-read was also not
+serviced. `cmd1` retried once, both reads returned the bus, and it handed the
+garbage byte back to its caller as the command's verdict. The caller stored it
+in `loopErr`, and `lda loopErr / beq frame / jmp finish` ended the program
+before its first frame.
+
+So a 4096-frame instrument was spent on a single dropped read of a register
+whose value did not matter. The bus is not what needs fixing here.
+
+### Three fixes, all in the client
+
+1. **Retry eight times, not once.** `ERRCODE` is a plain latch. The command
+   finished long before the first read returned, the value is settled, and
+   there is no deadline on reading it — unlike the firmware's *drive*, which
+   run 26 showed has no margin at all. At the measured rate (54 bad reads in
+   611000) eight consecutive failures is not a thing that happens, and the
+   retries cost a few microseconds on a path taken once in ten thousand
+   commands. There was never a reason to be stingy.
+
+2. **Exhaustion returns `$00`, not the garbage byte.** This is the run-27
+   lesson in one line: *"I could not read the answer"* is not *"the command
+   failed"*. The command was dispatched and `SEQACK` confirms that
+   independently; all that was lost is the reply. A caller told `$D3` does
+   something drastic with it; a caller told OK carries on. `errBad2` and
+   `lastBadErr` keep the event visible without letting it steer the program.
+
+3. **The `loopErr` gate is gone.** A refused `LOOP_START` is not fatal to
+   anything: `SCENE_COMMIT` against a stopped loop re-arms it (the self-healing
+   commit, 2026-09-10), so the first frame repairs precisely the condition this
+   test used to abort on. And if the loop genuinely cannot start, the frames
+   that follow say so in `CMT 06` / `NOLOOP`, which is strictly more
+   information than a blank screen. `loopErr` is still recorded and still
+   printed by SETUP — evidence, not a control-flow decision.
+
+### Proved with the fault injector, not by hoping
+
+`runsim.py --bus-fault=drop:N` fails every Nth register access.
+
+| injection | result |
+|---|---|
+| `drop:50` | `SETUP OK`, 404 frames, `MISSED 0021` |
+| `drop:1` — *every* access fails, worse than any hardware | `SETUP OK`, **404 frames still run**, `ERR 00 0E80 0E80 FF` |
+
+The `00` in the first field of `ERR` under `drop:1` is the whole point: with
+every single read failing, the exhaustion path reports OK rather than garbage,
+and the program completes its run instead of printing a blank screen.
+
+### What this changes beyond the demo
+
+This is an API contract, not a demo bug, and it is now written down in
+`docs/error-codes.md` as three rules: test the **range** (`>= $0D` means "ask
+again" — real runs have returned `$20`, `$3C`, `$A3`, `$D1`, `$D3`, so
+special-casing `$FF` is not enough); retry bounded, eight; and never let an
+unreadable answer become a failure verdict in your control flow. The same range
+rule applies to `STATUS`, whose unserviced read has busy *and* error set.
+
+It is also evidence for the user's own standing design question — *"why does
+`loop_stopped` even exist?"* A client should not have to know whether the loop
+started. Run 27 is what it costs when it does.
+
+
+## 50. The state refresh ring: giving retained state a bounded lifetime
+
+This is step 2 of the close-out plan, and it is the piece that decides whether
+a game can be built on this API at all.
+
+### The problem, stated once
+
+`SEQACK` covers the `SEQ` write and `CMD_LO`. It does not cover `ARG0`-`ARG15`
+or `ID_LO`/`ID_HI`, and nothing else does either. So the failure that matters
+is not a command that vanished — that is detected and retried — it is a command
+that **half arrived**: the dispatch runs, `ERRCODE` says `OK`, `SEQACK`
+matches, and one argument byte holds whatever was there before.
+
+In an immediate-mode API that is one bad frame. In a **retained** scene it is
+permanent, because the only thing that would ever correct it is a later command
+carrying the right value, and a program that sends a node's state only when
+that state *changes* never sends one.
+
+### The fix is expiry, not detection
+
+`GET_TRANSFORM` ($36) can read a node back, but a readback is a read, reads are
+the less reliable direction, and catching anything promptly would need one per
+node per frame — most of a frame spent proving nothing went wrong.
+
+Re-sending is cheaper than checking. Every class-1 transform and state opcode
+is absolute and idempotent (`SET_POSITION`, not a translate; `SET_ORIENTATION`
+replaces rather than composes), so a re-send is always safe, free when the
+state was already right, and repairs it when it was not.
+
+So: a round-robin ring. One entry per `REFRESH_EVERY` frames, each entry
+re-asserting one node's one piece of state whether or not it changed. Any lost
+store is corrected within `N * REFRESH_EVERY` frames. `quake3d` ended up with
+thirty entries every two frames — a full cycle in 60 frames, almost exactly
+a second, for half a command per frame against the eleven a frame already
+sends. **Cost per frame is set by `REFRESH_EVERY` alone**; adding entries
+lengthens the cycle rather than adding traffic, which is the argument for
+covering everything.
+
+This replaces the ad-hoc version that shipped earlier — camera every 32 frames,
+level on the frames halfway between — which was the right instinct applied to
+two nodes by hand.
+
+### Two instruments, because "it should work" is not a result
+
+`runsim.py` grew two options:
+
+- `--dump-scene` prints gpu64's retained node table at the end of the run:
+  every live node's id, type, visibility, position, yaw/pitch/roll, scale,
+  mesh/texture id, sprite size and flags, light strength and radius. This is
+  the ground truth a dropped `ARG` corrupts, and it is what two runs can be
+  diffed on.
+- `--bus-fault-until=F` stops the injection partway through. Without it a
+  faulted run and a clean run can only ever differ, and a program that repairs
+  its damage cannot be told from one that has no refresh at all. **The
+  faulted-then-clean run is the whole experiment.**
+
+### What it found, twice
+
+Both findings were holes in the ring I had just written, and neither was
+visible by reading it.
+
+**Monster 1.** The ring first shipped covering the monster standing in the
+corner — obviously static, obviously unhealable. The injected run came back
+with a *different* monster stranded at the wrong coordinates while every other
+node had repaired itself. Monster 1 turns on the spot: its orientation goes out
+every frame, which makes it look like a moving node, and its position is
+written once in `buildScene` and never again. Half of it healed and half of it
+could not, and nothing about the node said which half.
+
+So the test is not "does this node move". It is per piece of state, and it is
+mechanical: **anything not written unconditionally every frame needs an entry.**
+
+**The muzzle flash's yaw.** With every monster covered, the faulted run left
+one residue: the flash light holding `ypr 20992`. Nothing in the program ever
+sets a light's orientation. That value arrived from a `SET_ORIENTATION` aimed
+at a monster whose `ID_LO` write was lost — the documented symptom, landing on
+whichever node was addressed last. A light's yaw is unused so it did no harm,
+but the same accident on a sprite's size or a node's scale is an object that is
+the wrong size for the rest of the session.
+
+Which extends the rule again: **state you never write can still be written
+*for* you**, so size the ring by what each node *type* uses, not by what the
+program happens to set. `SET_SPRITE`, `SET_POINT_LIGHT` and `SET_SCALE` — the
+setup-only opcodes — get entries too.
+
+**The level's yaw.** Third round, same mechanism, different consequence. With
+all three monsters and the flash covered, the survivor was **node 2 holding
+`ypr 3072`** — the room itself, wearing a stray orientation that arrived from a
+misaddressed `SET_ORIENTATION`. Nothing in the program rotates the room, so
+nothing would ever put it back: the whole level sits tilted for the rest of the
+session. That is the same defect class as the flash's yaw and the opposite
+severity, which is the argument for covering every field a node type has rather
+than the ones that look like they matter.
+
+**The muzzle flash's position.** Fourth round, and the one that needed a new
+idea rather than another entry. The flash is placed at the player's eye on the
+frames he is *firing* and never touched otherwise, so it is squarely inside the
+mechanical rule — but what should a refresh send? Not "his eye now": that would
+drag the light around behind him between shots and make the clean run and the
+faulted run disagree for reasons unrelated to the fault. The answer is to
+refresh from **the last value the program intended**: `sfMove` now keeps the
+twelve staged bytes in `flashPosSave`, zeroed at load, and the ring re-sends
+that block. The shadow is the intent; the ring's job is to make the scene match
+the intent.
+
+The sweep found it the other way round, which is worth recording: in a run
+where the player never fired at all, a `SET_POSITION` meant for the camera lost
+its `ID_LO`, landed on the flash and stayed there. A field the program does
+write, in a run where it never did.
+
+### Result
+
+Twenty-nine entries at `REFRESH_EVERY = 2`. Injection runs for the first fifty
+rendered frames and then stops; the run continues to its usual ~192 frames; the
+final `--dump-scene` is diffed against a clean run's, node for node.
+
+| injected rate | outcome | notes |
+|---|---|---|
+| `drop:100` | **CONVERGED** | 5 missed commits |
+| `drop:50` | **CONVERGED** | 10 missed commits |
+| `drop:20` | **CONVERGED** | 37 missed commits |
+| `drop:10` | all state repaired | residue is one creation argument (`tex 16388`) |
+| `drop:5` | DIVERGED | setup itself failed; two nodes were never created |
+
+For scale: `drop:20` is one failed register access in twenty. The worst rate
+ever measured on the bench was one bad write in forty-six, in the single worst
+run of the campaign; the usual figure is one in tens of thousands. The ring
+converges at rates two to three orders of magnitude worse than the hardware,
+and it does it on *scene state*.
+
+What it does not cover is the class it was never going to: **node existence and
+creation arguments**. `CREATE_OBJECT`'s mesh id and `CREATE_SPRITE`'s texture
+id are not re-sent by any state opcode, and a node that was never created is
+not a node a refresh can address. The mitigation there is separate and blunt:
+**`buildScene` runs twice at start-up.** Creation replaces in place and the
+routine already orders itself create-then-state per node, so the second pass is
+a free repair of the first. It changed nothing about the clean run's final
+state, which is an independent confirmation that creation is idempotent. At
+`drop:5` even two passes were not enough, and that is the honest limit of the
+technique.
+
+### The API consequence
+
+Two rules for anyone building on the retained scene, both now in
+`docs/state-refresh.md`:
+
+1. Every piece of node state you do not write unconditionally every frame needs
+   a ring entry — including state you never write at all, because a lost
+   `ID_LO` will write it for you.
+2. Build your scene twice. Once is a scene with no error correction on the half
+   of it that the ring cannot reach.
+
+### One more entry than the scene has state
+
+The thirtieth entry is not node state at all: it re-asserts the **readback
+fence** (`SET_DMA_WINDOW`, section 52). It is in the ring for exactly the
+reason everything else is — set once at start-up, never written again, so
+nothing else would ever put it back — and the consequence of losing it is the
+worst on the list, because an unfenced readback is the one way a dropped write
+damages the C64 rather than the scene.
+
+At `drop:10` the run before the fence existed did not diverge: it **died**,
+with the Pi writing a health block over the program's own code. With the fence
+and its ring entry, the same rate leaves the program running and the scene
+correct except for one creation argument. That is the single clearest
+demonstration of what this whole section is for.
+
+## 51. "Why does `loop_stopped` even exist?" — answered, and mostly already fixed
+
+The user's design question, carried across several sessions:
+
+> Why the loop_stopped even exists? The loop will always be running, ready or
+> busy. To stop the loop the client will have to send explicit command to stop
+> or there will be reset that will also stop it.
+
+### The state is real; the client's obligation to manage it is not
+
+There genuinely are two mutually exclusive ownership models, and something has
+to select between them:
+
+| | loop running | loop stopped |
+|---|---|---|
+| framebuffer | core 1 owns it | the C64 owns it |
+| scene edits | redirected to a shadow, published at `SCENE_COMMIT` | write the live table directly |
+| `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` | refused `BUSY` | this is how you draw |
+
+So "stopped" is not a spurious state. It is *immediate mode*, and immediate
+mode is a real thing the API offers. What the user is objecting to is different
+and correct: **a client should never have to know which one it is in, nor
+recover from being in the wrong one.** Checked against the firmware, the API is
+already almost entirely there:
+
+- `SCENE_COMMIT` against a stopped loop calls `loopStartArmed()` and answers
+  `OK` (`gpu64_3d_class1.cpp`, the `!s_LoopRunning` branch). This works whether
+  the loop was stopped or **never started**, so `LOOP_START` is already
+  optional for handshake mode: a program that just commits every frame never
+  needs it.
+- `LOOP_STOP` answers `OK` against an already-stopped loop, so a teardown retry
+  never fails.
+- There is no `LOOP_STOPPED` error code and nothing reports one. `ERRCODE`
+  runs `$00`-`$0C` and has no entry for it.
+
+So `LOOP_START`'s only remaining job is **choosing a mode** — `ARG0` = 1 is
+free-running, and answering `UNSUPPORTED` for it rather than silently running
+handshake is what stops a program written for a future firmware from running
+the wrong protocol against this one.
+
+### What run 27 added to the argument
+
+Run 27 was a whole bench session spent printing a blank screen because a
+program treated an unreadable `LOOP_START` reply as a failure and refused to
+start its frame loop. The loop would have started itself on the first commit.
+That is the user's instinct vindicated at the cost of a test session: the
+client was made to care about something it did not need to care about, and
+caring about it is what broke.
+
+### The v1 decision
+
+Keep both opcodes and both modes; change the documentation, not the API.
+
+1. `LOOP_START` is **optional** in handshake mode. Document it as a mode
+   selector, not as a prerequisite. The idiom is "commit every ready frame";
+   the first commit starts the loop.
+2. `LOOP_STOP` keeps its job: hand the framebuffer back for immediate-mode
+   drawing, or tear down.
+3. No program should ever branch on whether the loop is running. Nothing in the
+   API requires it to, and run 27 is what it costs when one does.
+
+Free-running mode (Stage 18) does not change any of this — it changes who
+triggers the frame, not who owns the state.
+
+## 52. The readback fence: the one way a dropped write can kill the C64
+
+Found by the instrument built in section 50, in a run that was supposed to be
+measuring something else.
+
+### What happened
+
+The `drop:10` rung of the fault sweep stopped reporting a scene at all. The
+simulated 6502 died 9202 instructions in:
+
+```
+CPU fault: unimplemented opcode $FF at $1F54
+SETUP FAILED AT STEP 02 CODE 04
+```
+
+$1F54 is inside `showCol`, eleven bytes of ordinary screen-pointer arithmetic.
+Nothing in the program writes there; a trap on every CPU write to that address
+caught nothing. The bytes had been replaced anyway — and the memory dump said
+what with: 16.16 values and a run of `$FF`, which is a **health block**.
+
+`GET_HEALTH` takes its destination in `ARG0`-`ARG5`: space, three address
+bytes, two length bytes. `ARG` is not covered by `SEQ`/`SEQACK` and never has
+been. One dropped store to `ARG2` left the high byte of the address as whatever
+the *previous* command had put there, and gpu64 dutifully wrote 128 bytes to
+$1F48 — over the program's code, from the Pi, across the DMA bus, with the C64
+halted for the duration.
+
+### Why this one is different from every other ARG drop
+
+Every other lost `ARG` byte produces a wrong *scene*: a monster in the wrong
+place, a room the wrong size, a light out. The refresh ring of section 50 exists
+precisely to expire those. This one produces a wrong *C64*. There is nothing to
+expire, nothing to re-send, and no ring entry that repairs a program whose
+instructions are gone. It is also silent: `ERRCODE` says `OK`, because from the
+firmware's side the transfer did exactly what it was told.
+
+And the client cannot check it. `ARG` registers do not read back — the register
+file answers `$FF` to every offset except `STATUS`, `ERRCODE`, `RESULT` and
+`SEQACK` — so "write the pointer, read it back, then fire" is not available.
+
+That makes it the first defect of this campaign that **had** to be fixed in
+firmware rather than worked around in the client, and it had to be fixed before
+the v1 API is frozen, because it is reachable from every readback opcode:
+`GET_INFO`, `GET_HEALTH`, `READ_RECT`, `GET_TRANSFORM` and the class-2 info
+blocks all end in the same `gpu64_blobWrite()`.
+
+### The fix: `SET_DMA_WINDOW` ($0C)
+
+A client declares, once, the region a readback is allowed to write into.
+`gpu64_blobWrite()` refuses a C64-space destination outside it with
+`OUT_OF_RANGE` and writes nothing.
+
+- `ARG0-1` base, `ARG2-3` length. **Length 0 means unrestricted**, which is the
+  reset default, so nothing written before $0C changes behaviour.
+- `RESULT` echoes `ARG0 ^ ARG1 ^ ARG2 ^ ARG3 ^ $A5`. `RESULT` is one of the four
+  readable registers, so this is the only way a client can confirm an `ARG`
+  block landed — and the same "read it again if it looks wrong, then carry on
+  regardless" rule from section 49 applies.
+- Cleared back to unrestricted by a C64 reset: the memory map it describes
+  belongs to the program that declared it.
+
+Cost is two comparisons inside `gpu64_blobWrite()`, which already runs with the
+bus held. Nothing was added to either decode path and nothing to the polling
+loop.
+
+It does not make a corrupted pointer *correct* — the address still arrives over
+the same unprotected registers. It makes a corrupted pointer land inside a
+buffer the program has already written off, or fail outright. That is the whole
+of what is achievable without a second channel.
+
+### Measured
+
+Same sweep, same rung, before and after, with the demo declaring a 128-byte
+window around `hbuf` and carrying a ring entry to re-assert it:
+
+| | `drop:10` |
+|---|---|
+| before | 6502 dead at $1F54, no scene, no telemetry |
+| after | run completes, all node state repaired, one creation argument stale |
+
+### What is still exposed
+
+The window is set by the same unprotected registers as everything else. A
+dropped byte in `SET_DMA_WINDOW` itself gives a wrong window, and the two
+outcomes are: a window that is too narrow, which fails safe — readbacks answer
+`OUT_OF_RANGE` and the poison in the buffer stays put, which a client already
+checks for — or a window that is wrong in a way that still covers live memory,
+which is back to today's exposure. The `RESULT` echo catches the first case;
+the ring entry bounds how long the second can last. Neither is a proof, and the
+honest statement is that this reduces the exposure by orders of magnitude
+rather than removing it.
+
+`FULL_RESET` ($0B) is still unkeyed and still destructive — carried over from
+the loop-key work and still open.
+
+## 53. v1 API surface frozen (2026-09-11)
+
+Steps 2 and 3 of the four-step plan are done, so the surface is declared
+frozen and written down as such at the top of
+[docs/README.md](../docs/README.md). The freeze means: no opcode changes
+meaning, no existing opcode grows an argument. Anything new takes a new
+number. Three items are explicitly outside it — free-running mode
+(`LOOP_START ARG0=1`, still `UNSUPPORTED`), class 2 (frozen, not removed,
+no new opcodes), and visibility (not in v1 at all).
+
+Two client obligations were promoted from "good practice" to part of the
+contract, because the bus drop rate makes them load-bearing for any program
+that runs longer than a few seconds: the state refresh ring (section 50) and
+the readback fence (section 52). Both are now documented as required reading
+rather than as advice.
+
+What the freeze deliberately does **not** claim: nothing added in sections
+50-52 has run on hardware. The SD card carries the firmware
+(`743dfa5c-dirty src:4ac49d52`) and the rebuilt `gpu64_demo_quake3d.prg`
+(20047 bytes), md5-verified against the tree, and the conformance suite is
+`PASS 46 FAIL 00` with all twelve demos green in simulation. The bench run
+is what turns that into evidence.
+
+Next is step 4: build the game on the retained scene, as the proof that the
+frozen surface is actually sufficient to write one.
+
+## 54. Run 28 (2026-09-20): the first bench run of the frozen v1 build — parked
+
+The refresh-ring + readback-fence build ran on hardware and the session was
+paused here. This is the transcription and the three things to decode first
+next week; no analysis was done on it.
+
+```
+GPU64 QUAKE3D - A RETAINED SCENE
+STOPPED - RUN/STOP AGAIN TO EXIT
+SETUP OK
+MX      00390F FF   SLK -E4 00E6 8D   M 0030
+FRAMES  1000
+OK      0FF9
+MISSED  0BE1
+ERR     06 038D 0002 20
+STALLS  00
+CLOCK   411A
+CMT 06  0004
+CMT 07  0000
+CMT XX  0003 0C
+CMTMISS 010F
+FIRST   06 022F 0000
+STALLAT 0000 0FFF 00
+BUS A   5A5A 5A5A 550C00 5030?C
+BUS B   BAEE C03A A9CC47 A60A02 00 00
+SEQBAD  0001 00ED CD 00
+BUS RW  0008D031 0002D8FE 0000C977
+BUS BAD 1A94 1548 FF FF 00 0D FF 00
+DISPWHY 004480 -00FD 0000 0000 00 01 00
+SEQREP  000002AD 0137 0000 00 00 00
+STOPSRC 01 0A REALCMD KEY 03 00 00 00
+```
+
+**What is new and good.** `SETUP OK`, 4096 frames (`FRAMES 1000`), 4089 of
+them OK, and `STOPSRC 01 0A REALCMD KEY` — the run ended because a key was
+pressed, not because anything derailed. `STALLS 00`. This is the longest
+clean-exiting class-1 run the project has had, and it is the first one
+carrying the refresh ring and `SET_DMA_WINDOW`.
+
+**The three rows to decode first, in this order:**
+
+1. **`BUS BAD 1A94 1548`** — fields 1 and 2 are `H_RDBAD` (6804) and
+   `H_WRBAD` (5448), against `BUS RW` denominators of 577585 reads and
+   186110 writes: roughly 1 in 85 reads and 1 in 34 writes. Section 46 closed
+   the *address* defect at zero bad addresses in a whole session, so either
+   this is the read/data side that was always still open, or something in the
+   new build reopened it. `LASTBAD`/`ORBAD` both read `FF`, which per
+   `gpu64-errcode-ff-is-the-bus` may itself be an unserviced read rather than
+   a value — check that before believing the row at all.
+2. **`ERR 06 038D 0002 20`** — *(that reading was wrong; section 55 has the
+   decode. The row is `lastErr / errBad / errBad2 / lastBadErr`, so the 909
+   is unreadable `ERRCODE` reads, not `UNSUPPORTED` dispatches.)*
+3. **`M 0030`** — run 27's unanswered mux instrument finally has a hardware
+   reading: 48 `expiredMux` events. Small, and it is the number section 48
+   was built to get.
+
+`MISSED 0BE1` (3041 of 4096, 74%) is **not** a finding: per
+`gpu64-stage16-loop-verified`, flat-out commits are ~80% BUSY by design.
+
+**State of the tree when parked.** Nothing committed. SD card carries
+firmware `743dfa5c-dirty src:4ac49d52` and `gpu64_demo_quake3d.prg` (20047
+bytes), both md5-verified. Conformance suite `PASS 46 FAIL 00`, twelve demos
+green in simulation. Steps 1-3 of the four-step plan are closed (section 53);
+step 4, the game, has not been started.
+
+## 55. Run 28 decoded: the repair rate collapsed, and the instrument hid it
+
+Section 54's transcription stands; two of its three readings were wrong, and
+the row that looked worst turned out to be the one carrying the answer.
+
+### Row by row, against the printers rather than by eye
+
+| Row | Reading |
+|---|---|
+| `FRAMES 1000` / `OK 0FF9` | 4096 frames, 4089 committed OK. The seven that did not are exactly `CMT 06 0004` + `CMT XX 0003`. |
+| `STALLAT 0000 0FFF 00` | never stalled, last OK frame was 4095 — healthy to the last frame. `FIRST`'s `reviveCt 0000`: no camera ever had to be revived. |
+| `ERR 06 038D 0002 20` | `lastErr / errBad / errBad2 / lastBadErr`. **Not 909 `UNSUPPORTED`s.** 909 `ERRCODE` reads came back as a non-code, and **only 2 were still bad on the re-read**. The retry repaired 907 of 909 — section 49's fix earning its keep, and the best number in the run. |
+| `SEQREP ... 0137 0000 ...` | `missRd 311`, **`missRdFF 0000`**. Not one failed `SEQACK` read returned `$FF`. |
+| `SEQBAD 0001 00ED CD 00` | 237 of those instead returned **the `ERRCODE` value the same command had just read**. The failed read hands back the previously driven value, not a float-high. |
+| `MISSED 0BE1` | 74%, by design. Not a finding. |
+
+So `gpu64-errcode-ff-is-the-bus` needs amending: `$FF` was not the signature
+in this run at all. The stale-previous-value was.
+
+### The finding: the mux re-read is repairing about a sixth
+
+Three numbers from the same health sample, which makes this a within-run
+comparison and immune to the 30x between-run variance:
+
+```
+muxMiss     00390F   = 14607   IO2 samples taken through an unswitched mux
+readsBad    1A94     =  6804   discarded reads
+writesBad   1548     =  5448   discarded writes
+                       ------
+                       12252
+```
+
+A mux miss the single `GPLEV0` re-read does not repair is discarded, and a
+discarded access is scored bad — so `muxUnfixed >= 12252` and `muxFixed <=
+2355`. **The re-read is repairing about 16% of mux misses.** In runs 21-22 it
+repaired essentially all of them, which is how the address defect came to be
+called closed in section 46.
+
+The direct counter could not say so: `h[122]` publishes `muxUnfixed` clamped
+to 255, and it duly read `FF`. The clamp was justified in run 24 on the
+grounds that the expected value is zero and `BUS A`/`BUS B` reading `0000
+0000` was the direct proof — and run 28 lost `BUS A`/`BUS B` as well. Two
+independent views of the same fact, and this run had neither.
+
+**When did it collapse?** Unknown, and that is the honest answer. `muxFixed`
+stopped being published in run 24; runs 25-27 were short or died in setup.
+Run 28 is the first run since 22 that *could* have seen it, and it saw it only
+by inference. Do not assume the mux repair regressed recently, and do not
+assume this build caused it.
+
+### Why `BUS A`/`BUS B` were garbage, and the instrument defect behind it
+
+`doHealth` poisons `hbuf` with `$5A`, dispatches `GET_HEALTH`, and checks the
+poison is gone — up to eight times. After the eighth it **fell through to
+`dhOk` anyway**, and the caller could not tell. `phaseTally` then folded the
+poisoned buffer into an A/B accumulator and copied it into `hbufP`, so the
+*next* window's delta was wrong by the complement. The two cancel:
+
+```
+BUS A wrBad 5A5A + BUS B wrBad BAEE = 1_1548  -> BUS BAD wrBad 1548
+BUS A rdBad 5A5A + BUS B rdBad C03A = 1_1A94  -> BUS BAD rdBad 1A94
+```
+
+Both rows reconcile exactly against the run total, which is why the garbage
+looked arithmetically sound. The A/B split — the one thing the run existed to
+measure — is unrecoverable, and the screen never said so. The check existed;
+its verdict was discarded. That is the same failure CLAUDE.md rule 1 names,
+in the instrument built to measure it, for the second time (section 49 was the
+first).
+
+### What changed for run 29
+
+1. **`doHealth` returns its verdict** (`hFail`). A window whose sample came
+   back poison is voided, `hbufP` stays on the last good sample, and the
+   window *after* it is voided too — its delta spans one window of each
+   condition. `voidWin` counts them, saturating, at the end of row 17.
+   `00` there is the reading rows 16/17 need.
+2. **`healthBad`** keeps the last non-OK `ERRCODE` any `GET_HEALTH` answered,
+   at the end of row 22. The closing call's `healthErr` cannot show a mid-run
+   one. `$03 OUT_OF_RANGE` there means `SET_DMA_WINDOW`'s own arguments were
+   mis-sampled and the fence refused the readback — the fail-safe direction,
+   and exactly what section 52 predicted.
+3. **`muxUnfixed` is published wide** at `h[120..121]` (saturating u16;
+   `h[122]` keeps the clamped byte for the log) and printed as four digits on
+   row 3. `uuuu / mmmmmm` is now the repair rate directly, and it is the first
+   thing to read on that screen.
+
+Verified both directions on the host: a deliberately-too-narrow 64-byte window
+gives `voidWin 02`, `healthErr 03`, `healthTry 08`, `healthBad 03` and leaves
+`BUS A`/`BUS B` at zero instead of absorbing poison; the shipped build gives
+`voidWin 00`, `healthBad 00` and populated A/B rows.
+
+Suite `PASS 46 FAIL 00`, twelve demos green. Deployed and md5-verified:
+firmware build id `743dfa5c-dirty src:62a44d6d` (`kernel_rad.img`
+`1a81d362...`) and `gpu64_demo_quake3d.prg` `1c1cfe2e...`, 20140 bytes.
+
+### What run 29 answers
+
+`uuuu / mmmmmm` on row 3 is the repair rate, read first. `voidWin` at the end
+of row 17 says whether rows 16/17 are a split or a partial run — and only if
+it reads `00` does the A/B question (does core 1 rendering still cause the
+faults?) get an answer at all. `healthBad` at the end of row 22 says whether
+the fence was ever the reason a readback failed.
+
+## 56. Run 29 (2026-09-20): the mux collapse confirmed, and an unfenced readback found
+
+The user sent one photograph with the words "After it hanged". Transcribed:
+
+```
+MX 0035BA 28CF  SLK -EF 00EF A8  M 001B
+FRAMES  1000 / OK 0FEE / MISSED 0AAA
+ERR     04 0750 02AC 9C
+STALLS  00
+CLOCK   0000
+CMT 06 0000 / CMT 07 0000 / CMT XX 0007 04 / CMTMISS 0134
+FIRST   04 022E 0002 / STALLAT 0000 0FFF 00
+BUS A   0000 0000 3491CE 209403
+BUS B   0000 0000 8D7ED4 DF9D00 02 07 05
+SEQBAD  0000 0099 9C 00
+BUS RW  0009262F 0002E392 0000CB5F
+BUS BAD 1D07 11D1 FF FF 00 FF FF 00
+DISPWHY 0044AC -0879 0000 0000 00 01 00
+SEQREP  0000020C 011A 0000 00 AF 00 00
+STOPSRC 01 0A REALCMD KEY 05 12 00 00
+```
+
+Three readings, in order of confidence.
+
+### 1. The mux repair-rate collapse is confirmed, and measured
+
+Section 55 had to *infer* the collapse from `muxMiss` against the discarded
+count, because `muxFixed` stopped being published in run 24. Run 29 shipped
+`muxUnfixed` as a 16-bit field (`GET_HEALTH` 120-121) specifically to settle
+it, and it did:
+
+| | |
+|---|---|
+| `muxMiss` | `0x0035BA` = 13754 |
+| `muxUnfixed` | `0x28CF` = 10447 |
+| repaired | 3307, i.e. **24%** |
+
+Runs 21-22 repaired essentially all of them. So the single `GPLEV0` re-read
+that closed the address defect (section 46) is now failing three times in
+four. The bad-access counts follow: `rdBad 0x1D07` = 7431 of 599087 reads
+(1.24%) and `wrBad 0x11D1` = 4561 of 189842 writes (2.40%).
+
+`muxUnfixed` 10447 against 11992 total bad accesses leaves ~1545 bad
+accesses that were never mux-phase misses at all — a second, smaller
+population, consistent with the read-side floor that has been open since
+run 26.
+
+### 2. `CLOCK 0000` is a readback that missed its destination — and it was unfenced
+
+`CLOCK` is `dmInfo+14/15`, the frame period `GET_INFO` DMA-writes into C64
+memory. It read zero. The firmware's frame clock was demonstrably *fine*:
+`SCENE_COMMIT` hard-requires `gpu64Vsync.calibrated` and 4078 commits
+succeeded (`OK 0FEE`), with `CMT 06 0000` — not one commit refused
+`UNSUPPORTED`. So the period was non-zero in the Pi and zero in the C64:
+**the 16-byte info block did not land in `dmInfo`.**
+
+That readback had neither of the two guards every other readback in this
+program has:
+
+- **No fence.** `quake3d`'s `setDmaWin` comment reads "Before anything that
+  can write back into C64 memory: fence it" — and it is called *after*
+  `dmInit`, which had already done a writeback. A mis-sampled ARG1-ARG3
+  therefore sent sixteen bytes to whatever address the previous command
+  left behind, with the C64 halted while the Pi wrote them. This is exactly
+  the failure `SET_DMA_WINDOW` was built for (section 52), installed one
+  call too late.
+- **No check.** Nothing verified the block arrived, so a program whose
+  `GET_INFO` was lost ran the whole session believing the display had no
+  frame clock.
+
+An unfenced writeback that missed its destination is the one mechanism that
+explains both `CLOCK 0000` and the hang the user reported, and it needs no
+new hypothesis about the bus.
+
+Fixed in `gpu64_demo_rt.inc`, so every demo gets it:
+
+- `dmSetWin` declares a `dmInfo`-sized window, `RESULT`-verified with four
+  tries, before the `GET_INFO`; the window is handed back to "anywhere"
+  afterwards so a demo that sets none is left as permissive as it was.
+- The block is poisoned and then validated against a **real magic** —
+  bytes 0-2 are `'G','6','4'` unconditionally — with eight attempts. A
+  magic beats a poison check: it needs no assumption about what plausible
+  data looks like.
+- If all eight fail, `dmInit` zeroes `dmInfo` itself, because the `$5a5a`
+  poison is a *plausible* frame period (23130 us) and would otherwise
+  claim a frame clock that does not exist.
+- `dmInfoTry` is printed beside `CLOCK` (row 9), so the two readings of
+  `CLOCK 0000` are now distinguishable: `08` landed first time, `00` never
+  landed.
+
+Verified both directions on the host: shipped model gives `CLOCK 4E20 08`,
+and with `GET_INFO`'s writeback suppressed in the model it gives
+`CLOCK 0000 00` with the demo carrying on unpaced rather than derailing.
+
+### 3. The void-window fix worked; the 32-bit A/B columns are still garbage
+
+`voidWin 05`: five of sixteen A/B windows produced no usable health sample,
+so rows 16-17 are a partial run and not a clean split. That is the
+instrument fix from section 55 doing its job — run 28 folded those five
+windows into the accumulators and produced numbers that reconciled
+arithmetically while being meaningless.
+
+The 16-bit columns are now clean: `BUS A`/`BUS B` `wrBad`/`rdBad` all
+`0000`, against a run total of 11992 bad accesses. Every bad access fell
+inside a voided window. **Bus-fault bursts and health-readback failure
+co-occur**, which is itself a finding and the reason the A/B experiment
+cannot be run to completion until the readback is reliable.
+
+The 32-bit columns are not clean: `A writes 0x3491CE` = 3.4M against a run
+total of `0x2E392` = 189842. A window whose sample passed the poison check
+on bytes 0-11 but arrived *partially* would do this — poison surviving in
+bytes 52-55 gives one huge positive delta and one huge negative one, and
+the void logic never sees it because the check it runs passed. The health
+block has no spare byte for a checksum (all 128 are allocated), so the next
+step is to widen the client-side check to the fields the instrument
+actually subtracts, not to add one.
+
+Eight *consecutive* failed `GET_HEALTH` attempts, five times over, is far
+too many for the ~1-in-250 lost-write floor: something refused the readback
+systematically for a whole window and the screen could not say what. So
+`doHealth` now records the `ERRCODE` of the last attempt that produced no
+block, and a saturating count of them, printed on row 8 beside `STALLS`
+(`00 00` is the clean reading). `$03` is the fence refusing the
+destination, `$02` a length that arrived short, `$00` a dispatch that never
+happened, anything else an unreadable read.
+
+### Leads left open
+
+- `errBad2 0x02AC` = 684 of 1872 unreadable `ERRCODE` reads still bad after
+  the re-read (37%), against run 28's 2 of 909 (0.2%). A rate change of 30x
+  between runs is established (section 44); a change from 0.2% to 37% is a
+  change in *character*, and is the next thing to explain after the
+  readback.
+- `restartErr 02` / `restartCode 07` / `reviveCt 0002`: two mid-run
+  restarts, both on opcode `$07`.
+- `CMT XX 0007 04` and `CMTMISS 0134` — still open from run 28.
+
+### The health block now verifies itself (`GET_HEALTH` len 132)
+
+Section 55 and 56 both turned on the same weakness: the only integrity test a
+client had on the health block was "poison the buffer and see whether the
+poison is gone", and that test **passes on a block that arrived only in part** —
+the poison is gone from the bytes that landed and still present in the ones
+that did not. That is how run 28 lost its A/B split and how run 29's 32-bit
+columns came back at 3.4 million against a run total of 190 thousand.
+
+CLAUDE.md rule 3 says any bulk transfer through REU DMA needs a checksum or a
+length readback. The health block is a bulk transfer and had neither, and all
+128 of its bytes are allocated so there was nowhere to put one. Resolved by
+extending the existing length ladder, which was designed for exactly this:
+
+| Offset | Contents |
+|---|---|
+| 128 | `'G'` |
+| 129 | `'6'` |
+| 130 | XOR of bytes 0-129 |
+| 131 | Sum of bytes 0-129 mod 256 |
+
+Two independent check bytes, because XOR alone is blind to a transposition.
+Both cover the magic, so the magic is checked too. Purely additive: a caller
+asking for 128 gets the same 128 bytes it always did, which is what keeps this
+inside the v1 freeze (section 53) — no opcode changes meaning and no opcode
+grows an argument.
+
+`doHealth` in `gpu64_demo_quake3d.a` now asks for 132 and verifies all four,
+which retires the poison heuristic entirely. Verified both directions on the
+host: clean model gives row 8 `00 00 00`, and with one byte of the writes
+counter corrupted *after* the checksum is computed it gives `00 08 00` — eight
+rejected attempts with `ERRCODE 00`, the dispatch reporting success while the
+data did not arrive intact. That is precisely the case that was invisible
+before.
+
+One instrument bug found while testing it: `hFailCt`/`hErrF` were being zeroed
+in the block that runs *after* the baseline `GET_HEALTH`, so a failure in the
+first sample of the run was erased. They are zeroed before it now.
+
+### What run 30 answers
+
+1. **Does `CLOCK` read `4E20 08`?** If it does, the info block landed first
+   time and the fence is doing its job. `0000 00` means it still never landed,
+   with the fence up — which moves the problem from the destination to the
+   dispatch. `0000 08` means this display genuinely has no frame clock.
+2. **Row 8, `00 00`.** Any non-zero count is a health readback that failed
+   verification, and the byte beside it says why. Rows 16-17 are only readable
+   against `00`.
+3. **`voidWin`** (row 17, last field) should now be `00`, because the checksum
+   catches partial arrival that the poison check let through. If it is not,
+   the 32-bit columns are still not trustworthy and the reason is on row 8.
+4. **The mux repair rate**, `uuuu / mmmmmm` on the MX row — 24% in run 29, and
+   the first thing to read on the screen.
+5. **`errBad2`** against `errBad` on the ERR row: 37% in run 29 versus 0.2% in
+   run 28.
+
+## 57. Run 30 — the fence holds, and run 29's health numbers were fiction
+
+First run of the self-verifying health block (`GET_HEALTH` len 132) and the
+fenced, validated `GET_INFO` in `dmInit`. Build `743dfa5c-dirty src:d83ca097`.
+4096 frames, clean keypress exit (`STOPSRC 01 0A REALCMD KEY`), no hang.
+
+### The two results that are directly attributable to the change
+
+`CLOCK 411A 08` — the info block landed on the **first** attempt (`dmInfoTry`
+still at its initial 8) and the period reads 16666 us. Run 29's `CLOCK 0000`
+was a writeback that missed its destination; with `SET_DMA_WINDOW` declared
+before the readback and a `'G' '6' '4'` magic checked after it, the failure
+mode is gone. Question 1 for this run: pass.
+
+`STALLS 00 0F 00` — `waitFail 00`, **`hFailCt 15`**, `hErrF 00`. Fifteen
+`GET_HEALTH` readbacks failed the magic/XOR/sum with **ERRCODE 00**: the
+dispatch returned OK and the 132 bytes did not all arrive. That is precisely
+the case the old `$5A` poison check passed on, and it is the first time the
+instrument has been able to see it. No A/B window was voided (`voidWin 00`),
+so every call recovered inside its 8 retries.
+
+### Consequence: every health figure before this build is unverified
+
+`hFailCt 15` is proof that partially-arrived blocks occur at a rate high
+enough to matter. So the **health-block** columns of runs 28-29 -- `MX`,
+`BUS RW`, `BUS BAD` -- were read through a check that could not detect a
+partial arrival. In particular section 56's "the mux repair rate collapsed to
+24%" (`muxMiss 13754`, `muxUnfixed 10447`) rests on an unverified block and is
+**withdrawn**. Run 30's `MX 0001C5 0001` -- 453 misses, 1 unrepaired, 99.8%
+repaired -- is the first checksum-verified reading of that ratio and agrees
+with runs 21-22, not with 29.
+
+### What is NOT explained by the measurement fix
+
+`missed`, `missRd`, `errBad`, `errBad2` and `okFrames` are incremented by the
+6502 in C64 RAM. They never pass through the health block, so they are sound in
+every run -- and they moved too:
+
+| counter (C64 RAM)                  | run 28 | run 29 | run 30 |
+|------------------------------------|-------:|-------:|-------:|
+| `MISSED` dropped command writes    |  3041  |  2730  |   **77** |
+| `errBad` unreadable ERRCODE reads  |   low  |  1872  |    **0** |
+| `errBad2` still unreadable on retry|    ~4  |   684  |    **0** |
+| `OK` accepted commits              |  4089  |  4078  |   4089 |
+
+A 39x fall in genuinely dropped command writes, and ERRCODE reads that never
+once came back floating. **Nothing in this session's diff is on the bus path**,
+and `gpu64-bus-fault-rate-varies-30x` forbids judging a bus change from one
+run -- 39x is at the edge of the documented spread. This is recorded as
+unexplained, not as a fix.
+
+### What run 31 answers
+
+Re-run the same binary unchanged. `MISSED` is the whole question: near 77 twice
+means something real happened and is worth bisecting; back near 3000 means run
+30 was the lucky tail of the known 30x spread and the only durable gains this
+round were the two measurement fixes above.
+
+### Run 31 build (deployed 2026-09-20)
+
+**The firmware is byte-identical to run 30** -- `kernel_rad.img` md5
+`0f03f605041fcc9dbff1493df9a669f8`, build id `743dfa5c-dirty src:d83ca097`.
+Only `gpu64_demo_quake3d.prg` changed (md5 `b5acf7b9577e149985e4392348eb2bd5`),
+so run 31 is a true repeat of run 30's bus conditions with a better instrument,
+which is what makes the `MISSED` comparison worth anything.
+
+Three changes, all on rows 6 and 8 where bench photographs are legible:
+
+- **Row 6 gains a verdict word** after `MISSED`: `LO` under 256 (run 30
+  reproduced), `MID` under 1024, `HI` at or above (runs 28-29, ~3000). Per
+  [[gpu64-bench-photo-legibility]] -- a word survives a poor exposure where a
+  four-digit hex number the reader must compare against a document does not.
+- **Row 8 splits the health failure in two.** `hFailMag` counts blocks whose
+  magic was absent, so the block stopped arriving before its last four bytes;
+  `hFailSum` counts blocks whose magic was present and whose XOR/sum
+  disagreed, so the body is corrupt. `hFailMag + hFailSum` must equal
+  `hFailCt`. Run 30's 15 failures could not be split.
+- **Row 8 gains `hFirstBad`**, the first offset still holding the `$5a` poison
+  on the most recent failure. `80` on every failure means only the 132-byte
+  trailer this build added fails to land -- 128 bytes is two cache lines and
+  132 spills into a third, the shape of the bulk-transfer warm-window defect
+  ([[gpu64-bulk-transfer-mismatch]]). A low moving value means the body is
+  genuinely short; `FF` means nothing was poisoned; `FE` means no failure yet.
+- **`voidWin` moved onto row 8**, from the end of row 17 where no photograph
+  has ever been legible.
+
+Both failure paths were verified by fault injection into `gpu64model.py`
+(clobber `h[128]` -> `hFailMag 01 / hFirstBad FF`; corrupt `h[5]` after the
+trailer -> `hFailSum 01 / hFirstBad FF`), with the model restored afterwards.
+Suite green, all twelve demos green.
+
+## 58. Run 31 — MISSED reproduces LO, and the trailer is exonerated
+
+Same firmware as run 30 (`0f03f605...`, build `743dfa5c-dirty src:d83ca097`),
+demo `b5acf7b9...`. 4096 frames, clean keypress exit.
+
+```
+MX 0000F2 0000  SLK -CC 0110 B3  M 002C      CMT XX  0001 03
+FRAMES  1000                                 CMTMISS 000E
+OK      0FFF                                 FIRST   03 02BB 0000
+MISSED  000E  LO                             STALLAT 0000 0FFF 00
+ERR     03 0046 0000 00                      BUS RW  0000B58D 0002F546 0000CF00
+STALLS  00 0D 03 00 0D 03 00                 BUS BAD 0000 0000 00 00 FF 00 00 FF
+CLOCK   411A 08                              DISPWHY 00483E +0051 ...
+CMT 06  0000 / CMT 07 0000                   SEQREP  00000072 0145 0000 ...
+```
+
+### 1. The MISSED collapse is real
+
+`MISSED 000E` = **14**, verdict `LO`. Run 30 was 77; runs 28-29 were 3041 and
+2730. The firmware is byte-identical to run 30, so this is a clean
+reproduction, and the drop is now ~200x against run 29. `OK 0FFF` = 4095 of
+4096 frames committed, the best the demo has ever scored.
+
+The step happened between runs 29 and 30, which is where the demo gained the
+`SET_DMA_WINDOW` fence and the validated `GET_INFO`. **The mechanism is still
+not identified** and nothing in that change is on the bus path.
+
+One supporting observation: `BUS RW` reads fell from 577585 (run 28) to
+**46477**, 141 per frame down to 11, while writes barely moved (186622 ->
+193862). Reads are what a re-send costs -- every detected drop re-sends the
+node update from the top -- so the read collapse is most likely a *consequence*
+of MISSED falling, not a separate effect.
+
+### 2. The 132-byte trailer is exonerated
+
+Row 8 reads `waitFail 00, hFailCt 0D, hErrF 03, hFailMag 00, hFailSum 0D,
+hFirstBad 03, voidWin 00`, and `hFailMag + hFailSum == hFailCt` as required.
+
+**All 13 failures were `hFailSum`: the magic arrived and the body did not
+match.** Zero magic failures across 4096 frames, so the four trailer bytes land
+every time and the "132 spills into a third cache line" hypothesis is dead.
+
+`hFirstBad 03` says byte 3 of the block still held the `$5a` poison on the last
+failure. `h[3]` is the top byte of `s_Health.throttled`, which is 0 on a
+healthy Pi, so this is a genuine dropped byte and not the documented `$5a`
+false positive. The blob write therefore **drops bytes early in the body while
+delivering the tail intact** -- scattered loss, not truncation. `voidWin 00`:
+every window still recovered inside its 8 retries.
+
+### 3. hErrF 03 cannot be believed, and that is itself a finding
+
+`03` is `OUT_OF_RANGE`, i.e. the fence refused the destination. But a refused
+write puts nothing in the buffer, which would leave the magic poisoned and
+score `hFailMag` -- and `hFailMag` is 00. The two readings are incompatible, so
+the `03` is a misread ERRCODE.
+
+Note what that means for the guard in [[gpu64-errcode-ff-is-the-bus]]: `errBad`
+only counts reads that are **not a valid code**, and this run logged 70 of
+them (`ERR 03 0046`, all recovered -- `errBad2 0000`). A spurious read that
+happens to land on a *valid* code passes the range test silently. Range-testing
+is necessary and not sufficient.
+
+`CMT XX 0001 03` does show one genuine commit returning `OUT_OF_RANGE`, first
+error at frame `02BB` = 699, so 03 is a code that really does occur here.
+
+### 4. The address defect stays closed
+
+`MX 0000F2 0000` -- 242 mux misses, **0 unrepaired**, and `BUS BAD 0000 0000`.
+Two consecutive verified blocks now agree with runs 21-22, which independently
+confirms withdrawing run 29's "24% repair rate" (section 57).
+
+### What run 32 should answer
+
+`CMTMISS 000E` equals `MISSED 000E` exactly: **every detected drop landed on
+the SCENE_COMMIT dispatch**, none on the other three per frame. That matches
+the 55x concentration in [[gpu64-missed-not-the-drop-defect]] and is now the
+sharpest remaining lead -- 14 events is small, but they are all on one
+instruction.

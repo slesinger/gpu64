@@ -46,6 +46,42 @@
 
 #define GPU64_ARG_COUNT		16
 
+// --- the one-shot key for destructive opcodes ---------------------------
+//
+// gpu64 (2026-09-10, bench run 14). The bus loses and mis-samples writes
+// (CLAUDE.md, "The bus is not reliable"), and two bench runs have now caught
+// an opcode EXECUTING that the C64 never sent: run 11 a LOOP_STOP, run 14
+// something that wiped the live scene's active camera. A command that only
+// draws survives that -- one frame is wrong and the next is right. A command
+// that destroys state does not: the session is over and nothing says why.
+//
+// So every destructive opcode demands this byte in ARG15, and
+// gpu64_apiDispatch() SPENDS ARG15 on every dispatch of every class. The key
+// is therefore valid for exactly one command, the one that staged it:
+// a phantom CMD_LO write arriving at any other moment finds ARG15 zero and
+// is refused with BAD_ARGS, counted in gpu64ApiDiag.keyRefused along with
+// its opcode. The residue it cannot cover is a real keyed command whose own
+// opcode byte is mis-sampled into a different destructive opcode, which is
+// one write instead of a whole stream.
+//
+// $A5 rather than a small number: 10100101 shares no bit pattern with a
+// plausible coordinate or id byte, and an ARG register left over from a
+// previous command is overwhelmingly likely to hold one of those.
+#define GPU64_KEY_DESTRUCTIVE	0xA5
+#define GPU64_REG_KEY		( GPU64_ARG_COUNT - 1 )	// ARG15, i.e. $DF20
+
+// The value ARG15 held when the current dispatch began, before
+// gpu64_apiDispatch() cleared it. Every class reads the key through this and
+// never through gpu64Regs.arg[15], which by then is already zero.
+extern u8 gpu64ApiKey;
+
+// TRUE if the command now dispatching carried the key. The one test every
+// destructive opcode makes.
+static inline boolean gpu64_apiKeyed( void )
+{
+	return gpu64ApiKey == GPU64_KEY_DESTRUCTIVE;
+}
+
 // --- STATUS bits --------------------------------------------------------
 #define GPU64_STATUS_BUSY		0x01
 #define GPU64_STATUS_ERROR		0x02
@@ -127,6 +163,13 @@ extern GPU64REGS gpu64Regs;
 // Resets the whole register file. Called from resetREU().
 void gpu64_apiReset( void );
 
+// gpu64: the display half of a session reset -- mode, palette, border, pages
+// and the text planes back to their post-boot state, plus the health sticky
+// flags. Separate from gpu64_apiReset() because it must not touch the
+// register file: FULL_RESET ($0B) calls it from inside a dispatch. See its
+// definition in gpu64_api.cpp.
+void gpu64_apiFullReset( void );
+
 // Executes one command. Heavy and unbounded-ish by design: the caller holds
 // the bus across it (see the CMD_LO case in reuUsingPolling()).
 void gpu64_apiDispatch( u8 op );
@@ -165,6 +208,25 @@ static inline u8 gpu64_apiReadReg( u8 addr )
 		return gpu64Regs.seqAck;
 	return 0xFF;
 }
+
+// gpu64: the window C64-space writebacks are confined to.
+//
+// Every GET_* opcode takes the destination address in its ARG block, and no
+// ARG byte is covered by SEQ/SEQACK -- so one lost store turns "write 128
+// bytes into my buffer" into "write 128 bytes over whatever address the
+// previous command left in those registers", with the Pi doing the writing
+// and the C64 halted while it happens. It cost a simulated run its own code
+// at a fault-injected rate, which is exactly how it would present on the
+// bench: a program that dies for no visible reason some time after a
+// readback.
+//
+// So gpu64_blobWrite() refuses a C64-space destination outside this window.
+// Length 0 means "the whole address space", which is the reset default and
+// what every program written before $0C sees, so this changes nothing for
+// anyone who does not opt in. SET_DMA_WINDOW ($0C) sets it and echoes a
+// checksum in RESULT, because RESULT is readable and ARG is not.
+extern u16 gpu64DmaWinBase;
+extern u16 gpu64DmaWinLen;			// 0 = unrestricted
 
 // --- provided by rad_reu.cpp (they need the DMA macros and REU state) ---
 // Both return a GPU64_ERR_* code. A C64-space transfer costs one bounded

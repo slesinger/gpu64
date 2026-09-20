@@ -153,16 +153,20 @@ def mat_from_euler(yaw, pitch, roll):
     def m15_3(a, b, c):
         return s16((((a * b) >> 15) * c) >> 15)
 
+    # R = Ry(yaw) * Rx(pitch) * Rz(roll) -- must stay term-for-term identical
+    # to gpu64_3dMatFromEuler() in Source/Firmware/gpu64_3d_math.cpp, down to
+    # where each product truncates to 1.15, or the model and the firmware
+    # disagree silently.
     return [
-        s16(m15(cr, cy) - m15_3(sr, sp, sy)),
-        s16(-m15(sr, cp)),
-        s16(m15(cr, sy) + m15_3(sr, sp, cy)),
-        s16(m15(sr, cy) + m15_3(cr, sp, sy)),
-        s16(m15(cr, cp)),
-        s16(m15(sr, sy) - m15_3(cr, sp, cy)),
-        s16(-m15(cp, sy)),
-        s16(sp),
-        s16(m15(cp, cy)),
+        s16(m15(cy, cr) + m15_3(sy, sp, sr)),
+        s16(-m15(cy, sr) + m15_3(sy, sp, cr)),
+        s16(m15(sy, cp)),
+        s16(m15(cp, sr)),
+        s16(m15(cp, cr)),
+        s16(-sp),
+        s16(-m15(sy, cr) + m15_3(cy, sp, sr)),
+        s16(m15(sy, sr) + m15_3(cy, sp, cr)),
+        s16(m15(cy, cp)),
     ]
 
 
@@ -300,6 +304,39 @@ class Class1Mixin:
         self.c1_blobs = 0
         self.frame_hook = None
 
+    # --- refusal bookkeeping (Source/Firmware/gpu64_apidiag.h) ----------
+    def c1_loop_stop(self, cause):
+        if self.c1_loop_running:
+            self.loop_stops += 1
+        self.loop_stop_cause = cause
+        self.loop_stop_seq = self.disp_seq
+        self.loop_stop_seq_prev = self.disp_seq_prev
+        self.loop_stop_prev_op = self.disp_op_prev
+        self.c1_loop_running = False
+
+    def c1_refuse(self, op):
+        self.last_refuse_state = self.diag_state_byte()
+        self.last_refuse_op = op
+        self.last_refuse_class = 1
+
+    def diag_state_byte(self):
+        st = 0
+        if self.c1_loop_running:
+            st |= 0x01
+        if self.calibrated:
+            st |= 0x02
+        from gpu64model import MODE_GRAPHICS, ST_BUSY
+        if self.mode == MODE_GRAPHICS:
+            st |= 0x04
+        if self.flip_pending:
+            st |= 0x08
+        if self.status & ST_FRAME_READY:
+            st |= 0x10
+        if self.status & ST_BUSY:
+            st |= 0x20
+        st |= 0x40                                      # framebuffer is always up here
+        return st
+
     # --- redirection ----------------------------------------------------
     def c1_scene_target(self):
         return self.c1_shadow_scene if self.c1_loop_running else self.c1_scene
@@ -364,7 +401,8 @@ class Class1Mixin:
     def execute_r1(self, op):
         from gpu64model import (ERR_OK, ERR_BAD_OPCODE, ERR_OUT_OF_RANGE,
                                 ERR_BAD_ARGS, ERR_UNSUPPORTED, ERR_BUSY,
-                                ERR_OUT_OF_MEMORY, ERR_BAD_ID)
+                                ERR_OUT_OF_MEMORY, ERR_BAD_ID,
+                                KEY_DESTRUCTIVE)
         NO_CAMERA = 0x0B
         a = self.arg
 
@@ -380,10 +418,25 @@ class Class1Mixin:
         def node_err(n):
             return ERR_OK if n is not None else ERR_BAD_ID
 
+        # The one-shot key, mirroring the gate at the top of execute() in
+        # Source/Firmware/gpu64_3d_class1.cpp. Unconditional: a destructive
+        # opcode is destructive whether or not the loop happens to be
+        # running, and ARG15 (spent by every dispatch, read by no opcode)
+        # is what says the C64 meant it. See GPU64_KEY_DESTRUCTIVE in
+        # Source/Firmware/gpu64_api.h for the bench runs behind it.
+        if op in (OP_SCENE_RESET, OP_LOOP_STOP,
+                  OP_DESTROY_NODE, OP_FREE_RESOURCE):
+            if self.api_key != KEY_DESTRUCTIVE:
+                self.key_refused += 1
+                self.key_refused_op = op
+                return ERR_BAD_ARGS
+
         if op == OP_SCENE_RESET:
+            if self.c1_scene.have_active_camera:
+                self.scene_wipes += 1
             self.c1_state = State()
             self.c1_scene = Scene()
-            self.c1_loop_running = False
+            self.c1_loop_stop(2)                        # GPU64_LOOPSTOP_SCENE_RESET
             self.status &= ~ST_FRAME_READY
             self.c1_shadow_state = State()
             self.c1_shadow_scene = Scene()
@@ -522,9 +575,15 @@ class Class1Mixin:
             n = sc.find(self.c1_id())
             if n is None:
                 return ERR_BAD_ID
+            had_camera = self.c1_scene.have_active_camera
             if sc.have_active_camera and sc.active_camera_id == self.c1_id():
                 sc.have_active_camera = False
             n.type = NODE_NONE
+            # Counted against the LIVE scene, as the firmware does: losing
+            # the shadow's camera is repaired by the next commit, losing the
+            # live one is what run 14 never recovered from.
+            if had_camera and not self.c1_scene.have_active_camera:
+                self.cam_lost += 1
             return ERR_OK
 
         if op == OP_SET_ACTIVE_CAMERA:
@@ -662,26 +721,26 @@ class Class1Mixin:
             # a later firmware from running the wrong protocol here.
             if a[0] != 0:
                 return ERR_UNSUPPORTED
-            if not self.c1_scene.have_active_camera:
-                return NO_CAMERA
-            self.c1_shadow_scene = copy.deepcopy(self.c1_scene)
-            self.c1_shadow_state = copy.deepcopy(self.c1_state)
-            self.status &= ~ST_FRAME_READY
-            self.c1_push_frame()
-            self.c1_loop_running = True
-            return ERR_OK
+            return self.c1_loop_start_armed()
 
         if op == OP_LOOP_STOP:
             # Always succeeds, even against a loop that was not running.
-            self.c1_loop_running = False
+            self.c1_loop_stop(1)                        # GPU64_LOOPSTOP_OPCODE
             return ERR_OK
 
         if op == OP_SCENE_COMMIT:
             if not self.c1_loop_running:
-                return ERR_UNSUPPORTED
+                # Re-arm rather than refuse: a stopped loop is no longer a
+                # permanent state. The counter still climbs, so it stays
+                # the measure of how often this had to be repaired.
+                self.commit_no_loop += 1
+                self.c1_refuse(op)
+                return self.c1_loop_start_armed()
             if not (self.status & ST_FRAME_READY):
                 return ERR_BUSY
             if not self.calibrated:
+                self.commit_no_clock += 1
+                self.c1_refuse(op)
                 return ERR_UNSUPPORTED
             if self.flip_pending:
                 return ERR_BUSY
@@ -698,6 +757,20 @@ class Class1Mixin:
             return ERR_OK
 
         return ERR_BAD_OPCODE
+
+    def c1_loop_start_armed(self):
+        """Everything LOOP_START does once its mode argument is accepted.
+        SCENE_COMMIT calls it too, to re-arm a loop that stopped without
+        the C64 asking -- gpu64_3d_class1.cpp's loopStartArmed()."""
+        from gpu64model import ERR_OK
+        if not self.c1_scene.have_active_camera:
+            return 0x0B                             # NO_CAMERA
+        self.c1_shadow_scene = copy.deepcopy(self.c1_scene)
+        self.c1_shadow_state = copy.deepcopy(self.c1_state)
+        self.status &= ~ST_FRAME_READY
+        self.c1_push_frame()
+        self.c1_loop_running = True
+        return ERR_OK
 
     def c1_push_frame(self):
         """What pushLoopFrame() queues and core 1 then renders.

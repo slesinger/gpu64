@@ -19,6 +19,33 @@ Options:
     --no-vblank     model a display whose frame clock never calibrated, so
                     every vblank feature answers UNSUPPORTED. The suite is
                     expected to pass in this mode too -- it adapts.
+    --dump-scene        print the retained scene node table at the end
+    --bus-fault-until=F stop injecting after RENDERED frame F -- not the
+                       demo's own frame counter, which runs ahead of it
+                       whenever commits are missed
+    --bus-fault=KIND:N
+        Make every Nth access to the gpu64 register window ($DF0B-$DFFF) go
+        wrong, the two ways the hardware is known to be able to make one go
+        wrong. KIND is:
+          drop  the access never reaches the firmware at all. A read
+                answers $FF off a floating bus and is not counted; a write
+                simply does not happen and is not counted.
+          addr  the access IS serviced, but at a mis-sampled address: bit
+                6 comes back set, which is the shape of damage real
+                hardware can do (A0-A3 are on dedicated GPIOs, A4-A7 on the
+                multiplexed ones). A read answers $FF, a write
+                is discarded, and both are counted -- including in the
+                bad-address counters GET_HEALTH reports.
+          both  alternate between the two, so a probe that has to tell
+                them apart has to tell them apart in the same run.
+        There is no defect here to find: this exists so that a probe's
+        diagnosis of a defect can be checked against a known answer on a PC.
+        Source/TestPRG/gpu64_probe_bus.a is the one that needs it, and its
+        header says which verdict each kind must produce. The injector is
+        indiscriminate -- it will happily eat a CMD_LO write and turn a
+        command into nothing -- so keep N well above the number of accesses
+        any single command costs.
+
     --alias-drop=OFF[,OFF...]
         Corrupt a C64-space blob write: each listed byte offset comes back as
         the byte at offset $FF of its own page. Models the hardware failure
@@ -66,6 +93,16 @@ Options:
         so this, not --ppm, is how a class-1 demo gets a picture on a PC.
         For a class-1 demo a "frame" is an accepted SCENE_COMMIT, so
         --stop-after counts those.
+    --chain=PRG     run PRG first, on the same model, before the program
+        named on the command line. Repeatable, applied in order. This is how
+        a state leak BETWEEN programs is reproduced on a PC: the RAD menu
+        launches a .prg without resetting the C64, so gpu64 keeps whatever
+        the previous program left behind -- its palette, its draw/visible
+        page pairing, its framebuffer contents, its display mode. Each
+        chained program gets its own --stop-after budget and its screen is
+        discarded; only the last program's screen and PPM are reported.
+        A demo that comes up right after a reset and wrong after another
+        demo is exactly this, and $0B FULL_RESET is the cure.
     --trace N       dump the last N instructions if something goes wrong
     --max N         instruction budget (default 200 million)
 """
@@ -155,9 +192,48 @@ class Machine:
     def raw_write(self, addr, val):
         self.mem[addr & 0xFFFF] = val & 0xFF
 
+    # --bus-fault: which kind, how often, and how many window accesses have
+    # gone by. Class attributes so an instance that predates the option
+    # still behaves.
+    bus_fault_kind = None
+    bus_fault_every = 0
+    bus_fault_n = 0
+    bus_fault_until = -1
+
+    # True on the Nth access to the gpu64 register window. REU's own
+    # $DF00-$DF0A is excluded: the firmware's decode for it is a different
+    # path with different (worse) known defects, and nothing here models
+    # those.
+    def bus_fault(self, off):
+        if not self.bus_fault_kind or off < 0x0B:
+            return False
+        # --bus-fault-until stops the injection partway through the run, so
+        # that what the tail of the run shows is whether the program REPAIRED
+        # the damage, not whether it is still being damaged. Without it a
+        # faulted run and a clean run can only ever be different, and the
+        # state refresh ring (docs/state-refresh.md) cannot be told from a
+        # program that has no refresh at all.
+        if self.bus_fault_until >= 0 and self.frame > self.bus_fault_until:
+            return False
+        self.bus_fault_n += 1
+        return self.bus_fault_n % self.bus_fault_every == 0
+
+    # Which kind this particular injected fault is. Only 'both' has to
+    # decide; it alternates, so a run produces roughly equal numbers of each
+    # and a probe cannot pass by guessing.
+    def bus_fault_now(self):
+        if self.bus_fault_kind != 'both':
+            return self.bus_fault_kind
+        return 'drop' if (self.bus_fault_n // self.bus_fault_every) % 2 else 'addr'
+
     def read(self, addr):
         if 0xDF00 <= addr <= 0xDFFF:
-            return self.gpu.read_reg(addr - IO2)
+            off = addr - IO2
+            if self.bus_fault(off):
+                if self.bus_fault_now() == 'drop':
+                    return 0xFF             # a floating bus, uncounted
+                return self.gpu.read_reg_missampled(off)
+            return self.gpu.read_reg(off)
         if addr == 0xDC01:
             return self.keyboard()
         if addr == 0xDC00:
@@ -207,11 +283,16 @@ class Machine:
             # A page flip is the frame boundary, and it is the only one a
             # demo tells us about. Sample on the way in, while the page that
             # was just drawn is still the draw page.
+            off = addr - IO2
+            if self.bus_fault(off):
+                if self.bus_fault_now() == 'addr':
+                    self.gpu.write_reg_missampled(off, val)
+                return                      # 'drop': nothing happened at all
             flip = (addr == 0xDF0C and self.gpu.cmd_hi == 0
                     and (val & 0xFF) == 0x05)
             if flip:
                 self.on_flip()
-            self.gpu.write_reg(addr - IO2, val)
+            self.gpu.write_reg(off, val)
             return
         self.mem[addr] = val & 0xFF
 
@@ -360,6 +441,23 @@ def main(argv):
     for o in opts:
         if o.startswith('--alias-drop='):
             gpu64model.ALIAS_DROP[0] = [int(x, 0) for x in o.split('=')[1].split(',')]
+    bus_fault_kind = None
+    bus_fault_every = 0
+    for o in opts:
+        if o.startswith('--bus-fault='):
+            kind, every = o.split('=', 1)[1].split(':', 1)
+            if kind not in ('drop', 'addr', 'both'):
+                print('--bus-fault kind must be drop, addr or both')
+                return 2
+            bus_fault_kind, bus_fault_every = kind, int(every, 0)
+            if bus_fault_every < 1:
+                print('--bus-fault interval must be at least 1')
+                return 2
+    bus_fault_until = -1
+    for o in opts:
+        if o.startswith('--bus-fault-until='):
+            bus_fault_until = int(o.split('=', 1)[1], 0)
+    dump_scene = '--dump-scene' in opts
     trace = 0
     max_insns = 200_000_000
     ppm = None
@@ -392,10 +490,29 @@ def main(argv):
             ppm = o.split('=', 1)[1]
         if o.startswith('--c1-stream='):
             c1_stream = o.split('=', 1)[1]
+    chain = [o.split('=', 1)[1] for o in opts if o.startswith('--chain=')]
 
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
                 key_script=key_script, c1_stream=c1_stream)
+    m.bus_fault_kind = bus_fault_kind
+    m.bus_fault_every = bus_fault_every
+    m.bus_fault_until = bus_fault_until
+    for prev in chain:
+        m.load_prg(prev)
+        ok, _ = m.run(0x0810, max_insns=max_insns, trace=trace)
+        if not ok:
+            print("chained %s did not return" % os.path.basename(prev),
+                  file=sys.stderr)
+            return 1
+        # Reset the C64 side of the harness -- the STOP budget, the frame
+        # counter, the captured screen -- and deliberately NOT m.gpu, which
+        # is the state under test.
+        m.stop_polls = 0
+        m.col7_reads = 0
+        m.frame = 0
+        m.done = False
+        m.final = None
     addr, size = m.load_prg(args[0])
     # A BASIC stub sits at $0801; the code itself starts at $0810.
     start = 0x0810
@@ -417,6 +534,25 @@ def main(argv):
     if m.c1_stream is not None:
         m.c1_stream.close()
         print("--- %d class-1 frames ---" % m.gpu.c1_frames)
+
+    if dump_scene:
+        # The retained scene as gpu64 actually holds it at the end of the
+        # run. This is the ground truth a dropped ARG or ID write corrupts:
+        # ERRCODE says OK, SEQACK matches, and one of these numbers is wrong
+        # forever. Diff two runs of this to see whether a refresh scheme
+        # converges.
+        print("--- scene ---")
+        live = [n for n in m.gpu.c1_scene.node if n.type != 0]
+        for n in sorted(live, key=lambda n: n.id):
+            print("node %3d type %d vis %d pos %11d %11d %11d "
+                  "ypr %5d %5d %5d scale %5d mesh %3d tex %3d "
+                  "spr %5d %5d %02x light %3d %5d"
+                  % (n.id, n.type, 1 if n.visible else 0,
+                     n.pos[0], n.pos[1], n.pos[2],
+                     n.yaw, n.pitch, n.roll, n.scale,
+                     n.mesh_id, n.tex_id,
+                     n.sprite_w, n.sprite_h, n.sprite_flags,
+                     n.light_strength, n.light_radius))
 
     if ppm is not None and ok:
         write_ppm(ppm, m.gpu)
