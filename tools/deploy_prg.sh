@@ -16,9 +16,16 @@
 # never touches anything that is not gpu64's: the games, the monitors, the
 # memory tester and readme.txt are left exactly where they are.
 #
+# It also puts build/e1m1.g64lev on the card as RAD/level.g64lev if that file
+# exists, because the level and the program that loads it are one deploy: the
+# card kept a stale level through a whole bench round once, and a level file
+# that disagrees with the demo looks like a rendering bug and not like a copy
+# that never happened.
+#
 # It does NOT build anything. Run tools/testprg.sh and tools/demos.sh first
 # if you want the .prg files to be current -- they are what assembles them.
-# The firmware image is tools/build.sh's job, not this one's.
+# tools/gen_quakelevel.py builds the level, and the firmware image is
+# tools/build.sh's job; neither is this one's.
 #
 # Usage:
 #   SDCARD=/media/you/SIDEKICK tools/deploy_prg.sh          # copy + prune
@@ -102,6 +109,30 @@ for f in "$DEST"/*; do
 	removed=$((removed + 1))
 done
 [ $removed -eq 0 ] && echo "    nothing stale"
+
+# The level. Verified by content, not by exit status: this is the file whose
+# staleness is invisible at the bench -- the demo loads whatever is there and
+# reports success.
+LEVEL_SRC="$REPO_ROOT/build/e1m1.g64lev"
+if [ -f "$LEVEL_SRC" ]; then
+	if [ ! -d "$SDCARD/RAD" ]; then
+		echo "warning: $SDCARD/RAD does not exist -- level not deployed" >&2
+	elif [ $DRY -eq 1 ]; then
+		echo "==> would copy $(basename "$LEVEL_SRC") to RAD/level.g64lev"
+	else
+		echo "==> copying $(basename "$LEVEL_SRC") to RAD/level.g64lev"
+		cp "$LEVEL_SRC" "$SDCARD/RAD/level.g64lev"
+		sync
+		if cmp -s "$LEVEL_SRC" "$SDCARD/RAD/level.g64lev"; then
+			echo "    $(stat -c%s "$LEVEL_SRC") bytes, verified"
+		else
+			echo "error: RAD/level.g64lev does not match the build" >&2
+			exit 1
+		fi
+	fi
+else
+	echo "==> no build/e1m1.g64lev -- level left as it is on the card"
+fi
 
 [ $DRY -eq 0 ] && sync
 echo "==> done"

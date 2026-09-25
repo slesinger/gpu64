@@ -100,6 +100,87 @@ for n in "${names[@]}"; do
 	extra=()
 	c1=0
 	case "$n" in
+	level)
+		# The whole level comes off the Pi's SD card, so the model needs
+		# the same file -- without it LOAD_LEVEL answers BAD_ARGS and the
+		# run proves only that the refusal path works. Built by
+		# tools/gen_quakelevel.py; skipped rather than failed, because a
+		# tree without a Quake BSP to convert is a normal state.
+		c1=1
+		if [ ! -f "$REPO_ROOT/build/e1m1.g64lev" ]; then
+			echo "skip  level      (no build/e1m1.g64lev -- run tools/gen_quakelevel.py)"
+			continue
+		fi
+		# The schedule used to have to be a tour that RETURNS --
+		# every walk paired with its own reverse, because nothing
+		# stopped the camera leaving the map and the first schedule
+		# tried here flew out through a wall by frame 500 and spent
+		# the remaining thousand frames photographing the black
+		# outside of it. CLIP_MOVE ($15) is what changed that: the
+		# walls hold the player in now, so this is an ordinary walk
+		# and a wrong turn costs a dull frame rather than an empty
+		# one.
+		#
+		# It is still worth keeping the walks at the front. Forward
+		# at the start is +z and the corridor runs that way, so the
+		# first few hundred frames are the ones a reader can check
+		# against the level; the later stretches walk into walls on
+		# purpose, which is now a test rather than an escape.
+		extra=(--level="$REPO_ROOT/build/e1m1.g64lev"
+		       --key=W:20-260
+		       --key=A:280-340 --key=W:360-520
+		       --key=D:540-660 --key=W:680-840
+		       --key=Q:860-920
+		       --key=D:940-1000 --key=W:1020-1180
+		       --key=SPACE:1020-1180
+		       --key=S:1200-1300
+		       --key=A:1320-1450 --key=W:1320-1450)
+		;;
+	game)
+		# The doors demo needs the same level file the level demo
+		# does, and for the same reason.
+		c1=1
+		if [ ! -f "$REPO_ROOT/build/e1m1.g64lev" ]; then
+			echo "skip  game       (no build/e1m1.g64lev -- run tools/gen_quakelevel.py)"
+			continue
+		fi
+		# This schedule is not a tour: it is a ROUTE, and it was not
+		# written by hand. Walking to a door means getting past the
+		# geometry in between, and the three key ranges below were
+		# found by flooding E1M1's reachable space with the firmware's
+		# own trace (tools/hostsim/libclipmove.so, the library prgsim
+		# already calls) and taking the shortest path to each of three
+		# things worth touching:
+		#
+		#   the func_door_secret at 21.5 2.5 1.75, which opens on
+		#   being walked into;
+		#   the double door at 7.25 2 17.6, the level's first proper
+		#   door; and
+		#   the func_button at -2 1.5 18, whose target is a door on
+		#   the far side of the room -- the one touch in the run that
+		#   proves the target/targetname wiring rather than a
+		#   proximity test.
+		#
+		# It walks with left SHIFT (run) held throughout, so a frame
+		# is 0.53 world units and the whole route fits in four hundred
+		# of them. Each leg ends with ninety frames of standing still,
+		# which is what the assertions below are timed against. SPACE
+		# is the jump.
+		#
+		# The last leg presses the button and then steps back out with
+		# E. The door the button opens is the floor under the button
+		# and it lowers; a player left standing on it rides it down, is
+		# lifted out when it shuts (the demo climbs a player out of a
+		# shut mover since run 39), lands back inside the button and
+		# presses it again. The route used to stay, and every earlier
+		# build then sat inside the shut door for the rest of the run.
+		extra=(--level="$REPO_ROOT/build/e1m1.g64lev"
+		       --key=LSHIFT:20-426
+		       --key=W:20-43 --key=E:44-55
+		       --key=W:154-168 --key=Q:169-172
+		       --key=W:173-187 --key=Q:188-207
+		       --key=Q:308-324 --key=E:326-340)
+		;;
 	quake3d)
 		c1=1
 		extra=(--key=W:20-260 --key=A:120-200 --key=D:300-420
@@ -165,6 +246,27 @@ for n in "${names[@]}"; do
 			last=$(ls "$OUTDIR/$n.c1"/frame*.ppm 2>/dev/null | tail -1)
 			[ -n "$last" ] && cp "$last" "$OUTDIR/$n.ppm"
 		fi
+	fi
+
+	# The one demo that asserts something. Everything else here is
+	# checked by looking at the PPM, which cannot distinguish a door
+	# that opens from a door painted open -- see tools/check_game.py.
+	# The frames are the route's own: 110 is while the player stands in
+	# the secret door, 230 in the double doorway, 340 just after the
+	# button was pressed, and by 400 the door it opened has to have
+	# closed again.
+	if [ $bad -eq 0 ] && [ "$n" = "game" ]; then
+		for check in "110 310" "230 14" "340 29" "400 29 --shut"; do
+			set -- $check
+			if ! gout=$( python3 "$REPO_ROOT/tools/check_game.py" 					--prg="$prg" 					--level="$REPO_ROOT/build/e1m1.g64lev" 					--frame="$1" --ent="$2" ${3:-} 					"${extra[@]}" 2>&1 ); then
+				echo "GAME CHECK FAIL  $n"
+				echo "$gout"
+				bad=1
+				fail=1
+			else
+				[ $verbose -eq 1 ] && echo "$gout"
+			fi
+		done
 	fi
 
 	# The launch-order check. The chained-after program is whichever

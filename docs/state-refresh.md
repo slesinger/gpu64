@@ -212,6 +212,41 @@ leaves an orphan behind. In a 256-slot table with a handful of tenants that is
 cheaper to leave than to detect. If you do want to detect it, `ARENA_STATUS`
 and a node count are how.
 
+## A level the Pi built
+
+A level loaded with `LOAD_LEVEL` turns both of the rules above upside down.
+Its nodes, their meshes, their positions and its palette were put there by the
+Pi out of a file on its SD card, and your program holds a copy of none of it —
+so there is no shadow to refresh from. Two opcodes ask the Pi to refresh from
+the file instead:
+
+- **`LEVEL_NODE` ($1C)**, one node per call. It puts back the node's type, its
+  mesh, its visibility, scale and orientation, and with `ARG0` bit 0 its
+  position. Run it over the level's node ids on a ring, one a frame; the first
+  id past the end answers `BAD_ID`, which is where your ring wraps. Clear bit 0
+  for a node you move yourself — a door's position is yours, and the file's is
+  the closed one.
+- **`LEVEL_PALETTE` ($17)**, no arguments. It puts back any palette entries
+  that differ from the level's.
+
+Both answer 0 in `RESULT` when nothing was wrong, and cost next to nothing
+then, so there is no reason to call them only when something looks off.
+
+These exist because of what the E1M1 demo's first bench session showed:
+**creation is not only a setup-time risk.** Every `CREATE_*` replaces a live id,
+and a single flipped bit in `CMD_LO` turns a `SET_POSITION` ($30) into
+`CREATE_OBJECT` ($20), a `SET_ORIENTATION` ($31) into `CREATE_CAMERA` ($21), a
+`SET_VISIBLE` ($24) into `CREATE_SPRITE` ($25). With the id intact it lands on
+the node you meant; with a flipped `ID_LO` it lands on a wall. Either way the
+node is now a different kind of node, and no transform ever turns it back.
+A flipped `CMD_HI` is the same story in class 0: `SET_POSITION` becomes
+`PAL_SET` and a palette entry becomes a coordinate.
+
+Your own camera is exposed the same way, and it is yours to repair. If a
+periodic `SET_ACTIVE_CAMERA` answers `BAD_ID`, the node is no longer a camera:
+`CREATE_CAMERA` it again, re-activate it, and send its position and
+orientation before the frame is committed.
+
 ## The same idea for replies
 
 A read that is not serviced returns the last value on the bus, not an answer.

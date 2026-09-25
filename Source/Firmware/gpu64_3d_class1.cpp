@@ -33,6 +33,7 @@
 #include "gpu64_fb.h"
 #include "gpu64_vsync.h"
 #include "gpu64_apidiag.h"
+#include "gpu64_level.h"
 #include "lowlevel_arm64.h"
 #include <circle/util.h>
 
@@ -293,10 +294,28 @@ static boolean isShadowRedirectable( u8 op )
 	case GPU64_3D_OP_ROTATE_LOCAL:
 	case GPU64_3D_OP_SET_SCALE:
 	case GPU64_3D_OP_GET_TRANSFORM:
+	case GPU64_3D_OP_LEVEL_PALETTE:		// colormap via stateTargetForEdit()
+	case GPU64_3D_OP_LEVEL_NODE:		// scene via sceneTarget()
 		return TRUE;
 	default:
 		return FALSE;
 	}
+}
+
+// The drain gpu64_3dDispatch() skips is the same one either way, but the
+// reason differs, so it is a second predicate rather than another arm of the
+// list above. An isShadowRedirectable() opcode is exempt because its writes go
+// somewhere core 1 is not reading; CLIP_MOVE and LEVEL_ENT are exempt because
+// they do not write gpu64 state at all -- they read the level file, which is
+// immutable once loaded, and write the caller's own C64 memory. Making a
+// movement query wait for a frame to finish would put a whole render on the
+// critical path of every step the player takes, which is the opposite of what
+// the query is for.
+static boolean isDrainExempt( u8 op )
+{
+	return isShadowRedirectable( op ) ||
+	       op == GPU64_3D_OP_CLIP_MOVE ||
+	       op == GPU64_3D_OP_LEVEL_ENT;
 }
 
 // --- lifecycle ----------------------------------------------------------
@@ -309,6 +328,11 @@ static boolean isShadowRedirectable( u8 op )
 // backward across it. pollLoopFrame() is Stage 16's non-blocking counterpart
 // -- same forward-reference reason.
 static boolean drainAndFlush( void );
+// Milestone 18: disarms a level load in progress. Forward-declared for the
+// same reason as drainAndFlush() above -- gpu64_3dReset() and SCENE_RESET both
+// have to abandon a half-built level, and the loader itself is defined further
+// down with the resource table it uses.
+static void levelLoadAbort( void );
 // always_inline so gpu64_3dPollLoopFrame() below is self-contained: the
 // vsync commit warms exactly one address range for it (gpu64_vsyncWarmCommit()
 // in rad_reu.cpp), and a call out to a separate body 2.4 KB away would sit
@@ -386,6 +410,11 @@ void gpu64_3dReset( void )
 	gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
 	gpu64_3dStateDefaults( &s_ShadowState );
 	gpu64_3dSceneReset( &s_ShadowScene );
+
+	// A level load in flight must not survive the session that armed it: its
+	// parsed tables are still valid (the file buffer is untouched) but the
+	// arena it was building into has just been reset under it.
+	levelLoadAbort();
 
 	memset( &gpu64_3dHost, 0, sizeof( gpu64_3dHost ) );
 }
@@ -593,6 +622,737 @@ static u8 opFreeResource( void )
 
 	// Table slot only -- see resSlot() on why the bytes stay allocated.
 	pR->type = GPU64_3D_RES_NONE;
+	return GPU64_ERR_OK;
+}
+
+// --- milestone 18: the level loader -------------------------------------
+//
+// LOAD_LEVEL/LEVEL_STEP turn the .g64lev file the Pi read off its own SD card
+// at start-up (gpu64_level.cpp) into textures, meshes and object nodes. It
+// lives here rather than in gpu64_level.cpp because this is the file that
+// owns the resource table, the arena allocator and the scene -- the parser
+// deliberately knows about none of them.
+//
+// Why it is sliced. Building E1M1 is 66 textures, 108 meshes and 108 nodes;
+// done in one command the C64 would be DMA-halted for the whole of it, and if
+// anything in the middle failed the only reading would be one ERRCODE with no
+// way to say which of 282 items produced it. One bounded slice per command
+// gives both a loading bar and a per-item failure address, and keeps each
+// hold in the same range as the 64 KB REU transfers this cartridge already
+// does routinely.
+//
+// Why no SD access here. reuUsingPolling() is running: an EMMC transfer's
+// MMIO traffic would wreck core 0's per-C64-cycle bus timing the same way a
+// second core spinning on a register does (CLAUDE.md, "Multicore"). The file
+// is therefore already in RAM before the polling loop ever starts, and this
+// code only ever reads memory.
+//
+// Why not on core 1. The arena allocator is core-0-owned and unlocked, so a
+// core-1 build would race any concurrent UPLOAD_MESH; and a startup-time
+// build would not survive anyway, since gpu64_3dReset() wipes s_Res, the
+// arena, s_State and s_Scene at every session reset. The load has to be
+// C64-triggerable, and it has to be here.
+
+// Bytes of source blob a single LEVEL_STEP will consume before it returns.
+// 16 KB is roughly one 128x128 texture with its mip chain, or a dozen meshes;
+// at E1M1's 620 KB that is about 40 commands for the whole level.
+#define GPU64_LEVEL_SLICE_BYTES		16384
+
+// Eye height above an entity's origin, in Quake units -- Quake's own view_ofs.
+// At 32 units per world unit this is not negligible: without it the camera
+// sits at knee height and the floor fills half the frame.
+#define GPU64_LEVEL_EYE_QU		22
+
+enum Gpu64_LevelPhase
+{
+	GPU64_LEVELPH_IDLE = 0,
+	GPU64_LEVELPH_PALETTE,
+	GPU64_LEVELPH_TEXTURES,
+	GPU64_LEVELPH_MESHES,
+	GPU64_LEVELPH_NODES,
+	GPU64_LEVELPH_CAMERA,
+	GPU64_LEVELPH_DONE
+};
+
+static struct
+{
+	Gpu64_Level	lev;
+	u8		phase;
+	u16		index;		// item within the phase
+	u16		nMeshBase;	// mesh resource ids are nMeshBase + i
+	u16		nNodeBase;	// object node ids are nNodeBase + i
+	u16		nCameraId;	// 0 = do not create one
+	u32		nTotalItems;	// for the percentage only
+	u32		nDoneItems;
+}
+s_Load;
+
+// Textures are the one namespace the loader cannot choose. A face record's
+// texture id is a single byte (Gpu64_3dFaceWire.texid) which the renderer
+// passes straight to lookupTexture(), so texture resource id i must equal the
+// dense table index i the converter wrote into those bytes. Documented rather
+// than parameterised: a mesh base is a free choice, a texture base is not.
+static u8 levelBuildTexture( unsigned i, u32 *pBytes )
+{
+	const u8 *pR = s_Load.lev.pTexTab + i * GPU64_LEVEL_TEX_STRIDE;
+	// pR[0..1] is the source BSP miptex index, provenance only -- the
+	// resource id is i, per the note above.
+	const u8  ws = pR[ 2 ], hs = pR[ 3 ];
+	const u32 off = gpu64_levelRd32( pR + 4 ), len = gpu64_levelRd32( pR + 8 );
+
+	const u8 *pPix = gpu64_levelBlob( &s_Load.lev, off, len );
+	if ( pPix == 0 )
+		return GPU64_ERR_BAD_ARGS;
+
+	Gpu64_3dResource *pSlot = resSlot( (u16)i );
+	if ( pSlot == 0 )
+		return GPU64_ERR_OUT_OF_MEMORY;
+
+	Gpu64_3dTexture tex;
+	const u8 res = gpu64_3dBuildTexture( &tex, pPix, len, ws, hs, arenaAllocFn, 0 );
+	if ( res != GPU64_3D_OK )
+		return res;
+
+	pSlot->id   = (u16)i;
+	pSlot->type = GPU64_3D_RES_TEXTURE;
+	pSlot->tex  = tex;
+	*pBytes = len;
+	return GPU64_ERR_OK;
+}
+
+static u8 levelBuildMesh( unsigned i, u32 *pBytes )
+{
+	const u8 *pR = s_Load.lev.pMeshTab + i * GPU64_LEVEL_MESH_STRIDE;
+	const u32 vo = gpu64_levelRd32( pR ),      vl = gpu64_levelRd32( pR + 4 );
+	const u32 fo = gpu64_levelRd32( pR + 8 ),  fl = gpu64_levelRd32( pR + 12 );
+
+	const u8 *pV = gpu64_levelBlob( &s_Load.lev, vo, vl );
+	const u8 *pF = gpu64_levelBlob( &s_Load.lev, fo, fl );
+	if ( pV == 0 || pF == 0 )
+		return GPU64_ERR_BAD_ARGS;
+
+	const u16 id = (u16)( s_Load.nMeshBase + i );
+	Gpu64_3dResource *pSlot = resSlot( id );
+	if ( pSlot == 0 )
+		return GPU64_ERR_OUT_OF_MEMORY;
+
+	// Straight from the file, not via s_StageA/s_StageB: the blob is already
+	// in RAM and gpu64_3dBuildMesh() only reads it. UPLOAD_MESH stages
+	// because its source is REU space, which has to be DMAd across first.
+	Gpu64_3dMesh mesh;
+	const u8 res = gpu64_3dBuildMesh( &mesh, pV, vl, pF, fl, arenaAllocFn, 0 );
+	if ( res != GPU64_3D_OK )
+		return res;
+
+	pSlot->id   = id;
+	pSlot->type = GPU64_3D_RES_MESH;
+	pSlot->mesh = mesh;
+	*pBytes = vl + fl;
+	return GPU64_ERR_OK;
+}
+
+static u8 levelBuildNode( unsigned i )
+{
+	const u8 *pR = s_Load.lev.pNodeTab + i * GPU64_LEVEL_NODE_STRIDE;
+	const u16 nMesh = gpu64_levelRd16( pR );
+	if ( nMesh >= s_Load.lev.nMesh )
+		return GPU64_ERR_BAD_ARGS;
+
+	Gpu64_3dVec pos;
+	pos.x = gpu64_levelRdS32( pR + 2 );
+	pos.y = gpu64_levelRdS32( pR + 6 );
+	pos.z = gpu64_levelRdS32( pR + 10 );
+
+	const u16 id = (u16)( s_Load.nNodeBase + i );
+
+	// OUT_OF_MEMORY here is a capacity answer the converter needs, not a
+	// crash: a level can want more chunks than GPU64_3D_MAX_NODES holds, and
+	// the honest report is which node number ran out.
+	const u8 res = gpu64_3dSceneCreateObject( &s_Scene, id,
+						   (u16)( s_Load.nMeshBase + nMesh ) );
+	if ( res != GPU64_3D_OK )
+		return res;
+
+	return gpu64_3dSceneSetPosition( &s_Scene, id, &pos );
+}
+
+// info_player_start, converted to an eye position and a gpu64 yaw. FALSE if
+// the level has none, which check_g64lev.py already refuses to emit.
+static boolean levelPlayerStart( Gpu64_3dVec *pPos, u16 *pYaw )
+{
+	for ( unsigned i = 0; i < s_Load.lev.nEnt; i++ )
+	{
+		Gpu64_LevelEnt e;
+		if ( !gpu64_levelEnt( &s_Load.lev, i, &e ) )
+			continue;
+		if ( strcmp( e.pClassName, "info_player_start" ) != 0 )
+			continue;
+
+		pPos->x = e.x;
+		pPos->y = e.y + (s32)( GPU64_LEVEL_EYE_QU * 65536 / s_Load.lev.nScale );
+		pPos->z = e.z;
+		*pYaw   = e.nYaw;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+// The camera phase. Creating it here rather than leaving it to the caller is
+// what makes a level self-describing: info_player_start is in the file, and a
+// program that had to find it would need the entity table on the C64 side.
+// ARG4-5 = 0 opts out, for a caller that wants to place its own camera.
+static u8 levelPhaseCamera( void )
+{
+	if ( s_Load.nCameraId == 0 )
+		return GPU64_ERR_OK;
+
+	Gpu64_3dVec pos;
+	u16 yaw;
+	if ( !levelPlayerStart( &pos, &yaw ) )
+		return GPU64_ERR_BAD_ARGS;	// no info_player_start in the file
+
+	u8 res = gpu64_3dSceneCreateCamera( &s_Scene, s_Load.nCameraId );
+	if ( res != GPU64_3D_OK )
+		return res;
+	res = gpu64_3dSceneSetPosition( &s_Scene, s_Load.nCameraId, &pos );
+	if ( res != GPU64_3D_OK )
+		return res;
+	res = gpu64_3dSceneSetOrientation( &s_Scene, s_Load.nCameraId, yaw, 0, 0 );
+	if ( res != GPU64_3D_OK )
+		return res;
+	return gpu64_3dSceneSetActiveCamera( &s_Scene, s_Load.nCameraId );
+}
+
+// The palette the level travels with, installed into the framebuffer and then
+// turned into the shade ramp. A level's texels are Quake palette indices, so
+// without both of these the scene renders through the C64's sixteen colours
+// and looks like noise.
+static u8 levelPhasePalette( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 )
+		return GPU64_ERR_UNSUPPORTED;
+
+	const u8 *pPal = gpu64_levelBlob( &s_Load.lev, s_Load.lev.nPalOff, 768 );
+	if ( pPal == 0 )
+		return GPU64_ERR_BAD_ARGS;	// gpu64_levelParse() already checked
+
+	for ( unsigned i = 0; i < 256; i++ )
+		pFB->SetPaletteEntry( (u8)i, pPal[ i * 3 ], pPal[ i * 3 + 1 ], pPal[ i * 3 + 2 ] );
+
+	// SetPaletteEntry() updates the shadow and Circle's copy; only
+	// CommitPalette() pushes it to the VideoCore, which is why PAL_SET and
+	// PAL_LOAD both call it. Omitting it here cost bench run 33: the
+	// colormap was right, the geometry was right, and the display was still
+	// showing the boot palette -- the C64 sixteen in 0-15, black in 16-254
+	// and white at GPU64_LOG_INK -- so E1M1 rendered as a black screen with
+	// two white bars where index 255 happened to land. No host sim can
+	// catch this: hostsim, scenesim and levelsim all resolve indices
+	// through their own palette array and have no VideoCore to be out of
+	// step with.
+	pFB->CommitPalette();
+
+	gpu64_3dBuildColormap( &s_State, pFB->GetPaletteRGB() );
+	return GPU64_ERR_OK;
+}
+
+static void levelLoadAbort( void )
+{
+	s_Load.phase = GPU64_LEVELPH_IDLE;
+}
+
+static u8 opLoadLevel( void )
+{
+	// Keyed by the gate in execute(), like SCENE_RESET -- this wipes the
+	// resource table and the scene.
+	if ( s_LoopRunning )
+		return GPU64_ERR_BUSY;		// the shadow scene cannot take a whole level
+
+	if ( gpu64LevelFileBytes == 0 )
+		return GPU64_ERR_BAD_ARGS;	// no level file on the card
+
+	memset( &s_Load, 0, sizeof( s_Load ) );
+
+	if ( !gpu64_levelParse( &s_Load.lev, gpu64LevelFile, gpu64LevelFileBytes ) )
+		return GPU64_ERR_BAD_ARGS;
+
+	s_Load.nMeshBase = argU16( 0 );
+	s_Load.nNodeBase = argU16( 2 );
+	s_Load.nCameraId = argU16( 4 );
+
+	// The mesh ids must not collide with the texture ids, which the face
+	// format pins to 0..nTex-1 (see levelBuildTexture). Refusing beats
+	// silently overwriting a texture with a mesh in the same slot.
+	if ( s_Load.nMeshBase < s_Load.lev.nTex )
+		return GPU64_ERR_BAD_ARGS;
+	if ( (u32)s_Load.nMeshBase + s_Load.lev.nMesh > 0x10000 )
+		return GPU64_ERR_BAD_ARGS;
+	if ( (u32)s_Load.nNodeBase + s_Load.lev.nNode > 0x10000 )
+		return GPU64_ERR_BAD_ARGS;
+	if ( s_Load.nCameraId != 0 &&
+	     s_Load.nCameraId >= s_Load.nNodeBase &&
+	     s_Load.nCameraId <  s_Load.nNodeBase + s_Load.lev.nNode )
+		return GPU64_ERR_BAD_ARGS;	// the camera id is inside the node range
+
+	// A fresh table and a fresh scene, exactly as SCENE_RESET leaves them
+	// plus the arena: a second LOAD_LEVEL in one session would otherwise
+	// leak the first level's 20-odd MB and then answer OUT_OF_MEMORY.
+	gpu64_3dArenaReset();
+	memset( s_Res, 0, sizeof( s_Res ) );
+	gpu64_3dSceneReset( &s_Scene );
+	gpu64_3dSceneReset( &s_ShadowScene );
+
+	// s_State is deliberately NOT reset. The viewport, fov and near/far
+	// planes belong to the caller, who has to set them before the load
+	// anyway (the view they want exists before the level does) and would
+	// otherwise have to discover that LOAD_LEVEL silently undid them. The
+	// only state this load writes is the colormap, in the palette phase.
+
+	s_Load.phase       = GPU64_LEVELPH_PALETTE;
+	s_Load.nTotalItems = 1 + s_Load.lev.nTex + s_Load.lev.nMesh + s_Load.lev.nNode + 1;
+
+	gpu64Regs.result = 0;
+	return GPU64_ERR_OK;
+}
+
+static u8 opLevelStep( void )
+{
+	if ( s_Load.phase == GPU64_LEVELPH_IDLE )
+		return GPU64_ERR_BAD_ARGS;	// LEVEL_STEP without a LOAD_LEVEL
+
+	// Refused for the same reason LOAD_LEVEL is, and not left to the
+	// dispatcher's drain: a step creates nodes in s_Scene, which is the state
+	// GPU64_3D_OP_RENDER_SCENE reads on core 1. The drain proves the frame in
+	// flight has finished but says nothing about the next one, and a client
+	// that starts the loop halfway through a load should be told so rather
+	// than have half a level appear.
+	if ( s_LoopRunning )
+		return GPU64_ERR_BUSY;
+
+	if ( s_Load.phase == GPU64_LEVELPH_DONE )
+	{
+		gpu64Regs.result = GPU64_3D_LEVEL_DONE;
+		return GPU64_ERR_OK;		// idempotent: a lost RESULT read can retry
+	}
+
+	u32 nBudget = GPU64_LEVEL_SLICE_BYTES;
+
+	// At least one item per call even if it is over budget on its own,
+	// otherwise a single 128x128 texture would stall the load forever.
+	while ( s_Load.phase != GPU64_LEVELPH_DONE )
+	{
+		u32 nBytes = 0;
+		u8  res    = GPU64_ERR_OK;
+
+		switch ( s_Load.phase )
+		{
+		case GPU64_LEVELPH_PALETTE:
+			res    = levelPhasePalette();
+			nBytes = 768;
+			break;
+
+		case GPU64_LEVELPH_TEXTURES:
+			res = levelBuildTexture( s_Load.index, &nBytes );
+			break;
+
+		case GPU64_LEVELPH_MESHES:
+			res = levelBuildMesh( s_Load.index, &nBytes );
+			break;
+
+		case GPU64_LEVELPH_NODES:
+			res    = levelBuildNode( s_Load.index );
+			nBytes = 64;			// bookkeeping, not data
+			break;
+
+		case GPU64_LEVELPH_CAMERA:
+			res    = levelPhaseCamera();
+			nBytes = 64;
+			break;
+		}
+
+		if ( res != GPU64_ERR_OK )
+		{
+			// The failing item's number, so a failure names its address
+			// instead of just its kind. The phase stays where it is: a
+			// retry re-attempts the same item rather than skipping it.
+			gpu64Regs.result = (u8)s_Load.index;
+			s_Load.phase = GPU64_LEVELPH_IDLE;
+			return res;
+		}
+
+		s_Load.nDoneItems++;
+		s_Load.index++;
+
+		// Advance the phase when its table is exhausted. The single-item
+		// phases fall through on the first increment.
+		switch ( s_Load.phase )
+		{
+		case GPU64_LEVELPH_PALETTE:
+			s_Load.phase = GPU64_LEVELPH_TEXTURES;
+			s_Load.index = 0;
+			break;
+		case GPU64_LEVELPH_TEXTURES:
+			if ( s_Load.index >= s_Load.lev.nTex )
+			{
+				s_Load.phase = GPU64_LEVELPH_MESHES;
+				s_Load.index = 0;
+			}
+			break;
+		case GPU64_LEVELPH_MESHES:
+			if ( s_Load.index >= s_Load.lev.nMesh )
+			{
+				s_Load.phase = GPU64_LEVELPH_NODES;
+				s_Load.index = 0;
+			}
+			break;
+		case GPU64_LEVELPH_NODES:
+			if ( s_Load.index >= s_Load.lev.nNode )
+			{
+				s_Load.phase = GPU64_LEVELPH_CAMERA;
+				s_Load.index = 0;
+			}
+			break;
+		case GPU64_LEVELPH_CAMERA:
+			s_Load.phase = GPU64_LEVELPH_DONE;
+			break;
+		}
+
+		if ( nBytes >= nBudget )
+			break;
+		nBudget -= nBytes;
+	}
+
+	if ( s_Load.phase == GPU64_LEVELPH_DONE )
+	{
+		gpu64Regs.result = GPU64_3D_LEVEL_DONE;
+		return GPU64_ERR_OK;
+	}
+
+	// Percent, clamped to 99 so that only GPU64_3D_LEVEL_DONE ever means
+	// finished -- see the constant's comment.
+	u32 pct = s_Load.nTotalItems ? s_Load.nDoneItems * 100 / s_Load.nTotalItems : 0;
+	gpu64Regs.result = (u8)( pct > 99 ? 99 : pct );
+	return GPU64_ERR_OK;
+}
+
+// --- milestone 18: collision -------------------------------------------
+//
+// CLIP_MOVE is a pure function of the level file and the caller's block, so
+// unlike LOAD_LEVEL and LEVEL_STEP it does not refuse while the render loop
+// is running: it touches neither s_Scene nor the resource table. It is also
+// unkeyed -- see the block layout and the reasoning in gpu64_3d.h.
+
+static inline s32 blkS32( const u8 *p )
+{
+	return (s32)( (u32)p[ 0 ] | ( (u32)p[ 1 ] << 8 ) |
+		      ( (u32)p[ 2 ] << 16 ) | ( (u32)p[ 3 ] << 24 ) );
+}
+
+static inline void blkPutS32( u8 *p, s32 v )
+{
+	p[ 0 ] = (u8)( (u32)v       );
+	p[ 1 ] = (u8)( (u32)v >>  8 );
+	p[ 2 ] = (u8)( (u32)v >> 16 );
+	p[ 3 ] = (u8)( (u32)v >> 24 );
+}
+
+static inline void blkPut16( u8 *p, u16 v )
+{
+	p[ 0 ] = (u8)( v      );
+	p[ 1 ] = (u8)( v >> 8 );
+}
+
+static inline u8 blkXor( const u8 *p, unsigned n )
+{
+	u8 x = 0;
+	for ( unsigned i = 0; i < n; i++ )
+		x = (u8)( x ^ p[ i ] );
+	return x;
+}
+
+static u8 opClipMove( void )
+{
+	// The wire's limit and the tracer's are the same number in two headers.
+	typedef char moverLimitsAgree[
+		GPU64_3D_CLIPMOVE_MAX_MOVERS == GPU64_LEVEL_MAX_MOVERS ? 1 : -1 ];
+	( void )sizeof( moverLimitsAgree );
+
+	u8 space;
+	u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+
+	if ( len < GPU64_3D_CLIPMOVE_BYTES )
+		return GPU64_ERR_BAD_ARGS;
+	// Nothing to trace against until the load has finished. BAD_ARGS is what
+	// LEVEL_STEP-without-LOAD_LEVEL returns, for the same reason.
+	if ( s_Load.phase != GPU64_LEVELPH_DONE )
+		return GPU64_ERR_BAD_ARGS;
+
+	u8 blk[ GPU64_3D_CLIPMOVE_IN_BYTES ];
+	u8 res = gpu64_blobRead( space, addr, GPU64_3D_CLIPMOVE_IN_BYTES, blk );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	if ( blk[ 27 ] != GPU64_3D_CLIPMOVE_MAGIC_IN )
+		return GPU64_ERR_BAD_ARGS;
+
+	// The mover list, if there is one. It is a second burst rather than one
+	// long read because the records sit past the output half and their count
+	// is in the first burst; the block was laid out that way so the Pi's
+	// answer never has to move when a caller adds doors.
+	unsigned nMovers = blk[ 29 ];
+	u8 mvb[ GPU64_3D_CLIPMOVE_MAX_MOVERS * GPU64_3D_CLIPMOVE_MOVER_BYTES ];
+	unsigned nMvBytes = nMovers * GPU64_3D_CLIPMOVE_MOVER_BYTES;
+	if ( nMovers > GPU64_3D_CLIPMOVE_MAX_MOVERS )
+		return GPU64_ERR_BAD_ARGS;
+	if ( len < GPU64_3D_CLIPMOVE_MOVER_OFF + nMvBytes )
+		return GPU64_ERR_BAD_ARGS;
+	if ( nMvBytes != 0 )
+	{
+		res = gpu64_blobRead( space, addr + GPU64_3D_CLIPMOVE_MOVER_OFF,
+				      nMvBytes, mvb );
+		if ( res != GPU64_ERR_OK ) return res;
+	}
+
+	// Then the checksum, over both bursts. Either it or the magic failing
+	// means the DMA lost a byte or the caller never filled the block in, and
+	// in both cases the right answer is to write nothing at all and let the
+	// C64 retry: a half-trusted position would be a teleport, and a mover
+	// record that lost its offset byte would be a door in the wrong place.
+	u8 chk = blkXor( blk, 28 ) ^ blk[ 29 ];
+	for ( unsigned i = 0; i < nMvBytes; i++ )
+		chk ^= mvb[ i ];
+	if ( chk != blk[ 28 ] )
+		return GPU64_ERR_BAD_ARGS;
+
+	Gpu64_LevelVec start, delta;
+	for ( unsigned k = 0; k < 3; k++ )
+	{
+		start.v[ k ] = blkS32( blk + 0  + k * 4 );
+		delta.v[ k ] = blkS32( blk + 12 + k * 4 );
+	}
+
+	Gpu64_LevelMover movers[ GPU64_3D_CLIPMOVE_MAX_MOVERS ];
+	for ( unsigned i = 0; i < nMovers; i++ )
+	{
+		const u8 *r = mvb + i * GPU64_3D_CLIPMOVE_MOVER_BYTES;
+		movers[ i ].nModel = r[ 0 ];
+		for ( unsigned k = 0; k < 3; k++ )
+			movers[ i ].ofs.v[ k ] = blkS32( r + 4 + k * 4 );
+	}
+
+	Gpu64_LevelMove mv;
+	if ( !gpu64_levelMoveEnts( &s_Load.lev, blk[ 26 ], blk[ 24 ], blk[ 25 ],
+				   &start, &delta, movers, nMovers, &mv ) )
+		return GPU64_ERR_BAD_ARGS;
+
+	u8 out[ GPU64_3D_CLIPMOVE_OUT_BYTES ];
+	memset( out, 0, sizeof( out ) );
+	for ( unsigned k = 0; k < 3; k++ )
+		blkPutS32( out + k * 4, mv.end.v[ k ] );
+	out[ 12 ] = mv.nFlags;
+	out[ 13 ] = mv.nContents;
+	out[ 14 ] = mv.nFraction;
+	out[ 15 ] = mv.nBumps;
+	out[ 16 ] = GPU64_3D_CLIPMOVE_MAGIC_OUT;
+	out[ 17 ] = blkXor( out, 17 );
+
+	res = gpu64_blobWrite( space, addr + GPU64_3D_CLIPMOVE_OUT_OFF,
+			       GPU64_3D_CLIPMOVE_OUT_BYTES, out );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	// A convenience only. RESULT is a single register read, and a failed
+	// register read returns whatever was last on the bus (gpu64-errcode-ff-
+	// is-the-bus), so the block's own checksum is the channel to trust.
+	gpu64Regs.result = mv.nFlags;
+	return GPU64_ERR_OK;
+}
+
+static u8 opLevelPalette( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 )
+		return GPU64_ERR_UNSUPPORTED;
+	if ( s_Load.phase != GPU64_LEVELPH_DONE )
+		return GPU64_ERR_BAD_ARGS;
+
+	const u8 *pPal = gpu64_levelBlob( &s_Load.lev, s_Load.lev.nPalOff, 768 );
+	if ( pPal == 0 )
+		return GPU64_ERR_BAD_ARGS;
+
+	const u8 *pNow = pFB->GetPaletteRGB();
+	unsigned nFixed = 0;
+	for ( unsigned i = 0; i < 256; i++ )
+	{
+		const u8 *p = pPal + i * 3;
+		const u8 *q = pNow + i * 3;
+		if ( p[ 0 ] == q[ 0 ] && p[ 1 ] == q[ 1 ] && p[ 2 ] == q[ 2 ] )
+			continue;
+		pFB->SetPaletteEntry( (u8)i, p[ 0 ], p[ 1 ], p[ 2 ] );
+		nFixed++;
+	}
+
+	// The common answer is that nothing was wrong, and then nothing else
+	// happens: no mailbox call, no colormap -- a refresh ring can afford it.
+	if ( nFixed != 0 )
+	{
+		pFB->CommitPalette();
+		gpu64_3dBuildColormap( stateTargetForEdit(), pFB->GetPaletteRGB() );
+	}
+
+	gpu64Regs.result = (u8)( nFixed > 255 ? 255 : nFixed );
+	return GPU64_ERR_OK;
+}
+
+// LEVEL_NODE: see gpu64_3d.h. The comparison is on the fields a phantom
+// can reach; anything wrong in them earns the node a full nodeDefaults()
+// via CreateObject, which is also what makes a camera or sprite an object
+// again.
+static u8 opLevelNode( void )
+{
+	if ( s_Load.phase != GPU64_LEVELPH_DONE )
+		return GPU64_ERR_BAD_ARGS;
+	if ( sArg[ 0 ] & ~1 )
+		return GPU64_ERR_BAD_ARGS;
+
+	const u16 id = stagedId();
+	const unsigned i = (u16)( id - s_Load.nNodeBase );
+	if ( id < s_Load.nNodeBase || i >= s_Load.lev.nNode )
+		return GPU64_ERR_BAD_ID;
+
+	const u8 *pR = s_Load.lev.pNodeTab + i * GPU64_LEVEL_NODE_STRIDE;
+	const u16 nMesh = gpu64_levelRd16( pR );
+	if ( nMesh >= s_Load.lev.nMesh )
+		return GPU64_ERR_BAD_ARGS;
+	const u16 meshId = (u16)( s_Load.nMeshBase + nMesh );
+
+	Gpu64_3dVec filePos;
+	filePos.x = gpu64_levelRdS32( pR + 2 );
+	filePos.y = gpu64_levelRdS32( pR + 6 );
+	filePos.z = gpu64_levelRdS32( pR + 10 );
+
+	Gpu64_3dScene *pS = sceneTarget();
+	Gpu64_3dNode *pN = gpu64_3dSceneFind( pS, id, GPU64_3D_NODE_NONE );
+	u8 nFixed = 0;
+
+	if ( pN == 0 || pN->type != GPU64_3D_NODE_OBJECT || pN->meshId != meshId ||
+	     !pN->visible || pN->scale != GPU64_FX8_ONE ||
+	     pN->yaw != 0 || pN->pitch != 0 || pN->roll != 0 )
+	{
+		// A destroyed node has no position worth keeping.
+		const Gpu64_3dVec keep = pN ? pN->pos : filePos;
+
+		if ( pS->bHaveActiveCamera && pS->activeCameraId == id )
+			pS->bHaveActiveCamera = FALSE;
+
+		const u8 res = gpu64_3dSceneCreateObject( pS, id, meshId );
+		if ( res != GPU64_3D_OK )
+			return res;
+		gpu64_3dSceneSetPosition( pS, id, &keep );
+		pN = gpu64_3dSceneFind( pS, id, GPU64_3D_NODE_OBJECT );
+		nFixed |= 1;
+	}
+
+	if ( ( sArg[ 0 ] & 1 ) &&
+	     ( pN->pos.x != filePos.x || pN->pos.y != filePos.y || pN->pos.z != filePos.z ) )
+	{
+		gpu64_3dSceneSetPosition( pS, id, &filePos );
+		nFixed |= 2;
+	}
+
+	gpu64Regs.result = nFixed;
+	return GPU64_ERR_OK;
+}
+
+// LEVEL_ENT: one entity record, pre-digested for a 6502. Same block
+// discipline as CLIP_MOVE, same two reasons for being unkeyed and
+// drain-exempt; the layout is in gpu64_3d.h.
+static u8 opLevelEnt( void )
+{
+	u8 space;
+	u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+
+	if ( len < GPU64_3D_LEVELENT_BYTES )
+		return GPU64_ERR_BAD_ARGS;
+	if ( s_Load.phase != GPU64_LEVELPH_DONE )
+		return GPU64_ERR_BAD_ARGS;
+
+	u8 blk[ GPU64_3D_LEVELENT_IN_BYTES ];
+	u8 res = gpu64_blobRead( space, addr, sizeof( blk ), blk );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	if ( blk[ 2 ] != GPU64_3D_LEVELENT_MAGIC_IN )
+		return GPU64_ERR_BAD_ARGS;
+	if ( blkXor( blk, 3 ) != blk[ 3 ] )
+		return GPU64_ERR_BAD_ARGS;
+
+	const unsigned nIndex = (unsigned)blk[ 0 ] | ( (unsigned)blk[ 1 ] << 8 );
+
+	Gpu64_LevelEnt e;
+	if ( !gpu64_levelEnt( &s_Load.lev, nIndex, &e ) )
+		return GPU64_ERR_OUT_OF_RANGE;
+
+	// The brush model's box, and the run of scene nodes its geometry was
+	// built into. Half of E1M1's brush models are trigger volumes, which
+	// the converter draws nothing for: those answer nodeCount 0 and are
+	// still perfectly usable, because a trigger is its box.
+	Gpu64_LevelHull hull;
+	boolean bHaveBox = e.nModelIdx != 0 &&
+			   gpu64_levelHull( &s_Load.lev, e.nModelIdx, &hull );
+
+	u16 nFirst = 0, nCount = 0;
+	if ( e.nModelIdx != 0 )
+	{
+		for ( unsigned i = 0; i < s_Load.lev.nNode; i++ )
+		{
+			u16 nModel;
+			if ( !gpu64_levelNode( &s_Load.lev, i, 0, 0, &nModel ) )
+				break;
+			if ( nModel != e.nModelIdx )
+				continue;
+			if ( nCount == 0 )
+				nFirst = (u16)( s_Load.nNodeBase + i );
+			if ( nCount < 255 )
+				nCount++;
+		}
+	}
+
+	u8 out[ GPU64_3D_LEVELENT_OUT_BYTES ];
+	memset( out, 0, sizeof( out ) );
+
+	blkPutS32( out +  0, e.x );
+	blkPutS32( out +  4, e.y );
+	blkPutS32( out +  8, e.z );
+	if ( bHaveBox )
+		for ( unsigned k = 0; k < 3; k++ )
+		{
+			blkPutS32( out + 12 + k * 4, hull.mins.v[ k ] );
+			blkPutS32( out + 24 + k * 4, hull.maxs.v[ k ] );
+		}
+	blkPutS32( out + 36, e.ofsX );
+	blkPutS32( out + 40, e.ofsY );
+	blkPutS32( out + 44, e.ofsZ );
+
+	blkPut16( out + 48, e.nYaw );
+	blkPut16( out + 50, e.nSpawnFlags );
+	blkPut16( out + 52, (u16)e.nParam0 );
+	blkPut16( out + 54, (u16)e.nParam1 );
+	blkPut16( out + 56, e.nTargetId );
+	blkPut16( out + 58, e.nTargetNameId );
+	blkPut16( out + 60, nFirst );
+	blkPut16( out + 62, s_Load.lev.nEnt );
+	out[ 64 ] = (u8)nCount;
+	out[ 65 ] = e.nKind;
+	out[ 66 ] = (u8)( e.nModelIdx > 255 ? 0 : e.nModelIdx );
+	out[ 67 ] = 0;
+	out[ 68 ] = GPU64_3D_LEVELENT_MAGIC_OUT;
+	out[ 69 ] = blkXor( out, 69 );
+
+	res = gpu64_blobWrite( space, addr + GPU64_3D_LEVELENT_OUT_OFF,
+			       GPU64_3D_LEVELENT_OUT_BYTES, out );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	gpu64Regs.result = e.nKind;
 	return GPU64_ERR_OK;
 }
 
@@ -1070,6 +1830,7 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_LOOP_STOP:
 	case GPU64_3D_OP_DESTROY_NODE:
 	case GPU64_3D_OP_FREE_RESOURCE:
+	case GPU64_3D_OP_LOAD_LEVEL:
 		if ( !gpu64_apiKeyed() )
 		{
 			// BAD_ARGS and not a silent OK: a caller whose ARG15 write was
@@ -1109,6 +1870,9 @@ static u8 execute( u8 op )
 		gpu64Regs.status &= ~GPU64_STATUS_FRAME_READY;
 		gpu64_3dStateDefaults( &s_ShadowState );
 		gpu64_3dSceneReset( &s_ShadowScene );
+		// The scene this load was populating is gone; finishing it would
+		// add nodes to a scene the caller just asked to be empty.
+		levelLoadAbort();
 		return GPU64_ERR_OK;
 
 	case GPU64_3D_OP_SET_VIEWPORT:		return opSetViewport();
@@ -1150,6 +1914,19 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_UPLOAD_MESH:		return opUploadMesh();
 	case GPU64_3D_OP_UPLOAD_TEXTURE:	return opUploadTexture();
 	case GPU64_3D_OP_FREE_RESOURCE:		return opFreeResource();
+
+	// milestone 18. LOAD_LEVEL is keyed by the gate above; LEVEL_STEP is
+	// not, because it destroys nothing a phantom could not cause by simply
+	// arriving early -- an unarmed LEVEL_STEP answers BAD_ARGS and a
+	// duplicate one only re-does a slice of the load already in progress.
+	case GPU64_3D_OP_LOAD_LEVEL:		return opLoadLevel();
+	case GPU64_3D_OP_LEVEL_STEP:		return opLevelStep();
+	// Unkeyed and, alone among the non-render opcodes, exempt from the
+	// pre-execute drain -- see isDrainExempt() and gpu64_3d.h.
+	case GPU64_3D_OP_CLIP_MOVE:		return opClipMove();
+	case GPU64_3D_OP_LEVEL_ENT:		return opLevelEnt();
+	case GPU64_3D_OP_LEVEL_PALETTE:		return opLevelPalette();
+	case GPU64_3D_OP_LEVEL_NODE:		return opLevelNode();
 
 	case GPU64_3D_OP_CREATE_OBJECT:		return opCreateObject();
 	case GPU64_3D_OP_CREATE_CAMERA:		return opCreateCamera();
@@ -1606,7 +2383,7 @@ u8 gpu64_3dDispatch( u8 op )
 		// concurrency: without this, every SET_POSITION issued while the loop
 		// runs would still stall behind whatever frame core 1 is mid-render,
 		// exactly the cost the shadow copy exists to remove.
-		if ( !( s_LoopRunning && isShadowRedirectable( op ) ) )
+		if ( !( s_LoopRunning && isDrainExempt( op ) ) )
 		{
 			if ( !drainAndFlush() )
 				return GPU64_ERR_WORKER_TIMEOUT;

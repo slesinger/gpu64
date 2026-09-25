@@ -426,6 +426,13 @@ int main( int argc, char **argv )
 	if ( bFail )
 		return 1;
 
+#ifdef GPU64_PROJ_AUDIT
+	{
+		extern long long g_projOver, g_projTotal, g_projWorst;
+		printf( "scenesim: projected %lld verts, %lld overflowed s32, worst |coord| %lld px\n",
+			g_projTotal, g_projOver, g_projWorst >> 16 );
+	}
+#endif
 	printf( "scenesim: %u frames, %u PPMs in %s/\n", nFrames, nWritten, pOut );
 	return nFrames ? 0 : 1;
 }

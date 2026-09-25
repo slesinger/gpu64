@@ -7946,3 +7946,1272 @@ the SCENE_COMMIT dispatch**, none on the other three per frame. That matches
 the 55x concentration in [[gpu64-missed-not-the-drop-defect]] and is now the
 sharpest remaining lead -- 14 events is small, but they are all on one
 instruction.
+
+## 59. Milestone 18 step 3: E1M1 loads off the Pi's own SD card (2026-09-20)
+
+Step 4 of the plan the user set — *"develop the full quake game also to prove
+the API is useful"* — needs a level on the Pi before it needs anything else.
+620 KB of E1M1 cannot cross the register window, and it does not have to: the
+Pi has an SD card. This section is what got built and what it cost.
+
+### Two opcodes, on core 0, sliced
+
+`LOAD_LEVEL` ($13) and `LEVEL_STEP` ($14). The milestone 18 design had
+`LOAD_LEVEL` running on core 1 as one long command with the C64 free; three
+constraints killed that, and the as-built shape is recorded in
+[milestone18_quake_game_design.md](milestone18_quake_game_design.md):
+
+- the SD read is MMIO, so it happens **once at start-up**, before
+  `reuUsingPolling()` exists, into a 1 MB BSS buffer — `LOAD_LEVEL` only ever
+  parses memory;
+- it cannot run on core 1, because the arena allocator is core-0-owned and
+  unlocked;
+- it cannot be one command, because 282 items under one DMA hold is a
+  multi-second halt of the C64.
+
+So: **sliced on core 0, ~16 KB of source bytes per `LEVEL_STEP`**. E1M1
+finishes in **29 steps**. The slicing buys two things beyond hold length — a
+loading bar (`RESULT` is percent complete), and a failure that names *which*
+item failed instead of collapsing 282 of them into one ERRCODE.
+
+`LOAD_LEVEL` is keyed ($A5 in ARG15): it resets the arena, the resource table
+and both scenes. It deliberately does **not** reset `s_State` — the viewport
+and projection belong to the caller, who has to set them before the load
+anyway. Both opcodes answer `BUSY` while the loop is running, explicitly and
+not via the dispatcher's drain: a step creates nodes in `s_Scene`, which is
+what core 1 reads, and the drain proves only that the frame *in flight* has
+finished.
+
+Texture ids are forced to `0..nTex-1` because a mesh face carries its texture
+as one byte; mesh and node bases are the caller's.
+
+### The PC gate caught three defects that would each have cost a bench round
+
+`Source/Demos/gpu64_demo_level.a` is the program the bench runs.
+`tools/prgsim` now models both opcodes (`tools/prgsim/gpu64level.py` is a
+**third** independent `.g64lev` reader, deliberately — the firmware's magic
+constant was once wrong and built perfectly clean; only a second reader
+disagreeing caught it), and `tools/demos.sh level` renders every frame of the
+demo's own command stream through `scenesim`, i.e. the real firmware renderer.
+
+1. **`cmd1` returned the right byte in `A` and the wrong Z flag.** `sta` does
+   not affect flags, so the caller's `beq` was testing the `cmp #$0d` inside
+   the range check — which for a perfectly good ERRCODE of 0 is Z *clear*.
+   Every successful command fell straight into its own error path, and the run
+   printed `LOAD FAILED ERR 00`.
+2. **The demo read `$91` for RUN/STOP.** prgsim models the CIA matrix, not
+   `$91`. Replaced with a direct column scan, which is also what makes
+   `--key=` scripting work, so the simulated run actually walks the level.
+3. **`LOOP_START` answered `06` UNSUPPORTED.** It reads ARG0 as the mode, and
+   ARG0 still held `$E8` — the low byte of `LOAD_LEVEL`'s mesh base 1000. ARG
+   registers are not cleared between commands. Commits still succeeded because
+   `SCENE_COMMIT` self-starts a stopped loop, which is exactly the kind of
+   self-healing that hides a bug.
+
+A fourth thing the gate found is not a defect but is worth writing down: the
+first key schedule **flew the camera out through a wall by frame 500** and
+spent the remaining thousand frames photographing the black outside of the
+map. Nothing in gpu64 stops that until `CLIP_MOVE` exists. The schedule is now
+a tour that returns — every walk paired with the walk that undoes it, long
+stretches are yaw sweeps in place — and all 1500 frames render level geometry.
+
+### Where it stands
+
+1500-frame simulated run: `FRAMES 05DD OK 05DD`, `MISSED 0000`, `STALLS 00`,
+`CMT 07 0000 06 0000 XX 0000`. Under a display with no frame clock the demo
+does not hang — all 61 commits answer `06` and the counters say so, which is
+what that pass is for.
+
+**Hardware-unverified.** The card at `/media/honza/SIDEKICK` now carries
+`RAD/level.g64lev` (634633 bytes, md5 `3503e827…`), `RAD_PRG/gpu64_demo_level.prg`
+and firmware build id `4af768ae-dirty src:6c95c581`.
+
+Next: step 4, the hull trace and `CLIP_MOVE` ($15 reserved). The level file
+already carries E1M1's 1810 planes, 58 hulls and 5408 clipnodes for it.
+
+## 60. Run 33 (2026-09-20): E1M1 renders on hardware, through the wrong palette
+
+The level demo ran. **`LOAD DONE IN 001D STEPS`** — 29, exactly what the PC
+predicted — `SETUP OK LOOP 00`, and 2745 frames committed with 2724 accepted.
+The loader works on hardware. The picture did not.
+
+### What was on the HDMI screen
+
+Near-black everywhere, two hard-edged **pure white** vertical bars, and a red
+border. Sampling the photograph settles it without another bench run: the bars
+measure (247,250,254) and the dark field (13,13,22).
+
+That is the **boot palette**, not E1M1's. `ResetPalette()` leaves the C64
+sixteen in 0-15, **black in 16-254** and **white at `GPU64_LOG_INK` = 255**.
+Every Quake texel above 15 rendered black; every texel that happened to be
+255 rendered white; the handful of indices under 16 are the "some points
+moving around" the user reported.
+
+### Cause: `levelPhasePalette()` set the palette and never committed it
+
+`CGpu64FrameBuffer::SetPaletteEntry()` writes the shadow and Circle's tag
+buffer. Circle's `SetPalette32()` only stores into `m_pTagSetPalette->Palette[]`
+— **`UpdatePalette()` is what sends it to the VideoCore**, and
+`CommitPalette()` is what calls that. `PAL_SET` and `PAL_LOAD` both call it;
+`ResetPalette()` calls it. The level's palette phase was the one writer that
+did not, so the colormap was built from the right RGB while the display went
+on resolving indices through the palette it booted with.
+
+One line, plus the comment saying why. Audited: `SetPaletteEntry` now has no
+caller anywhere in the firmware that fails to commit.
+
+**No host sim can catch this class of defect.** `hostsim`, `scenesim` and
+`levelsim` all resolve indices through their own palette array; there is no
+VideoCore for them to be out of step with. levelsim's frame 0 of E1M1 is a
+correct, fully textured picture of the start room — the geometry, the
+colormap and the renderer were all right the whole time. Worth remembering
+the next time a PC gate is declared complete: **the gate covers what the
+firmware computes, never what it programs.**
+
+### The red border was a false alarm, and that is a second bug
+
+Border index 2 is `GPU64_HEALTH_BORDER_ALARM`. The demo never issues
+`GET_HEALTH`, so the only path that could have reddened it is `healthReset()`,
+which `FULL_RESET` calls from `dmInit` — and it called `readHealth()` **before**
+establishing `s_HealthEverBase`. On the first reset of a Pi session that
+baseline is zero, so the mask that is supposed to make the sticky flags
+session-scoped does not exist yet, and an `UNDERVOLT_EVER` bit latched any
+time since the Pi powered on reddens the border on its way to being excluded.
+
+Fixed by suppressing the test over the baseline read. A red border now means
+an under-voltage **in this session**, which is the only version of that signal
+worth having. It does not prove there was no brownout in run 33 — `MISSED` was
+`00B2`/2745, about 1 in 15, against the 1-in-27 of
+[[gpu64-missed-not-the-drop-defect]], and that is inside the known 30x
+run-to-run spread but at the bad end of it. Next run should read `GET_HEALTH`.
+
+### The rest of the telemetry was healthy
+
+`07 0000` — no BUSY refusals. `06 000E` — 14 commits before
+`gpu64Vsync.calibrated` came up, a start-up transient. `XX 0007 09` — seven
+`QUEUE_FULL`. `ERRBAD 000D` — 13 unreadable ERRCODE reads, repaired by the
+re-read. `STALLS FF` is saturated and therefore says only "often", which is
+expected: core 1 is rendering 15601 triangles a frame and the C64 outruns it.
+
+Build id after both fixes: `4af768ae-dirty src:c1599102`.
+
+## 61. Run 34 (2026-09-20): "it falls through the floor" — the camera was a delta
+
+The bench report was one sentence and a photograph: *"When I move forward few
+steps, it somehow falls through the floor."* The picture showed E1M1 correctly
+textured and lit — section 60's palette fix held — but the geometry had become
+a jagged island of surfaces against flat background, with large black voids.
+
+### It could not have been a movement bug
+
+`MOVE_LOCAL` rotates the requested delta by the node's own orientation and
+adds it. With pitch and roll zero, `gpu64_3dMatFromEuler()` leaves `m[5] = -sp
+= 0`, so a forward step of `(0, 0, s)` contributes **exactly zero** to y. Not
+approximately: the y term is a multiply by a literal zero. Four hundred
+simulated frames of walking confirmed it — `distinct camera y: [225280]`,
+count 1.
+
+So the eye did not descend. It was *put* somewhere else, once, and stayed
+there. `tools/hostsim/levelsim --pos=15,1.0,-11` reproduces the photograph:
+same arch, same two lamps, same voids, from an eye about 2.4 world units below
+where it belongs. Walking out of the level was ruled out separately —
+coverage holds at 100% from z=-11 to z=+23 and only collapses at z=+25, far
+beyond "a few steps", and that failure looks like open sky rather than an
+x-ray floor.
+
+### What actually happened
+
+`MOVE_LOCAL` and `ROTATE_LOCAL` **integrate**. Nothing in the protocol ever
+states where the camera is; each frame only says how far to shift it. The
+demo sent them through `cmd1`, which has no sequence number, and
+[[gpu64-arg-drops-are-undetected]] applies regardless: `SEQACK` covers `SEQ`
+and `CMD_LO` and nothing else, so a corrupted `ARG` byte is not merely
+undetected — it is *unreportable*. One bad byte in the y-adjacent argument
+block of one `SET_POSITION`-shaped command displaces the camera permanently,
+because no later frame ever contradicts it.
+
+This is the exact failure `docs/state-refresh.md` names, in the program that
+was meant to demonstrate the API being used correctly.
+
+### The fix: the C64 owns the camera
+
+`Source/Demos/gpu64_demo_level.a` now keeps position as three 16.16 world
+coordinates and heading as one 16-bit yaw, takes the step itself against a
+256-entry 8.8 sine table, and sends `SET_POSITION` + `SET_ORIENTATION`
+**absolutely, every frame, whether or not anything moved**. Both are
+idempotent, so a corrupted argument now lasts exactly one frame. It is also
+cheaper than what it replaced: two dispatches a frame instead of up to four.
+
+The starting pose is not hardcoded — that would be wrong for every other
+level. `seedCamera` reads it back once with `GET_TRANSFORM`, behind a
+`SET_DMA_WINDOW` fence whose `RESULT` echo is checked, and validates the block
+by a structural invariant rather than a poison: `LOAD_LEVEL` creates the
+camera with `SET_ORIENTATION(yaw, 0, 0)`, so pitch and roll must read zero.
+[[gpu64-health-block-self-verifying]] is why a poison check alone was not
+trusted — it passes on a partially arrived block.
+
+Screen row 4 is now `CAM X.... Y.... Z.... YAW.. P..`, printing integer world
+coordinates. **Y is the instrument**: no expression in the program can change
+it, so a Y that is not its start value of `0003` is a corrupted register write
+and nothing else. Printed as integers, not as a delta the photograph's reader
+would have to subtract — [[gpu64-bench-photo-legibility]].
+
+### Verified on a PC
+
+- The generated sine table is byte-exact against Python over all 256 entries;
+  `sin(0)=0`, `sin(64)=256`, `sin(192)=-256`.
+- Phase and sign match the firmware's own matrix: forward is
+  `(m[2], m[5], m[8]) = (sin yaw, 0, cos yaw)` and strafe-right is
+  `(m[0], m[3], m[6]) = (cos yaw, 0, -sin yaw)`, which is what `mcWalk` and
+  `mcStrafe` compute.
+- Across a 1502-frame run, **every one of the 367 moving frames** is exactly
+  `step x (sin, cos)` of the yaw then in force, and the camera's y is a single
+  value: `[225280]`.
+
+### The gate's own schedule was photographing the void
+
+`tools/demos.sh`'s level tour swept the yaw 225 degrees *before* taking a
+step, so every walk went into the wall behind the player: frames 375-450, 550
+and 1025-1075 rendered pure black — the exact failure the comment above that
+schedule warns about, sitting inside the schedule the comment introduces.
+
+Rewritten so the walks come first, at the yaw the level starts you at, with
+each pose the render samples checked against `levelsim` beforehand. No frame
+of the 60 rendered is now below 82% covered, and none is empty.
+
+Not committed. The firmware is unchanged this round; only the demo and the
+gate moved.
+
+## 62. Run 35 (2026-09-21): the giant "Trigger" text, and an instrument for "unsteady"
+
+The bench photograph shows E1M1 correctly textured and walkable — the palette
+and camera fixes both held — with the word "rigger" in giant white letters
+repeated six times diagonally across the right half of the screen. The report
+with it: *"It is quite blinking, unsteady, I can walk in the level a little
+bit."*
+
+Two separate findings, and only the first is closed.
+
+### The text was Quake's trigger volumes, drawn
+
+Texture 68 of E1M1 is Quake's `trigger` texture: 64x64 pixels with the word
+written across them. It is applied to the brush models that are the level's
+trigger volumes — the boxes you walk into to open a door or start a lift —
+and Quake never draws them. `InitTrigger()` in QuakeC sets
+`self.modelindex = 0; self.model = ""`, so a trigger brush is solid to a
+trace and absent from the renderer.
+
+`tools/gen_quakelevel.py` converted them like any other brush model, so gpu64
+was rendering 26 huge boxes wrapped in a texture that says what they are. Two
+rules now drop them:
+
+- the `trigger` texture itself is skipped when a face's texture is collected
+  (`stats['trigger_texture']`), and
+- a brush model referenced *only* by `trigger_*` entities is skipped entirely
+  (`stats['models_invisible']`).
+
+Collision hulls and the 369 entity records are deliberately kept: the volumes
+still have to be there for `CLIP_MOVE` and for the game logic that is
+milestone 18 step 5. It is the geometry that goes.
+
+Regenerating reports `models_invisible 26`, `trigger_texture 0`, and the file
+drops from 108 meshes / 15601 triangles / 634633 bytes to **82 meshes / 15253
+triangles / 65 textures / 609.5 KB**. A stacked A/B render at
+`pos=15,3.4375,-3 yaw=0` shows "Trigger Trigger Trigger" boxes in the old file
+and clean E1M1 in the new one; four sampled poses differ by 2.4%-10.0% of
+their pixels.
+
+### "Blinking, unsteady" is not localized, and the demo could not have said why
+
+Reading the commit path first, because a half-drawn page would have explained
+it outright — it does not. `SCENE_COMMIT` cannot present an unfinished frame:
+`gpu64_3dDispatch()` drains the ring before `execute()` sees the opcode,
+`pollLoopFrame()` then harvests it, the commit refuses with `BUSY` unless
+`FRAME_READY` is up, and `pushLoopFrame()` picks the draw page *after*
+`PrepareFlip()` has handed it over, so the page being rendered is neither on
+screen nor queued. Presentation is sound. What is left is the *rate* and its
+jitter, and the demo had no way to report either.
+
+It also had one defect that guaranteed the worst case:
+
+**`READY_WAIT` was 2000 polls, about 45ms, and a timeout does not skip the
+frame — it commits anyway.** `SCENE_COMMIT` is the one class 1 opcode that is
+not shadow-redirectable, so its dispatch drains the render ring with the C64
+DMA-halted. A too-short timeout therefore converts "poll a register while the
+6502 free-runs" into "stop the C64 until core 1 finishes" — which is exactly
+the shape of a program that answers the keyboard badly, and "I can walk in the
+level a little bit" is what that looks like from the chair. The constant was
+written against a premise stated in its own comment, "the render finishes in
+well under a display frame", which is not true of fifteen thousand triangles
+with no visibility system. Now 20000 polls (~450ms), a hang detector and
+nothing else. Run 33's `STALLS FF` was a saturated byte, not 255 stalls out
+of 4096 frames; it is 16 bits now.
+
+The instrument, all of it on rows the previous build left blank:
+
+- **A millisecond clock that a DMA hold cannot stop.** The KERNAL jiffy
+  counter can: it is incremented by the CIA1 interrupt, the 6510 is halted for
+  the whole of a dispatch, and an interrupt that falls inside a hold is
+  serviced once however many ticks it covered — so the jiffy clock
+  under-reports exactly the time this program most needs to measure. CIA2
+  timer A free-runs on a 985-cycle period and timer B counts its underflows,
+  which makes `$dd06/$dd07` a 16-bit millisecond counter, counting down,
+  wrapping every 65 seconds. CIA2 is free: the KERNAL drives its timers only
+  for RS232.
+- **Row 9, `MS/FRAME CUR/MIN/MAX`** — the frame period start to start.
+  `1000/CUR` is the rate the player is getting and MIN against MAX is the
+  steadiness they complained about.
+- **Row 10, `MS MAX CAM/WAIT/CMT/D`** — the same frame split into phases, so
+  a large period names its own cause: WAIT is core 1 rendering, CMT is core 1
+  rendering *with the C64 halted*, CAM is the command path, D is the
+  telemetry costing more than it is worth.
+- **Rows 11-12, the Pi's own account of itself.** `GET_HEALTH` at length 132,
+  four tries, and the magic-plus-XOR-plus-sum trailer has to check out before
+  any of it is believed (`BAD` counts the samples that never did, so a frozen
+  row says so instead of reading as a Pi whose numbers stopped changing).
+  `PWR` is the session throttle word — under-voltage is the first thing to
+  rule out when anything looks visually wrong, and it is the one cause the C64
+  side cannot see at all. `FLIP` against `OK`, both latched at the same
+  sample, are the two ends of one count: what the Pi thinks it presented
+  against what the program thinks it asked for.
+
+Decimal, not hex, for every millisecond figure — `dmDecA` in
+`gpu64_demo_rt.inc`. These numbers are read off a photograph of a CRT and
+compared against each other, and a reader who has to convert `$3C` to 60
+before knowing whether the frame was slow will not.
+
+Two things the instrument itself had to avoid being: the telemetry redraw is
+now once every 8 frames rather than every frame (eleven rows of text cost more
+than the whole command path, and the player gains nothing from it), and the
+health sample is once every 64 — about a millisecond with the C64 halted — with
+its own timing slot so it cannot inflate any other.
+
+`tools/prgsim/runsim.py` models the CIA2 timer pair (an instruction charged an
+average four cycles; the model has no cycle count) and `gpu64model.py` now
+answers `GET_HEALTH` bytes 18-19 with a real flips-posted count. Without both,
+the demo's clock arithmetic, its clamp, its minimum and its checksum path
+would have reached the bench never once executed. The desk run reads
+`FLIP 0101 OK 0101`, `PWR 0000`, `HOT 045`, `BAD 000`.
+
+Nothing here explains the blinking. It is the run that will.
+
+Not committed. The firmware is unchanged this round; the demo, the converter,
+the runtime include and both host models moved.
+
+---
+
+## 63. The blinking was the renderer (2026-09-21)
+
+Section 62 ended "Nothing here explains the blinking. It is the run that
+will." It was not the run. It was `tools/hostsim/scenesim`, which had been
+rendering the evidence every time `tools/demos.sh` ran and nobody had looked
+at the pictures.
+
+**35 of 300 sampled frames of the level demo render as one solid colour.**
+Not dark, not mostly dark -- 1.000 of the viewport is a single palette entry,
+the whole frame gone. Sampled every fifth frame of the 1502-frame desk run,
+which puts the real figure near 175. A player walking through E1M1 sees one
+frame in eight replaced by a flat screen. That is "quite blinking, unsteady".
+
+### The mechanism
+
+`project()` divides by z. `clipNear()` guarantees z >= nearZ and nothing
+else -- the design doc's open question 3 argued the other four frustum planes
+could be left to the rasteriser's scissor, because the scissor does clamp
+every span to the viewport and a triangle wholly outside it costs nothing.
+
+That is true right up until the projected coordinate stops fitting. A vertex
+that survives the near clip and sits far to the side lands at
+`x * focal / nearZ`, which in the level run reaches **62921 pixels**. `sx` and
+`sy` are s32 in 16.16, so anything past 32767 pixels wraps -- and a vertex
+that wraps puts its triangle across the whole screen with a valid-looking
+depth. `gpu64_3dRasterTriangle()` then fills the viewport with it. One
+triangle, one frame, gone.
+
+### What was changed
+
+**A four-plane frustum reject, added to the bounding-sphere test that already
+existed in `gpu64_3dDrawMesh()`.** The near and far planes were there since
+the mesh format was designed; the side planes never were. They are derived
+straight from `project()`: a vertex lands at `sx = centre + x * focal / z`, so
+the right edge is the half-space `focal * x <= ( vpW / 2 ) * z`, a plane
+through the view-space origin. Reject when the sphere's signed distance
+exceeds its radius. Everything is scaled to 8.8 pixels so the products stay
+inside s64, and the two plane norms are exact `gpu64_3dSqrt64()` calls rather
+than the `a + b >= sqrt( a*a + b*b )` shortcut, which would have loosened the
+test by up to 41% to save two square roots per mesh.
+
+Near/far alone rejected almost nothing here, and the reason is worth
+recording: `tools/gen_quakelevel.py`'s `QU_PER_WU` scales E1M1 so the whole
+map fits inside the 128-unit far plane. Standing in one room, every one of the
+82 meshes passed, and all 15253 triangles had every vertex rotated into view
+space before the backface test threw the far side of the map away.
+
+**A guard band on the lateral clip**, `GPU64_3D_GUARD` in
+`gpu64_3d_render.cpp`, at 64 viewport half-widths. At 64 half-widths a
+projected coordinate cannot exceed 10400 pixels, three times inside the s32
+that carries it, so the arithmetic is bounded by construction. It is a bound
+that also repairs frames -- see below; the first draft of this section called
+it "deliberately not a change to the picture" and that was wrong.
+
+### What was measured
+
+| | solid frames | flat frames | wall clock | overflowing vertices |
+|---|---|---|---|---|
+| shipped | ~175 / 1502 | 537 / 1502 | 4.68 s | 10266 + whatever wrapped |
+| + frustum reject | **0 / 1502** | 213 / 1502 | 3.83 s | 10266 |
+| + guard band | **0 / 1502** | 219 / 1502 | 4.00 s | **0** |
+
+The reject is 18% faster; the guard band costs 4% back and closes the
+overflow residue. 26% of the meshes that pass near/far are side-culled -- 56
+meshes per frame reach the side test and 15 of them stop there.
+
+"Solid" is 1.000 of the viewport in *one* palette entry, which is how the
+defect was found and is far too strict to measure it. A frame ruined by a
+wrapped triangle is usually not one colour: the giant triangle covers most of
+the screen, and what is left shows through in two or three more. "Flat" is
+the honest metric -- the top four colours covering more than 90% -- and it is
+the third column above.
+
+### The guard band is not just a bound
+
+Flat frames go 537 -> 213 with the reject and then *up* to 219 with the guard,
+which reads as the guard band making things slightly worse. It does not. Only
+45 frames differ between those two columns, and rendering all 45 pairs says
+the flat count cannot rank them:
+
+- Five of the 45 are **1.000 flat in the reject-only build** -- four colours
+  covering the entire viewport, the frame completely gone. The guard band
+  repairs every one. Frame 999 is a black rectangle with the reject alone and
+  a fully textured room with the guard.
+- The ones the metric calls "flatter" with the guard are the same repair seen
+  from the other side. Frame 1126 with the reject alone paints an olive band
+  across the top third of the screen -- a wrapped triangle. Removing it
+  *lowers* the colour count, so the frame scores flatter while being strictly
+  more correct.
+
+So all 45 differing frames are the guard band removing wrapped geometry, and
+the residual 219 are the level being dark rather than the renderer failing:
+the flattest frame in the finished build is 0.936, a legitimate corner of
+E1M1 with texture detail across all of it. Nothing after both changes is
+fully covered by four colours.
+
+Three metrics in a row were too crude for this defect -- single-colour, then
+`nDrawn`, then top-four-colours. Looking at the pictures settled each one.
+
+Three things were checked rather than assumed:
+
+- **The bounding sphere really bounds.** An audit build recomputed, for every
+  mesh drawn, the largest distance from the transformed sphere centre to any
+  transformed vertex and compared it against the radius. **Zero violations in
+  22.4 million vertices.** A conservative reject is only conservative if that
+  holds, and `gpu64_3dBuildMesh()` fits the sphere over the AABB centre rather
+  than minimally, so it was not obvious.
+- **The quake3d demo is byte-identical** -- all 771 frames, `ink` and
+  checksum, against the shipped renderer. Its meshes are small and its camera
+  never gets into the geometry, so nothing there should change, and nothing
+  does.
+- **The level demo differs on exactly 45 of 1502 frames**, which are the
+  frames the old code was overflowing on.
+
+The first audit run reported 20513 wrongly-culled meshes and was wrong: it
+counted `gpu64_3dDrawMesh()`'s return value, which is triangles *submitted* to
+the rasteriser, not pixels written, and a triangle entirely off the right edge
+submits and then scissors away to nothing. Comparing the framebuffer before
+and after instead cut it to 870, and every one of those turned out to be the
+overflow -- the cull was right and the renderer was wrong. Worth remembering
+the next time a differential says a change broke something.
+
+### Still open: the gradients are not stable
+
+Guard bands of 1, 2, 4 and 16 half-widths produce four different pictures of
+the same close-up wall, disagreeing across **50-79% of the frame** (quake3d
+frames 100, 250, 450). On the level run they score 205, 215, 219 and 219 flat
+frames for guards of 1, 4, 16 and 64 -- a spread of 14 frames in 1502, which
+after the paragraphs above is known to be below what the metric can resolve.
+There is no evidence here for tightening the guard and none against it. In exact arithmetic any three points on a triangle's
+plane give the same gradients, so this is entirely a conditioning effect:
+`gpu64_3dRasterTriangle()` takes its plane gradients from vertex 0 and
+extrapolates, and how far off-screen vertex 0 sits changes the answer. This is
+the same defect `gpu64-class1-gradient-precision` recorded on 2026-09-10 and
+widening to s64 16.32 did not finish it.
+
+The textbook guard band is 1 to 4, and it would cut the rasterised area as
+well -- but choosing it means choosing one of those four pictures without
+being able to say which is right. That needs a double-precision oracle in
+`tools/hostsim` that rasterises the same triangles and reports the texel and
+depth error per guard setting. Until then the guard stays at 64, where it
+changes nothing that was not already broken.
+
+None of this is hardware-verified. Section 62's pacing instrument is still
+unrun, and it is now measuring a renderer that no longer throws frames away --
+so `MS/FRAME` should read lower and steadier than it would have, and the
+remaining `WAIT` is the visibility system `docs/known-gaps.md` #1 describes:
+41 of 82 meshes are still drawn every frame, because the converter chunks
+geometry by the 256-vertex index limit and not by where it is.
+
+Gates: `tools/demos.sh` 13/13, `tools/testprg.sh` 13/13, ARM firmware links
+(kernel8.img 422840 bytes). Not committed.
+
+## 64. Milestone 18 step 4: the player walks on the floor (2026-09-21)
+
+`CLIP_MOVE` ($15) is in. The C64 sends where it is and where it would like to
+be; gpu64 traces that against the level's Quake clip hulls and answers with
+where it actually ends up. `gpu64_demo_level` now walks on the ground, climbs
+E1M1's stairs, slides along walls and cannot leave the map.
+
+### What is on the wire
+
+One 56-byte block in the caller's own memory, named by an ordinary blob
+descriptor in ARG0-5, rather than a position and a displacement spread across
+two dozen register writes. The layout is in
+[docs/class1-3d-mesh-reference.md](../docs/class1-3d-mesh-reference.md) under
+"Walking in a level"; `Source/Firmware/gpu64_3d.h` carries the same table with
+the reasons.
+
+The block does not fit in the registers — 24 bytes of 16.16 vectors before
+anything else — but that is the weaker argument. The stronger one is that this
+opcode runs every frame for the length of a session, which is precisely the
+exposure the ~1/180000 sampling defect wants, and a block can carry a checksum
+where the register file cannot. Both halves carry a magic **and** an XOR: a
+checksum alone accepts an all-zero block, and an all-zero block is what an
+uninitialised buffer looks like. The C64 poisons the output half before the
+call, so "nothing arrived" cannot read as "you may move there". A rejected
+answer costs one frame of standing still, and the next frame asks again from
+where the player really is — which is only sound because the C64 is
+authoritative about the position, per `gpu64-camera-must-be-absolute`.
+
+### Two things it deliberately is not
+
+**Not keyed.** It destroys nothing. The only memory it can damage is the
+caller's own, and `SET_DMA_WINDOW` is what confines that.
+
+**Not drained.** It is the one non-render opcode exempt from
+`gpu64_3dDispatch()`'s pre-execute drain (`isDrainExempt()`, next to
+`isShadowRedirectable()`), because it reads only the level file — immutable
+once loaded — and writes only the caller's block. Making a movement query wait
+for the frame in flight would put a whole render on the critical path of every
+step the player takes, which is the opposite of what the query is for.
+
+Gravity, friction and jumping are not in it either. It answers a geometric
+question; the demo's gravity is one constant subtracted from the
+displacement's y before the call.
+
+### The trace
+
+`gpu64_levelTrace()` and `gpu64_levelMove()` in `gpu64_level.cpp`: Quake's
+`SV_RecursiveHullCheck` and `SV_FlyMove` in 16.16, with time folded into the
+displacement so no velocity and no frame duration cross the bus. The hulls in
+the file are already expanded by the walker's size, so this is a *point*
+trace. Step-up runs the move a second time from one step higher and keeps
+whichever got further along the ground; the floor settle is what stops a
+downward slope leaving the eye in the air.
+
+### Gates
+
+- `tools/hostsim/hulltest` drives the trace directly against E1M1: 64 headings
+  x 400 frames, a 20000-frame deterministic wander, and the ten structural
+  checks. **The assertions that matter are the motion ones** — 19780 frames on
+  ground, 198402 qu of path, 2526 qu from the spawn — because a collision
+  system that blocks everything passes every safety check ever written. This
+  is the `L=0/0` trap from the milestone 6a ladder, in a new place.
+- `tools/prgsim` answers the opcode for the demo by calling the firmware's own
+  trace through `tools/hostsim/libclipmove.so`. The protocol is modelled in
+  Python; the geometry is not re-implemented, for the reason
+  `gpu64class1.py`'s header already gives about the renderer — a second
+  implementation is a second thing to be wrong, not an oracle.
+- The 6502 side was written from the documentation, independently of both, and
+  that is what earned its keep: it disagreed about the input checksum's
+  length. The firmware and the Python model both covered bytes 0..26 while the
+  doc said 0..27; every call answered `BAD_ARGS` until the two were corrected
+  to match the doc. A protocol with three implementations found its own
+  ambiguity on a PC instead of at the bench.
+
+`tools/demos.sh`'s level schedule no longer has to be a tour that returns.
+Nothing used to stop the camera leaving the map, so every walk had to be
+paired with its own reverse; walls hold the player in now, and a wrong turn
+costs a dull frame instead of the void
+(`gpu64-demo-gate-photographed-the-void`). One of the 60 sampled frames is
+flat, and it is a frame spent face-first against a wall, which is the demo
+doing its job.
+
+Not hardware-verified. Row 13 of the demo is the reading to photograph: `F`
+the contact flags, `C` the contents, `FR` the fraction of the step covered,
+`BAD` the answers whose checksum failed — which, being a per-frame readback,
+is also a second and much larger sample of the bus defect than anything the
+API has measured so far.
+
+Gates: `tools/hostsim/hulltest` ok (0 failures), `tools/demos.sh` 13/13,
+`tools/testprg.sh` 13/13, ARM firmware links (kernel8.img 426936 bytes). Not
+committed.
+
+## 65. Milestone 18 step 5a: what a level contains, and doors that block (2026-09-21)
+
+Step 4 left the player standing on E1M1's floor. Step 5 is the game, and its
+first two pieces are both prerequisites the rest of it cannot be written
+without: the C64 has no way to *read* the level's entity list, and a closed
+door does not block anything.
+
+### `LEVEL_ENT` ($16): one entity, pre-digested for a 6502
+
+A level's game is in its entity lump — E1M1 has 369 records naming the player
+start, fourteen doors and the buttons that open them, twenty-five triggers,
+forty-two monsters and every item on the map. It is already in the Pi's memory
+and it cannot travel to the C64 wholesale: 16 KB of records plus a string
+pool. So the C64 asks for one record at a time and keeps the handful it cares
+about; `entCount` comes back on every call, so the loop is "read 0, learn how
+many, read the rest".
+
+The protocol is `CLIP_MOVE`'s, for `CLIP_MOVE`'s reasons: a 96-byte block in
+the caller's own memory, input bytes 0..3, output 16..95, **a magic and an XOR
+either way** (a checksum alone accepts an all-zero block, which is exactly
+what a buffer the C64 never filled in looks like), unkeyed, and exempt from
+the pre-execute drain because it reads nothing but the immutable level file
+and writes nothing but the caller's block.
+
+What makes it worth having is that the record is *digested*, not dumped:
+
+- a classname arrives as a **`kind` byte** in ranges (10-19 brush movers,
+  20-29 triggers, 50-79 monsters...), so a game switches on a byte instead of
+  `strcmp`-ing 369 records, and an unlisted classname falls back to its family
+  number rather than to an error;
+- `target`/`targetname` arrive as **opaque 16-bit ids** into a deduped string
+  pool, so "this trigger opens that door" is one `cmp` and there is no string
+  comparison on the 6502 at all;
+- a mover's **travel** is a ready displacement, computed by the converter out
+  of Quake's `angle`/`lip` formula and a bounding box the C64 never sees;
+- a brush model's geometry is a **contiguous run of scene node ids**
+  (`nodeFirst`, `nodeCount`), so moving a door is `SET_POSITION` on a run and
+  nothing has to be looked up.
+
+Every one of those is the same decision made once: the Pi has the data and the
+cycles, the C64 has neither, so the wire carries the answer rather than the
+question. All of it is in the converter and the loader, i.e. in the two places
+a PC can check.
+
+### Doors that block: `CLIP_MOVE` grew a mover list
+
+A closed door is not part of the world's collision and never was. The BSP
+compiler puts the doorway's *hole* in the world hull and the door panel in a
+brush model of its own, so the step-4 trace — world hull only — walked through
+every door on E1M1. That is not a cosmetic gap; it is the difference between
+a level and a corridor.
+
+Quake's answer is `SV_Move` over `SV_ClipMoveToEntity`: sweep the world, then
+sweep every solid entity's own hull, and the nearest impact wins. The port is
+`traceMulti()` in `gpu64_level.cpp`, with the one detail that matters kept
+intact — `allsolid` and `startsolid` take the whole trace over *regardless* of
+fraction, and both flags OR forward. A mover's hull does not move, so the
+sweep is what moves: it is traced in the model's own frame (`-ofs`) and the
+answer brought back (`+ofs`).
+
+The list travels in the block, from byte 56, 16 bytes each, up to 16 of them:
+model index, flags, and `ofs`, the displacement the game has already applied
+to that model. **It is an argument, not state.** gpu64 does not know which
+doors are open — the C64 does — and says so on every call. That is what keeps
+`CLIP_MOVE` a pure function of its block, and therefore still answerable while
+the render loop is running, with no new firmware state and no new opcode. The
+input checksum was widened to cover the mover bytes and the count, because a
+mover record that lost its offset byte is a door in the wrong place.
+
+### The gate that matters, and the trap it was built around
+
+"A closed door blocks" is passed by a tracer that blocks *everything* — the
+`L=0/0` trap from the milestone 6a ladder, in its third appearance. So
+`hulltest`'s door test is two-sided and runs on the real E1M1: for every door
+whose doorway the world hull leaves clear, sweep the panel's thin axis three
+times — without the mover, with it where the level put it, and with it
+displaced by its own `travel` — and require that the first and third agree
+exactly while the second stops short. **8 doors testable, 8 blocked closed, 8
+clear open.**
+
+It also caught a measurement error worth recording: the first version compared
+`nFraction`, and door model 8 (a 14-unit slab whose thin axis is *vertical*)
+read 255 while standing perfectly still. `nFraction` is the fraction of the
+**horizontal** displacement by definition, so for a vertical sweep it is the
+fraction of nothing. The test measures end positions now.
+
+Gates: `tools/hostsim/hulltest` ok (0 failures, including the new door and
+mover-list tests), `tools/demos.sh` 13/13, `tools/testprg.sh` 13/13, ARM
+firmware links (kernel8.img 428984 bytes, build id 4af768ae-dirty
+src:f55fc1df). `docs/class1-3d-mesh-reference.md` publishes both the mover
+records and the `LEVEL_ENT` block with the kind table. Not committed.
+
+### What step 5 still needs
+
+The doors now *block*; nothing *opens* them yet. That is the C64's half:
+read the entities once at start-up, keep a table of movers and of the trigger
+and button volumes that fire them, match `target` to `targetname` by id, and
+animate a door by sending `travel × fraction` to `SET_POSITION` on its node
+run and the same `ofs` in the next frame's mover records. Node *base*
+positions come from `GET_TRANSFORM` at start-up — a level chunk's node is
+placed at its own origin, not at the entity's — so the animation stays
+absolute, which is what `docs/state-refresh.md` requires of anything that
+moves. Monsters are after that, and they need an MDL converter or a billboard
+stand-in; E1M1 has 34 grunts and 8 dogs waiting.
+
+## 66. Milestone 18 step 5b: the doors open (2026-09-21)
+
+Step 5a gave the C64 two things it could not previously get: the entity list,
+one digested record at a time (`LEVEL_ENT`), and a `CLIP_MOVE` that takes a
+mover list, so a closed door blocks. Neither of them *opens* a door. This is
+the half that does, and it is entirely 6502 code:
+`Source/Demos/gpu64_demo_game.a`, ~3400 lines, `$0810-$30fb` (10.5 KB).
+
+### What the 6502 actually does
+
+Four things, once per frame, in an order chosen so that the hull the Pi traces
+and the geometry the Pi draws are never more than one frame apart:
+
+```
+jsr moveCamera      ; keys -> the step the player asked for
+jsr gameSelect      ; the movers near enough to matter, for the trace
+jsr clipMove        ; that step, collided, with those movers in the block
+jsr gameTouch       ; what the new position fires
+jsr gameAnimate     ; the state machines, and the new ofs for each mover
+jsr sendMovers      ; SET_POSITION for whatever moved
+jsr sendCamera
+```
+
+At start-up it reads all 369 entities (`entScan`), sorts them by `kind` range
+into two sets of **parallel byte arrays** — 29 movers and 26 triggers on E1M1
+— and keeps nothing else. No structs, no strides: every field is its own array
+indexed by X, because a 6502 that has to multiply by a record size to reach a
+field spends its whole frame doing it.
+
+`target`/`targetname` stay 16-bit ids the whole way. A button's touch pushes
+its `target` id into an 8-slot FIFO (`firePush`), and `fireDrain` opens every
+mover whose `targetname` matches. The FIFO is not decoration — it is what
+keeps a door that fires another door from recursing on a 6502 stack.
+
+### Three findings worth keeping
+
+**The game logic cost more than the render.** The first working version spent
+46 ms a frame, most of it in `gameSelect` and `gameTouch` doing full box work
+for all 55 movers and triggers every frame. The fix that worked was a score
+cutoff (`NEAR_WU = 24`, computed from per-axis gap high bytes, which are
+already world units) plus hoisting the player's expanded box out of both
+loops: **46 ms → 31 ms, and the selected-mover list 16 → 8.** The fix that did
+*not* work is also worth recording: a byte-wide x pre-reject at 64 world units
+rejected nothing, because the whole of E1M1 is 57 world units wide. Profiling
+by building four ablated variants with `sed` found this in minutes; guessing
+did not.
+
+**No hand-written key schedule could ever reach a door.** From the E1M1 spawn
+the player is confined to x 12..18, z ≤ 21 until a door opens, and a walk
+route through that is not something you write by eye. It was found by
+*flooding* the reachable space with the firmware's own trace — the same
+`libclipmove.so` prgsim already calls — and taking shortest paths to the
+touchables: 1024 reachable cells, and the route now in `tools/demos.sh`
+chains the secret door (ent 310), the double door (14/15) and the button
+(ent 30) whose target is a door across the room. That last one is the only
+touch in the run that proves the `target`/`targetname` wiring rather than a
+proximity test. **Reusable method, not a one-off:** flood, chain waypoints,
+emit the key schedule.
+
+**A picture cannot tell a working door from a painted one.** Every other demo
+asserts nothing and is judged by its PPM; a door that renders open because the
+texture says so looks identical to one whose node moved. So step 5b has the
+deliberate exception: `tools/check_game.py` runs the demo under
+`runsim.py --dump-scene`, finds the scene nodes lying on the entity's travel
+line, and asserts the moved fraction is in (0,1] — or, with `--shut`, back at
+base. `tools/demos.sh -v game` now ends with four of those:
+
+```
+ok  ent 310 node 179 has moved 100% of its travel at frame 110
+ok  ent 14  node 151 has moved 100% of its travel at frame 230
+ok  ent 29  node 153 has moved 100% of its travel at frame 340
+ok  ent 29  node 153 is shut again at frame 400
+```
+
+The checker was also proven to *fail* correctly (an open-check at frame 40, a
+`--shut` at 340), which is the `L=0/0` discipline again: an assertion that has
+never failed has not been tested.
+
+### Bugs this found, in the order they bit
+
+- `bmI` as a label name is assembled as the **BMI mnemonic**. Renamed.
+- `entBlk` sat outside the `SET_DMA_WINDOW` fence, so every `LEVEL_ENT`
+  writeback was refused: `ENTS 0001 BAD 001`. The readback fence works.
+- `etMover` branched on the flags left by a `cpx`, not on the accumulator the
+  travel-OR loop had just built, so every mover looked like zero travel and
+  `MOV` read `000`. An explicit `cmp #0` fixes it.
+- `gameTouch` filtered to `MV_CLOSED`, which made `openMover`'s re-arm path
+  unreachable and shut a door on a player standing in it. The filter is gone;
+  `openMover` handles all four states.
+- Rows 14/15 overflowed 40 columns and silently truncated the fields that
+  mattered. Bench telemetry is read off a photograph — see
+  `gpu64-bench-photo-legibility`.
+
+### Numbers from the gate run (430 frames, PC)
+
+`ENTS 0171` (369) · `BAD 000` · `MOV 029` · `TRG 026` · `SEL 005` ·
+game logic `MS 035` max · frame `CUR 029 MAX 069` ms · `OPEN 0005` movers
+opened · `FIRE 0066` (the button's target id, `targetname` "t1") ·
+`CLIP BAD 0000`.
+
+The animation is exact where it should be: node 179 reaches 1535504 from base
+1409024 against a travel of 126976, i.e. travel × 255/256 — the documented one
+1/256th short of full travel, not drift.
+
+Gates, all green: `tools/demos.sh` 14/14 (game included, with its four
+assertions), `tools/testprg.sh` 13/13, `tools/hostsim/hulltest` 0 failures,
+`tools/check_g64lev.py` PASS, `tools/build.sh` links (kernel8.img 428984
+bytes, build id 4af768ae-dirty src:41187b1c). Not committed.
+
+### What is left of step 5
+
+Monsters (5c) — E1M1 has 34 grunts and 8 dogs, and they need an MDL converter
+or a billboard stand-in — then items and a HUD. `trigger_counter` is still
+unimplemented, so the big room's three buttons open nothing; that is a C64-side
+gap, not a firmware one. And none of step 5 has been on the bench: the next
+hardware trip needs `SDCARD=... tools/build.sh`, `tools/deploy_prg.sh`, and
+**`build/e1m1.g64lev` re-copied to `RAD/level.g64lev`**, with rows 4 and 9-16
+photographed.
+
+## 67. Run 36: one byte put the player outside the map, for good (2026-09-21)
+
+First hardware run of `CLIP_MOVE`. The photograph shows E1M1 floating in
+black, seen from outside, torn where the back faces were culled away — and
+the user had not pressed a key. The reading that names it is row 4:
+
+```
+CAM XFF0F Y0003 ZFFF5      CLIP F20 C01 FRFF B00 E04 BAD 0043
+```
+
+E1M1's spawn is x `$000F`, y 3, z `$FFF5`. **Y and z are exactly the spawn.
+Only the high byte of x is different, `$00` against `$FF`** — the camera is
+at -241 world units, 222 outside a map that is 57 wide. `F20` is "the whole
+trace was in solid", which is what the trace says about empty space beyond
+the world. The renderer was doing its job perfectly; it was drawing the level
+from where it had been told the eye was.
+
+### Reproduced on a PC, to the flags
+
+`runsim.py --clip-fault=N` corrupts the Nth `CLIP_MOVE` answer's x high byte
+and then computes the block's trailer **over the corrupted bytes**, which is
+what a fault on the way to the C64 looks like: the magic is right, the XOR is
+right, and the answer is wrong. Against the demo as it was, frame 60:
+
+```
+CAM XFF12 Y0001 Z0002      CLIP F20 C01 FRFF B00 E00 BAD 0000 W00
+```
+
+Same camera shape, same `F20 C01`. One injected byte, on a PC, reproduces the
+bench photograph — which is as close to proof as this project gets.
+
+### Why a checksum was never going to be enough here
+
+The output half carries a magic and an XOR over seventeen bytes, and the demo
+checked both. An 8-bit XOR passes about **one corrupted block in 256**. That
+run had the checksum *reject* 67 blocks in 345 frames, so the expected number
+of corrupted blocks it waved through is around a quarter — i.e. one silent
+acceptance per session is the ordinary outcome, not bad luck.
+
+And a wrong position is not a wrong frame. `gpu64-camera-must-be-absolute`
+made the C64 authoritative about where the player is, which is right, and the
+consequence is that **nothing will ever contradict a corrupted coordinate**.
+A dropped command costs a frame; a dropped coordinate costs the session.
+Widening the checksum only moves the exponent.
+
+### The fix is a bound, not a better hash
+
+`cmBound` in both `gpu64_demo_level.a` and `gpu64_demo_game.a`: a move cannot
+end further from where it started than the displacement that was asked for,
+plus the step-up the trace is allowed to add on its own. Integer halves only,
+two world units of slop, about forty cycles for three axes. It is **exact**
+rather than probabilistic — the question bounds the answer — and the failure
+it catches moves a coordinate by hundreds of units, not by two.
+
+Refusals are counted separately from checksum failures and printed as `W` on
+row 13, because they mean different things: `BAD` is the bus being caught,
+`W` is the bus very nearly getting away with it.
+
+The same injection against the patched build: `W01`, and the camera ends the
+run exactly where the un-faulted run leaves it. Against a build with the two
+instructions removed: `XFF12`, outside the map. **The instrument was proven
+to fire before it was trusted** — the `L=0/0` discipline, fifth appearance.
+
+`docs/class1-3d-mesh-reference.md` now lists bounding the answer as the third
+obligation of the readback, next to the magic/checksum check and
+`SET_DMA_WINDOW`, because it is advice for every user of the opcode and not a
+detail of one demo.
+
+### What is NOT explained
+
+- **`E04` is `BAD_ARGS`**, and on `CLIP_MOVE` that is the Pi rejecting the
+  *input* block. So faults are landing on the way out as well as on the way
+  back. `BAD 0043` = 67 rejected answers in 345 frames is roughly one frame in
+  five, far worse than any rate this project has measured, and
+  `gpu64-bus-fault-rate-varies-30x` forbids sizing anything from one run.
+- `CLIP_MOVE` is deliberately **drain-exempt**, so it is the first per-frame
+  readback that runs *while core 1 is rendering* — and run 13/19 established
+  that core 1 rendering is what causes bus faults. The exemption buys latency
+  and pays for it in exposure. An A/B with the exemption removed, inside one
+  run, is the way to price that; two runs cannot answer it.
+- `MISSED 0098` (152), `STALLS 0076` (118) and eight commits answering
+  something other than BUSY or UNSUPPORTED are all from the same run and the
+  same denominator.
+
+### Also from this run
+
+The screen that was photographed was `gpu64_demo_level`, not
+`gpu64_demo_game` — row 0 says which. Step 5b has still never run on
+hardware.
+
+Gates after the fix: `tools/demos.sh` 14/14 with the game demo's four door
+assertions, `tools/testprg.sh` 13/13, `hulltest` 0 failures. Not committed,
+and the card was unmounted before the patched programs could be deployed.
+
+## 68. Run 37: the bound held, and 61% of the answers never arrived (2026-09-24)
+
+First hardware run of `gpu64_demo_game` — row 0 said so, and row 2 said
+`THE DOORS WORK`. Step 5b has now executed on a C64.
+
+```
+CAM X0010 Y0003 ZFFF5 YAW24
+CLIP F01 C01 FRFF B00 E04 BAD 0430 W04
+MISSED 0283   ERRBAD 0017   CMT XX 0012 last 09
+SEL 001  MS 032  OPEN 0001  FIRE 0000  NODE 00A4
+ENTS 0171 BAD 000   PE 00
+```
+
+### The bound did its job, twice over
+
+`CAM X0010 Y0003 ZFFF5` is the spawn, one unit east. After 1753 frames the
+camera is **inside the map**, which run 36 could not manage for five seconds.
+`W04` says four answers passed magic *and* XOR and were refused anyway for
+ending further from the start than the step asked for. Four permanent wrong
+positions did not happen. Section 67's bound is not a theoretical instrument
+any more.
+
+`F01 FRFF` also says the last answer was a clean full-length step on ground,
+so nothing about the geometry or the hull is wrong.
+
+### But almost nothing gets through
+
+`BAD 0430` is 1072 rejected answers in 1753 frames — **61%**, against the
+level demo's 19% on the same hardware the same day. The game demo differs from
+the level demo in one way that touches the bus: it sends up to sixteen
+16-byte mover records per frame. The bytes crossing the bus roughly tripled
+and the failure rate tripled with it.
+
+Two things that would have explained it away, ruled out by reading the code
+rather than guessing:
+
+- **The checksum is not stale.** `buildMovers` runs before the checksum loop,
+  and the loop covers the count byte, bytes 0..27, *and* every mover byte.
+- **The 312-byte descriptor is not the cost.** `opClipMove()` reads
+  `GPU64_3D_CLIPMOVE_IN_BYTES` (32) plus `nMovers × 16` — not the declared
+  length — so the arena's size is free. The mover records themselves are not.
+
+A player pinned near the spawn by a 61% rejection rate also explains the
+user's report that the HDMI scene looked "exactly like last time": with 1072
+of 1753 steps discarded, x moved from 15 to 16 over the whole run. Static and
+correct looks the same as static and broken in a photograph. The alternative —
+mis-addressed `SET_POSITION` writes from `sendMovers` displacing level
+geometry, which `gpu64-arg-drops-are-undetected` permits — has not been ruled
+out. **An HDMI photograph of this demo is the next thing needed.**
+
+### Two defects in the demo, both found by reading it against our own docs
+
+1. **ERRCODE was the verdict.** `bne cmBad` on a non-zero ERRCODE threw the
+   frame away. But ERRCODE is one register read, and
+   `gpu64-errcode-ff-is-the-bus` says a failed read hands back whatever was
+   last on the bus — so a garbled *read* was being counted as a refused
+   *command*. This is precisely how run 27 died in setup, and
+   `docs/class1-3d-mesh-reference.md` already says to check the block and not
+   ERRCODE. ERRCODE is now a diagnostic printed as `E`, and the magic test is
+   the verdict: when the command really was refused the Pi wrote nothing, the
+   `$a5` poison is still there, and the magic catches it anyway.
+
+2. **There was no retry.** The Pi never writes the input half of the block, so
+   a second attempt is the six register writes of the `#argblob` descriptor
+   plus the dispatch. At a 61% first-try rate that is absurdly cheap against
+   standing still for a frame. `CLIP_TRIES = 4`, re-poisoning only bytes
+   32..55 each time so the movers and the input survive.
+
+### Row 13 was one number and had to become four
+
+`BAD` lumped three unrelated failures together and could not say which
+*direction* the bytes were being lost in. It is now:
+
+```
+CLIP F01 FRFF E04 N0000 M0000 S0000 W00
+```
+
+- `N` — ERRCODE came back non-zero. The Pi rejected the block we **sent**.
+- `M` — output magic wrong. The writeback **never landed** (or landed
+  elsewhere); the poison is still in place.
+- `S` — magic right, XOR wrong. The writeback **landed damaged**.
+- `W` — passed both and was refused by the bound. The bus getting past the
+  channel checks and caught by what the answer *means*.
+
+`N`, `M` and `S` retry; `W` does not, because a bounded-out answer is not a
+transport failure to try again but a datum to discard. `C` (contents) and `B`
+(slide iterations) lost their columns to make room — 40 columns, and neither
+has ever been the thing a reading turned on.
+
+The three counters are the whole point of run 38: `N` high says the input path
+is where the mover bytes are lost, `M` or `S` high says the readback is, and
+the fix is a different fix in each case.
+
+### Still open from this run
+
+- `MISSED 0283` (643 dispatches whose SEQACK did not match) and
+  `ERRBAD 0017` (23) share this run's denominator and no other.
+  `gpu64-bus-fault-rate-varies-30x` still forbids comparing them across runs.
+- `CMT XX 0012 last 09` — eighteen commits answered `QUEUE_FULL`, which at
+  `MS 032` per frame is pacing, not a fault.
+- The A/B priced in section 67 — `CLIP_MOVE` with and without its drain
+  exemption, *inside one run* — is still the only way to test whether being
+  the one opcode that answers while core 1 renders is what makes its bus
+  traffic this bad.
+
+## 69. Run 38: E1M1 walks, then loses its view, its colours, and the C64 (2026-09-24)
+
+First bench session of `gpu64_demo_game` with the doors in. User report: the
+scene looks perfect and walks; after a few seconds the view "abruptly
+changes"; the FOV is too wide and "right angles are unstable" while turning;
+F1/F3 do not look up/down; later the scene loses its colours (HDMI photo:
+white speckles on blue-grey) but still walks; later still the C64 hangs, last
+screen `FRAMES 1081 OK 1078`, `CMT 07 0000 06 0004 XX 0005 01`, `MISSED 000C`.
+
+### What the PC sweep reproduced
+
+prgsim with `--bus-fault=data:N` (new `--bus-fault-from=F` keeps setup clean)
+reproduces the view jump and the colour loss from a handful of corrupted data
+bytes. Both are retained state damaged by a *phantom* — a real command whose
+opcode bits arrived wrong:
+
+- **Colours:** `CMD_HI` 1→0 turns class 1 `SET_POSITION` $30 into class 0
+  `PAL_SET` (and $31 into `PAL_LOAD`). One palette entry becomes a camera
+  coordinate and stays that way. The C64 holds no copy of the level's palette,
+  so nothing it could send would put it back.
+- **View / world:** `CMD_LO` one-bit flips turn `SET_POSITION` $30 into
+  `CREATE_OBJECT` $20, `SET_ORIENTATION` $31 into `CREATE_CAMERA` $21,
+  `SET_VISIBLE` $24 into `CREATE_SPRITE` $25. `CREATE_*` replaces a live id by
+  design, so the target — the camera itself, or a level node via a flipped
+  `ID_LO` — becomes a different kind of node for the rest of the session.
+  Fault runs left level walls as cameras, sprites, and instances of mesh 49152.
+
+### Fixes
+
+- **`LEVEL_PALETTE` $17** (firmware + model): compares the live palette with
+  the level file's and repairs what differs; colormap rebuilt only then.
+- **`LEVEL_NODE` $1C** (firmware + model): restores one level node — type,
+  mesh from the file's node table, visible, scale, orientation, and with
+  `ARG0` bit 0 the file's position. `$1C` was chosen so that every one-bit
+  neighbour is undefined in both classes or `BUSY` in the loop.
+- **Demo refresh rings**, one step each per frame: `rgTab` (viewport, palette
+  ×2, perspective, active camera, background, light, DMA fence) and
+  `nodeRefresh` (one `LEVEL_NODE`, movers without bit 0 — `sendMovers`'
+  own ring owns their positions). An earlier cut of the node ring used
+  `GET_TRANSFORM` shadows plus `SET_POSITION/ORIENTATION/SCALE/VISIBLE`; the
+  sweep showed that ring *creating* the damage it was meant to heal (`$24` and
+  `$30` are one bit from `CREATE_*`), so it was replaced.
+- **Camera repair:** if `SET_ACTIVE_CAMERA` answers `BAD_ID`, re-`CREATE_CAMERA`,
+  re-activate and `sendCamera` before the commit. Row 18 `CAM` counts it.
+- **`FENCE_ECHO` precedence bug** in both E1M1 demos: 64tass `<`/`>` bind to
+  the whole expression on their right, so the constant assembled to $62, not
+  $EB, and every fence check failed after three tries. Parenthesised.
+- **View keys:** F1/F3 pitch ±4 per frame, clamped ±48; F7 levels; `+`/`-`
+  step the FOV 30°..110° in 5° steps, default 75° in both E1M1 demos (was a
+  fixed 90°; the user saw the world "collapsing" at the edges while turning).
+  75° confirmed right on the bench. F1/F3 had simply never been implemented in this demo.
+- runsim: `--bus-fault-from`, `PLUS`/`MINUS` keys, punctuation in the screen
+  decoder.
+
+### PC verification
+
+Clean 700-frame run: every frame OK, `RING ERR 000`, `NODES 082 FIX 000`,
+scene identical to the pre-change baseline. 5417 dispatches (the
+GET_TRANSFORM-shadow ring cost 7456). Eight fault runs (`data:97/131/173/251/
+61/43`, `both:97`, `drop:61`, faults on frames 1-450, stop at 700): state
+line, palette and **every level node** converge to the clean scene; `FIX`
+2-23, `CAM` 0-2, `PAL` 0-15 per run. The only residual difference is the
+camera's x/z — the C64's own walked path after lost moves, which
+`sendCamera` pushes every frame, so the Pi agrees with the C64.
+
+### Still open
+
+- **The hang.** No fault run hung. The HDMI side at the moment of the hang,
+  and whether the border was red, would separate a 6502 crash from a Pi
+  stall.
+- **"Right angles unstable"** — not yet understood; needs the user's words.
+- `RESULT` is stamped with the frame page by the vsync FRAME_READY harvest
+  while the loop runs, so a `RESULT` read after `LEVEL_PALETTE`/`LEVEL_NODE`
+  can race it. Only the `PAL`/`FIX` telemetry reads it, twice and compared.
+- The ring's own global entries have risky class-0 twins ($01 RESET_STATE,
+  $02/$03 VBLANK, $05 PAGE_FLIP, $08 SET_BORDER, $23 RECT_FILL); none showed
+  in the sweep, but they are one `CMD_HI` bit away.
+
+### Run 38b (2026-09-24): FOV right, walk slow, HDMI frozen with the C64 alive
+
+- 75° confirmed on the bench. Walking felt "much slower", though MS/FRAME
+  was 029, the same as every earlier E1M1 run: the narrower lens magnifies
+  the picture by tan 45°/tan 37.5° = 1.30. `WALK` 26 → 34, and the three
+  forward legs of demos.sh's game route were shortened by the same ratio
+  (all four door checks still pass).
+- The hang was not a C64 hang: the VIC screen read `STOPPED`, so RUN/STOP
+  and LOOP_STOP went through. `FRAMES 0AC1 OK 0AB7`, `FLIP OK 0AB7`, so the
+  Pi accepted and flipped every commit while HDMI stood still. `FIX 003`,
+  `PAL 0002`, `CAM 000`, `RING ERR 000`.
+- Suspected cause, not proven: the Pi's class 0 dispatcher never checked
+  whether the loop was running, so a class 1 command whose CMD_HI arrived
+  as 0 ran as its class 0 twin against the loop's display. SET_VIEWPORT
+  $01 → RESET_STATE (ResetPages + vsync state reset mid-loop), and
+  SET_BACKGROUND $05 → PAGE_FLIP. Both of those twins come from the refresh
+  ring this section added. $30/$31 → PAL_SET/PAL_LOAD is the colour loss.
+  **Fix:** while the loop runs, every display-touching class 0 op answers
+  BUSY (gpu64_api.cpp, model too). This is the rule already documented as
+  "no 2D overlay while the loop runs"; the firmware now enforces it. In
+  the fault sweeps, palette repairs dropped to 0 in both data-fault runs.
+  prgsim does not model which page is presented, so the freeze itself
+  cannot be reproduced on a PC; only the bench can confirm the fix.
+  Build id src:5ca633ac, deployed.
+
+
+### Run 38c (2026-09-24): the "hang" was the demo quitting on a key nobody pressed
+
+- The second freeze read `STOPPED` again after only 0154 frames, with every
+  error counter at zero, and the user had **not** pressed RUN/STOP. The
+  user also saw the FOV narrow twice on its own. Both are the same defect:
+  one wrong keyboard sample. The frame loop quit on a single column-7 read
+  showing RUN/STOP, and a single read of MINUS stepped the lens. Neither
+  run 38b nor 38c needed any Pi-side failure to explain it. **So the class-0
+  twin theory above is unproven, not confirmed.** The BUSY refusal stays as
+  hardening because it is correct by the documented rule anyway.
+- Why the CIA read is sometimes wrong is not known. readKeys runs under
+  `sei`, so the KERNAL scan is not the cause. This is the next thing to
+  find out, not something to assume.
+- **Fix, demo side** (gpu64_demo_game.a):
+  - Columns B, C, A and E are read twice and ORed, so a pressed key has to
+    show in both reads.
+  - RUN/STOP must be held for `STOP_HOLD` = 4 frames.
+  - PLUS/MINUS must be held for `FOV_HOLD` = 3 frames, then repeat every 8.
+  - Column 7 is read once, because runsim's `--stop-after` and
+    check_game.py count column-7 reads as frames. Reading it twice halved
+    every checkpoint.
+- PC check: a 2-frame MINUS and a 3-frame RUN/STOP are both ignored, PLUS
+  held for 31 frames steps the FOV 4 times, and RUN/STOP held for 11 frames
+  stops at frame 63. The game route passes all four door checks, and
+  testprg is green. Deployed.
+- gpu64_demo_level.a still quits on one sample. It is not the program on
+  the bench.
+
+
+### Run 39 (2026-09-24): black HDMI with the C64 still counting, and the jump
+
+- **What the bench showed.** The run went a long time. From the start it
+  blinked, the player moved on its own and colours broke, and each time it
+  recovered. It ended with HDMI black while the VIC kept counting.
+  - The photo: `CLIP F20` (ALLSOLID) `W15`, and `CAM Y FF33`. That is 205
+    world units below spawn, about 6,500 Quake units.
+  - What happened: cmBound let through answers that moved up to **2 whole
+    units** (64 QU, a player's height) per axis, and compared integer halves
+    only. That slop is the drifting player. One such move went through a
+    floor. Below the map nothing is a floor, the player fell at terminal
+    speed for good, and the camera ended up looking at nothing.
+  - Nothing brought them back. A STARTSOLID answer was skipped and an
+    ALLSOLID one was taken with end == start, so the player stayed put
+    either way, forever.
+- **Fix, demo side** (gpu64_demo_game.a):
+  - **cmBound** now works in 1/256 of a unit, on bytes 1..3.
+    - X and Z slop is `POS_SLOP_XZ` = $20 (4 QU).
+    - Y slop is `POS_SLOP_Y` = $128 (37 QU): a step-up or a floor settle,
+      on top of the fall that was asked for.
+    - The route still passes it with W = 0.
+  - **Stuck:** an answer flagged STARTSOLID or ALLSOLID puts the player back
+    at `lastGood`, the eye where they last stood. `lastGood` is taken from
+    the start of any accepted answer while the player is on the ground.
+    - If the next answer is solid too, the player climbs 16 QU a frame
+      above `lastGood` until an answer comes back clear. Try 48 times, then
+      start over.
+    - The route itself needed this. Door 29 is a lift. The route rides it
+      down, and when it shuts it rises straight through the player. The
+      firmware's mover does not push, and every build before this one sat
+      inside it for the rest of the run: `F20` from about frame 355 on,
+      invisible because nothing counted it.
+  - **Void:** `VOID_FRAMES` = 120 frames without ground puts the player back
+    at `lastGood`.
+  - **Row 19** shows `BODY JMP n STUCK n VOID n Gn`. A nonzero VOID, or a
+    STUCK that keeps growing while standing in the open, is a bad answer
+    that got past both the checksum and the bound.
+- **Jump:** SPACE, which must read down for 2 frames, since a phantom
+  sample is one frame.
+  - `velY` starts at `JUMP_V` = $3800 (7 QU a frame). `GRAV` = $450 comes
+    off each frame, clamped at `-FALL_16`.
+  - While standing, `velY` is `-FALL_16`, the same probe as before, so
+    walking and walk-offs have not changed.
+  - A jump traces with STEP and FLOOR off (`CLIP_MODE_AIR`), because the
+    floor settle would snap a rising player straight back down.
+  - It lands on ONGROUND only while `velY` is negative. A CEILING hit ends
+    the rise.
+  - Apex is about 45 QU, Quake's.
+  - Run moved from SPACE to left SHIFT. demos.sh's route uses `LSHIFT`,
+    which is new in runsim's KEY_MATRIX.
+- **Harness:** `runsim.py --clip-fault=N:solid` sends one ALLSOLID answer.
+  `N:void` makes answer N and every one after it a floorless free fall.
+  These are the first switches that reach the recovery, which a coordinate
+  fault never can, because the bound catches it.
+- **PC check:**
+  - A jump from a standstill rises about a unit and lands (G 00 → 01).
+  - `solid` at answer 150 costs exactly one STUCK over the clean route.
+  - `void` from answer 150 is restored twice by frame 500, with Y bounded
+    at −27. Before the fix Y would have been about −87 and still falling.
+  - The route passes all four door checks, the other gates below.
+- **Route change.** The climb made door 29 fail its "shut again by 400"
+  check. The player, lifted out on top of the door, landed back inside the
+  button's volume and pressed it again. The last leg is now `Q:308-324
+  E:326-340`: press, then step back off the door. All four door checks
+  pass. demos.sh game/level/quake3d/quake and testprg (13) are green.
+  Deployed 2026-09-25 (PRG only; the firmware did not change).
+
+### Run 40
+
+Bench, 2026-09-25, first run of the run 39 build. Three reports: the rest of
+E1M1 flickered through the walls about once a second, movement was still
+slow, and after about a minute the player could no longer move.
+
+Photo: FRAMES 0E41 OK 0E38, FLIP 0E42 (the Pi was still flipping), MISSED
+0025, `CLIP F01 FRFF E00 N088C M0917 S001F W09`, VIEW FIX 004,
+`BODY JMP 000 STUCK 004 VOID 000 G01`.
+
+- **The flicker was the camera, not the renderer.** Class 1 is z-buffered,
+  so far geometry showing means the near geometry was not drawn where it
+  should have been. What the frame loop resends every frame is the camera,
+  as 12 ARG bytes with no check. A write the polling loop does not sample
+  leaves the register holding the previous command's byte, and before
+  `sendCamera` that is a mover's position.
+  - `runsim --bus-fault=drop:400` over the demos.sh route, fed through a
+    stream differ, found 95 events in 1500 frames:
+    - one-frame camera jumps of 33 and 65 units;
+    - one-frame yaw blips;
+    - level nodes moved onto the camera by a dropped ID byte;
+    - doors moved onto other doors' ids, until a refresh put them back.
+  - The clean route has 0.
+- **Fix: `stage2`.** Camera position and orientation, mover positions and
+  the LEVEL_NODE refresh are built in RAM (`stId`, `stBuf`). Each block goes
+  to the registers twice, a whole block apart, so the second pass repairs a
+  lost write. With the same injection there are 0 events. It costs about 40
+  register writes a frame, and no dispatches.
+- **Speed.** `WALK` 34 → 68. Run (left SHIFT) is now `WALK*2`, still 136,
+  so the flooded route is unchanged.
+- **CLIP_TRIES 4 → 8.** Run 40 failed about 1.2 CLIP_MOVE attempts a frame
+  (N+M ≈ 4500 in 3649 frames). At that rate four tries gave up about one
+  frame in eight, which is a sticky, slow walk. Eight tries give up about
+  one frame in sixty.
+- **The lost movement is not diagnosed.** The photo cannot tell a
+  CLIP_MOVE that stopped answering from a player standing somewhere
+  nothing can leave. N and M are running totals, and STUCK 004 is small.
+  Row 19 now ends in `D cur/max`: frames in a row with no answer taken
+  (tries exhausted, or refused by the bound). It was reshortened to
+  `BODY JMP n STK n VD n Gn Dcc/mm`.
+  - Next time the player freezes:
+    - A climbing D means the Pi stopped answering.
+    - D 00 with a flat STK means the input or the answer is fine and the
+      player really is boxed in.
+    - A climbing STK means solid.
+- demos.sh game/level/quake3d/quake (all four door checks) and testprg are
+  green. Deployed 2026-09-25 (PRG only; the firmware did not change).

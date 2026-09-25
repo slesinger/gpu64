@@ -211,6 +211,141 @@ static unsigned clipNear( ClipVert *pOut, const ClipVert *pIn, unsigned n, s32 n
 	return nOut;
 }
 
+// --- the guard band -----------------------------------------------------
+//
+// clipNear() above handles the one plane that MUST be clipped -- nothing can
+// be projected through z <= 0 -- and the design doc's open question 3 argued
+// the other four could be left to the rasteriser's scissor. They cannot.
+//
+// project() divides by z, so a vertex that survives the near clip at
+// z == nearZ and sits far to the side lands at a screen coordinate of
+// x * focal / nearZ. In E1M1 that reaches 62921 pixels, and past 32767 it
+// overflows the s32 sx/sy carry it home in. The vertex then wraps to the
+// wrong side of the screen, the triangle it belongs to becomes enormous, and
+// gpu64_3dRasterTriangle() fills the whole viewport with it: 35 of 300
+// sampled frames of the level demo rendered as one solid colour before this
+// existed. That is the "blinking, unsteady" the bench reported on 2026-09-20.
+//
+// The fix is to clip laterally too. GUARD viewport half-widths out, not at
+// the viewport edge, so the value is first of all a bound on the arithmetic:
+// at 64 half-widths a projected coordinate cannot exceed 65 * 160 = 10400
+// pixels, a factor of three inside the s32 that carries it and a factor of
+// four inside the rasteriser's own dx * dy product.
+//
+// It is not only a bound. Of the 1502 frames in the level demo, 45 differ
+// between the mesh reject below on its own and the reject plus this clip, and
+// all 45 are this clip removing a wrapped triangle -- five of them are frames
+// the reject alone loses completely. The mesh reject removes the *work*; this
+// removes the last of the garbage.
+//
+// A tight guard (1 to 4) is the textbook choice and would also cut the
+// rasterised area, but it is NOT a free swap: clipping closer moves the
+// vertices the rasteriser takes its plane gradients from, and on a close-up
+// wall in the quake3d demo guards of 1, 2, 4 and 16 disagree with each other
+// across 50-79% of the frame. That is a separate precision defect -- see
+// project/progress_tracker.md section 63 -- and until there is an oracle that
+// says which of those pictures is right, narrowing this number is a change
+// with an unknown sign.
+#define GPU64_3D_GUARD		64
+
+struct GuardPlane
+{
+	s64	ax, ay, az;			// keep the a.p >= 0 side
+};
+
+static s64 guardDist( const ClipVert *pV, const GuardPlane *pP )
+{
+	return pP->ax * pV->p.x + pP->ay * pV->p.y + pP->az * pV->p.z;
+}
+
+// Sutherland-Hodgman against one guard plane. Each plane adds at most one
+// vertex, so a near-clipped triangle (at most 4) stays inside 8 across all
+// four of them.
+static unsigned clipGuardPlane( ClipVert *pOut, const ClipVert *pIn, unsigned n,
+				const GuardPlane *pP )
+{
+	unsigned nOut = 0;
+
+	for ( unsigned i = 0; i < n; i++ )
+	{
+		const ClipVert *pA = &pIn[ i ];
+		const ClipVert *pB = &pIn[ ( i + 1 ) % n ];
+
+		const s64 dA = guardDist( pA, pP );
+		const s64 dB = guardDist( pB, pP );
+
+		if ( dA >= 0 )
+			pOut[ nOut++ ] = *pA;
+
+		if ( ( dA >= 0 ) != ( dB >= 0 ) )
+		{
+			// lerpVert() multiplies a coordinate difference by num
+			// before dividing, and a guard-plane distance is a
+			// focal-times-coordinate product -- four orders of
+			// magnitude larger than the z differences clipNear()
+			// feeds it. Shift the ratio down until the product
+			// cannot overflow. den is dA + |dB| so it is always the
+			// larger of the two, and always positive here, which is
+			// why testing it alone is enough.
+			s64 num = dA, den = dA - dB;
+			while ( den > 0x7fffffff )
+			{
+				num >>= 1;
+				den >>= 1;
+			}
+			lerpVert( &pOut[ nOut++ ], pA, pB, num, den );
+		}
+	}
+
+	return nOut;
+}
+
+// Returns the polygon clipped to the guard band, in pA or pB -- whichever it
+// hands back. Leaves both alone and returns pA untouched when nothing
+// violates, which is the case for all but a few thousand of the twenty-two
+// million vertices a level run projects.
+static unsigned clipGuard( ClipVert **ppOut, ClipVert *pA, ClipVert *pB,
+			    unsigned n, const Gpu64_3dState *pState )
+{
+	const s64 f = pState->focal;
+	const s64 gh = (s64)( pState->vpW / 2 ) * GPU64_3D_GUARD << 16;
+	const s64 gv = (s64)( pState->vpH / 2 ) * GPU64_3D_GUARD << 16;
+
+	const GuardPlane plane[ 4 ] =
+	{
+		{ -f,  0, gh },			// right
+		{  f,  0, gh },			// left
+		{  0, -f, gv },			// up
+		{  0,  f, gv },			// down
+	};
+
+	ClipVert *pSrc = pA, *pDst = pB;
+
+	for ( unsigned k = 0; k < 4; k++ )
+	{
+		// The whole point of the guard band: test first, clip only when
+		// something is actually outside it.
+		boolean bOut = FALSE;
+		for ( unsigned i = 0; i < n; i++ )
+			if ( guardDist( &pSrc[ i ], &plane[ k ] ) < 0 )
+			{
+				bOut = TRUE;
+				break;
+			}
+		if ( !bOut )
+			continue;
+
+		n = clipGuardPlane( pDst, pSrc, n, &plane[ k ] );
+		ClipVert *pSwap = pSrc; pSrc = pDst; pDst = pSwap;
+
+		if ( n < 3 )
+			break;
+	}
+
+	*ppOut = pSrc;
+	return n;
+}
+
 static void project( Gpu64_3dRasterVert *pOut, const ClipVert *pIn,
 		     const Gpu64_3dState *pState )
 {
@@ -411,9 +546,17 @@ unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,
 	rel.z = pPos->z - pState->viewPos.z;
 	gpu64_3dVecRotate( &origin, &pState->viewRot, &rel );
 
-	// Bounding-sphere reject against the near and far planes. Cheap, and it
+	// Bounding-sphere reject against all six frustum planes. Cheap, and it
 	// is what makes splitting large geometry across meshes pay -- design doc,
 	// Mesh format.
+	//
+	// The four side planes matter as much as near/far and were missing until
+	// 2026-09-21. A level converted from Quake is scaled so the whole map
+	// fits inside the 128-unit far plane (tools/gen_quakelevel.py's
+	// QU_PER_WU), which means near/far alone rejects almost nothing: standing
+	// in one room of E1M1, all 82 meshes passed, and every vertex of all
+	// 15253 triangles was rotated into view space before the backface test
+	// threw the far side of the map away.
 	{
 		const s64 radius = ( (s64)pMesh->radius * nScale ) >> 8;	// 8.8 * 8.8 -> 8.8
 		Gpu64_3dVec c, cv;
@@ -422,11 +565,45 @@ unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,
 		c.z = ( (s32)pMesh->centre[ 2 ] * nScale );
 		gpu64_3dVecRotate( &cv, &total, &c );
 
+		const s64 cx = (s64)cv.x + origin.x;
+		const s64 cy = (s64)cv.y + origin.y;
 		const s64 cz = (s64)cv.z + origin.z;
 		const s64 r16 = radius << 8;				// 8.8 -> 16.16
 		if ( cz + r16 < pState->nearZ )
 			return 0;
 		if ( cz - r16 > pState->farZ )
+			return 0;
+
+		// The side planes, derived straight from project(): a vertex lands at
+		// sx = centre + x * focal / z, so the right edge of the viewport is
+		// the half-space focal * x <= ( vpW / 2 ) * z, a plane through the
+		// view-space origin with normal ( focal, 0, -vpW/2 ). Reject when the
+		// whole sphere is on the far side of it, i.e. when the signed
+		// distance exceeds the radius.
+		//
+		// Everything is scaled into 8.8 pixels so the products stay inside
+		// s64 with room to spare: focal is 16.16, the half-extents are whole
+		// pixels, and the common factor cancels out of an inequality. The
+		// norms are two sqrts per mesh, against a per-vertex cost this
+		// removes entirely -- and they are exact, so the test rejects as much
+		// as the sphere allows rather than being loosened by an
+		// ( a + b ) >= sqrt( a*a + b*b ) shortcut.
+		s64 f8 = pState->focal >> 8;				// 16.16 -> 8.8
+		if ( f8 < 1 ) f8 = 1;					// never a degenerate plane
+		const s64 h8 = (s64)( pState->vpW / 2 ) << 8;		// pixels -> 8.8
+		const s64 v8 = (s64)( pState->vpH / 2 ) << 8;
+
+		const s64 nx = (s64)gpu64_3dSqrt64( (u64)( f8 * f8 + h8 * h8 ) );
+		const s64 ny = (s64)gpu64_3dSqrt64( (u64)( f8 * f8 + v8 * v8 ) );
+
+		const s64 dx = f8 * cx, dy = f8 * cy, dh = h8 * cz, dv = v8 * cz;
+		if (  dx - dh > r16 * nx )		// right of the viewport
+			return 0;
+		if ( -dx - dh > r16 * nx )		// left
+			return 0;
+		if (  dy - dv > r16 * ny )		// above
+			return 0;
+		if ( -dy - dv > r16 * ny )		// below
 			return 0;
 	}
 
@@ -447,6 +624,8 @@ unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,
 		pScratch->view[ i ].y = r.y + origin.y;
 		pScratch->view[ i ].z = r.z + origin.z;
 	}
+
+
 
 	// The light lives in world space; the pipeline works in view space, so
 	// rotate it once here rather than rotating every normal back.
@@ -497,7 +676,7 @@ unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,
 			light = (u8)lit;
 		}
 
-		ClipVert in[ 3 ], out[ 8 ];
+		ClipVert in[ 3 ], out[ 9 ], out2[ 9 ];
 		const u8 idx[ 3 ] = { pF->i0, pF->i1, pF->i2 };
 
 		for ( unsigned k = 0; k < 3; k++ )
@@ -510,7 +689,12 @@ unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,
 			in[ k ].v = (s32)pF->v[ k ] << 16;
 		}
 
-		const unsigned nOut = clipNear( out, in, 3, pState->nearZ );
+		unsigned nOut = clipNear( out, in, 3, pState->nearZ );
+		if ( nOut < 3 )
+			continue;
+
+		ClipVert *pPoly;
+		nOut = clipGuard( &pPoly, out, out2, nOut, pState );
 		if ( nOut < 3 )
 			continue;
 
@@ -525,9 +709,9 @@ unsigned gpu64_3dDrawMesh( const Gpu64_3dState *pState,
 		for ( unsigned t = 1; t + 1 < nOut; t++ )
 		{
 			Gpu64_3dRasterVert rv[ 3 ];
-			project( &rv[ 0 ], &out[ 0 ],     pState );
-			project( &rv[ 1 ], &out[ t ],     pState );
-			project( &rv[ 2 ], &out[ t + 1 ], pState );
+			project( &rv[ 0 ], &pPoly[ 0 ],     pState );
+			project( &rv[ 1 ], &pPoly[ t ],     pState );
+			project( &rv[ 2 ], &pPoly[ t + 1 ], pState );
 
 			gpu64_3dRasterTriangle( pState, pTarget, rv, pTex, flat, light );
 			nDrawn++;

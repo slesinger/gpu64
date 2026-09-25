@@ -57,6 +57,7 @@ u64 armCycleCounter;
 #include "gpu64_api.h"
 #include "gpu64_vsync.h"
 #include "gpu64_ladder.h"
+#include "gpu64_level.h"
 
 // VSF
 u8 vsf[ 17 * 1024 * 1024 ] = {0};
@@ -802,6 +803,15 @@ void CRAD::Run( void )
 			}
 
 			reu.isModified = 0;
+
+			// gpu64 (milestone 18): the one moment the SD card can be
+			// touched. Everything after this runs inside
+			// reuUsingPolling(), where an EMMC transfer's MMIO traffic
+			// would wreck core 0's per-C64-cycle bus timing -- so the
+			// level file is read into RAM here and LOAD_LEVEL only ever
+			// parses memory. Deliberately ahead of the i-cache preloads
+			// below, which it would otherwise evict.
+			gpu64_levelPreload();
 
 			if ( radLaunchPRG )
 			{

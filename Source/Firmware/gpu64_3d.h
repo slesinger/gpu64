@@ -72,6 +72,218 @@
 // 0..256 for a 32 MB arena and so fits the one byte RESULT has.
 #define GPU64_3D_OP_ARENA_STATUS	0x09
 
+// gpu64 (milestone 18): the level loader. LOAD_LEVEL hands the Pi's own
+// .g64lev file to class 1 -- a whole Quake level's geometry, textures,
+// palette and entity table, which at 620 KB the C64 cannot upload and has no
+// reason to: it is level data, not game state. LOAD_LEVEL validates and arms;
+// LEVEL_STEP performs one bounded slice of the build and reports progress, so
+// the DMA hold per command stays in the same range as an ordinary REU
+// transfer instead of halting the C64 for the whole load.
+//
+// Two new opcode numbers rather than arguments on UPLOAD_MESH, which is what
+// the v1 surface freeze (project/milestone17*, gpu64-v1-surface-frozen)
+// requires of anything added after it.
+//
+// LOAD_LEVEL is keyed: it recreates the resource table and the scene from
+// scratch, so a phantom would destroy a running session exactly the way
+// SCENE_RESET would.
+#define GPU64_3D_OP_LOAD_LEVEL		0x13
+#define GPU64_3D_OP_LEVEL_STEP		0x14
+
+// LEVEL_STEP's RESULT: 0..99 is percent complete and more steps remain; this
+// means the build finished. A distinct value rather than "100", so that a
+// client cannot mistake the last progress report for completion.
+#define GPU64_3D_LEVEL_DONE		0xff
+
+// gpu64 (milestone 18): CLIP_MOVE, the answer to "can I walk here?".
+//
+// Collision is the one piece of game logic that cannot live on the C64 --
+// E1M1's clipnodes are 43 KB and its planes another 36 KB -- and the Pi is
+// already holding them. So the C64 sends where it is and where it would like
+// to be, and gets back where it actually ends up. It stays authoritative:
+// gpu64 never moves the camera, it only answers.
+//
+// Everything travels in one block in the C64's own memory rather than in the
+// ARG registers, for two reasons. The first is that it does not fit: a
+// position and a displacement in 16.16 are 24 bytes on their own. The second
+// is the better one -- a block is one DMA burst where the registers would be
+// twenty-four separate writes, i.e. twenty-four independent chances for the
+// sampling defect to drop one, and a block can carry a checksum where the
+// register file cannot.
+//
+// CLIP_MOVE is NOT keyed. It destroys no retained state; the state it could
+// damage is the C64's own memory, and SET_DMA_WINDOW ($0C) is what confines
+// that. A program that calls CLIP_MOVE should set the window.
+//
+// It is also the one class-1 opcode that answers while the render loop is
+// running, because it reads nothing but the level file, which is immutable
+// once loaded, and writes nothing but the caller's block.
+#define GPU64_3D_OP_CLIP_MOVE		0x15
+
+// The block, 56 bytes plus 16 per mover. ARG0-5 name it the way every other
+// blob argument is named (space, 24-bit address, 16-bit length) and the length
+// must cover all of it. Input is bytes 0..29 and the mover records from 56;
+// the Pi writes 32..55 and never touches the input half, so a readback that
+// fails its checksum can simply be retried.
+//
+//    0..11   in   start   x, y, z   s32 16.16 world units, gpu64 axes, y up
+//   12..23   in   delta   x, y, z   s32 16.16, the displacement wanted
+//      24    in   hull    1 = player, 2 = the larger monster hull
+//      25    in   mode    GPU64_CLIP_MODE_* in gpu64_level.h
+//      26    in   model   0 = the world, or a brush model to move instead
+//      27    in   magic   GPU64_3D_CLIPMOVE_MAGIC_IN
+//      28    in   check   XOR of bytes 0..27, byte 29, and every mover byte
+//      29    in   movers  how many mover records follow, 0..16
+//   30..31        reserved, not read, not summed
+//   32..43  out   end     x, y, z   s32 16.16, where the move actually ended
+//      44   out   flags   GPU64_CLIP_* in gpu64_level.h -- also in RESULT
+//      45   out   cont    GPU64_CLIP_CONT_* at the end position
+//      46   out   frac    0..255 of the horizontal displacement covered
+//      47   out   bumps   slide iterations used, diagnostic
+//      48   out   magic   GPU64_3D_CLIPMOVE_MAGIC_OUT
+//      49   out   check   XOR of bytes 32..48
+//   50..55  out   zero
+//
+// Then `movers` records of 16 bytes each, the first at byte 56. Each one is a
+// brush model standing somewhere in the world: a closed door, a lowered
+// platform, a button not yet pressed. The world's own hull knows nothing
+// about them -- they are separate clipnode trees -- so a trace that does not
+// name them walks straight through every door on the map.
+//
+//    +0        model   brush model index; 0 is an empty slot, skipped
+//    +1        flags   reserved, zero
+//    +2..3     reserved, zero
+//    +4..15    ofs     x, y, z  s32 16.16, where the model is NOW relative to
+//                      its closed position -- i.e. how far the C64 has already
+//                      opened it. A closed door is all zeroes.
+//
+// The mover list is an argument, not retained state: gpu64 does not know which
+// doors are open, the C64 does, and it says so on every call. That is what
+// keeps CLIP_MOVE a pure function of its block, and therefore safe to answer
+// while the render loop is running.
+//
+// Both magics are checked, not just the checksums: a checksum alone accepts
+// an all-zero block, which is exactly what a buffer the C64 never filled in
+// looks like (gpu64-getinfo-readback-was-unfenced -- validate with a magic,
+// not with a poison).
+#define GPU64_3D_CLIPMOVE_BYTES		56
+#define GPU64_3D_CLIPMOVE_IN_BYTES	32
+#define GPU64_3D_CLIPMOVE_OUT_OFF	32
+#define GPU64_3D_CLIPMOVE_OUT_BYTES	24
+#define GPU64_3D_CLIPMOVE_MAGIC_IN	0xc5
+#define GPU64_3D_CLIPMOVE_MAGIC_OUT	0x5c
+#define GPU64_3D_CLIPMOVE_MOVER_OFF	56
+#define GPU64_3D_CLIPMOVE_MOVER_BYTES	16
+// Must match GPU64_LEVEL_MAX_MOVERS; opClipMove() asserts that it does.
+#define GPU64_3D_CLIPMOVE_MAX_MOVERS	16
+
+// gpu64 (milestone 18): LEVEL_ENT, one entity out of the loaded level.
+//
+// A level's entity lump is where its game is: 369 records for E1M1, naming
+// the player start, fourteen doors and their buttons, the triggers that open
+// them, forty-two monsters and every item on the map. It is already in the
+// Pi's memory because the level file carries it, and it cannot travel to the
+// C64 wholesale -- 16 KB of records and a string pool -- so the C64 asks for
+// one record at a time and keeps the handful it cares about.
+//
+// The block protocol is CLIP_MOVE's, for the same reasons and with the same
+// two obligations: check the output magic AND the output checksum, and set
+// SET_DMA_WINDOW before calling. Unkeyed, and exempt from the pre-execute
+// drain, again because the level file is immutable once loaded.
+//
+// The record is pre-digested for a 6502. Classnames arrive as a `kind` byte
+// (a game switches on it; the ranges are in gpu64_level.h), target and
+// targetname as opaque 16-bit ids that compare equal when the strings do, a
+// brush mover's travel as a ready displacement, and a brush model's nodes as
+// a contiguous run of scene node ids -- so moving a door is SET_POSITION on
+// `nodeFirst`..`nodeFirst + nodeCount - 1` and nothing has to be looked up.
+#define GPU64_3D_OP_LEVEL_ENT		0x16
+
+// The block, 96 bytes. Input is bytes 0..3; the Pi writes 16..95.
+//
+//     0..1   in   index   which entity, 0 .. entCount-1
+//        2   in   magic   GPU64_3D_LEVELENT_MAGIC_IN
+//        3   in   check   XOR of bytes 0..2
+//     4..15       reserved, not read
+//   16..27  out   origin  x, y, z   s32 16.16 world units, gpu64 axes
+//   28..39  out   mins    the brush model's box, zero if not a brush model
+//   40..51  out   maxs
+//   52..63  out   travel  closed -> open displacement, zero if not a mover
+//   64..65  out   yaw     u16, a full turn is 65536
+//   66..67  out   spawnflags
+//   68..69  out   param0  s16, which key this is depends on the classname
+//   70..71  out   param1
+//   72..73  out   target      opaque id, 0 = none
+//   74..75  out   targetname  opaque id, 0 = none
+//   76..77  out   nodeFirst   scene node id of this model's first chunk
+//   78..79  out   entCount    how many entities the level has, every call
+//      80   out   nodeCount   chunks in the run, 0 if the model draws nothing
+//      81   out   kind        see Gpu64_LevelEnt::nKind
+//      82   out   model       brush model index, 0 = not a brush model
+//      83   out   reserved, zero
+//      84   out   magic   GPU64_3D_LEVELENT_MAGIC_OUT
+//      85   out   check   XOR of bytes 16..84
+//   86..95  out   zero
+//
+// entCount is in every answer rather than in a call of its own, because a
+// game's first act is to walk the table and it would otherwise need a second
+// opcode to know where to stop.
+#define GPU64_3D_LEVELENT_BYTES		96
+#define GPU64_3D_LEVELENT_IN_BYTES	4
+#define GPU64_3D_LEVELENT_OUT_OFF	16
+#define GPU64_3D_LEVELENT_OUT_BYTES	80
+#define GPU64_3D_LEVELENT_MAGIC_IN	0xc6
+#define GPU64_3D_LEVELENT_MAGIC_OUT	0x6c
+
+// gpu64 (milestone 18, bench run 38): LEVEL_PALETTE, put the loaded level's
+// palette back.
+//
+// A level's palette is installed once, by LEVEL_STEP, and the C64 never holds
+// a copy -- so it is the one piece of retained state a state refresh ring
+// could not repair from a shadow of its own. And it does get damaged: a
+// corrupted CMD_HI turns a class 1 SET_POSITION ($30) into class 0 PAL_SET,
+// which overwrites one palette entry with camera coordinates. Run 38's scene
+// "lost its colours" a few minutes in, one entry at a time, and the injected
+// runs in prgsim reproduce it.
+//
+// No arguments. Compares the installed palette with the level's and rewrites
+// only the entries that differ; if any did, it pushes the palette to the
+// VideoCore and rebuilds the colormap (into the shadow state while the loop
+// runs), because a phantom BUILD_COLORMAP could have baked the damage in.
+// RESULT is the number of entries repaired, saturated at 255 -- 0 is the
+// normal answer, and costs a 768-byte compare and nothing else, so a program
+// can afford it on a refresh ring. BAD_ARGS until a level load has finished.
+//
+// Unkeyed, idempotent, and exempt from the pre-execute drain: core 1 reads
+// neither the palette nor the shadow state.
+#define GPU64_3D_OP_LEVEL_PALETTE	0x17
+
+// gpu64 (milestone 18, bench run 38): LEVEL_NODE, put one level node back the
+// way LEVEL_STEP built it.
+//
+// The level's node table -- which mesh each chunk instances -- lives only in
+// the level file, so a C64 cannot repair a level node from a shadow of its
+// own the way it repairs its camera. And level nodes do get damaged: every
+// CREATE_* replaces a live ID by design, and one flipped CMD_LO bit turns
+// SET_POSITION ($30) into CREATE_OBJECT ($20), SET_ORIENTATION ($31) into
+// CREATE_CAMERA ($21), SET_VISIBLE ($24) into CREATE_SPRITE ($25). Aimed at a
+// level node by a flipped ID byte, any of them leaves a wall that is now a
+// camera, a sprite, or a mesh id nobody uploaded -- permanently.
+//
+// Staged ID = the node id (node base + index). ARG0 bit 0 = also put the
+// position back from the file; clear it for a node the program moves itself
+// (a door), whose position is the program's to refresh. Other ARG0 bits are
+// BAD_ARGS. Restores type OBJECT, the file's mesh id, visible, scale 1.0 and
+// zero orientation; if the node was the active camera, it no longer is.
+// RESULT bit 0 = type/mesh/visibility/scale/orientation was wrong, bit 1 =
+// position was wrong -- 0 is the normal answer. BAD_ID for an id outside the
+// level's node run; BAD_ARGS until a level load has finished.
+//
+// Unkeyed, idempotent, shadow-redirected like SET_POSITION. The number is
+// chosen for its neighbours: every one-bit flip of $1C lands on an opcode
+// that is undefined in both classes or answers BUSY while the loop runs.
+#define GPU64_3D_OP_LEVEL_NODE		0x1C
+
 // Resources -- $10-$1F
 #define GPU64_3D_OP_UPLOAD_MESH		0x10
 #define GPU64_3D_OP_UPLOAD_TEXTURE	0x11

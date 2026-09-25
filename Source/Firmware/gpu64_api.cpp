@@ -450,6 +450,16 @@ static void readHealth( void )
 // one is zero -- and a zero baseline masks nothing.
 static void healthReset( void )
 {
+	// The baseline read must not trip the alarm it is being taken to
+	// suppress. s_HealthEverBase still holds the PREVIOUS baseline at this
+	// point -- zero on a Pi's first reset of a session -- so the mask that
+	// makes the sticky flags session-scoped does not exist yet, and an
+	// under-voltage latched before this session reddens the border on its
+	// way to being excluded from it. Bench run 33 ran its whole session
+	// with a red border for that reason. Setting `flagged` over the read is
+	// what suppresses the test inside readHealth(); it is cleared again
+	// below, so a genuine in-session event still shows through.
+	s_Health.flagged = 1;
 	readHealth();
 	s_HealthEverBase = s_Health.throttled & 0xffff0000;
 	s_Health.sticky = 0;
@@ -1714,6 +1724,26 @@ void gpu64_apiDispatch( u8 op )
 		sStatus |= GPU64_STATUS_ERROR;
 		return;
 	} else
+#ifdef GPU64_3D_ENABLED
+	// gpu64 (2026-09-24, bench run 38): the class 1 loop owns the display
+	// -- pages, flip, vsync state, palette -- and class1-3d-mesh-reference.md
+	// has always said a class 0 framebuffer op against it is illegal. It was
+	// never enforced, and the one sender that ignores the documentation is
+	// the bus: a class 1 command whose CMD_HI write arrives as 0 runs as its
+	// class 0 twin. SET_VIEWPORT $01 became RESET_STATE (pages and vsync
+	// reset under a running loop), SET_BACKGROUND $05 a PAGE_FLIP,
+	// SET_POSITION/SET_ORIENTATION $30/$31 PAL_SET/PAL_LOAD -- run 38's lost
+	// colours, and the likeliest cause of its frozen HDMI. What stays legal
+	// is what does not touch the display: NOP, GET_INFO, LOG_ENABLE,
+	// VBLANK_SYNC, GET_HEALTH, SET_DMA_WINDOW, the matrix ops, and
+	// FULL_RESET, which is how a new program takes over from one that left
+	// the loop running.
+	if ( gpu64_3dLoopRunning() && op < 0x80 &&
+	     op != 0x00 && op != 0x06 && op != 0x07 && op != 0x09 &&
+	     op != 0x0A && op != 0x0B && op != 0x0C )
+		res = GPU64_ERR_BUSY;
+	else
+#endif
 	if ( op < 0x10 )
 		res = doSystem( op );
 	else if ( op >= 0x50 && op < 0x60 )

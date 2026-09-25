@@ -293,6 +293,7 @@ class Gpu64Model(Class1Mixin):
         self.txt_bg = bytearray([TXT_DEF_BG]) * TXT_CELLS
         self.txt_charset = gpu64font.CHARSET_LOWER
         self.health_samples = 0
+        self.flips_posted = 0
 
         # --- class 1 (the retained scene graph) ------------------------
         self.c1_init()
@@ -430,6 +431,10 @@ class Gpu64Model(Class1Mixin):
         must not be aimed at the page about to go on screen -- Stage 16's
         Finding 2, see project/progress_tracker.md."""
         self.pending_visible = self.draw_page
+        # GET_HEALTH byte 18: what the Pi thinks it presented, against what
+        # the program thinks it asked for. The firmware counts posts, which
+        # is this half of the flip and not _commit_flip()'s.
+        self.flips_posted += 1
         # The C carries a defensive `m_nDrawPage = m_nVisiblePage` default
         # ahead of this loop, for the case where the two exclusions cover
         # every page. With FB_PAGES == 3 that is unreachable on both sides,
@@ -698,6 +703,13 @@ class Gpu64Model(Class1Mixin):
                 res = self.execute_r2(op)
             elif self.cmd_hi == 1:
                 res = self.execute_r1(op)
+            elif (getattr(self, 'c1_loop_running', False) and op < 0x80 and
+                  op not in (0x00, 0x06, 0x07, 0x09, 0x0A, 0x0B, 0x0C)):
+                # gpu64 (2026-09-24, run 38): the class 1 loop owns the
+                # display, so a class 0 op that touches it -- in practice a
+                # class 1 command whose CMD_HI arrived as 0 -- is refused,
+                # as gpu64_apiDispatch() now does.
+                res = ERR_BUSY
             else:
                 res = self.execute(op)
         except IndexError:
@@ -846,6 +858,15 @@ class Gpu64Model(Class1Mixin):
             t = 452                                     # 45.2 C
             h[8], h[9] = t & 0xFF, t >> 8
             h[10], h[11] = t & 0xFF, t >> 8
+            if n >= 20:
+                # Bytes 12-19 are the flip path's "impossible" counters
+                # (Source/Firmware/gpu64_flip.h). Three of the four are
+                # mailbox pathologies the model has no mailbox to have, so
+                # they stay zero -- but flips posted is exact here, and it is
+                # the one a pacing check reads: it is the Pi's own count of
+                # the frames a program believes it committed.
+                h[18] = self.flips_posted & 0xFF
+                h[19] = (self.flips_posted >> 8) & 0xFF
             if n >= 36:
                 # Bytes 20-35 are the hold-gap instrument
                 # (Source/Firmware/gpu64_holdgap.h). There is no bus and no

@@ -357,6 +357,47 @@ dmhDec
 	adc #$30			; '0'..'9' are $30..$39
 	rts
 
+; A = byte, printed as three DECIMAL digits at the cursor, leading zeros
+; kept so the column does not move. Hex is the right format for a register
+; and the wrong one for a measurement: these numbers are read off a
+; photograph of a CRT and compared against each other, and a reader who has
+; to convert $3C to 60 before knowing whether the frame was slow will not.
+dmDecA
+	ldx #$ff
+	sec
+ddaHun
+	inx
+	sbc #100
+	bcs ddaHun
+	adc #100
+	pha
+	txa
+	jsr dmDecDigit
+	pla
+	ldx #$ff
+	sec
+ddaTen
+	inx
+	sbc #10
+	bcs ddaTen
+	adc #10
+	pha
+	txa
+	jsr dmDecDigit
+	pla
+	; falls into the units digit
+
+dmDecDigit
+	clc
+	adc #$30			; '0'..'9' are screen codes $30..$39
+	ldy #0
+	sta (DST),y
+	inc DST
+	bne +
+	inc DST+1
++
+	rts
+
 ; PETSCII upper case to screen code; digits, space and punctuation pass
 ; through unchanged, which covers everything these demos print.
 dmScreenCode

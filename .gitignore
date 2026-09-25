@@ -7,6 +7,9 @@
 # gpu64 host sim: build products and rendered output
 tools/hostsim/hostsim
 tools/hostsim/scenesim
+tools/hostsim/levelsim
+tools/hostsim/hulltest
+tools/hostsim/libclipmove.so
 tools/hostsim/out/
 
 # gpu64 rastercheck: build product and scratch scenario
@@ -20,3 +23,6 @@ __pycache__/
 
 # sim output written into the repo root
 /*.ppm
+
+# converted levels, rebuilt from PAK0.PAK by tools/gen_quakelevel.py
+/build/

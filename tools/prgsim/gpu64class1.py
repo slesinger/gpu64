@@ -36,6 +36,15 @@ OP_ARENA_STATUS = 0x09
 OP_UPLOAD_MESH = 0x10
 OP_UPLOAD_TEXTURE = 0x11
 OP_FREE_RESOURCE = 0x12
+OP_LOAD_LEVEL = 0x13
+OP_LEVEL_STEP = 0x14
+OP_CLIP_MOVE = 0x15
+OP_LEVEL_ENT = 0x16
+OP_LEVEL_PALETTE = 0x17
+OP_LEVEL_NODE = 0x1C
+LEVEL_DONE = 0xFF
+# Bytes of source blob one LEVEL_STEP consumes -- GPU64_LEVEL_SLICE_BYTES.
+LEVEL_SLICE_BYTES = 16384
 OP_CREATE_OBJECT = 0x20
 OP_CREATE_CAMERA = 0x21
 OP_DESTROY_NODE = 0x22
@@ -65,7 +74,7 @@ SHADOW_REDIRECTABLE = frozenset((
     OP_SET_ACTIVE_CAMERA, OP_SET_VISIBLE, OP_CREATE_SPRITE, OP_CREATE_LIGHT,
     OP_SET_SPRITE, OP_SET_POINT_LIGHT, OP_SET_POSITION, OP_SET_ORIENTATION,
     OP_MOVE_LOCAL, OP_MOVE_WORLD, OP_ROTATE_LOCAL, OP_SET_SCALE,
-    OP_GET_TRANSFORM,
+    OP_GET_TRANSFORM, OP_LEVEL_PALETTE, OP_LEVEL_NODE,
 ))
 
 NODE_NONE, NODE_OBJECT, NODE_CAMERA, NODE_SPRITE, NODE_LIGHT = 0, 1, 2, 3, 4
@@ -303,6 +312,13 @@ class Class1Mixin:
         self.c1_stream_dir = None
         self.c1_blobs = 0
         self.frame_hook = None
+        # The level file the Pi would have read off its SD card at start-up,
+        # set by the runner from --level=. None models a card with no
+        # RAD/level.g64lev on it, which is what LOAD_LEVEL's BAD_ARGS means
+        # and is worth being able to simulate.
+        self.c1_level_data = None
+        self.c1_load = None
+        self.c1_clip_lib = None
 
     # --- refusal bookkeeping (Source/Firmware/gpu64_apidiag.h) ----------
     def c1_loop_stop(self, cause):
@@ -397,6 +413,398 @@ class Class1Mixin:
                             n.sprite_flags, n.light_strength, n.light_radius))
         self.c1_emit("ENDFRAME")
 
+    # --- LOAD_LEVEL / LEVEL_STEP -----------------------------------------
+    #
+    # The firmware reads RAD/level.g64lev off the SD card once, at REU
+    # start-up, and LOAD_LEVEL then builds a whole level out of memory in
+    # bounded slices. The model does the same from --level=, through the very
+    # same c1_res / c1_scene / frame-stream paths UPLOAD_MESH and
+    # CREATE_OBJECT use -- so a level built this way renders in scenesim
+    # exactly as an uploaded one does, and gpu64_demo_level.a gets a picture
+    # on a PC without a bench trip.
+    #
+    # What is NOT modelled: the arena. levelBuildTexture/levelBuildMesh can
+    # answer OUT_OF_MEMORY on the Pi at a size this side has no notion of.
+    # That is a capacity question for tools/check_g64lev.py, not for a
+    # protocol model.
+    def c1_load_level(self, mesh_base, node_base, camera_id):
+        from gpu64model import ERR_OK, ERR_BAD_ARGS, ERR_BUSY
+        import gpu64level
+
+        if self.c1_loop_running:
+            return ERR_BUSY             # a whole level will not fit the shadow
+        if self.c1_level_data is None:
+            return ERR_BAD_ARGS         # no level file on the card
+
+        try:
+            lev = gpu64level.Level(self.c1_level_data)
+        except gpu64level.LevelError:
+            return ERR_BAD_ARGS
+
+        # Texture resource ids are forced to 0..ntex-1 by the one-byte texid
+        # in a face record, so the mesh ids must start above them.
+        if mesh_base < lev.ntex:
+            return ERR_BAD_ARGS
+        if mesh_base + lev.nmesh > 0x10000 or node_base + lev.nnode > 0x10000:
+            return ERR_BAD_ARGS
+        if camera_id != 0 and node_base <= camera_id < node_base + lev.nnode:
+            return ERR_BAD_ARGS
+
+        self.c1_res = {}
+        self.c1_arena_used = 0
+        self.c1_scene = Scene()
+        self.c1_shadow_scene = Scene()
+        # c1_state is deliberately left alone: the viewport and the clip
+        # planes belong to the caller. opLoadLevel() says why.
+        self.c1_emit("RESET")
+
+        self.c1_load = {
+            'lev': lev, 'phase': 'palette', 'index': 0,
+            'mesh_base': mesh_base, 'node_base': node_base,
+            'camera_id': camera_id, 'done': 0,
+            'total': 1 + lev.ntex + lev.nmesh + lev.nnode + 1,
+        }
+        self.result = 0
+        return ERR_OK
+
+    # --- CLIP_MOVE ($15) -------------------------------------------------
+    #
+    # The block layout is in Source/Firmware/gpu64_3d.h. The trace itself is
+    # NOT modelled here: it is called in the firmware's own C, through
+    # tools/hostsim/libclipmove.so, for the reason at the top of this file --
+    # a Python hull trace that could disagree with the Pi's would be a second
+    # thing to be wrong, not an oracle. What this method models is the
+    # protocol around it: the magics, the checksums, the blob window, and
+    # which failures write nothing back.
+    CLIPMOVE_BYTES = 56
+    CLIPMOVE_IN_BYTES = 32
+    CLIPMOVE_OUT_OFF = 32
+    CLIPMOVE_OUT_BYTES = 24
+    CLIPMOVE_MAGIC_IN = 0xC5
+    CLIPMOVE_MAGIC_OUT = 0x5C
+    CLIPMOVE_MOVER_OFF = 56
+    CLIPMOVE_MOVER_BYTES = 16
+    CLIPMOVE_MAX_MOVERS = 16
+
+    def c1_clipmove_lib(self):
+        """The shared library, loaded once and fed the level file the model is
+        already holding. None if it was never built -- the caller turns that
+        into a hard error rather than a wrong answer."""
+        import ctypes
+        import os
+
+        if getattr(self, 'c1_clip_lib', None) is not None:
+            return self.c1_clip_lib
+        if self.c1_level_data is None:
+            return None
+
+        so = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          '..', 'hostsim', 'libclipmove.so')
+        if not os.path.exists(so):
+            raise RuntimeError(
+                "CLIP_MOVE needs %s -- run 'make -C tools/hostsim'" % so)
+        lib = ctypes.CDLL(so)
+        lib.gpu64shim_open.restype = ctypes.c_int
+        lib.gpu64shim_open.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+        lib.gpu64shim_move_ents.restype = ctypes.c_int
+        lib.gpu64shim_move_ents.argtypes = [ctypes.POINTER(ctypes.c_int),
+                                            ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int,
+                                            ctypes.POINTER(ctypes.c_int),
+                                            ctypes.c_int,
+                                            ctypes.POINTER(ctypes.c_int)]
+        blob = bytes(self.c1_level_data)
+        if not lib.gpu64shim_open(blob, len(blob)):
+            raise RuntimeError("libclipmove.so refused the level file")
+        self.c1_clip_lib = lib
+        return lib
+
+    # --clip-fault=N corrupts the Nth answer in a way its own checksum
+    # cannot see; see the comment at the injection point below.
+    c1_clip_fault = 0
+    c1_clip_fault_kind = 'x'
+    c1_clip_n = 0
+
+    def c1_clip_move(self, space, addr, length):
+        import ctypes
+        import struct
+        from gpu64model import ERR_OK, ERR_BAD_ARGS
+
+        if length < self.CLIPMOVE_BYTES:
+            return ERR_BAD_ARGS
+        if self.c1_load is None or self.c1_load['phase'] != 'done':
+            return ERR_BAD_ARGS
+
+        err, blk = self.blob_read(space, addr, self.CLIPMOVE_IN_BYTES)
+        if err != ERR_OK:
+            return err
+
+        if blk[27] != self.CLIPMOVE_MAGIC_IN:
+            return ERR_BAD_ARGS
+
+        nmv = blk[29]
+        if nmv > self.CLIPMOVE_MAX_MOVERS:
+            return ERR_BAD_ARGS
+        mvbytes = nmv * self.CLIPMOVE_MOVER_BYTES
+        if length < self.CLIPMOVE_MOVER_OFF + mvbytes:
+            return ERR_BAD_ARGS
+        mvb = bytearray()
+        if mvbytes:
+            err, mvb = self.blob_read(space, addr + self.CLIPMOVE_MOVER_OFF,
+                                      mvbytes)
+            if err != ERR_OK:
+                return err
+
+        x = blk[29]
+        for b in blk[:28]:
+            x ^= b
+        for b in mvb:
+            x ^= b
+        if x != blk[28]:
+            return ERR_BAD_ARGS
+
+        lib = self.c1_clipmove_lib()
+        if lib is None:
+            return ERR_BAD_ARGS
+
+        sixin = (ctypes.c_int * 6)(*struct.unpack('<6i', bytes(blk[0:24])))
+        movers = (ctypes.c_int * (4 * max(nmv, 1)))()
+        for i in range(nmv):
+            r = mvb[i * self.CLIPMOVE_MOVER_BYTES:]
+            movers[i * 4] = r[0]
+            ox, oy, oz = struct.unpack('<3i', bytes(r[4:16]))
+            movers[i * 4 + 1] = ox
+            movers[i * 4 + 2] = oy
+            movers[i * 4 + 3] = oz
+        out = (ctypes.c_int * 7)()
+        if not lib.gpu64shim_move_ents(sixin, blk[26], blk[24], blk[25],
+                                       movers, nmv, out):
+            return ERR_BAD_ARGS
+
+        o = bytearray(self.CLIPMOVE_OUT_BYTES)
+        o[0:12] = struct.pack('<3i', out[0], out[1], out[2])
+        o[12] = out[3] & 0xFF
+        o[13] = out[4] & 0xFF
+        o[14] = out[5] & 0xFF
+        o[15] = out[6] & 0xFF
+        # Fault injection, --clip-fault=N. Reproduce bench run 36: one byte
+        # of the answer's x coordinate arrives wrong, and because the damage
+        # happened on the way to the C64 the trailer is computed over the
+        # corrupted block, so the magic and the checksum both pass. A client
+        # that only checks those accepts it, writes it into a position it is
+        # itself authoritative about, and is 222 world units outside the map
+        # for the rest of the session. Catching it needs a bound on the
+        # answer, not a better hash -- and an assertion that has never fired
+        # is not an assertion, which is what this switch is for.
+        #
+        # --clip-fault=N:solid and N:void reach the recovery behind that
+        # bound instead, which a coordinate fault never can: one answer
+        # that says ALLSOLID and stays put (a bad start the client must
+        # leave), and -- from answer N on -- a world with no floor, every
+        # answer the asked-for move with no flags (bench run 39: a player
+        # through the floor, falling at terminal speed for good).
+        self.c1_clip_n += 1
+        kind = self.c1_clip_fault_kind
+        if self.c1_clip_fault and kind == 'x' and self.c1_clip_n == self.c1_clip_fault:
+            o[3] = 0xFF
+        if self.c1_clip_fault and kind == 'solid' and self.c1_clip_n == self.c1_clip_fault:
+            o[0:12] = bytes(blk[0:12])
+            o[12] = 0x20
+        if self.c1_clip_fault and kind == 'void' and self.c1_clip_n >= self.c1_clip_fault:
+            sx, sy, sz, dx, dy, dz = struct.unpack('<6i', bytes(blk[0:24]))
+            o[0:12] = struct.pack('<3i', sx + dx, sy + dy, sz + dz)
+            o[12] = 0
+
+        o[16] = self.CLIPMOVE_MAGIC_OUT
+        x = 0
+        for b in o[:17]:
+            x ^= b
+        o[17] = x
+
+        err = self.blob_write(space, addr + self.CLIPMOVE_OUT_OFF, o)
+        if err != ERR_OK:
+            return err
+        self.result = o[12]
+        return ERR_OK
+
+    # --- LEVEL_ENT ($16) -------------------------------------------------
+    #
+    # The block layout is in Source/Firmware/gpu64_3d.h. Unlike CLIP_MOVE
+    # there is no algorithm here to get wrong -- the answer is a record out of
+    # the level file, a box out of its hull table and a run of node ids -- so
+    # this one is modelled in Python rather than called in the firmware.
+
+    LEVELENT_BYTES = 96
+    LEVELENT_IN_BYTES = 4
+    LEVELENT_OUT_OFF = 16
+    LEVELENT_OUT_BYTES = 80
+    LEVELENT_MAGIC_IN = 0xC6
+    LEVELENT_MAGIC_OUT = 0x6C
+
+    def c1_level_ent(self, space, addr, length):
+        import struct
+        from gpu64model import ERR_OK, ERR_BAD_ARGS, ERR_OUT_OF_RANGE
+
+        if length < self.LEVELENT_BYTES:
+            return ERR_BAD_ARGS
+        if self.c1_load is None or self.c1_load['phase'] != 'done':
+            return ERR_BAD_ARGS
+
+        err, blk = self.blob_read(space, addr, self.LEVELENT_IN_BYTES)
+        if err != ERR_OK:
+            return err
+        if blk[2] != self.LEVELENT_MAGIC_IN:
+            return ERR_BAD_ARGS
+        x = 0
+        for b in blk[:3]:
+            x ^= b
+        if x != blk[3]:
+            return ERR_BAD_ARGS
+
+        lev = self.c1_load['lev']
+        index = blk[0] | (blk[1] << 8)
+        if index >= lev.nent:
+            return ERR_OUT_OF_RANGE
+        e = lev.ent(index)
+
+        mins = maxs = (0, 0, 0)
+        first = count = 0
+        if e['model']:
+            h = lev.hull(e['model'])
+            mins, maxs = h['mins'], h['maxs']
+            for i in range(lev.nnode):
+                if lev.node_model(i) != e['model']:
+                    continue
+                if count == 0:
+                    first = self.c1_load['node_base'] + i
+                if count < 255:
+                    count += 1
+
+        o = bytearray(self.LEVELENT_OUT_BYTES)
+        o[0:12] = struct.pack('<3i', e['x'], e['y'], e['z'])
+        o[12:24] = struct.pack('<3i', *mins)
+        o[24:36] = struct.pack('<3i', *maxs)
+        o[36:48] = struct.pack('<3i', *e['ofs'])
+        o[48:64] = struct.pack('<8H', e['yaw'] & 0xFFFF, e['spawnflags'] & 0xFFFF,
+                               e['p0'] & 0xFFFF, e['p1'] & 0xFFFF,
+                               e['target_id'], e['targetname_id'],
+                               first & 0xFFFF, lev.nent)
+        o[64] = count
+        o[65] = e['kind']
+        o[66] = e['model'] & 0xFF if e['model'] < 256 else 0
+        o[67] = 0
+        o[68] = self.LEVELENT_MAGIC_OUT
+        x = 0
+        for b in o[:69]:
+            x ^= b
+        o[69] = x
+
+        err = self.blob_write(space, addr + self.LEVELENT_OUT_OFF, o)
+        if err != ERR_OK:
+            return err
+        self.result = e['kind']
+        return ERR_OK
+
+    def c1_level_step(self):
+        from gpu64model import (ERR_OK, ERR_BAD_ARGS, ERR_BUSY,
+                                ERR_OUT_OF_MEMORY)
+        import gpu64level
+
+        ld = self.c1_load
+        if ld is None:
+            return ERR_BAD_ARGS         # LEVEL_STEP without a LOAD_LEVEL
+        if self.c1_loop_running:
+            return ERR_BUSY             # a step creates nodes in the LIVE scene
+        if ld['phase'] == 'done':
+            self.result = LEVEL_DONE    # idempotent: a lost RESULT read retries
+            return ERR_OK
+
+        lev = ld['lev']
+        budget = LEVEL_SLICE_BYTES
+
+        # At least one item per call even if it blows the budget on its own,
+        # or a single 128x128 texture would stall the load forever.
+        while ld['phase'] != 'done':
+            nbytes = 64                 # bookkeeping phases: not data
+            try:
+                if ld['phase'] == 'palette':
+                    self.palette = bytearray(lev.palette)
+                    self.c1_state.colormap_valid = True
+                    self.c1_emit_palette()
+                    self.c1_emit("COLORMAP")
+                    nbytes = 768
+                elif ld['phase'] == 'textures':
+                    ws, hs, pix = lev.tex(ld['index'])
+                    rid = ld['index']
+                    self.c1_res[rid] = ('tex', (pix, ws, hs))
+                    self.c1_arena_used += len(pix)
+                    self.c1_emit("TEX %d %s %d %d"
+                                 % (rid, self.c1_write_blob('tex', pix), ws, hs))
+                    nbytes = len(pix)
+                elif ld['phase'] == 'meshes':
+                    vb, fb = lev.mesh(ld['index'])
+                    if len(vb) == 0 or len(vb) % 6 or len(fb) == 0 or len(fb) % 12:
+                        return ERR_BAD_ARGS
+                    rid = ld['mesh_base'] + ld['index']
+                    self.c1_res[rid] = ('mesh', (vb, fb))
+                    self.c1_arena_used += len(vb) * 4 + len(fb) * 4
+                    self.c1_emit("MESH %d %s %s"
+                                 % (rid, self.c1_write_blob('mv', vb),
+                                    self.c1_write_blob('mf', fb)))
+                    nbytes = len(vb) + len(fb)
+                elif ld['phase'] == 'nodes':
+                    mi, x, y, z = lev.node(ld['index'])
+                    n = self.c1_scene.slot(ld['node_base'] + ld['index'])
+                    if n is None:
+                        return ERR_OUT_OF_MEMORY
+                    n.reset(ld['node_base'] + ld['index'], NODE_OBJECT)
+                    n.mesh_id = ld['mesh_base'] + mi
+                    n.pos = [x, y, z]
+                elif ld['phase'] == 'camera':
+                    if ld['camera_id'] != 0:
+                        st = lev.player_start()
+                        if st is None:
+                            return ERR_BAD_ARGS
+                        n = self.c1_scene.slot(ld['camera_id'])
+                        if n is None:
+                            return ERR_OUT_OF_MEMORY
+                        n.reset(ld['camera_id'], NODE_CAMERA)
+                        n.pos = [st[0], st[1], st[2]]
+                        n.yaw = st[3]
+                        self.c1_scene.active_camera_id = ld['camera_id']
+                        self.c1_scene.have_active_camera = True
+            except gpu64level.LevelError:
+                # The failing item names itself in RESULT, and the phase stays
+                # put so a retry re-attempts the same item.
+                self.result = ld['index'] & 0xFF
+                self.c1_load = None
+                return ERR_BAD_ARGS
+
+            ld['done'] += 1
+            ld['index'] += 1
+
+            nxt = {'palette': 'textures', 'camera': 'done'}
+            if ld['phase'] in nxt:
+                ld['phase'] = nxt[ld['phase']]
+                ld['index'] = 0
+            elif ld['phase'] == 'textures' and ld['index'] >= lev.ntex:
+                ld['phase'], ld['index'] = 'meshes', 0
+            elif ld['phase'] == 'meshes' and ld['index'] >= lev.nmesh:
+                ld['phase'], ld['index'] = 'nodes', 0
+            elif ld['phase'] == 'nodes' and ld['index'] >= lev.nnode:
+                ld['phase'], ld['index'] = 'camera', 0
+
+            if nbytes >= budget:
+                break
+            budget -= nbytes
+
+        if ld['phase'] == 'done':
+            self.result = LEVEL_DONE
+            return ERR_OK
+        pct = ld['done'] * 100 // ld['total'] if ld['total'] else 0
+        self.result = min(pct, 99)
+        return ERR_OK
+
     # --- execute ----------------------------------------------------------
     def execute_r1(self, op):
         from gpu64model import (ERR_OK, ERR_BAD_OPCODE, ERR_OUT_OF_RANGE,
@@ -425,7 +833,7 @@ class Class1Mixin:
         # is what says the C64 meant it. See GPU64_KEY_DESTRUCTIVE in
         # Source/Firmware/gpu64_api.h for the bench runs behind it.
         if op in (OP_SCENE_RESET, OP_LOOP_STOP,
-                  OP_DESTROY_NODE, OP_FREE_RESOURCE):
+                  OP_DESTROY_NODE, OP_FREE_RESOURCE, OP_LOAD_LEVEL):
             if self.api_key != KEY_DESTRUCTIVE:
                 self.key_refused += 1
                 self.key_refused_op = op
@@ -440,6 +848,8 @@ class Class1Mixin:
             self.status &= ~ST_FRAME_READY
             self.c1_shadow_state = State()
             self.c1_shadow_scene = Scene()
+            self.c1_load = None         # levelLoadAbort(): the scene it was
+                                        # filling no longer exists
             self.c1_emit("RESET")
             return ERR_OK
 
@@ -545,6 +955,72 @@ class Class1Mixin:
                 return ERR_BAD_ID
             del self.c1_res[self.c1_id()]
             self.c1_emit("FREE %d" % self.c1_id())
+            return ERR_OK
+
+        if op == OP_LOAD_LEVEL:
+            return self.c1_load_level(u16(0), u16(2), u16(4))
+
+        if op == OP_LEVEL_STEP:
+            return self.c1_level_step()
+
+        if op == OP_CLIP_MOVE:
+            return self.c1_clip_move(*self.a_blob(0))
+        if op == OP_LEVEL_ENT:
+            return self.c1_level_ent(*self.a_blob(0))
+        if op == OP_LEVEL_PALETTE:
+            # gpu64_3d.h has the contract: rewrite only what differs from
+            # the level's own palette, and rebuild the colormap only if
+            # anything did.
+            ld = self.c1_load
+            if ld is None or ld['phase'] != 'done':
+                return ERR_BAD_ARGS
+            want = bytes(ld['lev'].palette)
+            fixed = sum(1 for i in range(256)
+                        if self.palette[i * 3:i * 3 + 3] != want[i * 3:i * 3 + 3])
+            if fixed:
+                self.palette = bytearray(want)
+                self.c1_state_target().colormap_valid = True
+                self.c1_emit_palette()
+                self.c1_emit("COLORMAP")
+            self.result = min(fixed, 255)
+            return ERR_OK
+
+        if op == OP_LEVEL_NODE:
+            # gpu64_3d.h: put one level node back the way LEVEL_STEP built
+            # it; ARG0 bit 0 also restores the file's position.
+            ld = self.c1_load
+            if ld is None or ld['phase'] != 'done':
+                return ERR_BAD_ARGS
+            if self.arg[0] & ~1:
+                return ERR_BAD_ARGS
+            nid = self.c1_id()
+            i = (nid - ld['node_base']) & 0xFFFF
+            if nid < ld['node_base'] or i >= ld['lev'].nnode:
+                return ERR_BAD_ID
+            mi, x, y, z = ld['lev'].node(i)
+            if mi >= ld['lev'].nmesh:
+                return ERR_BAD_ARGS
+            mesh_id = (ld['mesh_base'] + mi) & 0xFFFF
+            sc = self.c1_scene_target()
+            n = sc.find(nid)
+            fixed = 0
+            if (n is None or n.type != NODE_OBJECT or n.mesh_id != mesh_id
+                    or not n.visible or n.scale != FX8_ONE
+                    or n.yaw or n.pitch or n.roll):
+                keep = list(n.pos) if n is not None else [x, y, z]
+                if sc.have_active_camera and sc.active_camera_id == nid:
+                    sc.have_active_camera = False
+                n = sc.slot(nid)
+                if n is None:
+                    return ERR_OUT_OF_MEMORY
+                n.reset(nid, NODE_OBJECT)
+                n.mesh_id = mesh_id
+                n.pos = keep
+                fixed |= 1
+            if (self.arg[0] & 1) and list(n.pos) != [x, y, z]:
+                n.pos = [x, y, z]
+                fixed |= 2
+            self.result = fixed
             return ERR_OK
 
         # --- the scene graph ---------------------------------------------

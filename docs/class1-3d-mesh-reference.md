@@ -98,13 +98,19 @@ class 0, and every opcode reads exactly the byte count in its row.
 | $08 | `SCENE_COMMIT` | 0 | — | Publishes every shadow-redirected edit made since `LOOP_START`/the last commit, arms the next vblank flip the same way `PAGE_FLIP` does, and queues the loop's next frame. `RESULT` = the page the just-finished frame is in — the same page the flip this call just armed is about to show. If the loop is **not** running, this re-starts it (same checks as `LOOP_START`) and answers `OK` without committing — see "A stopped loop repairs itself". `UNSUPPORTED` if the flip subsystem is not calibrated yet; `BUSY` if a `PAGE_FLIP` is already pending. See "Frame lifecycle". |
 | $09 | `ARENA_STATUS` | 0 | — | `RESULT` = free resource RAM in 128 KB units (0..256 for the 32 MB phase-1 arena). Not in the original design; added because "you get `OUT_OF_MEMORY` eventually" is truthful and undebuggable without it. |
 
-### Resources — $10-$1F
+### Resources and the level — $10-$1F
 
 | Op | Name | Bytes | Arguments | Effect |
 |---|---|---|---|---|
 | $10 | `UPLOAD_MESH` | 12 | `ARG0-5` vertex blob descriptor, `ARG6-11` face blob descriptor | Uploads into resource RAM under the staged `ID`. Re-upload to a live ID replaces it in place — see Resource lifecycle below. `RESULT` = face count. |
 | $11 | `UPLOAD_TEXTURE` | 8 | `ARG0-5` blob descriptor, `ARG6` w shift, `ARG7` h shift | Dimensions are `1 << shift`, 3..8 (8 to 256 px, power of two). `len` must equal `w*h`; anything else is `BAD_ARGS`. |
 | $12 | `FREE_RESOURCE` | 0 | `ARG15` = `$A5` | Frees the staged `ID`'s table slot. Keyed — see "The key byte"; `BAD_ARGS` without it, and nothing is freed. In phase 1 this does not reclaim arena bytes — see Resource lifecycle. |
+| $13 | `LOAD_LEVEL` | 6 | `ARG0-1` mesh ID base, `ARG2-3` node ID base, `ARG4-5` camera ID, `ARG15` = `$A5` | Begins building a whole level out of the Pi's own SD card. Clears the resource table and the scene first, so it is keyed — see "The key byte". Does no building itself: call `LEVEL_STEP` until it says done. `BUSY` while the loop is running. See "Loading a level" below. |
+| $14 | `LEVEL_STEP` | 0 | — | Builds the next slice of the level begun by `LOAD_LEVEL`. `RESULT` = percent complete 0..99, or `$FF` when the level is fully built — and once done it stays `$FF`, so a lost `RESULT` read can simply step again. `BAD_ARGS` if no load is in progress. If a slice fails, the error is whatever that item's build returned (`OUT_OF_MEMORY`, `BAD_ARGS`, …) and `RESULT` carries the **low byte of the failing item's index**; the load is abandoned. `BUSY` while the loop is running. |
+| $15 | `CLIP_MOVE` | 6 | `ARG0-5` descriptor of a 56-byte block in C64 RAM or REU | Asks where a move actually ends: you send a position and the displacement you want, and gpu64 traces it against the level's Quake clip hulls and answers with the position you end up in. Everything travels in the block, checksummed both ways — see "Walking in a level". `BAD_ARGS` if `len < 56`, if no level is loaded, if the block's magic or checksum is wrong, or if the hull or model is not one this level has. **Not** keyed and **not** `BUSY` while the loop runs: it changes no gpu64 state, so it answers mid-frame. |
+| $16 | `LEVEL_ENT` | 6 | `ARG0-5` descriptor of a 96-byte block in C64 RAM or REU | Hands back one entity of the loaded level — where it is, what kind of thing it is, which scene nodes draw it, and how far it travels if it is a door. Same block discipline as `CLIP_MOVE`: input bytes 0-3, output 16-95, magic and checksum both ways. `RESULT` = the entity's `kind`. `BAD_ARGS` if `len < 96`, if no level is loaded, or if the block's magic or checksum is wrong; `OUT_OF_RANGE` past the last entity. Also not keyed and not `BUSY` while the loop runs. |
+| $17 | `LEVEL_PALETTE` | 0 | — | Puts the loaded level's palette back. Compares the live palette with the level file's and rewrites only the entries that differ; if any did, pushes the palette to the display and rebuilds the colormap. `RESULT` = entries repaired, saturated at 255 — 0 is the normal answer and costs nothing but the compare. For a refresh ring: the level's palette is the one piece of state your program never held a copy of. `BAD_ARGS` until a level load has finished. Not keyed; fine while the loop runs. |
+| $1C | `LEVEL_NODE` | 1 | `ARG0` bit 0 = also restore the position; other bits must be 0 | Puts one level node back the way `LEVEL_STEP` built it: an object, instancing the level's own mesh, visible, scale 1.0, no rotation — and, with bit 0, at the level file's position. Leave bit 0 clear for a node you move yourself (a door). Staged `ID` = the node id. `RESULT` bit 0 = the node itself was wrong, bit 1 = its position was; 0 is the normal answer. `BAD_ID` past the level's last node, which is also how a program finds where the run ends; `BAD_ARGS` until a level load has finished. If the node had become the active camera, it is not one any more. Not keyed; fine while the loop runs. |
 
 ### Scene nodes — $20-$2F
 
@@ -365,6 +371,12 @@ Quake demo puts its report. This is a real limitation of the stage-16 loop,
 not an oversight; immediate mode (`DRAW_MESH`/`DRAW_NODE` with the loop
 stopped) has no such restriction and can still be overlaid freely.
 
+The firmware enforces this: while the loop runs, every class 0 op that
+touches the display (`RESET_STATE`, `VBLANK_ARM`/`ACK`, `SET_DRAW_PAGE`,
+`PAGE_FLIP`, `SET_BORDER`, drawing, palette, blits and text mode) answers
+`BUSY` and does nothing. `NOP`, `GET_INFO`, `LOG_ENABLE`, `VBLANK_SYNC`,
+`GET_HEALTH`, `FULL_RESET`, `SET_DMA_WINDOW` and the matrix ops stay legal.
+
 **What free-running mode (`LOOP_START ARG0=1`) will add**, once built: the
 same loop driven by vblank instead of by `SCENE_COMMIT` — the C64 never
 calls anything per frame at all, it just edits the shadow state whenever it
@@ -442,6 +454,7 @@ blob 1 — faces, 12 bytes each, triangles only
     texid              1 byte, low byte of a texture resource ID
     flags              1 byte: bit0 double-sided, bit1 flat-colour
                        (texid is a palette index instead), bit2 unlit
+    pad                1 byte, unused; write 0
 ```
 
 Vertex and face counts are implied by each blob's `len` (`len/6`, `len/12`);
@@ -497,6 +510,274 @@ size is `BAD_ARGS`.
   arena dry and get `OUT_OF_MEMORY`, which is a truthful error, not a bug to
   work around. Use `ARENA_STATUS` ($09) to watch the free space if your
   program uploads/re-uploads a lot in one session.
+
+## Loading a level from the Pi's SD card
+
+A level is far too large to upload through the register window — E1M1 is
+620 KB of textures, meshes and world nodes — and it does not have to be. The
+Pi has its own SD card. Put a `.g64lev` file on it as **`RAD/level.g64lev`**,
+and two opcodes turn it into a live scene.
+
+```
+        ; --- begin ---
+        lda #<1000  : sta ARG+0     ; mesh resource IDs start here
+        lda #>1000  : sta ARG+1
+        lda #<100   : sta ARG+2     ; world node IDs start here
+        lda #>100   : sta ARG+3
+        lda #1      : sta ARG+4     ; create the camera as ID 1
+        lda #0      : sta ARG+5
+        lda #$a5    : sta ARG+15    ; LOAD_LEVEL is destructive
+        cmd $13
+
+        ; --- and then step it until it is done ---
+step    cmd $14
+        bne failed                  ; ERRCODE
+        lda RESULT
+        cmp #$ff
+        bne step                    ; RESULT is percent complete: draw a bar
+```
+
+E1M1 takes **29 steps**. Each one spends a bounded budget of work and returns,
+so the C64 is halted for a normal command's worth of time and not for the
+whole multi-second build; `RESULT` is there so you can show a loading bar
+while it happens.
+
+Four things the split implies:
+
+- **The file is read at power-on, not at `LOAD_LEVEL`.** If the card has no
+  `RAD/level.g64lev`, or the file is not a valid level, `LOAD_LEVEL` answers
+  `BAD_ARGS` — and the Pi's boot log says which of the two it was.
+- **`LOAD_LEVEL` resets the arena, the resource table and the scene**, so a
+  second level in one session does not leak the first one's 20-odd MB. It does
+  **not** touch your viewport, field of view or clip planes: set those up
+  before the load, because the view you want exists before the level does.
+- **Texture IDs are not yours to choose.** They are forced to `0..ntex-1`,
+  because a mesh face carries its texture as one byte. Mesh and node ID bases
+  are free; pick them clear of `0..ntex-1` and of each other.
+- **The camera comes from the level.** `info_player_start` is in the file, so
+  gpu64 creates the camera there, facing the right way, and makes it active.
+  Pass 0 for the camera ID if you would rather place your own.
+- **Neither opcode works while the loop is running.** Both answer `BUSY`.
+  Load first, then `LOOP_START` — or `LOOP_STOP` before reloading.
+
+Nothing above stops the camera leaving the map — placing it is your job, and
+`CLIP_MOVE` below is how you ask whether a place is legal.
+
+## Walking in a level
+
+`CLIP_MOVE` ($15) is one question: *I am here, I would like to move by this
+much, where do I actually end up?* gpu64 answers it against the same Quake
+clip hulls the level file carries, and then forgets it — **the C64 owns the
+player's position**. gpu64 never moves the camera on your behalf, which is
+why you send an absolute position every time rather than a running delta: one
+lost register write to a delta protocol is a permanent displacement nothing
+later contradicts.
+
+Everything travels in one 56-byte block rather than in the registers (plus 16
+bytes per door you name — see "Doors that block" below). It does not fit in
+them — a position and a displacement in 16.16 are 24 bytes by themselves — and
+a block is one DMA burst with a checksum where two dozen register writes would
+be two dozen independent chances to lose one.
+
+```
+        ; the block lives anywhere in C64 RAM (or the REU)
+        lda #0      : sta ARG+0     ; space: 0 = C64, 1 = REU
+        lda #<blk   : sta ARG+1
+        lda #>blk   : sta ARG+2
+        lda #0      : sta ARG+3
+        lda #56     : sta ARG+4
+        lda #0      : sta ARG+5
+        cmd $15
+        ; ERRCODE here is a diagnostic, not the verdict -- see below. If the
+        ; block really was rejected the Pi wrote nothing, so the magic test
+        ; on the output half catches it too, and that test cannot be fooled
+        ; by a garbled register read.
+```
+
+| Bytes | Dir | Meaning |
+|---|---|---|
+| 0-11 | in | `start` x, y, z — s32 16.16 world units, gpu64 axes, y up |
+| 12-23 | in | `delta` x, y, z — the displacement you want, same format |
+| 24 | in | hull: 1 = player, 2 = the larger hull. Anything else is `BAD_ARGS` |
+| 25 | in | mode, below |
+| 26 | in | model: 0 = the world, or a brush model to move *instead of* the world |
+| 27 | in | magic `$C5` |
+| 28 | in | check: XOR of bytes 0-27, byte 29, and every mover byte |
+| 29 | in | movers: how many 16-byte mover records follow, 0-16 |
+| 30-31 | — | reserved, not read, not summed |
+| 32-43 | out | `end` x, y, z — where the move really ended |
+| 44 | out | flags, below. Also copied to `RESULT` |
+| 45 | out | contents at `end`: 0 empty, 1 solid, 2 water, 3 slime, 4 lava, 5 sky, 255 unknown |
+| 46 | out | fraction 0-255 of the *horizontal* displacement actually covered |
+| 47 | out | bumps: slide iterations used, 0-4. Diagnostic |
+| 48 | out | magic `$5C` |
+| 49 | out | check: XOR of bytes 32-48 |
+| 50-55 | out | zero |
+
+**Mode** (bitwise): `$01` slide along walls instead of stopping dead, `$02`
+step up over obstacles up to 18 Quake units, `$04` settle onto the floor and
+report standing, `$08` the position you send and get back is the **eye**, not
+the feet — gpu64 subtracts the 22-unit view offset on the way in and adds it
+back on the way out, so you can hand it your camera's position unchanged.
+`$07` (slide + step + floor) is ordinary walking; `$0f` is ordinary walking
+with a camera-height position.
+
+**Flags**: `$01` standing on ground, `$02` hit a wall, `$04` hit a ceiling,
+`$08` the move needed a step up, `$10` the *start* was already inside solid
+(you are stuck — the move is refused, not attempted), `$20` the whole trace
+was in solid, `$40` the move was cut short by the iteration limit rather than
+by geometry.
+
+Three things worth doing, all cheap:
+
+- **Check the output magic and checksum**, not `ERRCODE`. `ERRCODE` is a
+  single register read, and a register read that fails returns whatever was
+  last on the bus rather than an error. The block's own `$5C` plus XOR is the
+  channel that cannot lie to you; if it fails, call `CLIP_MOVE` again — the
+  input half is untouched, so a retry is just the six register writes of the
+  descriptor and the dispatch. **Retry rather than skipping the frame.** Poison
+  only the output half between attempts, so the movers and the request survive.
+  Three or four attempts is the right budget: gpu64's bench run 37 had 61% of
+  first attempts rejected once it started sending sixteen mover records a
+  frame, and a frame the player does not move is far more expensive than
+  asking again.
+- **Set `SET_DMA_WINDOW`** ($0C, class 0) around the block. `CLIP_MOVE` is the
+  one class-1 opcode that writes to C64 memory every frame, and the window is
+  what guarantees a dropped address byte cannot put those 24 bytes somewhere
+  else — see [state-refresh.md](state-refresh.md).
+- **Bound the answer by the question.** The magic and the checksum are the
+  channel; this is the meaning. A move cannot end further from where it
+  started than the displacement you asked for, plus the 18 Quake units of
+  step-up mode `$02` is allowed to add — so compare the returned position
+  against your own start and reject anything outside that, exactly as you
+  reject a bad checksum. It costs a handful of compares on the integer halves
+  and it is the only check that is *exact*: an 8-bit XOR over seventeen bytes
+  passes roughly one corrupted block in 256, and unlike a dropped frame a
+  corrupted **position** is permanent, because you are the one who is
+  authoritative about it and nothing will ever contradict you. gpu64's own
+  bench run 36 lost a single byte of the x coordinate — `$000F` arriving as
+  `$FF0F` — and spent the rest of the session 222 world units outside the
+  map.
+
+### Doors that block
+
+A closed door is **not** part of the world's collision. The BSP compiler put
+the doorway's hole in the world hull and the door panel in a brush model of
+its own, so a trace that names only the world walks straight through every
+door on the map. Say which doors are in the way, and where they currently are,
+and the same trace is blocked by them:
+
+| Bytes | Meaning |
+|---|---|
+| +0 | model: the brush model index, from `LEVEL_ENT`. 0 is an empty slot, skipped |
+| +1 | flags: reserved, write 0 |
+| +2-3 | reserved, write 0 |
+| +4-15 | `ofs` x, y, z — s32 16.16, how far you have already opened it |
+
+The first record is at byte **56**, i.e. immediately after the output half, so
+`len` must be `56 + 16 × movers` and a block with no movers is unchanged from
+before. `ofs` is the same displacement you passed to `SET_POSITION` on that
+model's nodes: zero for a closed door, its full `travel` for an open one, and
+anything in between while it is moving.
+
+The list is an **argument, not state**. gpu64 does not know which of your
+doors are open — you do — so you say so on every call. That is what keeps
+`CLIP_MOVE` a pure function of its block, and therefore answerable while the
+render loop is running. Sixteen movers is the limit; a model the level does
+not have is `BAD_ARGS`, because a door that quietly stops blocking is how a
+player leaves the map.
+
+Gravity, jumping, friction and acceleration are **not** here. `CLIP_MOVE`
+answers a geometric question; how fast the player falls is a game's decision,
+and one the 6502 can make in a few bytes of arithmetic. Fall by calling it a
+second time with a downward delta and looking at `$01`.
+
+## What is in a level
+
+`CLIP_MOVE` tells you where you may walk; `LEVEL_ENT` ($16) tells you what is
+there. A level's entity list is where its *game* is — E1M1 has 369 entities
+naming the player start, fourteen doors and the buttons that open them, the
+triggers, forty-two monsters and every item on the map — and it is already in
+the Pi's memory, because the level file carries it.
+
+It does not travel to the C64 wholesale: 16 KB of records plus a string pool.
+So you ask for one record at a time, by index, and keep the handful your game
+cares about. `entCount` comes back on **every** call, so the loop is "read 0,
+learn how many there are, read the rest".
+
+The record is pre-digested for a 6502. There are no strings to compare: a
+classname arrives as a `kind` byte you can switch on, `target`/`targetname` as
+opaque 16-bit ids that are equal exactly when the strings were (the pool is
+deduped, so `door.targetname == button.target` is one `cmp`, not a `strcmp`),
+a door's travel as a ready displacement instead of Quake's `lip`/`angle`
+formula, and a brush model's geometry as a contiguous run of scene node ids.
+
+```
+        lda #0      : sta ARG+0     ; space: 0 = C64, 1 = REU
+        lda #<blk   : sta ARG+1
+        lda #>blk   : sta ARG+2
+        lda #0      : sta ARG+3
+        lda #96     : sta ARG+4
+        lda #0      : sta ARG+5
+        cmd $16
+```
+
+| Bytes | Dir | Meaning |
+|---|---|---|
+| 0-1 | in | index: which entity, `0 .. entCount-1` |
+| 2 | in | magic `$C6` |
+| 3 | in | check: XOR of bytes 0-2 |
+| 4-15 | — | reserved, not read |
+| 16-27 | out | `origin` x, y, z — s32 16.16 world units, gpu64 axes |
+| 28-39 | out | `mins` — the brush model's box, zero if it is not a brush model |
+| 40-51 | out | `maxs` |
+| 52-63 | out | `travel` — the closed→open displacement, zero if it is not a mover |
+| 64-65 | out | yaw, u16, a full turn is 65536 |
+| 66-67 | out | spawnflags |
+| 68-69 | out | `param0` — s16; which Quake key this is depends on the kind |
+| 70-71 | out | `param1` |
+| 72-73 | out | `target` id, 0 = none |
+| 74-75 | out | `targetname` id, 0 = none |
+| 76-77 | out | `nodeFirst` — scene node id of this model's first chunk |
+| 78-79 | out | `entCount` — how many entities this level has |
+| 80 | out | `nodeCount` — chunks in the run; 0 if the model draws nothing |
+| 81 | out | `kind`, below |
+| 82 | out | model — brush model index, 0 = not a brush model |
+| 83 | out | reserved, zero |
+| 84 | out | magic `$6C` |
+| 85 | out | check: XOR of bytes 16-84 |
+| 86-95 | out | zero |
+
+**Kind** is a range, not an enumeration, so a game can ignore a whole class of
+thing with one comparison:
+
+| Kind | What |
+|---|---|
+| 0 | no opinion — a classname the converter does not classify. Never an error |
+| 1-9 | the world and its wiring: 1 `worldspawn`, 2 `info_player_start`, 3-4 deathmatch/coop starts, 6 `path_corner`, 7 teleport destination, 8 intermission |
+| 10-19 | brush movers: 11 `func_door`, 12 `func_door_secret`, 13 `func_plat`, 14 `func_button`, 15 `func_wall`, 16 `func_train`, 17 `func_illusionary` |
+| 20-29 | triggers (invisible volumes): 21 `_once`, 22 `_multiple`, 23 `_secret`, 24 `_teleport`, 25 `_changelevel`, 26 `_counter`, 27 `_hurt`, 28 `_push` |
+| 30-49 | pickups: 31 health, 32-34 armour, 35-44 weapons, 45-48 ammo, 40-43 the four powerups |
+| 50-79 | monsters: 51 grunt, 52 dog, 53 ogre, 54 knight, 55 zombie, 56 wizard, 57 demon, 58 shambler, 59 enforcer, 60 hell knight |
+| 80-89 | scenery: 80-81 explosive boxes, 82 teleport train, 83 fireball |
+| 90-99 | lights and sound: 90 `light`, 91-94 the named light entities, 95-96 ambient sounds |
+
+Within a range, an unlisted classname falls back to the family's own number:
+anything `monster_` is 50, `item_` 30, `weapon_` 35, `trigger_` 20, `func_` 10,
+`light` 90. So "is this a monster?" is `kind >= 50 && kind < 80` and it stays
+right for a level with monsters E1M1 does not have. The full table is
+`ENT_KIND` in `tools/gen_quakelevel.py`.
+
+Moving a door is then three things and no lookups: `travel × fraction` into
+`SET_POSITION` on nodes `nodeFirst` through `nodeFirst + nodeCount - 1`, and
+the same displacement into the door's mover record in your next `CLIP_MOVE`
+block so the player stops walking through it. The wiring is the ids: a
+`trigger_multiple` whose `target` equals a door's `targetname` is what opens
+that door.
+
+Both obligations are `CLIP_MOVE`'s, for the same reasons: check the output
+magic **and** checksum rather than `ERRCODE`, and set `SET_DMA_WINDOW` around
+the block.
 
 ## Lighting
 
