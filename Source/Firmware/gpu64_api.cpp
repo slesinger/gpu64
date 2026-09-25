@@ -1669,6 +1669,24 @@ void gpu64_apiDispatch( u8 op )
 	gpu64ApiKey = sArg[ GPU64_REG_KEY ];
 	sArg[ GPU64_REG_KEY ] = 0;
 
+	// gpu64 (2026-09-25, bench run 41): the optional per-command check --
+	// gpu64_api.h, GPU64_KEY_CHECKED. Ahead of every class, so a command
+	// whose bytes did not arrive as sent executes nowhere.
+	if ( ( gpu64ApiKey & 0xF0 ) == GPU64_KEY_CHECKED )
+	{
+		const unsigned n = gpu64ApiKey & 0x0F;
+		u8 x = gpu64ApiKey ^ sCmdHi ^ op ^ sId[ 0 ] ^ sId[ 1 ];
+		for ( unsigned i = 0; i < n && i < GPU64_REG_CHECK; i++ )
+			x ^= sArg[ i ];
+		if ( n > GPU64_REG_CHECK || x != sArg[ GPU64_REG_CHECK ] )
+		{
+			gpu64ApiDiag.checkRefused++;
+			sErr = GPU64_ERR_BAD_ARGS;
+			sStatus |= GPU64_STATUS_ERROR;
+			return;
+		}
+	}
+
 	// gpu64: finish any page flip still in flight before anything else runs
 	// (gpu64_flip.h). Two reasons, and both are correctness, not tidiness:
 	// this command may draw into a page the VideoCore has not yet stopped

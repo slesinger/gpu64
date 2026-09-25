@@ -335,6 +335,57 @@ not the loop is running, so scene setup needs it too.
 count the damaging events that did get through (active camera lost, scene
 wiped while built).
 
+**The check byte (optional).** Any command, of any class, can carry its
+own check, and the firmware refuses it if its bytes did not arrive as sent.
+Write `ARG15` = `$D0 | n` and `ARG14` = the XOR of:
+
+- that `ARG15` byte,
+- `CMD_HI`, `CMD_LO`, `ID_LO` and `ID_HI`,
+- `ARG0` to `ARG(n-1)`.
+
+`n` is how many argument bytes the command writes, `0` to `14`. It is part
+of the key because arguments the command does not write still hold the
+previous command's bytes, and your program cannot vouch for those. If the
+sum does not match, the command is refused with `BAD_ARGS` before any class
+sees it: nothing executes. A flipped `CMD_LO` or `CMD_HI` is refused too,
+because both are in the sum.
+
+```asm
+        ; SET_POSITION ($30) on node $0001, 12 argument bytes in pos
+        lda #$d0 | 12
+        sta key
+        eor #1                  ; CMD_HI
+        eor #$30                ; CMD_LO
+        eor #$01                ; ID_LO
+        eor #$00                ; ID_HI
+        ldx #11
+-       eor pos,x
+        dex
+        bpl -
+        sta $df1f               ; ARG14 -- the check
+        lda key
+        sta $df20               ; ARG15 -- spent by this dispatch
+        lda #$30
+        sta $df0c               ; CMD_LO
+```
+
+Why it exists: writing every byte twice defeats a write the bus loses, but
+not one it delivers with a bit flipped, because the second copy is believed
+just as well. On a retained scene a flipped position byte is a camera 128
+units away for a frame, or a door in the wrong place until something re-sends
+it. That is the see-through flicker the E1M1 game showed at the bench. A
+command that is **absolute** (a position, an orientation, a node repair) can
+simply be sent again on `BAD_ARGS`, so put the check on those and retry a few
+times. `SCENE_COMMIT` has no `ID` or arguments, so write `ID_LO` = `ID_HI` =
+`0` and its check is the constant `$D0 ^ 1 ^ $08` = `$D9`.
+
+The check shares the one-shot `ARG15` with the destructive key, so a single
+command carries one or the other, never both. A command without it runs
+unchecked, exactly as before, and so does a checked command sent to firmware
+that predates the check. What it cannot catch is the `ARG15` write itself
+being lost or flipped out of the `$D0` range: the command then runs
+unchecked.
+
 **A stopped loop repairs itself.** If a `SCENE_COMMIT` arrives while the
 loop is not running, it re-starts the loop — the same checks `LOOP_START`
 makes, the same shadow reseed — and answers `OK`. It does not commit that

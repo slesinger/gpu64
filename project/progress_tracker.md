@@ -9215,3 +9215,82 @@ Photo: FRAMES 0E41 OK 0E38, FLIP 0E42 (the Pi was still flipping), MISSED
     - A climbing STK means solid.
 - demos.sh game/level/quake3d/quake (all four door checks) and testprg are
   green. Deployed 2026-09-25 (PRG only; the firmware did not change).
+
+### Run 41 (2026-09-25): no hang in 30 minutes; the jump, and the last of the flicker
+
+About 30 minutes, the furthest through E1M1 yet, and no hang. `LOAD DONE IN
+001C`, `FRAMES 40D0 OK B28C`, `MISSED 011F`, `ERRBAD 0002`, `MS/FRAME CUR
+031 MAX 255`, `CLIP F01 FRFF E00 N0FD0 M10E6 S0026 W06`, `OPEN 001E`, `VIEW
+... FIX 005`, `RING ERR 001 PAL 0002`, `BODY JMP 007 STK 082 VD 000 G01
+D00/03`. D max 03 says CLIP_MOVE never stopped answering for long, so the
+run-40 slow walk is gone.
+
+User report: the jump is about twice as long as it should be, and the
+scene still flickers a bit.
+
+- **Jump.** Physics are per frame, and the bench runs at about 32 fps (MS
+  CUR 031), not 50. The old constants gave about 26 frames of air, roughly
+  0.8 s. `JUMP_V` $3800 → $7000 and `GRAV` $0450 → $1140: twice the speed
+  against four times the gravity keeps the apex (v²/2g) and halves the
+  airtime. runsim: apex 40 units, down in 11 frames. A frame rate that
+  moves will still change how the jump feels, because nothing here is
+  scaled by real time.
+- **"Is the BSP computed correctly?" It is not used for drawing.**
+  - gen_quakelevel.py fans every BSP face into triangles and splits them
+    spatially into chunks of at most 256 vertices, which become mesh nodes.
+  - The renderer draws every node, clipping against the near plane and the
+    guard band, and depth-tests per pixel with a 16-bit z-buffer.
+  - The BSP tree is used only for collision (the clip hulls behind
+    CLIP_MOVE).
+  - On a clean bus the demos.sh route shows no temporal flicker at all. The
+    one exception is frame 362, the lift climb-out, which is a real camera
+    move.
+- **The flicker left after `stage2` is bytes with a flipped bit.**
+  - Double-writing repairs a lost write, but not a flipped one: the second
+    pass is believed just as well.
+  - `runsim --bus-fault=data:300` still gave 196 events in 1500 frames:
+    - camera jumps of 4, 8 and 128 units for one frame;
+    - yaw blips;
+    - a door displaced by 8 units until the ring reached it.
+  - At higher rates the ring itself was a source. Its `SET_ACTIVE_CAMERA`
+    arrived as `CREATE_CAMERA` and put the eye at the origin for a frame.
+- **Fix: an optional per-command check (firmware + game).**
+  - `ARG15` = `$D0|n` and `ARG14` = the XOR of the key, CMD_HI, CMD_LO,
+    ID_LO, ID_HI and ARG0..n-1.
+  - `gpu64_apiDispatch()` refuses a mismatch with `BAD_ARGS` before any
+    class runs, so nothing executes. The count is in
+    `gpu64ApiDiag.checkRefused`; the health block has no room for it.
+  - A firmware that predates the check runs these commands unchecked, so
+    PRG and firmware can be deployed in either order.
+  - The game sends everything through `stage2`, which now takes the opcode,
+    computes the check, and re-stages up to 4 times on `BAD_ARGS`. That
+    covers:
+    - camera, movers and LEVEL_NODE;
+    - every class 1 ring entry;
+    - LEVEL_STEP.
+  - `SCENE_COMMIT` carries the constant check `$D9`.
+  - Row 16 ends in `CK nnnn`: blocks refused and re-sent.
+  - Modelled in gpu64model.py. runsim prints `checked commands refused: N`.
+  - The load loop now believes RESULT only when two reads agree. At
+    `both:97` a floating `$FF` read equals `LEVEL_DONE` and ended the load
+    after 2 of 29 steps.
+
+Glitch events in 1500 frames of the demos.sh route (blips.py over the class
+1 stream):
+
+| injection | before | after | refused |
+|---|---|---|---|
+| none | 0 | 0 | 0 |
+| data:300 | 196 | 0 | 457 |
+| data:131 | — | 0 | 776 |
+| data:97 | load failed | 0 | 1628 |
+| data:61 | 39 | 1* | 2314 |
+| drop:300 / drop:61 | 0 | 0 / 0 | 16 / 83 |
+| both:97 / both:61 | load ended at step 2 | 1* / 0 | 134 / 83 |
+
+\* A 1.6–1.8 unit step: one frame of motion landing twice after a refused
+commit. Not a wrong pose.
+
+demos.sh (all 14, with the game's door checks), testprg and the firmware
+build are green. **The firmware changed** (`gpu64_api.cpp/.h`,
+`gpu64_apidiag.h`), so the deploy is `tools/build.sh` plus the PRG. Deployed 2026-09-25, build id `eb396ea3-dirty src:78abdb56`.

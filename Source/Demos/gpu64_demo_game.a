@@ -139,6 +139,8 @@ OP_SET_SCALE         = $35
 OP_GET_TRANSFORM     = $36
 
 KEY_DESTRUCTIVE = $a5
+KEY_CHECKED	= $d0		; | n, see stage2
+CHK_TRIES	= 4
 
 SEQ      = $df22
 SEQACK   = $df23
@@ -301,12 +303,16 @@ FALL = 64
 FALL_16 = FALL * 256
 
 ; The jump, in the 16.16 world units mov carries (1 Quake unit = $0800).
-; Quake's is 270 up against 800 gravity, a 45-unit apex; per frame that is
-; 7 Quake units up and 0.54 off each frame after. FALL_16 is both the
-; terminal speed and the probe a standing player sends every frame, so a
-; walk-off and a landing behave exactly as they did before there was a jump.
-JUMP_V  = $3800
-GRAV    = $0450
+; Quake's is 270 up against 800 gravity, a 45-unit apex. The first cut was
+; 7 Quake units up and 0.54 off each frame after -- 26 frames in the air,
+; which at the bench's ~32 frames a second run 41 called "about two times
+; longer" than it should be. Twice the speed against four times the
+; gravity keeps the 45-unit apex (v^2 / 2g) and halves the time: 14 up,
+; 2.16 off, about 13 frames. FALL_16 is both the terminal speed and the
+; probe a standing player sends every frame, so a walk-off and a landing
+; behave exactly as they did before there was a jump.
+JUMP_V  = $7000
+GRAV    = $1140
 VEL_MIN = $10000 - FALL_16	; -FALL_16 as a 16-bit signed velocity
 JUMP_HOLD = 2			; frames SPACE must read down: a phantom
 				; keyboard sample is one frame (run 38c)
@@ -511,8 +517,16 @@ loadArmed
 	sta stepCt+1
 
 stepLoop
+	; Checked, with no arguments: a LEVEL_STEP that arrives with any byte
+	; flipped -- CMD_HI into a class that does not exist was the one that
+	; ended runsim --bus-fault=data:97 at step $1D -- is refused before it
+	; runs and sent again by stage2, where it used to end the program.
+	lda #0
+	sta stId
+	sta stId+1
 	lda #OP_LEVEL_STEP
-	jsr cmd1
+	ldx #$ff
+	jsr stage2
 	sta stepErr
 	bne stepFailed
 
@@ -520,8 +534,16 @@ stepLoop
 	bne +
 	inc stepCt+1
 +
-	lda RESULT
-	sta stepPct
+	; Believed only when two reads agree. A read the loop misses returns the
+	; last bus value, very often $FF -- which is LEVEL_DONE, and runsim
+	; --bus-fault=both:97 duly ended the load after two steps of 29.
+	ldx #8
+-	lda RESULT
+	cmp RESULT
+	beq +
+	dex
+	bne -
++	sta stepPct
 	cmp #LEVEL_DONE
 	beq stepDone
 
@@ -684,6 +706,16 @@ frame
 	ldx #MS_WAIT
 	jsr clkLap
 
+	; Checked like everything stage2 sends; with no ID and no arguments the
+	; check is a constant. A commit whose CMD_LO arrives as some other
+	; opcode is then refused instead of obeyed, and the next frame commits.
+	lda #0
+	sta ID_LO
+	sta ID_HI
+	lda #KEY_CHECKED ^ 1 ^ OP_SCENE_COMMIT
+	sta ARG+14
+	lda #KEY_CHECKED
+	sta ARG+15
 	lda #OP_SCENE_COMMIT
 	jsr cmdSeq1
 	ldx #MS_CMT
@@ -1642,10 +1674,9 @@ sendCamera
 	sta stBuf,x
 	dex
 	bpl -
+	lda #OP_SET_POSITION
 	ldx #11
 	jsr stage2
-	lda #OP_SET_POSITION
-	jsr cmd1
 	sta posErr
 
 	lda camYaw
@@ -1659,10 +1690,9 @@ sendCamera
 	sec
 	sbc camPitch
 	sta stBuf+3
+	lda #OP_SET_ORIENTATION
 	ldx #5
 	jsr stage2
-	lda #OP_SET_ORIENTATION
-	jsr cmd1
 	ora posErr
 	sta posErr
 	rts
@@ -1846,51 +1876,72 @@ RG_N = ( * - rgTab ) / 2
 
 ; Every entry returns the ERRCODE, flags set, and stages all of its own
 ; arguments: ARG is not cleared between commands, and a leftover byte is
-; exactly the kind of state this ring exists to distrust.
+; exactly the kind of state this ring exists to distrust. Every class 1
+; entry goes through stage2 and so carries the check: at one flipped byte in
+; 61, runsim showed the ring's own SET_ACTIVE_CAMERA arriving as
+; CREATE_CAMERA and putting the eye at the origin for a frame -- the ring
+; that repairs damage was itself the commonest source of it.
+stb	.macro	off, val
+	lda #\val
+	sta stBuf+\off
+	.endm
+stw	.macro	off, val
+	lda #<(\val)
+	sta stBuf+\off
+	lda #>(\val)
+	sta stBuf+\off+1
+	.endm
+
 rgViewport
-	#argw 0, 0
-	#argw 2, 0
-	#argw 4, VP_W
-	#argw 6, VP_H
+	#stw 0, 0
+	#stw 2, 0
+	#stw 4, VP_W
+	#stw 6, VP_H
 	lda #OP_SET_VIEWPORT
-	jmp cmd1
+	ldx #7
+	jmp stage2
 
 rgPersp
 	lda fovIx
 	asl a
 	tax
 	lda fovTab,x
-	sta ARG+0
+	sta stBuf+0
 	lda fovTab+1,x
-	sta ARG+1
-	#argw 2, NEARZ
-	#argw 4, FARZ
+	sta stBuf+1
+	#stw 2, NEARZ
+	#stw 4, FARZ
 	lda #OP_SET_PERSPECTIVE
-	jmp cmd1
+	ldx #5
+	jmp stage2
 
 rgBackground
-	#argb 0, 0
+	#stb 0, 0
 	lda #OP_SET_BACKGROUND
-	jmp cmd1
+	ldx #0
+	jmp stage2
 
 ; BAD_ID means CAM_ID is no longer a camera -- a phantom CREATE_OBJECT or
 ; DESTROY_NODE got it, and the loop has been rendering NO_CAMERA or a stale
 ; view since. Make it a camera again and put it where the player is before
 ; this frame is committed; any other error is left to the next time round.
 rgActiveCam
-	#id16 CAM_ID
+	jsr stCamId
 	lda #OP_SET_ACTIVE_CAMERA
-	jsr cmd1
+	ldx #$ff
+	jsr stage2
 	cmp #ERR_BAD_ID
 	beq +
 	cmp #0
 	rts
-+	#id16 CAM_ID
++	jsr stCamId
 	lda #OP_CREATE_CAMERA
-	jsr cmd1
-	#id16 CAM_ID
+	ldx #$ff
+	jsr stage2
+	jsr stCamId
 	lda #OP_SET_ACTIVE_CAMERA
-	jsr cmd1
+	ldx #$ff
+	jsr stage2
 	inc camFix
 	bne +
 	dec camFix
@@ -1900,18 +1951,27 @@ rgActiveCam
 
 ; The state default, towards the viewer, with gpu64's default ambient.
 rgLight
-	#argw 0, 0
-	#argw 2, 0
-	#argw 4, -32767
-	#argb 6, 4
+	#stw 0, 0
+	#stw 2, 0
+	#stw 4, -32767
+	#stb 6, 4
 	lda #OP_SET_LIGHT3D
-	jmp cmd1
+	ldx #6
+	jmp stage2
+
+stCamId
+	lda #<CAM_ID
+	sta stId
+	lda #>CAM_ID
+	sta stId+1
+	rts
 
 ; RESULT is how many entries the Pi had to put back. A read of it that fails
 ; returns the last bus value, so it is believed only when two reads agree.
 rgPalette
 	lda #OP_LEVEL_PALETTE
-	jsr cmd1
+	ldx #$ff
+	jsr stage2
 	sta palErr
 	bne rpDone
 	lda RESULT
@@ -2008,10 +2068,9 @@ nodeRefresh
 	lda #>NODE_BASE
 	adc #0
 	sta stId+1
+	lda #OP_LEVEL_NODE
 	ldx #0
 	jsr stage2
-	lda #OP_LEVEL_NODE
-	jsr cmd1
 	beq nrOk
 	cmp #ERR_BAD_ID
 	bne nrErr
@@ -3234,10 +3293,9 @@ spNodeLoop
 	lda spNode+1
 	sta stId+1
 	sta lastNodeH
+	lda #OP_SET_POSITION
 	ldx #11
 	jsr stage2
-	lda #OP_SET_POSITION
-	jsr cmd1
 	beq +
 	lda movErr
 	cmp #255
@@ -3485,10 +3543,40 @@ clkFrame
 ; to its register twice, a whole block apart, so a lost write is repaired
 ; by the second pass instead of being believed.
 ;
-; stId and stBuf hold the block; X = its last ARG index. Destroys A, X, Y.
+; Run 41 then showed what double-writing cannot cover: a write sampled with
+; a bit flipped is believed by the second pass just as well. runsim
+; --bus-fault=data:300 still put the camera 4, 8 or 128 units off for a
+; frame and a door 8 units off until the refresh. So the block now carries
+; its own check (GPU64_KEY_CHECKED, gpu64_api.h): ARG15 = $D0|n and ARG14 =
+; the XOR of that key, CMD_HI, CMD_LO, ID_LO, ID_HI and ARG0..n-1. The Pi
+; refuses a block that does not add up with BAD_ARGS and executes nothing,
+; and every command sent this way is absolute, so it is simply sent again.
+; A firmware older than the check ignores the key and runs it unchecked.
+;
+; stId and stBuf hold the block; A = the class 1 opcode, X = the last ARG
+; index, or $FF for a command with no arguments. Sends it, and returns like cmd1: ERRCODE in A, Z set on OK.
+; Destroys A, X, Y.
 ; ======================================================================
 stage2
+	sta stOp
 	stx stLast
+	inx
+	txa
+	ora #KEY_CHECKED
+	sta stKey
+	eor #1				; CMD_HI: this is always class 1
+	eor stOp
+	eor stId
+	eor stId+1
+	ldx stLast
+	bmi +				; X = $FF: no arguments at all
+-	eor stBuf,x
+	dex
+	bpl -
++	sta stChk
+	lda #CHK_TRIES
+	sta stTry
+st2Send
 	ldy #2
 st2Pass
 	lda stId
@@ -3496,12 +3584,29 @@ st2Pass
 	lda stId+1
 	sta ID_HI
 	ldx stLast
+	bmi +
 -	lda stBuf,x
 	sta ARG,x
 	dex
 	bpl -
++	lda stChk
+	sta ARG+14
+	lda stKey
+	sta ARG+15
 	dey
 	bne st2Pass
+	lda stOp
+	jsr cmd1
+	cmp #ERR_BAD_ARGS
+	bne st2Done
+	inc chkRetry
+	bne +
+	inc chkRetry+1
++	dec stTry
+	bne st2Send
+	lda #ERR_BAD_ARGS
+st2Done
+	cmp #0
 	rts
 
 ; ======================================================================
@@ -4032,6 +4137,13 @@ showFrame
 	.byte 0
 	lda movErr
 	jsr dmHexA
+	jsr dmText
+	.text " CK"
+	.byte 0
+	lda chkRetry+1
+	jsr dmHexA
+	lda chkRetry
+	jsr dmHexA
 
 	; Row 17: the view the keys have set; NODES is how long the level's
 	; node run turned out to be, FIX how many times LEVEL_NODE found one
@@ -4510,6 +4622,11 @@ clipDry		.byte 0
 clipDryMax	.byte 0
 stBuf		.fill 12
 stLast		.byte 0
+stOp		.byte 0
+stKey		.byte 0
+stChk		.byte 0
+stTry		.byte 0
+chkRetry	.word 0		; blocks the Pi refused on the check (row 16 CK)
 refreshIx	.byte 0
 movErr		.byte 0
 lastNodeL	.byte 0

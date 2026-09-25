@@ -625,6 +625,12 @@ def main(argv):
                      n.sprite_w, n.sprite_h, n.sprite_flags,
                      n.light_strength, n.light_radius))
 
+    if m.gpu.check_refused:
+        # GPU64_KEY_CHECKED refusals: commands whose ARG14 check did not
+        # match what arrived, i.e. bus faults the check stopped.
+        print("checked commands refused: %d" % m.gpu.check_refused,
+              file=sys.stderr)
+
     if ppm is not None and ok:
         write_ppm(ppm, m.gpu)
         print("--- wrote %s ---" % ppm)

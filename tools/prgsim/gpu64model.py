@@ -67,6 +67,10 @@ ERR_BAD_ID = 0x0A
 # that staged it.
 KEY_DESTRUCTIVE = 0xA5
 KEY_ARG = 15
+# gpu64_api.h, GPU64_KEY_CHECKED: ARG15 = $D0|n, ARG14 = XOR of that key,
+# CMD_HI, CMD_LO, ID_LO, ID_HI and ARG0..n-1.
+KEY_CHECKED = 0xD0
+CHECK_ARG = 14
 
 # Class 2 -- the raster layer (docs/class2-raster-reference.md, "Class 2 opcodes").
 RASTER_REC_BYTES = 16
@@ -274,6 +278,7 @@ class Gpu64Model(Class1Mixin):
         self.err = ERR_OK
         self.result = 0
         self.ident = [0, 0]
+        self.check_refused = 0
         self.arg = [0] * 16
 
         self.pages = [bytearray(FB_W * FB_H) for _ in range(FB_PAGES)]
@@ -684,6 +689,18 @@ class Gpu64Model(Class1Mixin):
         # survive into the command after it. gpu64_api.h has the contract.
         self.api_key = self.arg[KEY_ARG]
         self.arg[KEY_ARG] = 0
+        # gpu64 (2026-09-25, bench run 41): the optional per-command check,
+        # ahead of every class exactly as gpu64_apiDispatch() makes it.
+        if (self.api_key & 0xF0) == KEY_CHECKED:
+            n = self.api_key & 0x0F
+            x = self.api_key ^ self.cmd_hi ^ op ^ self.ident[0] ^ self.ident[1]
+            for i in range(min(n, CHECK_ARG)):
+                x ^= self.arg[i]
+            if n > CHECK_ARG or (x & 0xFF) != self.arg[CHECK_ARG]:
+                self.check_refused += 1
+                self.err = ERR_BAD_ARGS
+                self.status |= ST_ERROR
+                return
         if self.cmd_hi not in (0, 1, 2):
             self.err = ERR_BAD_CLASS
             self.status |= ST_ERROR

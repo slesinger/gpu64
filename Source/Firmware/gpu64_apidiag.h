@@ -129,6 +129,7 @@ typedef struct
 	u32	camLost;		// live scene's active camera went away
 	u32	sceneWipes;		// SCENE_RESETs that executed on a built scene
 	u8	keyRefusedOp;	// CMD_LO of the last key refusal -- the phantom's name
+	u32	checkRefused;	// checked commands refused: ARG14 did not match (gpu64_api.h)
 } GPU64APIDIAG;
 
 extern GPU64APIDIAG gpu64ApiDiag;

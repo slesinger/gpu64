@@ -70,6 +70,34 @@
 #define GPU64_KEY_DESTRUCTIVE	0xA5
 #define GPU64_REG_KEY		( GPU64_ARG_COUNT - 1 )	// ARG15, i.e. $DF20
 
+// --- the checked-command key --------------------------------------------
+//
+// gpu64 (2026-09-25, bench run 41). Writing every argument byte twice
+// (the game's stage2) defeats a write the polling loop does not sample, but
+// not one it samples with a bit flipped: the second pass is simply believed,
+// and a retained scene keeps believing it. Run 41 still flickered E1M1's
+// far side through the walls, and runsim --bus-fault=data showed every event
+// was one of those -- a camera 4, 8 or 128 units off for one frame, a door
+// displaced until the refresh ring got to it.
+//
+// So a command may carry its own check. ARG15 = GPU64_KEY_CHECKED | n says
+// ARG14 holds the XOR of that ARG15 byte, CMD_HI, CMD_LO, ID_LO, ID_HI and
+// ARG0..ARG(n-1). The length travels in the key because ARGs the command
+// does not write still hold the previous command's bytes, which the C64
+// cannot vouch for. A mismatch is refused with BAD_ARGS before any class
+// sees the command -- nothing executes -- and an absolute command can simply
+// be sent again. CMD_LO is in the sum, so a CMD_LO flipped into another
+// opcode is refused too.
+//
+// It rides the same one-shot ARG15 as the destructive key and is spent with
+// it, so it is optional and costs nothing when absent: a firmware that
+// predates it sees neither $A5 nor anything else it knows, and runs the
+// command unchecked. What it cannot cover is the key byte itself being lost
+// or flipped out of the $D0 range -- the command then runs unchecked, which
+// is where every command was before.
+#define GPU64_KEY_CHECKED	0xD0	// high nibble; low nibble = n, 0..14
+#define GPU64_REG_CHECK		( GPU64_ARG_COUNT - 2 )	// ARG14, i.e. $DF1F
+
 // The value ARG15 held when the current dispatch began, before
 // gpu64_apiDispatch() cleared it. Every class reads the key through this and
 // never through gpu64Regs.arg[15], which by then is already zero.
