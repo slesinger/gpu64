@@ -284,10 +284,21 @@ static unsigned clipGuardPlane( ClipVert *pOut, const ClipVert *pIn, unsigned n,
 			// focal-times-coordinate product -- four orders of
 			// magnitude larger than the z differences clipNear()
 			// feeds it. Shift the ratio down until the product
-			// cannot overflow. den is dA + |dB| so it is always the
-			// larger of the two, and always positive here, which is
-			// why testing it alone is enough.
+			// cannot overflow. |den| is |dA| + |dB|, so it is always
+			// the larger of the two -- but it is only positive when A
+			// is the inside end. When B is, both are negative, the
+			// loop below used never to run, and the unshifted product
+			// overflowed into a vertex behind the eye (a divide by
+			// zero in project() on a PC; a garbage triangle on the Pi,
+			// where sdiv by zero returns 0). The stunt demo's long
+			// track chunks passing beside the camera found it. Flip
+			// both to positive first.
 			s64 num = dA, den = dA - dB;
+			if ( den < 0 )
+			{
+				num = -num;
+				den = -den;
+			}
 			while ( den > 0x7fffffff )
 			{
 				num >>= 1;

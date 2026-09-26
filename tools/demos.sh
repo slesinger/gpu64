@@ -188,6 +188,18 @@ for n in "${names[@]}"; do
 		       --key=F7:780-800 --key=SPACE:820-900 --key=S:950-1150
 		       --key=Q:1000-1080 --key=F3:1200-1260)
 		;;
+	stunt)
+		# The grid countdown is 180 frames. The autopilot (F3) then
+		# drives a lap and a half -- the bridge, the humps and the
+		# jump -- with the cockpit view (F1) through the middle of it,
+		# and the last stretch is driven by hand: throttle held, a
+		# touch of steering, enough to put a car off the edge and
+		# prove the crane.
+		c1=1
+		extra=(--key=F3:190-195 --key=F1:500-505 --key=F1:700-705
+		       --key=F3:1000-1005 --key=W:1000-1500
+		       --key=A:1100-1130 --key=D:1250-1320)
+		;;
 	esac
 
 	bad=0
