@@ -24,7 +24,7 @@
 ;      the API itself ever emits -- and false for two shapes a C64
 ;      program is entitled to write:
 ;
-;        inc $DF11        c4 reads $DF11, c5 writes the old value, c6
+;        inc $DF56        c4 reads $DF56, c5 writes the old value, c6
 ;                         the new one. A hold opened after c4 asserts
 ;                         into a write.
 ;        sta $DFFF,X      c4 is an *unconditional* dummy read at the
@@ -47,14 +47,14 @@
 ;        -----   -------------------------   -------------------------
 ;        BASE    NOP dispatches              none -- the control rung,
 ;                                              today's hardened path
-;        STAP    sta $DFFF,X  (X=$12)        indexed store: IO2 dummy
-;                                              read at $DF11, then a
-;                                              write to $E011
-;        INCA    inc $DF11                   absolute RMW: IO2 read,
+;        STAP    sta $DFFF,X  (X=$57)        indexed store: IO2 dummy
+;                                              read at $DF56, then a
+;                                              write to $E056
+;        INCA    inc $DF56                   absolute RMW: IO2 read,
 ;                                              then two IO2 writes
-;        INCP    inc $DFFF,X  (X=$12)        indexed RMW across a page:
-;                                              IO2 dummy read at $DF11,
-;                                              a real read at $E011 with
+;        INCP    inc $DFFF,X  (X=$57)        indexed RMW across a page:
+;                                              IO2 dummy read at $DF56,
+;                                              a real read at $E056 with
 ;                                              the SAME low byte, then
 ;                                              two writes
 ;
@@ -71,7 +71,7 @@
 ;
 ;      INCP is the rung the fix's fourth term exists for. Indexed
 ;      addressing only ever fixes up the *high* address byte, so the
-;      dummy read at $DF11 and the real read at $E011 share a low byte,
+;      dummy read at $DF56 and the real read at $E056 share a low byte,
 ;      and a gate that only asked "is the next cycle a read?" would let
 ;      the real read confirm the dummy one and open the hold into a
 ;      write after all.
@@ -157,16 +157,16 @@
 ;      (at your option) any later version.
 ;
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-STATUS   = $df0d
-ERRCODE  = $df0e
-ID_LO    = $df0f
-ID_HI    = $df10
-ARG      = $df11
-RESULT   = $df21
-SEQ      = $df22
-SEQACK   = $df23
+CMD_HI   = $df50
+CMD_LO   = $df51
+STATUS   = $df52
+ERRCODE  = $df53
+ID_LO    = $df54
+ID_HI    = $df55
+ARG      = $df56
+RESULT   = $df66
+SEQ      = $df67
+SEQACK   = $df68
 
 ERR_BUSY = $07
 
@@ -184,13 +184,13 @@ DST      = $fd
 ; The page-crossing pair, chosen so the dummy read lands on ARG+0 and the
 ; real access lands on RAM under the KERNAL that nothing else touches:
 ;
-;   $DFFF + $12 = $E011, and the un-fixed address is $DF11 = ARG+0.
+;   $DFFF + $57 = $E056, and the un-fixed address is $DF56 = ARG+0.
 ;
-; Both bytes matter. $DF11 is what makes the dummy read an IO2 access the
-; polling loop samples and can arm on; $11 being the low byte of BOTH
+; Both bytes matter. $DF56 is what makes the dummy read an IO2 access the
+; polling loop samples and can arm on; $56 being the low byte of BOTH
 ; addresses is what the gate's fourth term has to notice.
 XBASE    = $dfff
-XOFF     = $12
+XOFF     = $57
 
 ; ----------------------------------------------------------------------
 ; Rung budgets. Sized for events per minute, not for statistical power --
@@ -429,8 +429,8 @@ stapLoop
 	jmp stapNext
 stapShape
 	; sta XBASE,X with X = XOFF. Cycle 4 is an unconditional dummy read
-	; at $DF11 -- an IO2 access the polling loop samples and can arm on --
-	; and cycle 5 is a write to $E011. Under the old rule a commit hold
+	; at $DF56 -- an IO2 access the polling loop samples and can arm on --
+	; and cycle 5 is a write to $E056. Under the old rule a commit hold
 	; armed on that dummy read opened into the write.
 	ldx #XOFF
 	lda #0
@@ -470,7 +470,7 @@ incaLoop
 	jsr tally
 	jmp incaNext
 incaShape
-	; inc ARG+0: c4 reads $DF11 (which reads back as $FF -- see
+	; inc ARG+0: c4 reads $DF56 (which reads back as $FF -- see
 	; gpu64_apiReadReg), c5 writes $FF and c6 writes $00. Two IO2 writes
 	; in a row, straight after an IO2 read at the same address. Nothing
 	; observable happens: ARG+0 is a staging byte and no command in this
@@ -508,8 +508,8 @@ incpLoop
 	jsr tally
 	jmp incpNext
 incpShape
-	; inc XBASE,X with X = XOFF: c4 dummy-reads $DF11 (IO2), c5 reads
-	; $E011, c6 and c7 write it. The two reads share a low byte, which is
+	; inc XBASE,X with X = XOFF: c4 dummy-reads $DF56 (IO2), c5 reads
+	; $E056, c6 and c7 write it. The two reads share a low byte, which is
 	; the whole point -- a gate that only asked "is the next cycle a
 	; read?" would let c5 confirm c4's arm and open the hold into c6.
 	ldx #XOFF

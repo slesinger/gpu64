@@ -7,17 +7,33 @@ per-class reference files — see [README.md](README.md) for the map.
 
 ## Register map
 
-gpu64 owns `$DF0B`–`$DFFF` in IO2 (REU keeps `$DF00`–`$DF0A`; IO1,
-`$DE00`–`$DEFF`, is untouched).
+gpu64's registers are `$DF50`–`$DF68` in IO2 (REU keeps `$DF00`–`$DF0A`;
+`$DF0B`–`$DF4F` is left to other hardware; IO1, `$DE00`–`$DEFF`, is
+untouched).
+
+**On a C64 Ultimate / Ultimate 64 / 1541 Ultimate** gpu64 coexists with the
+Ultimate's Command Interface (`$DF1B`–`$DF1F`, fine to leave enabled), but two
+other Ultimate features must be **off**: its own REU emulation (gpu64 provides
+the REU at `$DF00`–`$DF0A`) and *Map Ultimate Audio `$DF20`-`$DFFF`*, which
+covers gpu64's registers.
+
+**If gpu64 hangs on your machine** while 3D rendering runs, add
+`GPU64_BURST_BYTES 128` to `SD:RAD/rad.cfg` (range 64–448, default 256). It
+limits how much the Pi's rendering core writes between pauses: smaller is
+slower to render but gives the C64 bus more margin. The picture is identical at
+every setting.
 
 | Register | Address | Purpose |
 |---|---|---|
-| `CMD_HI` | $DF0B | Selects the opcode class. Sticky — set once, then fire many opcodes in that class. |
-| `CMD_LO` | $DF0C | Write an opcode number here to dispatch it. This is the write that halts the C64 until the command completes. |
-| `STATUS` | $DF0D | bit0 busy, bit1 error, bit2 vblank-pending, bit3 vblank-IRQ-armed |
-| `ERRCODE` | $DF0E | Written by every dispatch, success or failure — see [error-codes.md](error-codes.md) |
-| `ID` | $DF0F–$DF10 | 16-bit resource id, for opcodes that create or reference one (textures, meshes, nodes...) |
-| `ARG0`–`ARG15` | $DF11–$DF20 | 16-byte argument block for the opcode about to fire |
+| `CMD_HI` | $DF50 | Selects the opcode class. Sticky — set once, then fire many opcodes in that class. |
+| `CMD_LO` | $DF51 | Write an opcode number here to dispatch it. This is the write that halts the C64 until the command completes. |
+| `STATUS` | $DF52 | bit0 busy, bit1 error, bit2 vblank-pending, bit3 vblank-IRQ-armed |
+| `ERRCODE` | $DF53 | Written by every dispatch, success or failure — see [error-codes.md](error-codes.md) |
+| `ID` | $DF54–$DF55 | 16-bit resource id, for opcodes that create or reference one (textures, meshes, nodes...) |
+| `ARG0`–`ARG15` | $DF56–$DF65 | 16-byte argument block for the opcode about to fire |
+| `RESULT` | $DF66 | Low byte of the last command's result, per opcode |
+| `SEQ` | $DF67 | Sequence number you write before `CMD_LO`, $01–$FE |
+| `SEQACK` | $DF68 | The `SEQ` of the last command that actually dispatched |
 
 ## What a command costs the C64
 

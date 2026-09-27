@@ -134,16 +134,16 @@
 ;      (at your option) any later version.
 ;
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-STATUS   = $df0d
-ERRCODE  = $df0e
-ID_LO    = $df0f
-ID_HI    = $df10
-ARG      = $df11
-RESULT   = $df21
-SEQ      = $df22
-SEQACK   = $df23
+CMD_HI   = $df50
+CMD_LO   = $df51
+STATUS   = $df52
+ERRCODE  = $df53
+ID_LO    = $df54
+ID_HI    = $df55
+ARG      = $df56
+RESULT   = $df66
+SEQ      = $df67
+SEQACK   = $df68
 
 STATUS_FRAME_READY = $10
 

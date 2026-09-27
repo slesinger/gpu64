@@ -66,13 +66,13 @@
 ;      (at your option) any later version.
 ;
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-ERRCODE  = $df0e
-ID_LO    = $df0f
-ID_HI    = $df10
-ARG      = $df11
-RESULT   = $df21
+CMD_HI   = $df50
+CMD_LO   = $df51
+ERRCODE  = $df53
+ID_LO    = $df54
+ID_HI    = $df55
+ARG      = $df56
+RESULT   = $df66
 
 OP_ARENA_STATUS   = $09
 OP_UPLOAD_TEXTURE = $11

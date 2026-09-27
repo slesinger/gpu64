@@ -19,13 +19,33 @@
 // it was clean at every rate tested, and it maps onto a natural unit -- a
 // 320-pixel 8bpp scanline is 320 bytes, so one yield per scanline (or two)
 // falls out of the geometry instead of being bolted on.
-#define GPU64_3D_SPAN_BYTES		256
+//
+// 2026-09-27: the budget is now a runtime value, not a constant. 448 was
+// measured on one C64; other boards (breadbin, Ultimate, C128) hang sooner or
+// later, and the A/B runs put every bus fault on core 1's rendering. A
+// smaller burst is the knob that trades render speed for bus margin, so it
+// has to be settable per machine: rad.cfg's GPU64_BURST_BYTES, clamped to
+// [MIN, MAX] by gpu64_3dSetSpanBytes(). Core 0 writes it once at boot, before
+// core 1 starts; core 1 only reads it, so the multicore read rule is not
+// involved.
+#define GPU64_3D_SPAN_BYTES_DEFAULT	256
+#define GPU64_3D_SPAN_BYTES_MIN		64	// one cache line
+#define GPU64_3D_SPAN_BYTES_MAX		448	// milestone 6a's measured edge
+
+extern unsigned gpu64_3dSpanBytes;
+
+// Returns the value actually applied, after clamping and rounding down to a
+// whole cache line.
+unsigned gpu64_3dSetSpanBytes( unsigned nBytes );
 
 #ifdef GPU64_HOSTSIM
 
 // The host sim is measuring pixels, not bus timing. A barrier here would
-// cost nothing but noise.
-#define GPU64_3D_YIELD()		( (void)0 )
+// cost nothing but noise -- but the NUMBER of yields is core 1's burst
+// count, the load that the A/B runs tied the bus faults to, so scenesim
+// reports it per frame.
+extern unsigned long gpu64_3dYieldCount;
+#define GPU64_3D_YIELD()		( (void)gpu64_3dYieldCount++ )
 
 #else
 

@@ -439,6 +439,11 @@ static void countEnts( void )
 
 int main( int argc, char **argv )
 {
+	// The firmware's rad.cfg GPU64_BURST_BYTES, for proving a budget
+	// changes only where the rasteriser yields, never a pixel.
+	if ( const char *pBurst = getenv( "GPU64_BURST_BYTES" ) )
+		gpu64_3dSetSpanBytes( (unsigned)atoi( pBurst ) );
+
 	const char *pLevel = 0;
 	const char *pOut = "out";
 	unsigned nFrames = 1;

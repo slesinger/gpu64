@@ -80,7 +80,7 @@ lifecycle" below for the full protocol.
 
 ## Opcode table
 
-`CMD_HI = 1`. `ARG` offsets are relative to `ARG0` ($DF11), exactly as in
+`CMD_HI = 1`. `ARG` offsets are relative to `ARG0` ($DF56), exactly as in
 class 0, and every opcode reads exactly the byte count in its row.
 
 ### System and loop — $00-$0F
@@ -319,9 +319,9 @@ staging the arguments, in the same place you write `ARG0`:
 
 ```asm
         lda #$a5
-        sta $df20               ; ARG15 -- the key
+        sta $df65               ; ARG15 -- the key
         lda #$07                ; LOOP_STOP
-        sta $df0c               ; CMD_LO -- and it is spent here
+        sta $df51               ; CMD_LO -- and it is spent here
 ```
 
 `ARG15` is read by no opcode for anything else, which is what makes it the
@@ -362,11 +362,11 @@ because both are in the sum.
 -       eor pos,x
         dex
         bpl -
-        sta $df1f               ; ARG14 -- the check
+        sta $df64               ; ARG14 -- the check
         lda key
-        sta $df20               ; ARG15 -- spent by this dispatch
+        sta $df65               ; ARG15 -- spent by this dispatch
         lda #$30
-        sta $df0c               ; CMD_LO
+        sta $df51               ; CMD_LO
 ```
 
 Why it exists: writing every byte twice defeats a write the bus loses, but
@@ -385,6 +385,25 @@ unchecked, exactly as before, and so does a checked command sent to firmware
 that predates the check. What it cannot catch is the `ARG15` write itself
 being lost or flipped out of the `$D0` range: the command then runs
 unchecked.
+
+**Strict mode: checking once means checking always.** The bus can also
+deliver a `CMD_LO` write your program never made, and that phantom runs on
+whatever the argument registers still hold from the previous command. At the
+bench a phantom `SET_PERSPECTIVE` ran on a `SET_POSITION`'s coordinates:
+the field of view jumped, and near a certain spot the near plane landed tens
+of units out and whole frames went black. A phantom never carries a check, so
+the firmware uses that. The first checked `SCENE_COMMIT` switches strict mode
+on, and from then on a class-1 command **without** a check is refused with
+`BAD_ARGS`, with these exceptions:
+
+- commands carrying the `$A5` destructive key;
+- `LOOP_START` ($06), `ARENA_STATUS` ($09), `CLIP_MOVE` ($15),
+  `LEVEL_ENT` ($16) and `GET_TRANSFORM` ($36). These only read state or are
+  retried by design, so a phantom one does no lasting harm.
+
+A keyed `SCENE_RESET`, a `FULL_RESET` or a C64 reset switches strict mode
+off again. A program that never checks its commits is unaffected. A program
+that checks its commits must check every other class-1 command it sends.
 
 **A stopped loop repairs itself.** If a `SCENE_COMMIT` arrives while the
 loop is not running, it re-starts the loop — the same checks `LOOP_START`
@@ -444,7 +463,7 @@ exists so that "retained is cheaper on the bus" is a measurement rather
 than an argument.
 
 The figures below come from `tools/prgsim`, which counts every dispatch and
-every write into the `$DF0B-$DF23` window. They are **marginal** per-frame
+every write into the `$DF50-$DF68` window. They are **marginal** per-frame
 costs — a 400-frame run subtracted from an 800-frame one — so one-time
 start-up traffic is out of them. That start-up is smaller than it sounds:
 about 60 dispatches and 570 register writes for class 1 (against class 2's
@@ -929,7 +948,7 @@ Class 1 adds one readable byte beyond the class 0 register set:
 
 | Address | Name | Dir | Purpose |
 |---|---|---|---|
-| $DF21 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT`, triangle count from `DRAW_MESH`/`DRAW_NODE`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. `CREATE_OBJECT`/`CREATE_CAMERA` don't allocate an ID and so don't set `RESULT` — node IDs are chosen by the C64 side, same as resource IDs. As of stage 15b, `DRAW_MESH`/`DRAW_NODE`'s `RESULT` is deferred — see "Deferred RESULT" above for when it actually becomes valid. |
+| $DF66 | `RESULT` | R | Low byte of the last command's result — page number from `SCENE_COMMIT`, triangle count from `DRAW_MESH`/`DRAW_NODE`, face count from `UPLOAD_MESH`. Meaning is per-opcode; undefined for opcodes that define none. `CREATE_OBJECT`/`CREATE_CAMERA` don't allocate an ID and so don't set `RESULT` — node IDs are chosen by the C64 side, same as resource IDs. As of stage 15b, `DRAW_MESH`/`DRAW_NODE`'s `RESULT` is deferred — see "Deferred RESULT" above for when it actually becomes valid. |
 
 and one `STATUS` bit:
 

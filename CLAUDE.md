@@ -33,7 +33,7 @@ Consequences that are binding on new work:
 There is a second, much larger defect: under extra *REU* register write
 pressure the emulation latches into 100% transfer failure. It lives in the
 `$df00-$df0a` decode path, which resets `reu.pl`/`reu.pl2` and calls
-`reuPrefetch()` on **every** write. The gpu64 register window `$df0b-$df21`
+`reuPrefetch()` on **every** write. The gpu64 register window `$df50-$df68`
 does neither, which is why command traffic has never reproduced it. **Do not
 add per-write work to either decode path.**
 

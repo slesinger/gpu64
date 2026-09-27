@@ -1632,7 +1632,7 @@ reuEmulationMainLoop:
 		// sampled at the top of the pass, NOT the settled sample at
 		// WAIT_FOR_SIGNALS that IO2_ACCESS uses -- and the button is active
 		// low, so any pass on which bit 3 does not read as the button reads
-		// as a press. A7 is 0 for every gpu64 register ($DF0B-$DF0E), which
+		// as a press. A7 is 0 for every gpu64 register ($DF50-$DF68), which
 		// is what a class-1 program polls flat out.
 		//
 		// Reported from the bench 2026-09-08: the Quake demo "switched to
@@ -1757,8 +1757,8 @@ reuEmulationMainLoop:
 		// the sampled address, which is the thing being repaired.
 		// Run 21 tightened the test from "is it in the signal range" to "is
 		// it a nibble a real access could have produced". The REU decodes
-		// $DF00-$DF0A and the API $DF0B-$DF23, so the high nibble of any
-		// access either of them cares about is $0, $1 or $2 and never more.
+		// $DF00-$DF0A and (then) the API $DF0B-$DF23, so the high nibble of
+		// any access either of them cared about was $0, $1 or $2.
 		// The old >= $C let a half-switched $9 through as repaired, which is
 		// why run 21's muxFixed read exactly equal to muxMiss while 37 bad
 		// writes survived, every one of them in $90-$9F. The second re-read
@@ -1771,13 +1771,17 @@ reuEmulationMainLoop:
 		// information -- did one re-read suffice? -- without spending a
 		// second bus access to learn it. If it is ever nonzero the access is
 		// discarded and BUS A/BUS B will show it as a bad read or write.
-		if ( IO2_ACCESS && ( g3 & 15 ) >= 3 )
+		// 2026-09-27: the register block moved to $DF50-$DF68, so the valid
+		// nibbles are now $0, $5 and $6 and the test is a mask lookup rather
+		// than a threshold. Still two ALU ops, and still only on IO2 passes.
+		// A threshold cannot express it: $5/$6 sit between invalid nibbles.
+		if ( IO2_ACCESS && ( ( GPU64_MUX_BAD_NIBBLES >> ( g3 & 15 ) ) & 1 ) )
 		{
 			gpu64BusStats.muxMiss++;
 			muxRetried = 1;
 			g3 = read32( ARM_GPIO_GPLEV0 );
 
-			if ( ( g3 & 15 ) < 3 )
+			if ( !( ( GPU64_MUX_BAD_NIBBLES >> ( g3 & 15 ) ) & 1 ) )
 				gpu64BusStats.muxFixed++;
 			else
 				gpu64BusStats.muxUnfixed++;
@@ -1808,7 +1812,7 @@ reuEmulationMainLoop:
 				SET_BANK2_OUTPUT
 			}
 
-			// gpu64: full 8-bit decode, not REU's own "& 0x1f" -- $DF0B-$DFFF
+			// gpu64: full 8-bit decode, not REU's own "& 0x1f" -- $DF50-$DFFF
 			// is gpu64's register window (docs/api_design.md), and the 5-bit
 			// mask would alias it back onto REU's 11 registers.
 			register u8 addr = IO_ADDRESS;
@@ -1825,9 +1829,9 @@ reuEmulationMainLoop:
 			{
 				register u8 addr = IO_ADDRESS;
 
-				// gpu64: $DF0B-$DFFF is gpu64's own register window -- the
+				// gpu64: $DF50-$DFFF is gpu64's own register window -- the
 				// command API's registers (docs/api_design.md). REU keeps
-				// $DF00-$DF0A below. Note this is the full 8-bit address:
+				// $DF00-$DF0A below, and $DF0B-$DF4F belongs to neither. Note this is the full 8-bit address:
 				// REU's own "& 0x1f" decode would alias the whole gpu64
 				// window down onto REU's 11 registers.
 				//
@@ -1851,8 +1855,8 @@ reuEmulationMainLoop:
 						// that is *not* an instruction's last cycle is a
 						// read-modify-write's first write, and an RMW always
 						// reads the same address on the cycle immediately
-						// before it (inc $DF0C: c4 reads, c5 and c6 write;
-						// inc $DF0C,X: c4 dummy-reads, c5 reads, c6 and c7
+						// before it (inc $DF51: c4 reads, c5 and c6 write;
+						// inc $DF51,X: c4 dummy-reads, c5 reads, c6 and c7
 						// write). So: previous *C64 cycle*, an IO2 read, same
 						// low address byte -- and the write is ambiguous.
 						//
@@ -1868,7 +1872,7 @@ reuEmulationMainLoop:
 						// its previous cycle is a write, not a read -- which
 						// discards the deferred arm and runs the command once,
 						// with the incremented value, on the instruction's
-						// genuine last cycle. `inc $DF0C` becomes correct
+						// genuine last cycle. `inc $DF51` becomes correct
 						// rather than merely safe.
 						if ( prevAnchor == ( GPU64_ANCHOR_READ | addr ) &&
 								(u32)( armCycleCounter - prevStamp ) <= gateSpan )
@@ -1952,6 +1956,14 @@ reuEmulationMainLoop:
 						gpu64_busStatsWrite( addr );
 					}
 				} else
+				// gpu64 2026-09-27: $DF0B-$DF4F belongs to nobody we
+				// emulate -- on an Ultimate it is the Command Interface at
+				// $DF1B-$DF1F. Without this test those writes would fall
+				// into REU's switch, whose tail resets reu.pl/reu.pl2 and
+				// calls reuPrefetch() on every write, which is the REU
+				// write-pressure latch CLAUDE.md forbids feeding. One compare,
+				// and only on a path that is not gpu64's.
+				if ( addr <= GPU64_REG_REU_LAST )
 				{
 					switch ( addr )
 					{
@@ -2071,10 +2083,11 @@ reuEmulationMainLoop:
 					//
 					// Costs nothing new: it is the same single MRS the run
 					// 25 build already spent, moved up inside a branch that
-					// had already been taken. The REU path (addr < 0x0B)
+					// had already been taken. The REU path (addr <= $0A)
 					// never reaches it.
 					READ_CYCLE_COUNTER( ccArrived );
 				} else
+				if ( addr <= GPU64_REG_REU_LAST )
 				{
 					D = ( (u8 *)&reu.status )[ addr ];
 					if ( addr == 0 )
@@ -2086,6 +2099,12 @@ reuEmulationMainLoop:
 						{
 							D |= reu.regBankUnused;
 						}
+				} else
+				{
+					// gpu64 2026-09-27: $DF0B-$DF4F is not ours. Leave the
+					// data bus alone -- on an Ultimate the Command Interface
+					// is driving it -- and never index REUSTATE past $0A.
+					goto io2ReadNotOurs;
 				}
 
 				register u32 DD = D << D0;
@@ -2115,6 +2134,7 @@ reuEmulationMainLoop:
 					gpu64_readSlackNote( reu.WAIT_CYCLE_READ + armCycleCounter, ccArrived, muxRetried );
 				}
 			}
+	io2ReadNotOurs:
 
 		// gpu64: the deferred flip commit fires here, and only here.
 		//
@@ -2145,7 +2165,7 @@ reuEmulationMainLoop:
 		//
 		// That was the reasoning as shipped, and it had a hole: the "last
 		// cycle" claim is true of absolute loads and stores, which is all the
-		// API itself uses, and false of a read-modify-write (inc $DF0D reads
+		// API itself uses, and false of a read-modify-write (inc $DF52 reads
 		// on c4 and writes on c5 and c6) and of an indexed store, whose
 		// unconditional dummy read can land in IO2 one cycle before the
 		// write. Recorded as an API constraint at the time; closed
@@ -2239,7 +2259,7 @@ reuEmulationMainLoop:
 		//
 		// Note what is *not* in the list: how long ago the arm happened. The
 		// four terms are self-contained, so an arm that cannot fire simply
-		// waits -- through the rest of an inc $DF0D, or through a whole REU
+		// waits -- through the rest of an inc $DF52, or through a whole REU
 		// transfer -- and fires on the first pair of cycles that qualifies.
 		// gateAge counts how long that took, in C64 cycles.
 		if ( gateArmed )

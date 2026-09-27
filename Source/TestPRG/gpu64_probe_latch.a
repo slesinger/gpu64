@@ -16,7 +16,7 @@
 ;      arm B run 2 lost 98.5% of every register write after commit 204.
 ;      That shape is a LATCH, not accumulating timing damage, and it is
 ;      the signature CLAUDE.md documents for the $df00-$df0a REU decode
-;      path -- which the gpu64 window $df0b-$df21 had never reproduced
+;      path -- which the gpu64 window $df50-$df66 had never reproduced
 ;      before stage 16. See project/progress_tracker.md section 16b.
 ;
 ;      Stage 16 changed three things at once, and the bench data cannot
@@ -174,16 +174,16 @@
 ;      (at your option) any later version.
 ;
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-STATUS   = $df0d
-ERRCODE  = $df0e
-ID_LO    = $df0f
-ID_HI    = $df10
-ARG      = $df11
-RESULT   = $df21
-SEQ      = $df22
-SEQACK   = $df23
+CMD_HI   = $df50
+CMD_LO   = $df51
+STATUS   = $df52
+ERRCODE  = $df53
+ID_LO    = $df54
+ID_HI    = $df55
+ARG      = $df56
+RESULT   = $df66
+SEQ      = $df67
+SEQACK   = $df68
 
 ERR_BUSY = $07
 

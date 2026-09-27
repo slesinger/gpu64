@@ -24,7 +24,7 @@ opcode below can return.
 | $08 | `SET_BORDER` | 1: colour | Sets the HDMI border colour. Overridden automatically by the sticky under-voltage indicator — see the health block below. |
 | $09 | `VBLANK_SYNC` | none | Blocks until the next vblank. May halt up to a full frame. `UNSUPPORTED` if the boot-time frame period measurement failed. |
 | $0A | `GET_HEALTH` | 0-5: dest descriptor | Writes the health block (below) to the given destination — 12 bytes, up to 128 with the diagnostic counters, or 132 with a magic and two check bytes that let you verify the block arrived whole. |
-| $0B | `FULL_RESET` | none | Puts the whole display back to the state it has just after the Pi boots: graphics mode, the C64 palette, border 0, page 0 both drawn and visible, every page black, text planes cleared, and the health alarm re-baselined. A **setup-time** command — leaving text mode reprograms the VideoCore and the C64 is halted for all of it (up to ~20 ms), so never issue it per frame. |
+| $0B | `FULL_RESET` | none | Puts the whole display back to the state it has just after the Pi boots: graphics mode, the C64 palette, border 0, page 0 both drawn and visible, every page black, text planes cleared, the health alarm re-baselined, and a running class 1 loop stopped (the next `SCENE_COMMIT` restarts it). A **setup-time** command — leaving text mode reprograms the VideoCore and the C64 is halted for all of it (up to ~20 ms), so never issue it per frame. |
 | $0C | `SET_DMA_WINDOW` | 0-1: base, 2-3: length | Confines every C64-space **readback** (`GET_INFO`, `GET_HEALTH`, `READ_RECT`, `GET_TRANSFORM`, the class-2 info blocks) to `base..base+length-1`. A destination outside it is refused with `OUT_OF_RANGE` and nothing is written. Length 0 means unrestricted, which is the reset default. `RESULT` echoes `ARG0^ARG1^ARG2^ARG3^$A5` so you can confirm the window landed — see below. |
 
 ## Whole surface — $10–$1F
@@ -229,7 +229,7 @@ contract.
 | 82 | 2 | Class 1/2 commands refused because the display was not in graphics mode (saturating) |
 | 84 | 2 | `SCENE_COMMIT`s refused because the frame clock was not calibrated (saturating) |
 | 86 | 1 | Flag byte sampled at the **last** refusal — see the bit list below |
-| 87 | 1 | What stopped the class 1 loop last: 0 nothing, 1 the `LOOP_STOP` opcode, 2 `SCENE_RESET`, 3 a session teardown (C64 reset), 4 boot |
+| 87 | 1 | What stopped the class 1 loop last: 0 nothing, 1 the `LOOP_STOP` opcode, 2 `SCENE_RESET`, 3 a session teardown (C64 reset), 4 boot, 5 the `FULL_RESET` opcode |
 | 88 | 2 | Times the loop went running → stopped (saturating) |
 | 90 | 2 | `CMD_LO` and `CMD_HI` of the last refusal |
 | 92 | 1 | The same flag byte as 86, sampled **now** |
@@ -239,12 +239,12 @@ contract.
 
 Bytes 44-47 are 0 for every program that writes `CMD_LO` with a plain `sta`,
 which is every program in this tree. A non-zero value there means something
-is doing `inc $DF0C` or an indexed store whose dummy read lands in `$DFxx` —
+is doing `inc $DF51` or an indexed store whose dummy read lands in `$DFxx` —
 safe, and handled, but worth knowing about.
 
 Bytes 48-63 count what the polling loop actually saw on the bus, which is
 what makes a lost access measurable from the C64 side. Count your own
-accesses to `$DF0B-$DF23` between two `GET_HEALTH` calls and compare:
+accesses to `$DF50-$DF68` between two `GET_HEALTH` calls and compare:
 
 - **Fewer seen than issued** — an access was never sampled at all. The C64
   read a floating bus, which answers `$FF`.

@@ -142,8 +142,8 @@ KEY_DESTRUCTIVE = $a5
 KEY_CHECKED	= $d0		; | n, see stage2
 CHK_TRIES	= 4
 
-SEQ      = $df22
-SEQACK   = $df23
+SEQ      = $df67
+SEQACK   = $df68
 
 ST_FRAME_READY = $10
 LEVEL_DONE = $ff
@@ -3553,6 +3553,12 @@ clkFrame
 ; and every command sent this way is absolute, so it is simply sent again.
 ; A firmware older than the check ignores the key and runs it unchecked.
 ;
+; The check made the second pass redundant, so the block now goes once
+; (section 75): a dropped or flipped ARG/ID byte fails the XOR, and a
+; dropped ARG15 runs the block unchecked, which strict mode refuses once
+; the first checked SCENE_COMMIT has latched it. Either way it is BAD_ARGS
+; and sent again. The second pass was over 40% of every frame's writes.
+;
 ; stId and stBuf hold the block; A = the class 1 opcode, X = the last ARG
 ; index, or $FF for a command with no arguments. Sends it, and returns like cmd1: ERRCODE in A, Z set on OK.
 ; Destroys A, X, Y.
@@ -3577,7 +3583,7 @@ stage2
 	lda #CHK_TRIES
 	sta stTry
 st2Send
-	ldy #2
+	ldy #1				; one pass: the check replaced the second
 st2Pass
 	lda stId
 	sta ID_LO

@@ -32,6 +32,7 @@
 #include "config.h"
 #include "helpers.h"
 #include "linux/kernel.h"
+#include "gpu64_3d_span.h"
 
 u32 radStartup = 0, radStartupSize = 0, radSilentMode = 0, radWaitCycles = 200000;
 
@@ -92,6 +93,16 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 					while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					if ( delay < 200 ) delay = 200;
 					radWaitCycles = delay * 1000;
+				}
+
+				// gpu64: core 1's store-burst budget, per machine. See
+				// gpu64_3d_span.h -- smaller is slower but kinder to the
+				// polling loop's bus timing.
+				if ( strcmp( ptr, "GPU64_BURST_BYTES" ) == 0 && ( ptr = strtok_r( NULL, "\"", &rest ) ) )
+				{
+					unsigned n = gpu64_3dSetSpanBytes( (unsigned)atoi( ptr ) );
+					logger->Write( "RaspiMenu", LogNotice, "  GPU64_BURST_BYTES %u", n );
+					continue;
 				}
 
 				if ( strcmp( ptr, "VERBOSITY" ) == 0 )

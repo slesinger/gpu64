@@ -1,6 +1,6 @@
 # Error codes
 
-`ERRCODE` (`$DF0E`) is written by **every** dispatch, success or failure —
+`ERRCODE` (`$DF53`) is written by **every** dispatch, success or failure —
 there is no code path that leaves it stale. `STATUS` bit1 is exactly
 `ERRCODE != OK`, so a caller that only wants pass/fail can check one bit
 instead of decoding the value.
@@ -31,9 +31,8 @@ of a gpu64 register was not serviced:
 - the polling loop never sampled the access, so nothing drove the data bus
   and the C64 latched whatever was there; or
 - the loop sampled the access at a *wrong* address (A4-A7 are multiplexed on
-  the cartridge port, so a mis-sample can only set those bits — `$DF0E`
-  degrades to `$1E`, `$2E`, `$4E` or `$8E`, all still inside the gpu64
-  window), found no readable register there, and answered `$FF` deliberately;
+  the cartridge port, so a mis-sample can only set those bits — `$DF53`
+  degrades to `$73` or `$D3`, both still at or above the gpu64 window), found no readable register there, and answered `$FF` deliberately;
   or
 - the firmware drove the data late enough that the C64 latched the previous
   cycle's value instead.

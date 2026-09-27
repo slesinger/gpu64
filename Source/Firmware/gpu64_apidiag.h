@@ -51,6 +51,7 @@
 #define GPU64_LOOPSTOP_SCENE_RESET	2	// SCENE_RESET ran
 #define GPU64_LOOPSTOP_SESSION		3	// gpu64_3dReset(), i.e. resetREU()
 #define GPU64_LOOPSTOP_INIT		4	// gpu64_3dInit(), boot only
+#define GPU64_LOOPSTOP_FULL_RESET	5	// the FULL_RESET opcode ran
 
 // gpu64_apiDiagStateByte()
 #define GPU64_DIAG_LOOP_RUNNING		0x01
@@ -130,6 +131,10 @@ typedef struct
 	u32	sceneWipes;		// SCENE_RESETs that executed on a built scene
 	u8	keyRefusedOp;	// CMD_LO of the last key refusal -- the phantom's name
 	u32	checkRefused;	// checked commands refused: ARG14 did not match (gpu64_api.h)
+	u32	strictRefused;	// unchecked class 1 commands refused in strict mode
+	u8	strictRefusedOp;	// CMD_LO of the last one -- the phantom's name
+	u32	commitScanBusy;		// SCENE_COMMITs refused BUSY because the page
+				// they would hand core 1 was still being scanned
 } GPU64APIDIAG;
 
 extern GPU64APIDIAG gpu64ApiDiag;

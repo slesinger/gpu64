@@ -69,11 +69,11 @@
 ;      (at your option) any later version.
 ;
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-STATUS   = $df0d
-ERRCODE  = $df0e
-ARG      = $df11		; ARG0..ARG15 = $df11..$df20
+CMD_HI   = $df50
+CMD_LO   = $df51
+STATUS   = $df52
+ERRCODE  = $df53
+ARG      = $df56		; ARG0..ARG15 = $df56..$df65
 
 ; opcodes used here (docs/api_design.md, class 0)
 OP_VBLANK_ARM  = $02

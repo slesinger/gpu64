@@ -88,8 +88,8 @@ KEY_CHECKED	= $d0		; | n, see stage2
 CHK_TRIES	= 4
 UPLOAD_TRIES	= 4
 
-SEQ      = $df22
-SEQACK   = $df23
+SEQ      = $df67
+SEQACK   = $df68
 ST_FRAME_READY = $10
 READY_WAIT = 20000
 
@@ -2426,7 +2426,7 @@ stage2
 	lda #CHK_TRIES
 	sta stTry
 st2Send
-	ldy #2
+	ldy #1				; one pass: the check replaced the second
 st2Pass
 	lda stId
 	sta ID_LO

@@ -162,6 +162,11 @@ static Gpu64_3dScratch g_Scratch;
 
 int main( int argc, char **argv )
 {
+	// The firmware's rad.cfg GPU64_BURST_BYTES, for proving a budget
+	// changes only where the rasteriser yields, never a pixel.
+	if ( const char *pBurst = getenv( "GPU64_BURST_BYTES" ) )
+		gpu64_3dSetSpanBytes( (unsigned)atoi( pBurst ) );
+
 	const char *pStream = 0;
 	const char *pOut = "out";
 	unsigned nPpmEvery = 0;
@@ -402,6 +407,7 @@ int main( int argc, char **argv )
 		{
 			nFrames++;
 			struct timespec t0, t1;
+			const unsigned long nYield0 = gpu64_3dYieldCount;
 			clock_gettime( CLOCK_MONOTONIC, &t0 );
 			gpu64_3dSceneRender( &g_Scene, &g_State, &target, &g_Scratch,
 					      lookupMesh, 0, lookupTexture, 0 );
@@ -434,8 +440,9 @@ int main( int argc, char **argv )
 					if ( g_Pixels[ i ] != g_State.background )
 						ink++;
 				if ( bTime )
-					printf( "frame %4u  ink %6u  checksum %08x  render %7.0f us\n",
-						nFrames, ink, checksum(), us );
+					printf( "frame %4u  ink %6u  checksum %08x  render %7.0f us  bursts %5lu\n",
+						nFrames, ink, checksum(), us,
+						gpu64_3dYieldCount - nYield0 );
 				else
 					printf( "frame %4u  ink %6u  checksum %08x\n",
 						nFrames, ink, checksum() );

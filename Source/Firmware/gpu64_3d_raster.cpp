@@ -10,7 +10,28 @@
 // milestone 6a burst budget is this many pixels, not this many bytes. The
 // yield sits inside the span loop rather than at the end of a scanline
 // because a full-width span is 960 bytes, nearly four times the budget.
-#define GPU64_3D_SPAN_PIXELS	( GPU64_3D_SPAN_BYTES / 3 )
+//
+// The budget is a runtime value (gpu64_3d_span.h), so the pixel count is
+// derived once by the setter rather than divided per chunk.
+unsigned gpu64_3dSpanBytes = GPU64_3D_SPAN_BYTES_DEFAULT;
+static int s_nSpanPixels   = GPU64_3D_SPAN_BYTES_DEFAULT / 3;
+
+#ifdef GPU64_HOSTSIM
+unsigned long gpu64_3dYieldCount = 0;
+#endif
+
+#define GPU64_3D_SPAN_PIXELS	s_nSpanPixels
+
+unsigned gpu64_3dSetSpanBytes( unsigned nBytes )
+{
+	if ( nBytes < GPU64_3D_SPAN_BYTES_MIN ) nBytes = GPU64_3D_SPAN_BYTES_MIN;
+	if ( nBytes > GPU64_3D_SPAN_BYTES_MAX ) nBytes = GPU64_3D_SPAN_BYTES_MAX;
+	nBytes &= ~63u;
+
+	gpu64_3dSpanBytes = nBytes;
+	s_nSpanPixels     = (int)( nBytes / 3 );
+	return nBytes;
+}
 
 // Pixels between the divides that recover u and v from u/z and v/z. Quake's
 // own number, for Quake's own reason: the error a linear step accumulates
@@ -19,6 +40,18 @@
 // but only because tools/rastercheck diffs it texel-for-texel against a
 // Python model; class 1 has no such model and is free to subdivide.
 #define GPU64_3D_PERSP_RUN	16
+
+// The triangle loop's chunk, which is also a whole number of perspective
+// runs (below). The runs restart at every chunk boundary, so a chunk that is
+// not a multiple of the run length moves the divides -- and with them the
+// texel rounding -- whenever the budget changes. Rounding the chunk down
+// keeps the picture identical at every GPU64_BURST_BYTES; tools/hostsim
+// proves it (GPU64_BURST_BYTES=64 vs 448, byte-identical PPMs).
+static int triSpanPixels( void )
+{
+	const int n = s_nSpanPixels & ~( GPU64_3D_PERSP_RUN - 1 );
+	return n > GPU64_3D_PERSP_RUN ? n : GPU64_3D_PERSP_RUN;
+}
 
 typedef __int128 s128;
 
@@ -146,8 +179,8 @@ void gpu64_3dClearViewport( const Gpu64_3dState *pState, Gpu64_3dTarget *pTarget
 		while ( x < w )
 		{
 			unsigned n = w - x;
-			if ( n > GPU64_3D_SPAN_PIXELS )
-				n = GPU64_3D_SPAN_PIXELS;
+			if ( n > (unsigned)GPU64_3D_SPAN_PIXELS )
+				n = (unsigned)GPU64_3D_SPAN_PIXELS;
 
 			for ( unsigned i = 0; i < n; i++ )
 			{
@@ -341,17 +374,19 @@ void gpu64_3dRasterTriangle( const Gpu64_3dState *pState,
 		u8  *pRow = pTarget->pPixels + (size_t)y * pTarget->pitch;
 		u16 *pZ   = pTarget->pDepth + (size_t)( y - vpY0 ) * pState->vpW - vpX0;
 
+		const int nTriSpan = triSpanPixels();
+
 		int x = x0;
 		while ( x < x1 )
 		{
 			int n = x1 - x;
-			if ( n > GPU64_3D_SPAN_PIXELS )
-				n = GPU64_3D_SPAN_PIXELS;
+			if ( n > nTriSpan )
+				n = nTriSpan;
 
 			const int xChunk = x + n;
 
 			// The perspective runs sit INSIDE the burst chunk rather
-			// than replacing it. GPU64_3D_SPAN_PIXELS is milestone
+			// than replacing it. triSpanPixels() is milestone
 			// 6a's store-burst budget and nothing else may set it;
 			// yielding every sixteen pixels instead would multiply
 			// the DSBs by five and buy nothing.

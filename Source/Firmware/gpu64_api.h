@@ -17,32 +17,48 @@
 #include <circle/types.h>
 
 // --- register offsets within IO2 (i.e. $DFxx) ---------------------------
-#define GPU64_REG_CMD_HI	0x0B
-#define GPU64_REG_CMD_LO	0x0C
-#define GPU64_REG_STATUS	0x0D
-#define GPU64_REG_ERRCODE	0x0E
-#define GPU64_REG_ID_LO		0x0F
-#define GPU64_REG_ID_HI		0x10
-#define GPU64_REG_ARG0		0x11
-#define GPU64_REG_ARG15		0x20
+//
+// gpu64 2026-09-27: the block lives at $DF50-$DF68 (it was $DF0B-$DF23).
+// The old window overlapped the Ultimate's Command Interface at $DF1B-$DF1F
+// (project/uci_register_remap_design.md), and the next free byte, $DF20, is
+// where the Ultimate maps Ultimate Audio. $DF50 is chosen for the address
+// multiplexer, not for tidiness: a half-switched '257 can only ADD one-bits
+// to the high nibble (the signal nibble it switches away from is $C-$F), so
+// the valid nibbles must not be supersets of one another. REU's $0 plus our
+// $5 and $6 satisfy that; $2 and $3 would not. See GPU64_MUX_BAD_NIBBLES.
+//
+// $DF0B-$DF4F is deliberately not ours and not REU's: the polling loop
+// neither drives a read nor acts on a write there (rad_reu.cpp), so the
+// UCI and anything else in that range owns the bus alone.
+#define GPU64_REG_CMD_HI	0x50
+#define GPU64_REG_CMD_LO	0x51
+#define GPU64_REG_STATUS	0x52
+#define GPU64_REG_ERRCODE	0x53
+#define GPU64_REG_ID_LO		0x54
+#define GPU64_REG_ID_HI		0x55
+#define GPU64_REG_ARG0		0x56
+#define GPU64_REG_ARG15		0x65
 // gpu64: class 1 only. Low byte of the last command's result -- the page
 // number from SCENE_COMMIT, the allocated ID from a CREATE_*. Meaning is per
 // opcode and undefined for opcodes that define none.
-#define GPU64_REG_RESULT	0x21
+#define GPU64_REG_RESULT	0x66
 
-// gpu64: reliability-protocol detector-only build (project/reliability_protocol_design.md,
-// "Recommended next step"). SEQ is write-only, C64-chosen, cycled $01-$FE
-// (never $00 or $FF); SEQACK is read-only and is set to the most recently
-// *dispatched* SEQ, so a C64-side compare against the value it just wrote
-// catches a dropped CMD_LO the same way a dropped ARG write would silently
-// go unnoticed today. No retry logic yet -- see the design doc. Provisional
-// addresses: these sit in the currently-reserved tail of the un-remapped
-// $DF0B-$DF21 block, ahead of the planned UCI remap
-// (project/uci_register_remap_design.md) -- acceptable here only because
-// this pair is throwaway diagnostic instrumentation, not the shipped
-// protocol, which will land after the remap at $DF37+.
-#define GPU64_REG_SEQ		0x22
-#define GPU64_REG_SEQACK	0x23
+// gpu64: reliability-protocol sequence pair (project/reliability_protocol_design.md).
+// SEQ is write-only, C64-chosen, cycled $01-$FE (never $00 or $FF); SEQACK
+// is read-only and is set to the most recently *dispatched* SEQ, so a
+// C64-side compare against the value it just wrote catches a dropped CMD_LO.
+#define GPU64_REG_SEQ		0x67
+#define GPU64_REG_SEQACK	0x68
+
+// The last REU register. $DF00-$DF0A is REU's; everything above it and
+// below GPU64_REG_CMD_HI is left alone.
+#define GPU64_REG_REU_LAST	0x0A
+
+// Bit n set = a sampled IO2 address whose high nibble is n cannot have come
+// from an access either device answers, so the multiplexer was sampled in
+// the wrong phase and the address must be re-read. Valid: $0 (REU), $5 and
+// $6 (gpu64). Must be kept in step with the register map above.
+#define GPU64_MUX_BAD_NIBBLES	0xFF9E
 
 #define GPU64_ARG_COUNT		16
 
@@ -68,7 +84,7 @@
 // plausible coordinate or id byte, and an ARG register left over from a
 // previous command is overwhelmingly likely to hold one of those.
 #define GPU64_KEY_DESTRUCTIVE	0xA5
-#define GPU64_REG_KEY		( GPU64_ARG_COUNT - 1 )	// ARG15, i.e. $DF20
+#define GPU64_REG_KEY		( GPU64_ARG_COUNT - 1 )	// ARG15, i.e. $DF65
 
 // --- the checked-command key --------------------------------------------
 //
@@ -96,7 +112,33 @@
 // or flipped out of the $D0 range -- the command then runs unchecked, which
 // is where every command was before.
 #define GPU64_KEY_CHECKED	0xD0	// high nibble; low nibble = n, 0..14
-#define GPU64_REG_CHECK		( GPU64_ARG_COUNT - 2 )	// ARG14, i.e. $DF1F
+#define GPU64_REG_CHECK		( GPU64_ARG_COUNT - 2 )	// ARG14, i.e. $DF64
+
+// --- strict mode --------------------------------------------------------
+//
+// gpu64 (2026-09-27, bench video). The check covers a command the C64 sent
+// with a byte damaged. It cannot cover a command the C64 never sent: a
+// phantom CMD_LO write finds ARG15 already spent to zero, runs unchecked,
+// and executes on whatever the last real command staged. E1M1 showed it --
+// SET_PERSPECTIVE run on SET_POSITION's coordinates, a 145-degree field of
+// view until the refresh ring re-sent the real one.
+//
+// So the first checked SCENE_COMMIT switches strict mode on: from then on a
+// class 1 command must carry either a check that matches or the destructive
+// key, or it is refused with BAD_ARGS (gpu64ApiDiag.strictRefused). The
+// exceptions are the commands that change no retained state -- a phantom of
+// one of those costs nothing, and making every query carry a check is not
+// worth it. A keyed SCENE_RESET, gpu64_apiFullReset() (FULL_RESET, a C64
+// reset) and gpu64_apiReset() switch it off again, so a program that
+// never checks is never affected.
+static inline boolean gpu64_apiStrictExempt( u8 op )
+{
+	return op == 0x06		// LOOP_START: SCENE_COMMIT starts it anyway
+	    || op == 0x09		// ARENA_STATUS
+	    || op == 0x15		// CLIP_MOVE: a query, answered into the DMA window
+	    || op == 0x16		// LEVEL_ENT: a query
+	    || op == 0x36;		// GET_TRANSFORM: a query
+}
 
 // The value ARG15 held when the current dispatch began, before
 // gpu64_apiDispatch() cleared it. Every class reads the key through this and

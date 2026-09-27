@@ -9487,3 +9487,227 @@ is debug only. As-built detail is in `project/milestone19_nighthawk_design.md`
 - `$01=$35` (variables under the KERNAL) is unverified on hardware.
 
 **Next:** the bench.
+
+## 73. Other machines hang: register remap and a per-machine burst budget (2026-09-27)
+
+**Trigger.** gpu64 hangs sooner or later on four machines: a breadbin v3
+short board, a rev1 short board, a C64 Ultimate, and a C128 in C64 mode. It
+runs on the dev C64.
+
+**Scope the user set:**
+- Every C64 revision must work, the Ultimate included.
+- The C128 is optional and NTSC is nice to have.
+- **The C64 is never halted while core 1 renders.** C64 programs spend raster
+  time on logic and IRQs.
+- Recovery ("D") is deferred until the other changes can be judged on their
+  own.
+- Sequence: C → B → F → calibration. See the memory note
+  `gpu64-stability-scope-decisions`.
+
+**C: registers moved to `$DF50`–`$DF68`** (was `$DF0B`–`$DF23`).
+- The design doc's `$DF20` target collides with the Ultimate's *Map Ultimate
+  Audio*, and its low-nibble mux check would have rejected every real access.
+- The mux check is now a mask of valid high nibbles:
+  `GPU64_MUX_BAD_NIBBLES`, with `$0`/`$5`/`$6` valid.
+- `$DF0B`–`$DF4F` is not decoded at all: reads are not driven and writes do
+  nothing.
+- As-built detail is in `project/uci_register_remap_design.md`.
+- All C64 sources were remapped mechanically. The conformance suite and every
+  `demos.sh` demo are green on the PC. Hardware is unverified.
+
+**B: `GPU64_BURST_BYTES` in `rad.cfg`.**
+- Core 1's store-burst budget is now a runtime value: default 256, clamped to
+  64–448 and rounded to whole cache lines.
+- Before this, the only way to trade render speed for bus margin was to
+  rebuild the firmware.
+- Two loops changed shape to honour a budget smaller than a row:
+  - **Triangle chunks** are rounded down to whole 16-pixel perspective runs.
+    Without that, the budget moved the divides and changed up to 782 bytes of
+    texel rounding per frame. At the default this is 80 pixels (240 bytes),
+    where it was 85.
+  - **`cleanViewport`** now cleans in budget-sized pieces through
+    `CleanRowSpan()`. That function aligns both ends itself, because Circle's
+    `CleanDataCacheRange()` skips the last line of an unaligned range.
+- hostsim takes the same env var. Its PPMs are byte-identical at 64, 128, 256
+  and 448.
+
+**Next:**
+- F: fewer C64 register writes per frame.
+- Calibration.
+- G: check `config.txt` for `force_turbo`/`core_freq` when the SD card is back.
+- The bench question for B: does `GPU64_BURST_BYTES 128` (or 64) stop the
+  hangs on the machines that hang?
+
+## 74. The corridor blink was a phantom SET_PERSPECTIVE: strict mode (2026-09-27)
+
+On the user's own C64, the system and draw tests passed. Stunt blinked
+visibly. `gpu64_demo_game` blinked hard in the start corridor, and the
+player's view "seemed restless" there, but it was smooth past the first door.
+The user filmed it.
+
+**Reading the video.** The frames were matched against scenesim renders
+swept over FOV and camera position:
+- The steady view is the spawn camera at FOV 13653.
+- The flashes are the same camera at FOV of about 18000 and 26000–27904,
+  plus fully black frames.
+- The camera position never moved, so this was not a lost camera write.
+
+**Mechanism.** It is a phantom `CMD_LO` write, one the C64 never made, that
+decodes as `SET_PERSPECTIVE` ($02). It runs on the `ARG`s left over from the
+last `SET_POSITION` ($30):
+- fov = the fraction of x;
+- near = the integer part of x;
+- far = the fraction of y.
+
+The firmware refuses fov ≥ 32768 and far ≤ near, which is why the damage
+depends on where you stand. In the start corridor the values pass. A near
+plane of about 39 units renders black. The wrong value stays until the state
+refresh ring re-sends the real `rgPersp`. A phantom spends the `ARG15` key
+like any other dispatch, so it ran unchecked. The checked-command key (run 41)
+catches damaged real commands, not commands that were never sent.
+
+**Fix: strict mode.**
+- The first checked `SCENE_COMMIT` latches `sStrict` in `gpu64_api.cpp`.
+- From then on, an unchecked class-1 command is refused with `BAD_ARGS`.
+  - Exempt: `$A5`-keyed commands, plus `gpu64_apiStrictExempt()`: `LOOP_START`,
+    `ARENA_STATUS`, `CLIP_MOVE`, `LEVEL_ENT` and `GET_TRANSFORM`.
+  - Cleared by a keyed `SCENE_RESET`, `FULL_RESET` or `gpu64_apiReset()`.
+- The refusals are counted in `gpu64ApiDiag.strictRefused` and
+  `strictRefusedOp`. They are not in `GET_HEALTH`, because the block is full.
+- The model `tools/prgsim/gpu64model.py` mirrors this.
+- runsim has a new fault kind, `--bus-fault=phantom:N`: every Nth window write
+  to a register other than `CMD_LO` is also delivered to `CMD_LO`, carrying its
+  own data.
+
+**PC verification (game).**
+
+| Run | Wrong frames | Node deviations | Refused |
+|---|---|---|---|
+| phantom:150, before the fix | reproduces the video's FOV flashes and displaced chunks | | |
+| phantom:150, after | 0 | 0 | 187 |
+| phantom:60, after | 0 | 0 | 750 |
+| clean game, stunt, nighthawk, quake3d, level | | | 0 strict refusals |
+
+The conformance suite is all ok. The build is `86402a60-dirty src:1dc48f92`.
+Hardware is unverified.
+
+**Bench question:**
+- Stand in `gpu64_demo_game`'s start corridor. Are the flashes and the black
+  frames gone?
+- Stunt uses checked commits too. Is its blinking gone?
+
+**Bench result (same day):** the game's corridor FOV flashes are gone. Still
+open: the game's scene "jumps vertically and back", and Stunt still blinks.
+
+**Stunt's video: half-drawn frames on screen.** Each blink is one refresh of
+a page that has been cleared to sky colour and only partly painted. The
+phone's rolling shutter records it as a horizontal stripe in which grass,
+road and car are missing, and one ground polygon's edge shows as a notch.
+
+The mechanism is a hole in the three-page rotation:
+- `CommitFlip()` sets `m_nVisiblePage` when it *posts* the new offset.
+- The VideoCore applies that offset at its own next vsync, anywhere up to a
+  frame later, because the frame clock is extrapolated and drifts against the
+  real vsync.
+- If a light frame finishes inside that gap, the next `SCENE_COMMIT`'s
+  `PrepareFlip()` hands core 1 the page still being scanned out.
+
+This explains why the problem is intermittent, why it shows in light scenes
+(Stunt, E1M1's start corridor) and why it stops past the first door.
+
+**Fix:**
+- `CommitFlip()` stamps the page it retires.
+- `CGpu64FrameBuffer::NextDrawPageIdle()` keeps that page from being handed
+  over until `periodUs` + 2 ms has passed since the post.
+- `SCENE_COMMIT` answers `BUSY` until then (counted in
+  `gpu64ApiDiag.commitScanBusy`). This is the existing retry contract.
+
+Build `src:2c3dc4bb`. The conformance suite is green. No PC sim models the
+scanout timing, so only the bench can confirm the fix.
+
+Known and left alone: the class-0 deferred `PAGE_FLIP` has the same exposure.
+Class-0 programs don't retry `BUSY` on a flip, and no class-0 blink has been
+reported.
+
+**Bench (same day, `src:2c3dc4bb`):** Stunt's blinking is gone. The game's
+vertical jump is now rare, too rare to catch on video, and is left open. Back to
+plan item F.
+
+## 75. Plan item F: one pass per state block, and a FULL_RESET hang (2026-09-27)
+
+**F: the second stage2 pass is gone.** Section 67 made stage2 send each state
+block twice, so that a dropped write in one pass would be repaired by the
+other. The checked-command key (section 70) and strict mode (section 74) now
+do that job:
+- A dropped or flipped ARG/ID byte fails the XOR.
+- A dropped ARG15 turns the block into an unchecked command, which strict
+  mode refuses once the first checked `SCENE_COMMIT` has latched it.
+
+Either way the C64 gets `BAD_ARGS` and sends the block again. So `st2Send` in
+`gpu64_demo_{stunt,game,nighthawk}.a` now uses `ldy #1`.
+
+Writes per frame (`runsim.py --write-stats`, 1500 frames):
+
+| demo | before | after |
+|---|---|---|
+| stunt | 256.0 | 140.6 |
+| nighthawk | 232.4 | 128.2 |
+| game | 134.0 | 79.9 |
+
+**Did we lose any correctness? A dispatch judge says no.**
+`runsim.py --bus-fault` now records, for every window register, the value the
+C64 *meant* to write. It then judges every dispatch that the firmware model
+accepts (`ERR_OK`):
+- **checked / unchecked:** CMD_HI, ID or ARG0..n-1 differ from what the C64
+  sent. n comes from the key the C64 sent, or is 14 for an unchecked command.
+- **key:** only ARG15 differs. This is harmless.
+- **early:** a phantom CMD_LO write landed on a fully staged checked block.
+  This is the real command, fired before its own CMD_LO.
+- **phantom:** a CMD_LO write the C64 never made, on a block that is not
+  checked.
+
+The report line is `believed wrong: N cls:$op:why xK`.
+
+We ran all three demos at `drop:200`, `data:200` and `phantom:150`, with the
+old and the new PRGs:
+- In neither build did a checked command execute with wrong data.
+- The remaining wrongs are the same in both builds:
+  - class-0 `$0C` SET_DMA_WINDOW and `$0A` GET_HEALTH, both unchecked;
+  - class-1 `$15` CLIP_MOVE, a query that is exempt from strict mode;
+  - phantom NOP and `$09`.
+- The game's apparent phantom `$01` SET_VIEWPORT was a phantom on the CMD_HI
+  write (value 1) landing on a staged checked SET_VIEWPORT. The judge now
+  calls this 'early'.
+
+**The FULL_RESET hang.** The old game's `data:200` run stalled at frame 445
+with 913 BUSY answers: HDMI frozen, C64 alive. The sequence:
+1. A flipped data bit turned the unchecked class-0 `$0A` GET_HEALTH into
+   `$0B` FULL_RESET, which is allowed while the loop runs.
+2. `gpu64_apiFullReset()` drains through `gpu64_3dSync` → `pollLoopFrame`,
+   which harvested the frame in flight.
+3. Then `sStatus = 0` erased FRAME_READY.
+4. The loop kept running with no frame pending, so every later
+   `SCENE_COMMIT` answered BUSY forever.
+
+The model had the same hole (`c1_ready_deferred` is released only inside
+`advance()`'s flip-pending branch). This is a plausible mechanism for the
+hangs on the other machines (section 73).
+
+**The fix:** the `$0B` opcode now calls `gpu64_3dLoopFullReset()`. It stops the
+loop with a new cause, `GPU64_LOOPSTOP_FULL_RESET` 5 (GET_HEALTH byte 87), and
+clears the pending frame. The next `SCENE_COMMIT` self-starts the loop (section 51).
+The call is deliberately not inside
+`gpu64_apiFullReset()`, because the /RESET path records its own SESSION cause.
+`gpu64model.py` mirrors the fix. The replayed scenario now runs 1504 frames,
+`CMT 07 0000`.
+
+Build `src:c53d7044`. The conformance suite is green.
+
+**Not done, candidate follow-on:** send `$0A`, `$0C` and `$15` checked from the
+demos. That would close the remaining unchecked exposures, including the
+`$0A`→`$0B` twin itself.
+
+**Bench asks:**
+- Stunt, the game and Nighthawk run as before, with no new blinking.
+- Watch whether anything changes about the hang or the game's rare vertical
+  jump.

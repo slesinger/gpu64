@@ -40,18 +40,18 @@
 ;
 
 ; ----------------------------------------------------------------------
-; The register window. gpu64 owns $DF0B-$DFFF in IO2; the REU keeps
+; The register window. gpu64 owns $DF50-$DFFF in IO2; the REU keeps
 ; $DF00-$DF0A and IO1 ($DE00-$DEFF) is untouched.
 ; ----------------------------------------------------------------------
 
-CMD_HI   = $df0b		; class selector, sticky
-CMD_LO   = $df0c		; opcode -- WRITING THIS FIRES THE COMMAND
-STATUS   = $df0d		; bit0 busy, bit1 error, bit2 vblank, bit3 armed
-ERRCODE  = $df0e		; result of the last dispatch
-ID_LO    = $df0f
-ID_HI    = $df10
-ARG      = $df11		; ARG0..ARG15 = $df11..$df20
-RESULT   = $df21		; readable; the only way to check an ARG landed
+CMD_HI   = $df50		; class selector, sticky
+CMD_LO   = $df51		; opcode -- WRITING THIS FIRES THE COMMAND
+STATUS   = $df52		; bit0 busy, bit1 error, bit2 vblank, bit3 armed
+ERRCODE  = $df53		; result of the last dispatch
+ID_LO    = $df54
+ID_HI    = $df55
+ARG      = $df56		; ARG0..ARG15 = $df56..$df65
+RESULT   = $df66		; readable; the only way to check an ARG landed
 
 ST_BUSY		= $01
 ST_ERROR	= $02

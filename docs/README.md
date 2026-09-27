@@ -3,7 +3,7 @@
 gpu64 turns a Raspberry Pi 3A+ cartridge into a second, independent HDMI
 screen for the Commodore 64 — not a VIC-II overlay, but a separate display
 (think C128's 80-column screen) that the 6502 drives through a small
-command API mapped into IO2 (`$DF0B`-`$DFFF`). A program writes arguments
+command API mapped into IO2 (`$DF50`-`$DF68`). A program writes arguments
 into `ARG0`-`ARG15`, then writes an opcode to `CMD_LO`; that write halts the
 C64 until gpu64 finishes and writes `ERRCODE`. Everything in this directory
 documents that API from the point of view of someone writing a C64 program

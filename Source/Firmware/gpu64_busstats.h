@@ -25,10 +25,11 @@
 
  -- the *low* nibble A0-A3 comes from GPIO 10-13, which are dedicated, and
  the *high* nibble A4-A7 comes from GPIO 0-3, which the LVC257 multiplexes
- with NMI, ROMH, IO1 and BUTTON. Every gpu64 register lives at $DF0B-$DF23,
- so A4-A7 read 0 on every correct sample and a mis-sample can only ever set
- bits, never clear them. A read of ERRCODE ($DF0E) therefore degrades to
- $1E, $2E, $4E or $8E -- all still inside the gpu64 window, all still
+ with NMI, ROMH, IO1 and BUTTON. (Written when every gpu64 register lived at
+ $DF0B-$DF23; since 2026-09-27 the block is $DF50-$DF68, see gpu64_api.h.)
+ A mis-sample can only ever set bits, never clear them. A read of ERRCODE
+ ($DF0E then) therefore degraded to $1E, $2E, $4E or $8E -- all inside the
+ gpu64 window, all still
  decoded here, and all four returning $FF from gpu64_apiReadReg(). That is
  the whole of hypothesis (a), and it predicts a specific fingerprint: the
  bad addresses share the low nibble of the register the program was reading

@@ -126,8 +126,8 @@ OP_GET_TRANSFORM     = $36
 ; once at start-up. gpu64_api.h has the reasoning.
 KEY_DESTRUCTIVE = $a5
 
-SEQ      = $df22
-SEQACK   = $df23
+SEQ      = $df67
+SEQACK   = $df68
 
 ST_FRAME_READY = $10
 

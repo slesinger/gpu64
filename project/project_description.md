@@ -26,6 +26,8 @@ gpu64 must coexist with REU across three deployments, in ascending order of cons
 
 ## IO address space allocation
 
+> **Current map (2026-09-27):** gpu64's registers moved to $DF50–$DF68 and $DF0B–$DF4F is no longer decoded. The addresses below are historical; see [uci_register_remap_design.md](uci_register_remap_design.md), "As built".
+
 The C64 expansion port exposes two 256-byte IO windows to cartridges: **IO1** ($DE00–$DEFF) and **IO2** ($DF00–$DFFF).
 
 GeoRAM emulation is out of scope for gpu64 — gpu64 is only ever active alongside REU mode, never GeoRAM mode.

@@ -10,7 +10,7 @@
 ;      gpu64 -- milestone 2 test PRG: writes one byte to the gpu64 trigger
 ;      register to kick off CRAD's showTestPattern() checkerboard pattern.
 ;
-;      gpu64 uses the unused remainder of REU's IO2 window, $DF0B-$DFFF, so
+;      gpu64 uses the unused remainder of REU's IO2 window, $DF50-$DFFF, so
 ;      it coexists with REU emulation (RAD's own, or a real 1750-compatible
 ;      REU / the Ultimate's) which only ever decodes $DF00-$DF0A -- see
 ;      project/project_description.md's "IO address space allocation" section.
@@ -28,7 +28,7 @@
 ;      (at your option) any later version.
 ;
 
-GPU64_TRIGGER = $df0b		; gpu64's trigger register (see rad_reu.cpp)
+GPU64_TRIGGER = $df50		; gpu64's trigger register (see rad_reu.cpp)
 
 	* = $0801			; standard BASIC load address
 

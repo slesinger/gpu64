@@ -15,11 +15,11 @@
  API itself uses, and false for two shapes a C64 program is perfectly
  entitled to emit:
 
-   inc $DF0D      c4 reads $DF0D, c5 writes the old value, c6 the new one.
+   inc $DF52      c4 reads $DF52, c5 writes the old value, c6 the new one.
                   Firing after c4 asserts DMA into c5, a write.
-   inc $DF0D,X    c4 is a dummy read at the *un-fixed* address, c5 the real
+   inc $DF52,X    c4 is a dummy read at the *un-fixed* address, c5 the real
                   read, c6/c7 the writes. Firing after c5 asserts into c6.
-   sta $DF0D,X    c4 is an unconditional dummy read at the un-fixed address
+   sta $DF52,X    c4 is an unconditional dummy read at the un-fixed address
                   -- in IO2 -- and c5 is the write.
 
  The exposure was recorded as an API constraint and carried since milestone
@@ -38,7 +38,7 @@
  Note that the arming cycle is not in that list. The four terms are
  self-contained -- they are a statement about N and N+1 alone -- so the arm
  is only a request for the bus, and it stays pending until some later pair
- qualifies. That is what makes the rule safe through an `inc $DF0D`: the arm
+ qualifies. That is what makes the rule safe through an `inc $DF52`: the arm
  taken on c4 cannot fire on c5 or c6 (both writes) and lands on the opcode
  fetch after c6, which is exactly right.
 

@@ -5,6 +5,7 @@
 #include "gpu64_fb.h"
 #include "gpu64_c64font.h"
 #include "gpu64_flip.h"
+#include "gpu64_vsync.h"
 #include <circle/synchronize.h>
 #include <circle/util.h>
 
@@ -57,6 +58,7 @@ CGpu64FrameBuffer::CGpu64FrameBuffer( void )
 	m_nDrawPage( 0 ),
 	m_nVisiblePage( 0 ),
 	m_nPendingVisible( 0 ),
+	m_nRetiringMask( 0 ),
 	m_nBorder( 0 ),
 	m_bLogEnabled( TRUE ),
 	m_nLogRow( 0 ),
@@ -209,6 +211,7 @@ boolean CGpu64FrameBuffer::SetMode( u8 nMode )
 	// visible, and restore the log overlay if it is still on.
 	ClearAllPages();
 	m_nDrawPage = m_nVisiblePage = m_nPendingVisible = 0;
+	m_nRetiringMask = 0;
 	SetBorder( m_nBorder );
 	DrawLogOverlay( 0 );
 	CleanPage( 0 );
@@ -291,6 +294,29 @@ void CGpu64FrameBuffer::CleanRows( unsigned nPage, unsigned y0, unsigned y1 )
 
 	u8 *p = pBase + (size_t)( GPU64_BORDER_H + y0 ) * m_nPitch;
 	CleanDataCacheRange( (u64)(uintptr)p, (size_t)( y1 - y0 ) * m_nPitch );
+}
+
+void CGpu64FrameBuffer::CleanRowSpan( unsigned nPage, unsigned y, unsigned x0, unsigned x1 )
+{
+	if ( !m_bInitialized || nPage >= GPU64_FB_PAGES || y >= GPU64_FB_HEIGHT )
+		return;
+	if ( x1 > GPU64_FB_WIDTH ) x1 = GPU64_FB_WIDTH;
+	if ( x0 >= x1 )
+		return;
+
+	u8 *pBase = PageBase( nPage );
+	if ( pBase == 0 )
+		return;
+
+	// Align both ends to whole lines. Circle's CleanDataCacheRange() steps
+	// 64 bytes from the address it is given, so an unaligned start would
+	// leave the last partial line dirty -- a pixel column that never reaches
+	// DRAM. Neighbouring pieces may share a line; cleaning it twice is free.
+	const u64 a0 = (u64)(uintptr)( pBase + (size_t)( GPU64_BORDER_H + y ) * m_nPitch + GPU64_BORDER_W + x0 );
+	const u64 a1 = a0 + ( x1 - x0 );
+	const u64 s  = a0 & ~(u64)63;
+	const u64 e  = ( a1 + 63 ) & ~(u64)63;
+	CleanDataCacheRange( s, e - s );
 }
 
 void CGpu64FrameBuffer::CleanPage( unsigned nPage )
@@ -419,6 +445,15 @@ boolean CGpu64FrameBuffer::CommitFlip( void )
 			return FALSE;
 	}
 
+	// The page just replaced is not off the screen yet: the post above is
+	// applied at the VideoCore's next vsync, not now. Stamp it so
+	// NextDrawPageIdle() keeps it away from core 1 until it provably is.
+	if ( m_nPendingVisible != m_nVisiblePage )
+	{
+		m_nRetiringMask |= (u8)( 1u << m_nVisiblePage );
+		m_nRetiredAt[ m_nVisiblePage ] = gpu64_vsyncNow();
+	}
+
 	// The draw page is deliberately *not* chosen here any more -- PrepareFlip()
 	// already advanced it, from the same two exclusions this used to apply
 	// (the page still being scanned and the page just posted), so that core 1
@@ -426,6 +461,38 @@ boolean CGpu64FrameBuffer::CommitFlip( void )
 	// halves of a deferred flip. See PrepareFlip()'s comment. All that is
 	// left here is publishing which page the post above made current.
 	m_nVisiblePage = m_nPendingVisible;
+	return TRUE;
+}
+
+// How long a page stays off-limits after CommitFlip() posted it away: one
+// whole frame, because the VideoCore's vsync can fall anywhere in the period
+// after the post (the frame clock is extrapolated and drifts against it),
+// plus a margin for the mailbox to be picked up at all.
+#define GPU64_FB_RETIRE_MARGIN_US	2000
+
+boolean CGpu64FrameBuffer::NextDrawPageIdle( void )
+{
+	if ( !m_bInitialized )
+		return TRUE;
+
+	// The same pick PrepareFlip() makes: neither the page on screen nor the
+	// one about to be queued (today's draw page).
+	for ( u8 p = 0; p < GPU64_FB_PAGES; p++ )
+	{
+		if ( p == m_nVisiblePage || p == m_nDrawPage )
+			continue;
+		if ( !( m_nRetiringMask & ( 1u << p ) ) )
+			return TRUE;
+		// Unsigned elapsed time: a stamp older than the timer's 71-minute
+		// wrap reads as recent and costs one extra frame of BUSY, once.
+		u32 elapsed = gpu64_vsyncNow() - m_nRetiredAt[ p ];
+		if ( elapsed >= gpu64Vsync.periodUs + GPU64_FB_RETIRE_MARGIN_US )
+		{
+			m_nRetiringMask &= (u8)~( 1u << p );
+			return TRUE;
+		}
+		return FALSE;
+	}
 	return TRUE;
 }
 
@@ -452,6 +519,7 @@ void CGpu64FrameBuffer::ResetPages( void )
 	if ( !m_bInitialized || m_nMode != GPU64_MODE_GRAPHICS )
 		return;
 	m_nDrawPage = m_nVisiblePage = m_nPendingVisible = 0;
+	m_nRetiringMask = 0;
 	// Circle's mailbox call below would otherwise swallow an in-flight
 	// flip's reply -- and pay 20 ms for the privilege, per CBcmMailBox::Flush().
 	gpu64_flipDrain();

@@ -24,9 +24,9 @@
 ;            through its four cases to `return 0xFF`. IO_ADDRESS takes
 ;            A0-A3 from GPIO 10-13, which are dedicated, and A4-A7 from
 ;            GPIO 0-3, which the LVC257 multiplexes with NMI, ROMH, IO1
-;            and BUTTON. Every gpu64 register is at $DF0B-$DF23, so
+;            and BUTTON. Every gpu64 register is at $DF50-$DF68, so
 ;            A4-A7 read 0 when sampled correctly and a mis-sample can
-;            only ever SET bits: $DF0E degrades to $1E, $2E, $4E or $8E,
+;            only ever SET bits: $DF53 degrades to $1E, $2E, $4E or $8E,
 ;            all of which still decode into the gpu64 window and all of
 ;            which return $FF.
 ;
@@ -187,12 +187,12 @@
 ;      (at your option) any later version.
 ;
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-STATUS   = $df0d
-ERRCODE  = $df0e
-ARG      = $df11
-RESULT   = $df21
+CMD_HI   = $df50
+CMD_LO   = $df51
+STATUS   = $df52
+ERRCODE  = $df53
+ARG      = $df56
+RESULT   = $df66
 
 ST_BUSY  = $01
 

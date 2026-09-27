@@ -63,17 +63,17 @@
 ;
 
 ; ----------------------------------------------------------------------
-; The register window. gpu64 owns $DF0B-$DFFF; REU keeps $DF00-$DF0A.
+; The register window. gpu64 owns $DF50-$DFFF; REU keeps $DF00-$DF0A.
 ; ----------------------------------------------------------------------
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-STATUS   = $df0d
-ERRCODE  = $df0e
-ID_LO    = $df0f
-ID_HI    = $df10
-ARG      = $df11
-RESULT   = $df21
+CMD_HI   = $df50
+CMD_LO   = $df51
+STATUS   = $df52
+ERRCODE  = $df53
+ID_LO    = $df54
+ID_HI    = $df55
+ARG      = $df56
+RESULT   = $df66
 
 ST_BUSY		= $01
 ST_ERROR	= $02

@@ -9,13 +9,13 @@
 ;
 ;      gpu64 -- milestone 3 diagnostic PRG: does nothing at all and RTS's
 ;      straight back to BASIC. Deliberately does NOT touch GPU64_TRIGGER
-;      ($DF0B) -- unlike gpu64_trigger_pattern.a, this must NOT set
+;      ($DF50) -- unlike gpu64_trigger_pattern.a, this must NOT set
 ;      gpu64ApiActive (see rad_reu.cpp), since that flag permanently stops
 ;      the milestone-3 mirror poll for the rest of the session.
 ;
 ;      Purpose: some way to get RAD to actually enter REU emulation (and so
 ;      run reuUsingPolling(), the loop the mirror poll lives in) without a
-;      program that overwrites the mirror's own effect on IO2/$DF0B or does
+;      program that overwrites the mirror's own effect on IO2/$DF50 or does
 ;      anything else that could confound the test. Launching a plain PRG
 ;      (e.g. SMON) from RAD's file list alone was observed on real hardware
 ;      to take RAD's "no memory expansion" launch path instead -- which
@@ -62,7 +62,7 @@ CHROUT	= $ffd2				; KERNAL: print character in A
 	; come from the reset RAD does when leaving its menu. The banner makes
 	; "the PRG really executed" a fact rather than an inference -- and it is
 	; still safe for the mirror test, since printing only touches screen RAM
-	; and the KERNAL, never IO2/$DF0B (see the note above about
+	; and the KERNAL, never IO2/$DF50 (see the note above about
 	; gpu64ApiActive).
 start
 	ldx #0

@@ -81,18 +81,28 @@ entry holds, and becomes invisible if you set it to match your background.
 
 ## Register map
 
-gpu64 owns **$DF0B–$DFFF** in IO2. REU keeps $DF00–$DF0A; IO1
-($DE00–$DEFF) is untouched.
+gpu64's registers are **$DF50–$DF68** in IO2. REU keeps $DF00–$DF0A;
+$DF0B–$DF4F is left alone for other hardware (the firmware neither answers
+reads nor acts on writes there); IO1 ($DE00–$DEFF) is untouched.
+
+**On a C64 Ultimate / Ultimate 64 / 1541 Ultimate** gpu64 coexists with the
+Ultimate's Command Interface (`$DF1B`–`$DF1F`, fine to leave enabled), but two
+other Ultimate features must be **off**: its own REU emulation (gpu64 provides
+the REU at `$DF00`–`$DF0A`) and *Map Ultimate Audio `$DF20`-`$DFFF`*, which
+covers gpu64's registers.
 
 | Address | Name | Dir | Purpose |
 |---|---|---|---|
-| $DF0B | `CMD_HI` | W | Class selector. **Sticky** — persists until changed, 0 at reset. Writing it alone triggers nothing. |
-| $DF0C | `CMD_LO` | W | Opcode within the current class. **Writing it fires the command**, using whatever `ID`/`ARG` are staged. |
-| $DF0D | `STATUS` | R | bit0 busy, bit1 error, bit2 vblank-pending, bit3 vblank-IRQ-armed |
-| $DF0E | `ERRCODE` | R | Result of the last dispatch (see [Error codes](#error-codes)) |
-| $DF0F–$DF10 | `ID` | W | Resource ID, 16-bit — unused in class 0; class 2 names a texture with it |
-| $DF11–$DF20 | `ARG0`–`ARG15` | W | 16-byte argument block, layout defined per opcode |
-| $DF21–$DFFF | — | — | Reserved |
+| $DF50 | `CMD_HI` | W | Class selector. **Sticky** — persists until changed, 0 at reset. Writing it alone triggers nothing. |
+| $DF51 | `CMD_LO` | W | Opcode within the current class. **Writing it fires the command**, using whatever `ID`/`ARG` are staged. |
+| $DF52 | `STATUS` | R | bit0 busy, bit1 error, bit2 vblank-pending, bit3 vblank-IRQ-armed |
+| $DF53 | `ERRCODE` | R | Result of the last dispatch (see [Error codes](#error-codes)) |
+| $DF54–$DF55 | `ID` | W | Resource ID, 16-bit — unused in class 0; class 2 names a texture with it |
+| $DF56–$DF65 | `ARG0`–`ARG15` | W | 16-byte argument block, layout defined per opcode |
+| $DF66 | `RESULT` | R | Low byte of the last command's result; meaning is per opcode (class 1) |
+| $DF67 | `SEQ` | W | Sequence number, $01–$FE, written before `CMD_LO` |
+| $DF68 | `SEQACK` | R | The `SEQ` of the most recently dispatched command |
+| $DF69–$DFFF | — | — | Reserved |
 
 ### What a command costs the C64
 
@@ -171,7 +181,7 @@ that computed count exactly as if you had written it out.
 ## Class 0 opcodes — 2D, system, math
 
 Set `CMD_HI = 0` (the reset default). `ARG` offsets below are relative to
-`ARG0` ($DF11). "Bytes" is exactly how many `ARG` bytes the opcode reads.
+`ARG0` ($DF56). "Bytes" is exactly how many `ARG` bytes the opcode reads.
 
 ### System — $00–$0F
 
@@ -1004,8 +1014,8 @@ Eight complete, commented programs are in [`Source/Demos/`](../Source/Demos/) �
 Clear the screen to blue (index 6), then draw a filled white box:
 
 ```asm
-CMD_LO  = $df0c
-ARG0    = $df11
+CMD_LO  = $df51
+ARG0    = $df56
 
         lda #6
         sta ARG0

@@ -360,6 +360,12 @@ boolean gpu64_3dLoopRunning( void )
 	return s_LoopRunning;
 }
 
+void gpu64_3dLoopFullReset( void )
+{
+	loopStop( GPU64_LOOPSTOP_FULL_RESET );
+	s_LoopFramePending = FALSE;
+}
+
 void gpu64_3dReset( void )
 {
 	// Stage 15b made this drain load-bearing rather than cosmetic: before
@@ -473,10 +479,20 @@ static void cleanViewport( u8 nPage )
 	if ( pFB == 0 )
 		return;
 
+	// 2026-09-27: the budget is a runtime value and may now be smaller than
+	// a row, so a row is cleaned in budget-sized pieces of the viewport's own
+	// columns. At the default 256 that is two pieces of a 320-wide viewport.
+	const unsigned nSpan = gpu64_3dSpanBytes;
+	const unsigned x1    = s_State.vpX + s_State.vpW;
+
 	for ( u16 y = s_State.vpY; y < s_State.vpY + s_State.vpH; y++ )
 	{
-		pFB->CleanRows( nPage, y, y + 1 );
-		GPU64_3D_YIELD();
+		for ( unsigned x = s_State.vpX; x < x1; x += nSpan )
+		{
+			const unsigned xe = ( x1 - x > nSpan ) ? x + nSpan : x1;
+			pFB->CleanRowSpan( nPage, y, x, xe );
+			GPU64_3D_YIELD();
+		}
 	}
 }
 
@@ -2028,6 +2044,19 @@ static u8 execute( u8 op )
 			gpu64ApiDiag.lastRefuseOp    = GPU64_3D_OP_SCENE_COMMIT;
 			gpu64ApiDiag.lastRefuseClass = 1;
 			return GPU64_ERR_UNSUPPORTED;
+		}
+		// The page this commit would hand core 1 must be off the screen.
+		// The previous flip's post only lands at the VideoCore's next vsync,
+		// so after a light frame the commit can arrive while the page it
+		// retired is still being scanned -- core 1 then clears it to the
+		// sky colour and paints it in full view. That was the half-drawn
+		// frame Stunt showed at the bench on 2026-09-27, one refresh at a
+		// time. Nothing is published, so the program's retry is the same
+		// commit a moment later -- the same contract as flipPending above.
+		if ( !pFB->NextDrawPageIdle() )
+		{
+			gpu64ApiDiag.commitScanBusy++;
+			return GPU64_ERR_BUSY;
 		}
 
 		// Publish: everything isShadowRedirectable() redirected since

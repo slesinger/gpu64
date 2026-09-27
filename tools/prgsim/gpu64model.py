@@ -70,6 +70,9 @@ KEY_ARG = 15
 # gpu64_api.h, GPU64_KEY_CHECKED: ARG15 = $D0|n, ARG14 = XOR of that key,
 # CMD_HI, CMD_LO, ID_LO, ID_HI and ARG0..n-1.
 KEY_CHECKED = 0xD0
+# gpu64_api.h, gpu64_apiStrictExempt(): the class 1 opcodes strict mode lets
+# through unchecked -- LOOP_START, ARENA_STATUS, and the three queries.
+STRICT_EXEMPT = (0x06, 0x09, 0x15, 0x16, 0x36)
 CHECK_ARG = 14
 
 # Class 2 -- the raster layer (docs/class2-raster-reference.md, "Class 2 opcodes").
@@ -109,12 +112,16 @@ ST_ERROR = 0x02
 ST_VB_PEND = 0x04
 ST_VB_ARMED = 0x08
 
-REG_CMD_HI, REG_CMD_LO = 0x0B, 0x0C
-REG_STATUS, REG_ERRCODE = 0x0D, 0x0E
-REG_ID_LO, REG_ID_HI = 0x0F, 0x10
-REG_ARG0, REG_ARG15 = 0x11, 0x20
-REG_RESULT = 0x21
-REG_SEQ, REG_SEQACK = 0x22, 0x23
+# $DF50-$DF68 since 2026-09-27 (was $DF0B-$DF23), off the Ultimate's
+# Command Interface at $DF1B-$DF1F. $DF0B-$DF4F answers nothing: the firmware
+# neither drives a read nor acts on a write there. See gpu64_api.h.
+REG_REU_LAST = 0x0A
+REG_CMD_HI, REG_CMD_LO = 0x50, 0x51
+REG_STATUS, REG_ERRCODE = 0x52, 0x53
+REG_ID_LO, REG_ID_HI = 0x54, 0x55
+REG_ARG0, REG_ARG15 = 0x56, 0x65
+REG_RESULT = 0x66
+REG_SEQ, REG_SEQACK = 0x67, 0x68
 
 
 def s16(v):
@@ -279,6 +286,10 @@ class Gpu64Model(Class1Mixin):
         self.result = 0
         self.ident = [0, 0]
         self.check_refused = 0
+        # gpu64_api.h, strict mode: set by the first checked SCENE_COMMIT.
+        self.strict = False
+        self.strict_refused = 0
+        self.strict_refused_ops = {}
         self.arg = [0] * 16
 
         self.pages = [bytearray(FB_W * FB_H) for _ in range(FB_PAGES)]
@@ -499,8 +510,10 @@ class Gpu64Model(Class1Mixin):
 
     # --- register window ------------------------------------------------
     def read_reg(self, off):
-        if off <= 0x0A:
+        if off <= REG_REU_LAST:
             return self.reu_read(off)
+        if off < REG_CMD_HI:
+            return 0xFF                     # nobody drives it: a floating bus
         self.reg_reads += 1
         if off == REG_STATUS:
             return self.status
@@ -517,9 +530,11 @@ class Gpu64Model(Class1Mixin):
     # wrongly. Only the high nibble can move on real hardware -- A0-A3 come
     # off dedicated GPIOs and A4-A7 off the multiplexed ones -- so the
     # injected damage sets a high-nibble bit and leaves the low nibble
-    # alone, which is the fingerprint a probe is looking for.
+    # alone, which is the fingerprint a probe is looking for. A7 is the bit
+    # real faults set (bad addresses always had it), and unlike A6 it takes
+    # every register in $50-$68 out of the window.
     def read_reg_missampled(self, off):
-        bad = (off | 0x40) & 0xFF
+        bad = (off | 0x80) & 0xFF
         self.reg_reads += 1
         self.reg_reads_bad += 1
         self.last_bad_addr = bad
@@ -528,7 +543,7 @@ class Gpu64Model(Class1Mixin):
         return 0xFF
 
     def write_reg_missampled(self, off, val):
-        bad = (off | 0x40) & 0xFF
+        bad = (off | 0x80) & 0xFF
         self.reg_writes += 1
         self.pending_writes += 1
         self.reg_writes_bad += 1
@@ -543,9 +558,11 @@ class Gpu64Model(Class1Mixin):
 
     def write_reg(self, off, val):
         val &= 0xFF
-        if off <= 0x0A:
+        if off <= REG_REU_LAST:
             self.reu_write(off, val)
             return
+        if off < REG_CMD_HI:
+            return                          # not ours, not REU's
         # Every write into the gpu64 window, counted for its own sake: what a
         # command costs the C64 is these, not the dispatch. Comparing an
         # immediate-mode demo with a retained one is a comparison of this
@@ -701,6 +718,21 @@ class Gpu64Model(Class1Mixin):
                 self.err = ERR_BAD_ARGS
                 self.status |= ST_ERROR
                 return
+            if self.cmd_hi == 1 and op == 0x08:
+                self.strict = True
+        elif (self.strict and self.cmd_hi == 1 and
+              op not in STRICT_EXEMPT):
+            # gpu64 (2026-09-27): strict mode, as gpu64_apiDispatch() has it.
+            if self.api_key == KEY_DESTRUCTIVE:
+                if op == 0x00:
+                    self.strict = False
+            else:
+                self.strict_refused += 1
+                self.strict_refused_ops[op] = \
+                    self.strict_refused_ops.get(op, 0) + 1
+                self.err = ERR_BAD_ARGS
+                self.status |= ST_ERROR
+                return
         if self.cmd_hi not in (0, 1, 2):
             self.err = ERR_BAD_CLASS
             self.status |= ST_ERROR
@@ -752,6 +784,7 @@ class Gpu64Model(Class1Mixin):
             self.txt_reset()
             return ERR_OK
         if op == 0x0B:                                  # FULL_RESET
+            self.strict = False
             # The whole display back to its post-boot state. Unlike
             # RESET_STATE this also drops the display mode, the palette,
             # the border and the framebuffer contents -- see
@@ -764,6 +797,11 @@ class Gpu64Model(Class1Mixin):
             self.result = 0
             self.vb_armed = False
             self.flip_pending = False
+            # gpu64 (2026-09-27): and the class 1 loop stops, as
+            # gpu64_3dLoopFullReset() does -- or its deferred FRAME_READY is
+            # orphaned and SCENE_COMMIT answers BUSY forever.
+            self.c1_loop_stop(5)                    # GPU64_LOOPSTOP_FULL_RESET
+            self.c1_ready_deferred = False
             self.mode = MODE_GRAPHICS
             for i, rgb in enumerate(C64_PALETTE):
                 self.palette[i * 3:i * 3 + 3] = bytes(rgb)

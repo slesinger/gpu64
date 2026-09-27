@@ -332,6 +332,12 @@ void gpu64_3dReset( void );
 // gpu64_apiDiagStateByte() needs this -- see gpu64_apidiag.h.
 boolean gpu64_3dLoopRunning( void );
 
+// gpu64 (2026-09-27): FULL_RESET's half of the loop. Stops it and drops the
+// in-flight frame's bookkeeping, so the next SCENE_COMMIT re-arms it instead
+// of answering BUSY forever -- see the case 0x0B comment in gpu64_api.cpp.
+// Call only after a drain (gpu64_apiFullReset() has one).
+void gpu64_3dLoopFullReset( void );
+
 // Executes one class 1 command from core 0, exactly as doSystem()/doDraw()
 // do for class 0: returns a GPU64_ERR_* code, having already pushed
 // whatever core 1 needs to do onto the ring.

@@ -7,6 +7,40 @@ map gpu64 is moving to, and the checklist for when that move is implemented.
 Implementation is deferred; this doc exists so the decision doesn't get
 re-derived later.
 
+## As built (2026-09-27) — read this first
+
+Implemented, but **not** as planned below. Three things the plan missed:
+
+1. **$DF20 is Ultimate Audio.** The Ultimate can map its sampler at
+   $DF20–$DFFF ("Map Ultimate Audio" in its cartridge settings). With the UCI
+   at $DF1B–$DF1F and REU at $DF00–$DF0A only 16 bytes stay free, and gpu64
+   needs 25, so gpu64 cannot coexist with *both*. Decided with the user:
+   coexist with the UCI, require Ultimate Audio **off** (and the Ultimate's
+   own REU off, which was always true). Documented in docs/api_design.md and
+   docs/getting-started.md.
+2. **The mux repair is keyed on the high nibble.** rad_reu.cpp re-reads the
+   address when the sampled A4–A7 nibble cannot be real. A half-switched
+   LVC257 can only *add* one-bits (it is leaving the $C–$F signal nibble), so
+   the valid nibbles must not be supersets of each other. $2/$3 fail that
+   ($3 ⊃ $2): a block at $DF20–$DF38 would have made some mis-samples
+   undetectable and put ARG10+/RESULT/SEQ/SEQACK on the re-read path.
+   **The block is at $DF50–$DF68** (nibbles $5/$6, plus REU's $0), and the
+   test is a mask, `GPU64_MUX_BAD_NIBBLES` in gpu64_api.h.
+3. **A constants-only change was unsafe.** The read path drove the data bus
+   for every IO2 read ≥ CMD_HI and indexed `reu.status` for the rest; the
+   write path sent everything below CMD_HI into REU's switch, whose tail
+   resets prefetch state on every write (the REU write-pressure latch). Both
+   now ignore $DF0B–$DF4F outright: no drive, no REU side effects. The added
+   compare sits only on the REU/foreign branch, never on gpu64's.
+
+SEQ/SEQACK (added after this doc) moved with the block: $DF67/$DF68.
+Final map: `CMD_HI` $DF50, `CMD_LO` $DF51, `STATUS` $DF52, `ERRCODE` $DF53,
+`ID` $DF54–55, `ARG0`–`ARG15` $DF56–$DF65, `RESULT` $DF66, `SEQ` $DF67,
+`SEQACK` $DF68. The prgsim model's address-fault injector now sets A7
+instead of A6, because A6 is already set in every new register.
+
+Everything below is the original plan, kept for the reasoning.
+
 ## The collision
 
 gpu64 currently owns $DF0B–$DFFF in IO2 (REU keeps $DF00–$DF0A), with actual

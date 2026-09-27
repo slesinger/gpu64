@@ -106,13 +106,13 @@
 ;      (at your option) any later version.
 ;
 
-CMD_HI   = $df0b
-CMD_LO   = $df0c
-STATUS   = $df0d
-ERRCODE  = $df0e
-ID       = $df0f		; ID_LO/ID_HI = $df0f/$df10
-ARG      = $df11		; ARG0..ARG15 = $df11..$df20
-RESULT   = $df21		; class 1 only
+CMD_HI   = $df50
+CMD_LO   = $df51
+STATUS   = $df52
+ERRCODE  = $df53
+ID       = $df54		; ID_LO/ID_HI = $df54/$df55
+ARG      = $df56		; ARG0..ARG15 = $df56..$df65
+RESULT   = $df66		; class 1 only
 
 ; class 0
 OP_GET_INFO    = $06

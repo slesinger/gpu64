@@ -117,6 +117,14 @@ public:
 	// actually waiting for, which is what the bus-watch loop runs.
 	void PrepareFlip( void );
 	boolean CommitFlip( void );
+	// Whether the page PrepareFlip() would hand over as the next draw page
+	// has really left the screen. CommitFlip() only *posts* the new scanout
+	// offset; the VideoCore applies it at its own next vsync, which the
+	// frame clock only approximates, so the page it replaced keeps being
+	// scanned for up to a frame after m_nVisiblePage has moved on. Anything
+	// that renders asynchronously into the handed-over page (SCENE_COMMIT's
+	// core 1 frame) must ask this first and answer BUSY while it is FALSE.
+	boolean NextDrawPageIdle( void );
 	// Back to the reset arrangement: page 0 drawn and visible.
 	void ResetPages( void );
 	// Every page to black, border band included, and cleaned out to DRAM.
@@ -197,6 +205,9 @@ public:
 	// not to the physical page; whole physical rows get cleaned either way,
 	// which costs nothing extra and keeps the border covered.
 	void CleanRows( unsigned nPage, unsigned y0, unsigned y1 );
+	// One row's [x0, x1) only -- lets a caller split a clean to fit the
+	// core-1 store-burst budget (gpu64_3d_span.h).
+	void CleanRowSpan( unsigned nPage, unsigned y, unsigned x0, unsigned x1 );
 	// Whole physical page, border included.
 	void CleanPage( unsigned nPage );
 
@@ -230,6 +241,11 @@ private:
 	u8		m_nVisiblePage;
 	// Page PrepareFlip() readied and CommitFlip() will make visible.
 	u8		m_nPendingVisible;
+	// Pages CommitFlip() moved off the screen whose scanout may still be
+	// running (bit per page), and the system-timer stamp of each post. See
+	// NextDrawPageIdle().
+	u8		m_nRetiringMask;
+	u32		m_nRetiredAt[ GPU64_FB_PAGES ];
 
 	u8		m_nBorder;
 

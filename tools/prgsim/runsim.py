@@ -20,6 +20,10 @@ Options:
                     every vblank feature answers UNSUPPORTED. The suite is
                     expected to pass in this mode too -- it adapts.
     --dump-scene        print the retained scene node table at the end
+    --write-stats[=F]   count register-window traffic from rendered frame F
+                        (default 50) to the end, and print writes/frame,
+                        reads/frame and a per-opcode table to stderr --
+                        which commands the bus budget is actually spent on
     --level=FILE        stand in for RAD/level.g64lev on the Pi's SD card, so
                         LOAD_LEVEL/LEVEL_STEP build a real level. Without it
                         LOAD_LEVEL answers BAD_ARGS, as it does on a card that
@@ -35,7 +39,7 @@ Options:
                        clean and the run measures what the frame loop
                        repairs rather than whether setup survived
     --bus-fault=KIND:N
-        Make every Nth access to the gpu64 register window ($DF0B-$DFFF) go
+        Make every Nth access to the gpu64 register window ($DF50-$DFFF) go
         wrong, the two ways the hardware is known to be able to make one go
         wrong. KIND is:
           drop  the access never reaches the firmware at all. A read
@@ -57,6 +61,13 @@ Options:
                 lands on a VALID one is a phantom command. This is the kind
                 that tests a state refresh ring against phantoms rather
                 than against lost ARG writes.
+          phantom  a WRITE to any other gpu64 register is serviced as a
+                write to CMD_LO instead, with its own data byte as the
+                opcode: a command dispatches that the C64 never sent, on
+                whatever ARG bytes happen to be staged, and the ARG write
+                itself is lost. Bench video 2026-09-27: E1M1's field of
+                view jumping to values the program cannot send -- a
+                SET_PERSPECTIVE run on SET_POSITION's staged bytes.
         There is no defect here to find: this exists so that a probe's
         diagnosis of a defect can be checked against a known answer on a PC.
         Source/TestPRG/gpu64_probe_bus.a is the one that needs it, and its
@@ -234,15 +245,34 @@ class Machine:
     bus_fault_kind = None
     bus_fault_every = 0
     bus_fault_n = 0
+    phantoms = 0
+    # --write-stats: window traffic attributed to the command it belongs to.
+    # Every write since the previous CMD_LO is charged to the next CMD_LO's
+    # (class, opcode), CMD_LO included; reads are counted apart, because a
+    # STATUS poll belongs to no one command. Only frames from stats_from on
+    # are counted, so setup does not swamp the per-frame figure.
+    stats_from = -1
+    stats_pending = 0
+    stats_writes = None
+    stats_reads = 0
     bus_fault_until = -1
     bus_fault_from = 0
+    # The register file as the C64 MEANT it, fault or no fault, so a
+    # dispatch can be judged against the truth: a command the firmware
+    # executed with a byte the C64 never wrote there is one it BELIEVED.
+    # That is the verdict a faulted run needs, and a frame diff against a
+    # clean run cannot give it, because every retry moves the demo's timing
+    # and no two runs share a frame after the first fault. wrong_ops counts
+    # executed-but-wrong dispatches by (class, op, why).
+    intent = None
+    wrong_ops = None
 
     # True on the Nth access to the gpu64 register window. REU's own
     # $DF00-$DF0A is excluded: the firmware's decode for it is a different
     # path with different (worse) known defects, and nothing here models
     # those.
     def bus_fault(self, off):
-        if not self.bus_fault_kind or off < 0x0B:
+        if not self.bus_fault_kind or off < gpu64model.REG_CMD_HI:
             return False
         # --bus-fault-until stops the injection partway through the run, so
         # that what the tail of the run shows is whether the program REPAIRED
@@ -268,7 +298,11 @@ class Machine:
     def read(self, addr):
         if 0xDF00 <= addr <= 0xDFFF:
             off = addr - IO2
-            if self.bus_fault_kind != 'data' and self.bus_fault(off):
+            if (self.stats_writes is not None and off >= gpu64model.REG_CMD_HI
+                    and self.frame >= self.stats_from):
+                self.stats_reads += 1
+            if (self.bus_fault_kind not in ('data', 'phantom') and
+                    self.bus_fault(off)):
                 if self.bus_fault_now() == 'drop':
                     return 0xFF             # a floating bus, uncounted
                 return self.gpu.read_reg_missampled(off)
@@ -348,21 +382,77 @@ class Machine:
             # demo tells us about. Sample on the way in, while the page that
             # was just drawn is still the draw page.
             off = addr - IO2
+            if (self.stats_writes is not None and off >= gpu64model.REG_CMD_HI
+                    and self.frame >= self.stats_from):
+                self.stats_pending += 1
+                if off == gpu64model.REG_CMD_LO:
+                    k = (self.gpu.cmd_hi, val & 0xFF)
+                    c = self.stats_writes.setdefault(k, [0, 0])
+                    c[0] += 1
+                    c[1] += self.stats_pending
+                    self.stats_pending = 0
+            true_off, true_val = off, val & 0xFF
+            if self.intent is not None and off >= gpu64model.REG_CMD_HI:
+                self.intent[off] = true_val
             if self.bus_fault(off):
                 if self.bus_fault_now() == 'data':
                     bit = (self.bus_fault_n // self.bus_fault_every) % 8
                     val = (val & 0xFF) ^ (1 << bit)
+                elif self.bus_fault_now() == 'phantom':
+                    if off != gpu64model.REG_CMD_LO:
+                        self.phantoms += 1
+                        off = gpu64model.REG_CMD_LO
                 else:
                     if self.bus_fault_now() == 'addr':
                         self.gpu.write_reg_missampled(off, val)
                     return                  # 'drop': nothing happened at all
-            flip = (addr == 0xDF0C and self.gpu.cmd_hi == 0
+            flip = (off == gpu64model.REG_CMD_LO and self.gpu.cmd_hi == 0
                     and (val & 0xFF) == 0x05)
             if flip:
                 self.on_flip()
-            self.gpu.write_reg(off, val)
+            if self.intent is not None and off == gpu64model.REG_CMD_LO:
+                self.judge_dispatch(true_off, val & 0xFF)
+            else:
+                self.gpu.write_reg(off, val)
             return
         self.mem[addr] = val & 0xFF
+
+    # One dispatch, judged against self.intent. Only a dispatch that answers
+    # OK is counted: every refusal -- the check, strict mode, a bad class,
+    # the loop owning the display -- executed nothing, which is the defences
+    # working. Only the registers the command could have used are compared:
+    # ARG0..n-1 by the key the C64 SENT when it sent one, all fourteen when
+    # it did not. A key that alone arrived wrong ran the right command and
+    # is reported apart, as 'key'; so is 'early' (below).
+    def judge_dispatch(self, true_off, op):
+        g = self.gpu
+        M = gpu64model
+        it = self.intent
+        why = None
+        if true_off != M.REG_CMD_LO:
+            # A phantom that lands on a whole checked block passes the check
+            # only if its opcode is the one the block was built for: it is
+            # the real command, fired one write early -- 'early', not damage.
+            k = g.arg[M.KEY_ARG]
+            why = 'early' if (k & 0xF0) == M.KEY_CHECKED else 'phantom'
+        else:
+            sent = it.get(M.REG_ARG15, 0)
+            checked = (sent & 0xF0) == M.KEY_CHECKED
+            n = sent & 0x0F if checked else 14
+            regs = [(M.REG_CMD_HI, g.cmd_hi), (M.REG_ID_LO, g.ident[0]),
+                    (M.REG_ID_HI, g.ident[1])]
+            regs += [(M.REG_ARG0 + i, g.arg[i]) for i in range(min(n, 14))]
+            if any(it.get(r, v) != v for r, v in regs):
+                why = 'checked' if checked else 'unchecked'
+            elif g.arg[M.KEY_ARG] != sent:
+                why = 'key'
+        cls = g.cmd_hi
+        g.write_reg(M.REG_CMD_LO, op)
+        # The firmware spends ARG15 on every dispatch, and the C64 knows it.
+        it[M.REG_ARG15] = 0
+        if why and g.err == M.ERR_OK:
+            k = (cls, op, why)
+            self.wrong_ops[k] = self.wrong_ops.get(k, 0) + 1
 
     def on_flip(self):
         self.frame_boundary(self.gpu.draw_page)
@@ -515,8 +605,9 @@ def main(argv):
     for o in opts:
         if o.startswith('--bus-fault='):
             kind, every = o.split('=', 1)[1].split(':', 1)
-            if kind not in ('drop', 'addr', 'both', 'data'):
-                print('--bus-fault kind must be drop, addr, both or data')
+            if kind not in ('drop', 'addr', 'both', 'data', 'phantom'):
+                print('--bus-fault kind must be drop, addr, both, data or '
+                      'phantom')
                 return 2
             bus_fault_kind, bus_fault_every = kind, int(every, 0)
             if bus_fault_every < 1:
@@ -531,6 +622,10 @@ def main(argv):
             bus_fault_until = int(o.split('=', 1)[1], 0)
         if o.startswith('--bus-fault-from='):
             bus_fault_from = int(o.split('=', 1)[1], 0)
+    stats_from = -1
+    for o in opts:
+        if o.startswith('--write-stats'):
+            stats_from = int(o.split('=', 1)[1], 0) if '=' in o else 50
     dump_scene = '--dump-scene' in opts
     trace = 0
     max_insns = 200_000_000
@@ -599,8 +694,14 @@ def main(argv):
             m.log_rows = (int(a), int(b) + 1)
     m.gpu.c1_clip_fault_kind = clip_fault_kind
     m.bus_fault_kind = bus_fault_kind
+    if bus_fault_kind:
+        m.intent = {}
+        m.wrong_ops = {}
     m.bus_fault_every = bus_fault_every
     m.bus_fault_until = bus_fault_until
+    if stats_from >= 0:
+        m.stats_from = stats_from
+        m.stats_writes = {}
     m.bus_fault_from = bus_fault_from
     for prev in chain:
         m.load_prg(prev)
@@ -666,6 +767,39 @@ def main(argv):
                      n.mesh_id, n.tex_id,
                      n.sprite_w, n.sprite_h, n.sprite_flags,
                      n.light_strength, n.light_radius))
+
+    if m.stats_writes is not None:
+        frames = max(1, m.frame - m.stats_from)
+        tot = sum(c[1] for c in m.stats_writes.values())
+        print("write stats: frames %d..%d (%d), %.1f writes/frame, "
+              "%.1f reads/frame" % (m.stats_from, m.frame, frames,
+                                    tot / frames, m.stats_reads / frames),
+              file=sys.stderr)
+        for k, c in sorted(m.stats_writes.items(), key=lambda kv: -kv[1][1]):
+            print("  class %d $%02X  %6d cmds  %7d writes  %6.1f/frame  "
+                  "%4.1f/cmd  %4.1f%%"
+                  % (k[0], k[1], c[0], c[1], c[1] / frames,
+                     c[1] / c[0], 100.0 * c[1] / max(1, tot)),
+                  file=sys.stderr)
+
+    if m.phantoms:
+        print("phantom dispatches injected: %d" % m.phantoms, file=sys.stderr)
+
+    if m.wrong_ops is not None:
+        print("believed wrong: %d %s" % (
+            sum(m.wrong_ops.values()),
+            ' '.join('%d:$%02X:%s x%d' % (k[0], k[1], k[2], v)
+                     for k, v in sorted(m.wrong_ops.items()))),
+              file=sys.stderr)
+
+    if m.gpu.strict_refused:
+        # Unchecked class 1 commands refused in strict mode. With no
+        # --bus-fault this must be zero: anything here is the PROGRAM
+        # sending an unchecked command after its first checked commit.
+        print("strict mode refused: %d %s" % (m.gpu.strict_refused,
+              ' '.join('$%02X x%d' % kv for kv in
+                       sorted(m.gpu.strict_refused_ops.items()))),
+              file=sys.stderr)
 
     if m.gpu.check_refused:
         # GPU64_KEY_CHECKED refusals: commands whose ARG14 check did not

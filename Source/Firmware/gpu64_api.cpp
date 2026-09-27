@@ -59,6 +59,11 @@ GPU64APIDIAG gpu64ApiDiag;
 // belongs to.
 u8 gpu64ApiKey = 0;
 
+// gpu64 (2026-09-27): strict mode -- gpu64_api.h, GPU64_KEY_CHECKED. Set by
+// the first checked SCENE_COMMIT, cleared by gpu64_apiFullReset() (a C64
+// reset or FULL_RESET) and by a keyed SCENE_RESET.
+static boolean sStrict = FALSE;
+
 // gpu64: the seven-flag snapshot behind GET_HEALTH byte 86 -- see
 // gpu64_apidiag.h. Cheap enough to call on every refusal: four loads and a
 // virtual call that only happens on a path that has already decided to fail.
@@ -95,6 +100,7 @@ void gpu64_apiReset( void )
 	// side could explain.
 	gpu64DmaWinBase = 0;
 	gpu64DmaWinLen  = 0;
+	sStrict = FALSE;
 	// The frame clock's calibration survives -- it describes the display,
 	// not the session -- but nothing else about the vblank state does.
 	gpu64_vsyncResetState();
@@ -495,6 +501,9 @@ void gpu64_apiFullReset( void )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
 
+	// A new program owns the machine now, and it may not check anything.
+	sStrict = FALSE;
+
 	gpu64_vsyncResetState();
 
 	// Stage 15b observation point, and the strongest reason this cannot be
@@ -588,7 +597,21 @@ static u8 doSystem( u8 op )
 		// the loop frame, so its gpu64_apiFullReset() has nothing to harvest.
 		// The opcode is the only caller with a render possibly still in
 		// flight.
+		//
+		// gpu64 (2026-09-27): and the loop stops with it. FULL_RESET used
+		// to leave a running loop running: gpu64_apiFullReset()'s drain
+		// harvested the frame in flight, the clear below then erased its
+		// FRAME_READY, and with no frame left to raise it again every
+		// SCENE_COMMIT answered BUSY for the rest of the run -- HDMI frozen,
+		// C64 alive. runsim found it: a data fault turned the game's
+		// unchecked GET_HEALTH $0A into $0B. Stopped, the loop is re-armed
+		// by the next SCENE_COMMIT like any other stop. Not in
+		// gpu64_apiFullReset() itself: the /RESET path has already stopped
+		// the loop as SESSION, and that cause is the one worth keeping.
 		gpu64_apiFullReset();
+#ifdef GPU64_3D_ENABLED
+		gpu64_3dLoopFullReset();
+#endif
 		sStatus = 0;
 		sResult = 0;
 		return GPU64_ERR_OK;
@@ -1681,6 +1704,35 @@ void gpu64_apiDispatch( u8 op )
 		if ( n > GPU64_REG_CHECK || x != sArg[ GPU64_REG_CHECK ] )
 		{
 			gpu64ApiDiag.checkRefused++;
+			sErr = GPU64_ERR_BAD_ARGS;
+			sStatus |= GPU64_STATUS_ERROR;
+			return;
+		}
+
+		// A program that commits a checked frame checks everything it
+		// sends from then on -- that is what turns strict mode on.
+		if ( sCmdHi == 1 && op == GPU64_3D_OP_SCENE_COMMIT )
+			sStrict = TRUE;
+	}
+	else if ( sStrict && sCmdHi == 1 && !gpu64_apiStrictExempt( op ) )
+	{
+		// gpu64 (2026-09-27, bench video): a phantom -- a CMD_LO write the
+		// C64 never made -- finds ARG15 already spent to zero, so the check
+		// above never runs and it executes on whatever ARG bytes the last
+		// real command staged. E1M1's SET_PERSPECTIVE ran on SET_POSITION's
+		// coordinates: the view jumped to a 145-degree field of view for
+		// the eight frames the refresh ring took to put it back. The one
+		// thing a phantom cannot forge is the key, so once the program has
+		// shown it keys everything, an unkeyed command is not its own.
+		if ( gpu64ApiKey == GPU64_KEY_DESTRUCTIVE )
+		{
+			if ( op == GPU64_3D_OP_SCENE_RESET )
+				sStrict = FALSE;	// a program starting over
+		}
+		else
+		{
+			gpu64ApiDiag.strictRefused++;
+			gpu64ApiDiag.strictRefusedOp = op;
 			sErr = GPU64_ERR_BAD_ARGS;
 			sStatus |= GPU64_STATUS_ERROR;
 			return;

@@ -126,7 +126,7 @@
 ;        BUS BAD  bad READS, bad WRITES, then the read-side address
 ;                 fingerprint (last, OR, AND) and the last bad write
 ;                 address, then the write-side OR and AND. A gpu64 register
-;                 lives at $DF0B-$DF23, so a correct sample has A4-A7 clear;
+;                 lives at $DF50-$DF68, so a correct sample has A4-A7 clear;
 ;                 a bad address names the bits that moved. Runs 16 and 17
 ;                 both gave AND = $80, i.e. A7 set in EVERY bad read
 ;                 address -- A7 being GPIO 3 in the g3 phase, the pin the
@@ -349,8 +349,8 @@ OP_SET_SCALE         = $35
 ; The sequence-number pair. Writing SEQ costs one register write and buys a
 ; detector for the dropped-write defect; SEQACK reads back the SEQ of the
 ; command gpu64 actually dispatched.
-SEQ      = $df22
-SEQACK   = $df23
+SEQ      = $df67
+SEQACK   = $df68
 
 ; GET_HEALTH block offsets (Source/Firmware/gpu64_api.cpp, case 0x0A, and
 ; Source/Firmware/gpu64_busstats.h). The 80-byte rung is the one that
@@ -3872,7 +3872,7 @@ showNib
 	;
 	; mmmmmm  sampled IO2 accesses whose high address nibble was one no real
 	;         access could produce -- the REU decodes $DF00-$DF0A and the API
-	;         $DF0B-$DF23, so a true nibble is $0, $1 or $2 -- i.e. the
+	;         $DF50-$DF68, so a true nibble is $0, $1 or $2 -- i.e. the
 	;         LVC257 had not switched and A4-A7 were really some mix of
 	;         NMI/ROMH/IO1/BUTTON, and this pass paid a GPLEV0 re-read to
 	;         repair it. Six digits: the ceiling is one per IO2 access.
