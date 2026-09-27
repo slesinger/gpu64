@@ -200,6 +200,14 @@ for n in "${names[@]}"; do
 		       --key=F3:1000-1005 --key=W:1000-1500
 		       --key=A:1100-1130 --key=D:1250-1320)
 		;;
+	nighthawk)
+		# The autopilot (F3) takes off and flies the circuit; the
+		# cockpit view (F1) is switched in over the climb-out and
+		# back to the chase camera before the first turn.
+		# tools/check_nighthawk.py flies the rest of the circuit.
+		c1=1
+		extra=(--key=F3:30-35 --key=F1:600-605 --key=F1:1000-1005)
+		;;
 	esac
 
 	bad=0
@@ -279,6 +287,21 @@ for n in "${names[@]}"; do
 				[ $verbose -eq 1 ] && echo "$gout"
 			fi
 		done
+	fi
+
+	# Nighthawk's claim is that the C64 flies the aeroplane, which a
+	# picture of a jet over a field cannot show: the checkride flies a
+	# whole autopilot circuit and requires one landing and no crash.
+	if [ $bad -eq 0 ] && [ "$n" = "nighthawk" ]; then
+		if ! gout=$( python3 "$REPO_ROOT/tools/check_nighthawk.py" \
+				--prg="$prg" 2>&1 ); then
+			echo "CHECKRIDE FAIL  $n"
+			echo "$gout"
+			bad=1
+			fail=1
+		else
+			[ $verbose -eq 1 ] && echo "$gout"
+		fi
 	fi
 
 	# The launch-order check. The chained-after program is whichever

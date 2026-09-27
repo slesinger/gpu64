@@ -19,6 +19,12 @@
  the hardware can produce it in time.
 
  Usage: ./scenesim <stream.txt> [outdir] [--ppm-every=N] [--ppm-frame=N]...
+                   [--time]
+
+ --time adds each frame's render time on THIS machine to its line, plus a
+ summary. It is a relative measure only -- an x86 core is not the Pi's A53 --
+ so compare two streams rendered on the same PC (a new scene against one the
+ bench already ran at a known rate), never a number against a frame period.
 */
 #include "gpu64_3d_render.h"
 #include "gpu64_3d_scene.h"
@@ -26,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define MAX_RES		512
 #define MAX_PPM_PICKS	64
@@ -161,6 +168,8 @@ int main( int argc, char **argv )
 	unsigned ppmPick[ MAX_PPM_PICKS ];
 	unsigned nPicks = 0;
 	boolean bQuiet = FALSE;
+	boolean bTime = FALSE;
+	double tSum = 0, tMax = 0;
 
 	for ( int i = 1; i < argc; i++ )
 	{
@@ -173,6 +182,8 @@ int main( int argc, char **argv )
 		}
 		else if ( !strcmp( argv[ i ], "--quiet" ) )
 			bQuiet = TRUE;
+		else if ( !strcmp( argv[ i ], "--time" ) )
+			bTime = TRUE;
 		else if ( !pStream )
 			pStream = argv[ i ];
 		else
@@ -390,8 +401,16 @@ int main( int argc, char **argv )
 		if ( !strncmp( line, "ENDFRAME", 8 ) )
 		{
 			nFrames++;
+			struct timespec t0, t1;
+			clock_gettime( CLOCK_MONOTONIC, &t0 );
 			gpu64_3dSceneRender( &g_Scene, &g_State, &target, &g_Scratch,
 					      lookupMesh, 0, lookupTexture, 0 );
+			clock_gettime( CLOCK_MONOTONIC, &t1 );
+			double us = ( t1.tv_sec - t0.tv_sec ) * 1e6
+				  + ( t1.tv_nsec - t0.tv_nsec ) / 1e3;
+			tSum += us;
+			if ( us > tMax )
+				tMax = us;
 
 			boolean bWrite = nPpmEvery && ( nFrames % nPpmEvery ) == 0;
 			for ( unsigned i = 0; i < nPicks; i++ )
@@ -414,8 +433,12 @@ int main( int argc, char **argv )
 				for ( unsigned i = 0; i < sizeof( g_Pixels ); i++ )
 					if ( g_Pixels[ i ] != g_State.background )
 						ink++;
-				printf( "frame %4u  ink %6u  checksum %08x\n",
-					nFrames, ink, checksum() );
+				if ( bTime )
+					printf( "frame %4u  ink %6u  checksum %08x  render %7.0f us\n",
+						nFrames, ink, checksum(), us );
+				else
+					printf( "frame %4u  ink %6u  checksum %08x\n",
+						nFrames, ink, checksum() );
 			}
 			continue;
 		}
@@ -433,6 +456,9 @@ int main( int argc, char **argv )
 			g_projTotal, g_projOver, g_projWorst >> 16 );
 	}
 #endif
+	if ( bTime && nFrames )
+		printf( "scenesim: render mean %.0f us, max %.0f us (this machine)\n",
+			tSum / nFrames, tMax );
 	printf( "scenesim: %u frames, %u PPMs in %s/\n", nFrames, nWritten, pOut );
 	return nFrames ? 0 : 1;
 }

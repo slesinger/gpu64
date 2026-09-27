@@ -88,6 +88,13 @@ Options:
         keyboard needs this option for its desk run to mean anything.
         Names: W A S D Q E, F1 F3 F5 F7, SPACE, RETURN, RUNSTOP, and the
         letters and digits in the table below.
+    --joy=DIR[+DIR...]:FIRST-LAST
+        Hold joystick 2 from frame FIRST to frame LAST, counted as --key
+        counts. DIR is UP DOWN LEFT RIGHT FIRE. Port 2 is $dc00, the same
+        lines the keyboard scan drives its columns on, so a held direction
+        also grounds that column exactly as on hardware: a key pressed in
+        columns 0-4 then ghosts into every scan. Without it $dc00 reads back
+        whatever was written to it, i.e. a joystick nobody touches.
     --demo          do not require a VERDICT line. The conformance suite
                     judges itself and exit status follows its verdict; a
                     demo has nothing to judge, so returning cleanly is the
@@ -102,6 +109,8 @@ Options:
                     page's non-zero pixel count, and the two status rows the
                     demo prints. This is what turns "it blinks" into a frame
                     number and a delta.
+    --log-rows=A-B  the screen rows a --frame-log line quotes (default
+                    20-24), for a demo whose interesting rows are elsewhere
     --ppm-frame=N:PATH
                     write the page being flipped away at frame N. Repeatable.
     --c1-stream=PATH
@@ -154,8 +163,12 @@ KEY_MATRIX = {
     '9': (4, 0x01), 'I': (4, 0x02), 'J': (4, 0x04), '0': (4, 0x08),
     'M': (4, 0x10), 'K': (4, 0x20), 'O': (4, 0x40), 'N': (4, 0x80),
     'PLUS': (5, 0x01), 'P': (5, 0x02), 'L': (5, 0x04), 'MINUS': (5, 0x08),
+    '1': (7, 0x01), '2': (7, 0x08),
     'SPACE': (7, 0x10), 'Q': (7, 0x40), 'RUNSTOP': (7, 0x80),
 }
+
+# Joystick 2 on $dc00, active low.
+JOY_BITS = {'UP': 0x01, 'DOWN': 0x02, 'LEFT': 0x04, 'RIGHT': 0x08, 'FIRE': 0x10}
 
 # Screen code -> ASCII, enough to read a result line back.
 def screen_to_ascii(c):
@@ -173,7 +186,7 @@ def screen_to_ascii(c):
 class Machine:
     def __init__(self, calibrated=True, stop_after=4, frame_log=False,
                  ppm_frames=None, key_script=None, c1_stream=None,
-                 level=None):
+                 level=None, joy_script=None):
         self.mem = bytearray(65536)
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
@@ -183,10 +196,12 @@ class Machine:
         self.done = False
         self.final = None
         self.frame_log = frame_log
+        self.log_rows = (20, 25)
         self.ppm_frames = ppm_frames or {}
         self.frame = 0
         self.cia_pra = 0xFF
         self.key_script = list(key_script or [])
+        self.joy_script = list(joy_script or [])
         # A class-1 program never issues PAGE_FLIP: the autonomous loop owns
         # the framebuffer, and its frame boundary is the accepted
         # SCENE_COMMIT the model reports here instead.
@@ -261,7 +276,7 @@ class Machine:
         if addr == 0xDC01:
             return self.keyboard()
         if addr == 0xDC00:
-            return self.cia_pra
+            return self.cia_pra & ~self.joy() & 0xFF
         if addr in (0xDD06, 0xDD07):
             return self.cia2_timer_b(addr)
         if addr == 0xFFE1:
@@ -282,15 +297,24 @@ class Machine:
         v = (0xFFFF - ms) & 0xFFFF
         return v & 0xFF if addr == 0xDD06 else v >> 8
 
+    def joy(self):
+        bits = 0
+        for mask, first, last in self.joy_script:
+            if first <= self.frame <= last:
+                bits |= mask
+        return bits
+
     def keyboard(self):
         # Both halves of the matrix are active low: a column is selected by
-        # a ZERO in $dc00 and a pressed key answers with a ZERO row bit.
+        # a ZERO in $dc00 and a pressed key answers with a ZERO row bit. A
+        # held joystick direction grounds its $dc00 line as well.
         if not (self.cia_pra & 0x80):
             self.col7_reads += 1
+        pra = self.cia_pra & ~self.joy()
         rows = 0xFF
         for name in self.keys_down():
             col, bit = KEY_MATRIX[name]
-            if not (self.cia_pra & (1 << col)):
+            if not (pra & (1 << col)):
                 rows &= ~bit
         return rows & 0xFF
 
@@ -359,7 +383,8 @@ class Machine:
             return
         ink = sum(1 for b in self.gpu.pages[page] if b)
         rows = self.screen()
-        status = ' | '.join(r.strip() for r in rows[20:25] if r.strip())
+        status = ' | '.join(r.strip() for r in rows[self.log_rows[0]:self.log_rows[1]]
+                            if r.strip())
         print("frame %4d  ink %6d  %s" % (self.frame, ink, status))
 
     def load_prg(self, path):
@@ -526,6 +551,18 @@ def main(argv):
                 print("unknown key: %s" % name)
                 return 2
             key_script.append((name, int(first), int(last)))
+    joy_script = []
+    for o in opts:
+        if o.startswith('--joy='):
+            dirs, span = o.split('=', 1)[1].split(':', 1)
+            first, last = (span.split('-', 1) + [span])[:2]
+            mask = 0
+            for d in dirs.upper().split('+'):
+                if d not in JOY_BITS:
+                    print("unknown joystick direction: %s" % d)
+                    return 2
+                mask |= JOY_BITS[d]
+            joy_script.append((mask, int(first), int(last)))
     for o in opts:
         if o.startswith('--stop-after='):
             stop_after = int(o.split('=')[1])
@@ -553,8 +590,13 @@ def main(argv):
 
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
-                key_script=key_script, c1_stream=c1_stream, level=level)
+                key_script=key_script, c1_stream=c1_stream, level=level,
+                joy_script=joy_script)
     m.gpu.c1_clip_fault = clip_fault
+    for o in opts:
+        if o.startswith('--log-rows='):
+            a, b = o.split('=', 1)[1].split('-')
+            m.log_rows = (int(a), int(b) + 1)
     m.gpu.c1_clip_fault_kind = clip_fault_kind
     m.bus_fault_kind = bus_fault_kind
     m.bus_fault_every = bus_fault_every

@@ -9294,3 +9294,196 @@ commit. Not a wrong pose.
 demos.sh (all 14, with the game's door checks), testprg and the firmware
 build are green. **The firmware changed** (`gpu64_api.cpp/.h`,
 `gpu64_apidiag.h`), so the deploy is `tools/build.sh` plus the PRG. Deployed 2026-09-25, build id `eb396ea3-dirty src:78abdb56`.
+
+## 70. Milestone 19 stage A: NIGHTHAWK flies (2026-09-26)
+
+A new class-1 demo, `gpu64_demo_nighthawk`, a flight game in the spirit of
+*F-117A Stealth Fighter*. The design is
+[milestone19_nighthawk_design.md](milestone19_nighthawk_design.md). This
+section covers design steps 1 and 2 (the theatre plus flight), with the
+autopilot and checkride brought forward from step 5. No firmware change.
+
+- **Step 1: GO at full view distance.** Across the whole theatre the worst
+  frame was 1.1 ms of core-1 render time, against E1M1's 3.5 ms mean, so
+  the far plane stays at 12.8 km with no fog and no LODs.
+- **What exists.**
+  - The C64 builds and uploads the terrain: 56 tiles, 5196 triangles.
+  - There are two airbases and the ocean.
+  - Flight model: the ground comes from the same height map as the
+    terrain, and touchdown rules number 1–8 (`crashWhy`).
+  - Chase and cockpit views, the cockpit with a pitch ladder.
+  - The C64 cockpit screen:
+    - rows 2–8: instruments and score;
+    - a 16×12 tactical map, redrawn 3 rows a frame;
+    - rows 14–21: the message line, debug rows and stunt's bus report
+      card.
+  - An autopilot that flies takeoff, four waypoints, a 3° final, flare and
+    rollout.
+- **Size.** $0801–$8F0F (34.5 KB), so RAM is not yet a constraint and the
+  REU is not needed.
+- **Verification.**
+  - The `nighthawk` case in demos.sh (1500 frames, autopilot plus a
+    cockpit-view spell, rendered by scenesim).
+  - `tools/check_nighthawk.py`: a 5300-frame autopilot circuit that must
+    end `LAND 001 CRASH 000`, `FIRSTBAD 000`, and FRAMES == OK. PASS.
+  - A 10500-frame run landed twice with 0 crashes and 0 bus errors. Each
+    touchdown was within 0.1 units (10 m) of the centreline.
+- **Bugs worth remembering.**
+  - **The sine tables are indexed by the angle's high byte only.** Any
+    pitch or roll below 256 (1.4°) is exactly zero. A flare pitch of 182
+    was level flight, and the jet floated the whole runway. The
+    centreline controller also has a dead zone of the same size.
+  - **17-bit deltas.** A waypoint more than 128 units away overflowed the
+    signed 16-bit dx, and the autopilot flew off the north edge. The
+    deltas are now halved.
+  - **`spdToward` does not preserve A.** Speed was stepped toward the
+    target twice, and the second call stepped toward zero. The result was
+    half speed, then "too fast" crashes on landing, which followed from
+    the same bug.
+  - **64tass symbols are case-insensitive:** `gear`/`GEAR`, `inx`/`INX`
+    and `autoPilot`/`autopilot` all clashed.
+- **Next:** stage B (radars, the EMV meter, SAMs, the first mission), then
+  stage C (MiGs, weapons, night, missions). Not yet on the bench.
+
+## 71. Milestone 19 stage B: radars, SAMs and the strike (2026-09-26)
+
+Stage A flew on the bench: the user reported that it "works as expected".
+The one defect they found was that **the jet banked the wrong way on
+screen**: it turned left and rolled right. Class-1 +roll is a left bank and
+the flight model's +roll is a right bank, so roll is now negated in both
+`aimCamera` and `sendView`.
+
+Stage B is design step 3, delivered as mission 2. Key 1 selects the
+checkride and key 2 the strike. No firmware change.
+
+- **The enemy** is six sites:
+  - two early-warning radars;
+  - four SAM batteries, each with a turning dish.
+
+  One site is tested a frame, against `range × EMV / 16`. The range is
+  halved below 150 m AGL, and a hill on the line of sight hides the jet.
+  The line-of-sight test samples the height map at four points.
+- **The alert** rises 12 per sighting and decays when the jet is out of
+  sight.
+- **Launches.** A battery launches when the alert is past 128 and that
+  battery itself sees the jet. Each battery then needs 200 frames to
+  reload.
+- **Missiles** (two at once):
+  - rate-limited pursuit, 3° a frame;
+  - a 160-frame burn, a 0.375-unit fuse and smoke puffs.
+- **Chaff (C).** Ten cartridges. A cloud rolls 150/256 against every
+  locked missile within 12 units per axis.
+  - A missile that loses its lock flies on straight and **cannot fuse**.
+  - The HUD shows `LOST`, then `MISSILE EVADED` at burnout.
+- **Weapons.** SPACE opens the bay, which costs +8 EMV. FIRE or RETURN
+  drops one of two GBUs.
+  - The bomb is purely ballistic from the jet's velocity: there is no
+    steering and nothing is scripted.
+  - A hit leaves rubble (an `X` on the map) and stops that site.
+- **The C64 screen.**
+  - Rows 9–13 are new: the EMV bar, alert, arms, missile/target
+    distances, and the mission line (`M2 HIT/UP PEAK nnn SAM nnn`).
+  - Rows 22–24 list the keys.
+  - The map adds R/S sites (orange; red while they see you), missiles as
+    `+`, and the waypoint through the same plotter.
+- **The autopilot** flies mission 2 end to end: route, bay open 10 units
+  out, drop on the cue, home, land. It is the attract mode and the PC gate.
+- **Size: $0801–$B32F (43.8 KB), so BASIC is banked out.**
+  - `$01=$36` is set before `dmInit`, and `$37` is restored at exit.
+  - `.cerror * > $d000` guards the top.
+  - **runsim has flat RAM and cannot see a banking bug**, so this part is
+    bench-only.
+  - The REU is still unused.
+
+**Verification (PC).**
+- `check_nighthawk.py` now flies two rides, and demos.sh runs both:
+  - the checkride: 5300 frames, `LAND 001 CRASH 000`;
+  - the strike: 5000 frames. The EW radar sees the jet at about 12 units,
+    `BOMB AWAY` comes at 7 units, `TARGET DESTROYED` at frame 2237, and it
+    lands at 4496.
+  - Both end with `FRAMES == OK` and `FIRSTBAD 000`. PASS.
+- The autopilot's route never gets inside a SAM's closed-bay range, so the
+  strike run has `SAM 000`.
+- The launch, shoot-down and chaff paths were exercised with scratchpad
+  variants that are not in the tree: SAM range ×3 and burn 255.
+  - A launch at 27 units ends in `SHOT DOWN` (crash rule 9).
+  - Two close chaff clouds break the lock (`LOST`); the missile passes
+    within a unit and ends in `MISSILE EVADED`.
+  - scenesim shows the fireball on the wreck.
+- runsim gained `--log-rows=A-B`, which chooses the rows that
+  `--frame-log` quotes.
+
+**Bugs worth remembering.**
+- **The shoot-down fireball was invisible.** It was placed where the jet
+  had been, and then `flCrash` put the wreck and the chase camera on the
+  ground. The fireball burned 2 units above the camera, out of view. It is
+  now placed after `flCrash`.
+- **Chaff could never save you.** A decoyed missile still ran `misFuse`,
+  and it keeps flying straight down the jet's path, so the second cloud
+  broke the lock and the missile fused anyway. Only a locked missile fuses
+  now.
+- **A missile burning out was silent.** It now says `MISSILE EVADED`.
+- **Bang-bang bomb steering overshot by tens of units** and was removed.
+  Plain ballistics hit.
+- **The case-insensitivity trap again:** `exX` clashed with `eXX`.
+
+**Next:** the bench, for stage B and the BASIC banking. Then stage C: MiGs,
+flares/AIM-9, the bomb cam, night, and missions 3–4.
+
+## 72. Milestone 19 stage C: the cockpit moves to HDMI, MiGs, night, missions 3–4 (2026-09-26)
+
+**Change of plan from the user:** the C64 screen is out of sight while you
+watch the HDMI one, so the cockpit is now drawn on HDMI and the C64 screen
+is debug only. As-built detail is in `project/milestone19_nighthawk_design.md`
+(the step-4 section and the superseded-HUD note).
+
+**What was built.**
+- **HDMI HUD.** `MESH_HUD` is posed on the camera every frame. The C64
+  renders rows 0–5 of its own screen into 60 segment textures (4 characters
+  each) plus a 16 × 16 tactical map, and re-uploads whatever changed. One
+  segment in 16 frames is re-sent unasked, as a state refresh.
+- **MiGs** in missile slots 0–1. They hold a CAP, then hunt, and fire IR
+  missiles. Mission 4 has two on CAP, and BASE1 scrambles more past LAUNCH.
+- **AIM-9 (`M`)**, **flares (`F`)** and the **bomb cam (`F5`)**.
+- **Night** is a low moon. Missions 3 (bridge) and 4 (factory) are night
+  missions, flown by the autopilot through `1`–`4` then `F3`.
+- **C64 row 9** shows the missile slots and the last AIM-9's closest
+  approach and end code (`F`/`B`/`L`/`H`).
+
+**Verified on the PC** (`tools/check_nighthawk.py`, four rides in parallel):
+- Mission 3: `TARGET DESTROYED` at 3406, lands at 6104, `PEAK 000`. It is
+  never detected, so no MiG launches.
+- Mission 4:
+  - `FOX TWO` at 3170, `MIG DOWN` at 3197; the MiG's IR shot is flared off.
+  - The factory is destroyed at 3714, and a second kill (`K 2`) at 4185.
+  - Then it lands.
+- scenesim renders confirm the night terrain, the moonlit slopes and the
+  HUD.
+
+**Bugs worth remembering.**
+- **The HDMI cockpit lagged by two seconds.** `segChanged` ended its
+  "identical" path on `dey / bpl`, which leaves Z clear, so every segment
+  always read as changed. The budget of one upload per two frames then went
+  blind round-robin over all 60, and a segment was refreshed only every
+  ~120 frames: `FOX TWO` and `MIG DOWN` never reached the HDMI screen in
+  time. The scenesim renders of the MiG fight showed it, and a
+  strictly sequential texture-id order in the c1 stream confirmed it. The
+  fix is one `lda #0`, and uploads now follow what changed.
+- **Night stayed bright.** `SET_LIGHT` normalises its direction, so a
+  shorter sun vector changes nothing. It is now a low moon.
+- **The AIM-9 orbited its target.** It had a SAM's turn rate and fuse, and
+  the closest approach (`mdMax`) stalled at 0.625 units until burn-out.
+  Doubling the turn and raising the fuse to 0.875 units gives a first-shot
+  kill.
+- **Flares at 150/256 lost 17% of rides** to a second IR shot. They now
+  break the lock at 224/256.
+
+**Known limits, not bugs.**
+- A texture re-upload cannot free the old copy, so the HUD leaks arena
+  (about 3.4 KB/s). After about 2.5 hours the first `OUT_OF_MEMORY` freezes
+  the HDMI cockpit, and row 7 then reads `DEAD`. The game keeps running.
+  A fix needs a replace-texture opcode, and this milestone allows no
+  firmware change.
+- `$01=$35` (variables under the KERNAL) is unverified on hardware.
+
+**Next:** the bench.
