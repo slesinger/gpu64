@@ -212,6 +212,10 @@ void gpu64_3dBuildColormap( Gpu64_3dState *pState, const u8 *pPaletteRGB );
 // Fills the viewport with the background index and resets the z-buffer.
 void gpu64_3dClearViewport( const Gpu64_3dState *pState, Gpu64_3dTarget *pTarget );
 
+// Resets the z-buffer alone, leaving the pixels. Milestone 20's view-space
+// pass: what is drawn after it lies in front of everything before it.
+void gpu64_3dClearDepth( const Gpu64_3dState *pState, Gpu64_3dTarget *pTarget );
+
 // Draws one mesh at a model transform. Returns the number of faces actually
 // rasterised, which is the bring-up signal that says "the geometry arrived
 // and was not entirely culled" -- distinguishable from "nothing was drawn"

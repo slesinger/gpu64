@@ -196,6 +196,35 @@ void gpu64_3dClearViewport( const Gpu64_3dState *pState, Gpu64_3dTarget *pTarget
 	}
 }
 
+void gpu64_3dClearDepth( const Gpu64_3dState *pState, Gpu64_3dTarget *pTarget )
+{
+	const unsigned w = pState->vpW;
+	const unsigned h = pState->vpH;
+
+	// The same span-sized bursts as gpu64_3dClearViewport(), for the same
+	// reason: it runs on core 1 and must yield inside CLAUDE.md's store
+	// burst limit. A span here stores two bytes a pixel against the three
+	// the full clear stores, so it is inside whatever that one is tuned to.
+	for ( unsigned y = 0; y < h; y++ )
+	{
+		u16 *pZ = pTarget->pDepth + (size_t)y * w;
+
+		unsigned x = 0;
+		while ( x < w )
+		{
+			unsigned n = w - x;
+			if ( n > (unsigned)GPU64_3D_SPAN_PIXELS )
+				n = (unsigned)GPU64_3D_SPAN_PIXELS;
+
+			for ( unsigned i = 0; i < n; i++ )
+				pZ[ x + i ] = 0;
+
+			x += n;
+			GPU64_3D_YIELD();
+		}
+	}
+}
+
 // --- the rasteriser -----------------------------------------------------
 
 struct Gpu64_3dGrad

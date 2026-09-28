@@ -289,6 +289,24 @@ for n in "${names[@]}"; do
 		done
 	fi
 
+	# Stage D's claim is a chain -- fire key, cone search, a trace in the
+	# frame's WORLD_TICK, pellets, pain, death, a backpack, the player's
+	# own death and restart -- whose every link ends in a scene node or a
+	# number on rows 21-22. tools/check_combat.py drives its own two
+	# scripted runs, so it does not use the door route above.
+	if [ $bad -eq 0 ] && [ "$n" = "game" ]; then
+		if ! gout=$( python3 "$REPO_ROOT/tools/check_combat.py" \
+				--prg="$prg" \
+				--level="$REPO_ROOT/build/e1m1.g64lev" 2>&1 ); then
+			echo "COMBAT CHECK FAIL  $n"
+			echo "$gout"
+			bad=1
+			fail=1
+		else
+			[ $verbose -eq 1 ] && echo "$gout"
+		fi
+	fi
+
 	# Nighthawk's claim is that the C64 flies the aeroplane, which a
 	# picture of a jet over a field cannot show: the checkride flies a
 	# whole autopilot circuit and requires one landing and no crash.

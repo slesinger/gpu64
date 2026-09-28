@@ -106,6 +106,11 @@ Options:
         also grounds that column exactly as on hardware: a key pressed in
         columns 0-4 then ghosts into every scan. Without it $dc00 reads back
         whatever was written to it, i.e. a joystick nobody touches.
+    --mouse=DX,DY[,FIRE]:FIRST-LAST
+        A 1351 mouse in port 1: from frame FIRST to LAST, move DX, DY pot
+        counts a frame (Y positive is away from you) and, with FIRE, hold
+        the left button, which grounds $dc01 bit 4 as on hardware. Without
+        it $d419/$d41a read $ff, an empty port. Repeatable.
     --demo          do not require a VERDICT line. The conformance suite
                     judges itself and exit status follows its verdict; a
                     demo has nothing to judge, so returning cleanly is the
@@ -174,8 +179,9 @@ KEY_MATRIX = {
     '9': (4, 0x01), 'I': (4, 0x02), 'J': (4, 0x04), '0': (4, 0x08),
     'M': (4, 0x10), 'K': (4, 0x20), 'O': (4, 0x40), 'N': (4, 0x80),
     'PLUS': (5, 0x01), 'P': (5, 0x02), 'L': (5, 0x04), 'MINUS': (5, 0x08),
-    '1': (7, 0x01), '2': (7, 0x08),
-    'SPACE': (7, 0x10), 'Q': (7, 0x40), 'RUNSTOP': (7, 0x80),
+    '1': (7, 0x01), 'ARROWLEFT': (7, 0x02), 'CTRL': (7, 0x04),
+    '2': (7, 0x08),
+    'SPACE': (7, 0x10), 'CBM': (7, 0x20), 'Q': (7, 0x40), 'RUNSTOP': (7, 0x80),
 }
 
 # Joystick 2 on $dc00, active low.
@@ -197,7 +203,7 @@ def screen_to_ascii(c):
 class Machine:
     def __init__(self, calibrated=True, stop_after=4, frame_log=False,
                  ppm_frames=None, key_script=None, c1_stream=None,
-                 level=None, joy_script=None):
+                 level=None, joy_script=None, mouse_script=None):
         self.mem = bytearray(65536)
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
@@ -213,6 +219,7 @@ class Machine:
         self.cia_pra = 0xFF
         self.key_script = list(key_script or [])
         self.joy_script = list(joy_script or [])
+        self.mouse_script = list(mouse_script or [])
         # A class-1 program never issues PAGE_FLIP: the autonomous loop owns
         # the framebuffer, and its frame boundary is the accepted
         # SCENE_COMMIT the model reports here instead.
@@ -313,6 +320,8 @@ class Machine:
             return self.cia_pra & ~self.joy() & 0xFF
         if addr in (0xDD06, 0xDD07):
             return self.cia2_timer_b(addr)
+        if addr in (0xD419, 0xD41A):
+            return self.mouse_pot(0 if addr == 0xD419 else 1)
         if addr == 0xFFE1:
             return 0x60                     # RTS -- intercepted below
         return self.mem[addr]
@@ -338,14 +347,36 @@ class Machine:
                 bits |= mask
         return bits
 
+    def mouse_pot(self, axis):
+        # A 1351: the position modulo 64 in bits 6-1, read through the SID
+        # pot the port-1 half of $dc00 bits 7:6 (= 01) selects. The model
+        # has no settling time; the program's wait is simply not needed.
+        if not self.mouse_script or (self.cia_pra & 0xC0) != 0x40:
+            return 0xFF
+        pos = 0
+        for dx, dy, fire, first, last in self.mouse_script:
+            if self.frame >= first:
+                pos += (dx, dy)[axis] * (min(self.frame, last) - first + 1)
+        return 0x40 + ((pos * 2) & 0x7E) & 0xFF
+
+    def mouse_fire(self):
+        return any(fire and first <= self.frame <= last
+                   for dx, dy, fire, first, last in self.mouse_script)
+
     def keyboard(self):
         # Both halves of the matrix are active low: a column is selected by
         # a ZERO in $dc00 and a pressed key answers with a ZERO row bit. A
         # held joystick direction grounds its $dc00 line as well.
         if not (self.cia_pra & 0x80):
             self.col7_reads += 1
+            # gpu64_demo_game.a ignores RUN/STOP on hardware; its exit in
+            # a simulated run is this byte, set while the schedule below
+            # holds RUN/STOP down. Nothing else here uses $02a7.
+            self.mem[0x02A7] = 0xA7 if self.stop_in_matrix() else 0
         pra = self.cia_pra & ~self.joy()
         rows = 0xFF
+        if self.mouse_fire():
+            rows &= ~0x10              # port 1 drives the row lines
         for name in self.keys_down():
             col, bit = KEY_MATRIX[name]
             if not (pra & (1 << col)):
@@ -658,6 +689,15 @@ def main(argv):
                     return 2
                 mask |= JOY_BITS[d]
             joy_script.append((mask, int(first), int(last)))
+    mouse_script = []
+    for o in opts:
+        if o.startswith('--mouse='):
+            move, span = o.split('=', 1)[1].split(':', 1)
+            first, last = (span.split('-', 1) + [span])[:2]
+            parts = move.split(',')
+            fire = len(parts) > 2 and parts[2].upper() == 'FIRE'
+            mouse_script.append((int(parts[0]), int(parts[1]), fire,
+                                 int(first), int(last)))
     for o in opts:
         if o.startswith('--stop-after='):
             stop_after = int(o.split('=')[1])
@@ -686,7 +726,7 @@ def main(argv):
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
                 key_script=key_script, c1_stream=c1_stream, level=level,
-                joy_script=joy_script)
+                joy_script=joy_script, mouse_script=mouse_script)
     m.gpu.c1_clip_fault = clip_fault
     for o in opts:
         if o.startswith('--log-rows='):

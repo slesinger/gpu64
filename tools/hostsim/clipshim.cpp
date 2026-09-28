@@ -95,3 +95,46 @@ extern "C" int gpu64shim_move( const int *pIn, int nModel, int nHull, int nMode,
 {
 	return gpu64shim_move_ents( pIn, nModel, nHull, nMode, 0, 0, pOut );
 }
+
+// WORLD_TICK's trace query (milestone 20). pIn: start x,y,z then end x,y,z,
+// six s32 16.16. pOut: end x,y,z, fraction 16.16, startsolid, allsolid,
+// hit contents byte -- seven s32. Returns 0 exactly where
+// gpu64_levelTraceEnts() answers FALSE. pMovers as gpu64shim_move_ents.
+extern "C" int gpu64shim_trace_ents( const int *pIn, int nHull,
+				     const int *pMovers, int nMovers,
+				     int *pOut )
+{
+	if ( !s_bOpen )
+		return 0;
+	if ( nMovers < 0 || nMovers > GPU64_LEVEL_MAX_MOVERS )
+		return 0;
+
+	Gpu64_LevelVec start, end;
+	for ( unsigned k = 0; k < 3; k++ )
+	{
+		start.v[ k ] = pIn[ k ];
+		end.v[ k ]   = pIn[ 3 + k ];
+	}
+
+	Gpu64_LevelMover mvrs[ GPU64_LEVEL_MAX_MOVERS ];
+	for ( int i = 0; i < nMovers; i++ )
+	{
+		mvrs[ i ].nModel = (u16)pMovers[ i * 4 + 0 ];
+		for ( unsigned k = 0; k < 3; k++ )
+			mvrs[ i ].ofs.v[ k ] = pMovers[ i * 4 + 1 + k ];
+	}
+
+	Gpu64_LevelTrace tr;
+	u8 hit = 0;
+	if ( !gpu64_levelTraceEnts( &s_Lev, (unsigned)nHull, &start, &end, mvrs,
+				    (unsigned)nMovers, &tr, &hit ) )
+		return 0;
+
+	for ( unsigned k = 0; k < 3; k++ )
+		pOut[ k ] = tr.end.v[ k ];
+	pOut[ 3 ] = tr.nFraction;
+	pOut[ 4 ] = tr.bStartSolid ? 1 : 0;
+	pOut[ 5 ] = tr.bAllSolid ? 1 : 0;
+	pOut[ 6 ] = hit;
+	return 1;
+}

@@ -21,6 +21,7 @@ model follows.
 import copy
 import os
 import re
+import struct
 
 # --- opcodes (docs/class1-3d-mesh-reference.md) --------------------------
 OP_SCENE_RESET = 0x00
@@ -42,6 +43,7 @@ OP_CLIP_MOVE = 0x15
 OP_LEVEL_ENT = 0x16
 OP_LEVEL_PALETTE = 0x17
 OP_LEVEL_NODE = 0x1C
+OP_WORLD_TICK = 0x6C
 LEVEL_DONE = 0xFF
 # Bytes of source blob one LEVEL_STEP consumes -- GPU64_LEVEL_SLICE_BYTES.
 LEVEL_SLICE_BYTES = 16384
@@ -74,7 +76,7 @@ SHADOW_REDIRECTABLE = frozenset((
     OP_SET_ACTIVE_CAMERA, OP_SET_VISIBLE, OP_CREATE_SPRITE, OP_CREATE_LIGHT,
     OP_SET_SPRITE, OP_SET_POINT_LIGHT, OP_SET_POSITION, OP_SET_ORIENTATION,
     OP_MOVE_LOCAL, OP_MOVE_WORLD, OP_ROTATE_LOCAL, OP_SET_SCALE,
-    OP_GET_TRANSFORM, OP_LEVEL_PALETTE, OP_LEVEL_NODE,
+    OP_GET_TRANSFORM, OP_LEVEL_PALETTE, OP_LEVEL_NODE, OP_WORLD_TICK,
 ))
 
 NODE_NONE, NODE_OBJECT, NODE_CAMERA, NODE_SPRITE, NODE_LIGHT = 0, 1, 2, 3, 4
@@ -193,7 +195,8 @@ def vec_rotate(m, v):
 class Node:
     __slots__ = ('id', 'type', 'visible', 'pos', 'yaw', 'pitch', 'roll',
                  'scale', 'mesh_id', 'tex_id', 'sprite_w', 'sprite_h',
-                 'sprite_flags', 'light_strength', 'light_radius')
+                 'sprite_flags', 'light_strength', 'light_radius',
+                 'view_space')
 
     def __init__(self):
         self.type = NODE_NONE
@@ -212,6 +215,7 @@ class Node:
         self.sprite_flags = 0
         self.light_strength = 0
         self.light_radius = 0
+        self.view_space = False
 
 
 class Scene:
@@ -275,7 +279,7 @@ FRAME_STREAM_DOC = """\
 #     CAM <id>                        or -1 for none
 #     N <slot> <id> <type> <visible> <x> <y> <z> <yaw> <pitch> <roll> <scale>
 #       <meshid> <texid> <spritew> <spriteh> <spriteflags> <lstrength>
-#       <lradius>
+#       <lradius> <viewspace>
 #   ENDFRAME
 #
 # Node lines are emitted in scene-slot order, which is the order
@@ -405,12 +409,13 @@ class Class1Mixin:
             # The id, not just the slot: CAM names a node by id, and so do
             # the scene's own lookups. Emitting only the slot left every node
             # with id 0 on the scenesim side and no camera ever resolved.
-            self.c1_emit("N %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d"
+            self.c1_emit("N %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d"
                          % (i, n.id, n.type, 1 if n.visible else 0,
                             n.pos[0], n.pos[1], n.pos[2],
                             n.yaw, n.pitch, n.roll, n.scale,
                             n.mesh_id, n.tex_id, n.sprite_w, n.sprite_h,
-                            n.sprite_flags, n.light_strength, n.light_radius))
+                            n.sprite_flags, n.light_strength, n.light_radius,
+                            1 if n.view_space else 0))
         self.c1_emit("ENDFRAME")
 
     # --- LOAD_LEVEL / LEVEL_STEP -----------------------------------------
@@ -625,6 +630,174 @@ class Class1Mixin:
         if err != ERR_OK:
             return err
         self.result = o[12]
+        return ERR_OK
+
+    # --- WORLD_TICK ($6C) ------------------------------------------------
+    #
+    # The block layout is in Source/Firmware/gpu64_3d.h. Same split as
+    # CLIP_MOVE: the protocol -- counts, checksum, what refuses the block,
+    # what refuses one record, what is written back -- is modelled here, and
+    # the traces and moves are the firmware's own C through libclipmove.so.
+    WTICK_MAGIC_IN = 0xD8
+    WTICK_MAGIC_OUT = 0x8D
+    WTICK_HDR = 16
+    WTICK_ACTOR = 20
+    WTICK_TRACE_IN = 28
+    WTICK_MOVE_IN = 28
+    WTICK_OUT_HDR = 8
+    WTICK_ANSWER = 16
+    WTICK_TRAILER = 4
+    WTICK_MAX = (32, 24, 24, 16)        # actors, traces, moves, movers
+    WTICK_VISIBLE = 0x01
+    WTICK_VIEWSPACE = 0x02
+
+    c1_wtick_n = 0
+
+    def c1_wtick_actor(self, sc, r):
+        """One actor record; False refuses it having changed nothing."""
+        nid = r[0] | (r[1] << 8)
+        res = r[2] | (r[3] << 8)
+        flags = r[4]
+        if flags & ~(self.WTICK_VISIBLE | self.WTICK_VIEWSPACE):
+            return False
+        n = sc.find(nid)
+        if n is None:
+            return False
+        kind = self.c1_res.get(res, (None,))[0]
+        if n.type == NODE_OBJECT:
+            if res != 0xFFFF and kind != 'mesh':
+                return False
+        elif n.type == NODE_SPRITE:
+            if res != 0xFFFF and kind != 'tex':
+                return False
+        elif n.type in (NODE_LIGHT, NODE_CAMERA):
+            if res != 0xFFFF:
+                return False
+        else:
+            return False
+        if res != 0xFFFF:
+            if n.type == NODE_OBJECT:
+                n.mesh_id = res
+            else:
+                n.tex_id = res
+        n.visible = bool(flags & self.WTICK_VISIBLE)
+        n.view_space = (n.type != NODE_CAMERA
+                        and bool(flags & self.WTICK_VIEWSPACE))
+        n.pos = list(struct.unpack('<3i', bytes(r[8:20])))
+        n.yaw, n.pitch, n.roll = r[5] << 8, r[6] << 8, r[7] << 8
+        return True
+
+    def c1_world_tick(self, space, addr, length):
+        import ctypes
+        from gpu64model import ERR_OK, ERR_BAD_ARGS
+
+        self.c1_wtick_n += 1
+        if length < self.WTICK_HDR:
+            return ERR_BAD_ARGS
+        err, hdr = self.blob_read(space, addr, self.WTICK_HDR)
+        if err != ERR_OK:
+            return err
+        nact, ntr, nmv, nmover = hdr[1], hdr[2], hdr[3], hdr[4]
+        if (hdr[0] != self.WTICK_MAGIC_IN
+                or any(c > m for c, m in zip((nact, ntr, nmv, nmover),
+                                             self.WTICK_MAX))):
+            return ERR_BAD_ARGS
+        act_off = self.WTICK_HDR
+        tr_off = act_off + nact * self.WTICK_ACTOR
+        mv_off = tr_off + ntr * self.WTICK_TRACE_IN
+        mover_off = mv_off + nmv * self.WTICK_MOVE_IN
+        out_off = mover_off + nmover * self.CLIPMOVE_MOVER_BYTES
+        out_len = (self.WTICK_OUT_HDR + (ntr + nmv) * self.WTICK_ANSWER
+                   + self.WTICK_TRAILER)
+        if length < out_off + out_len:
+            return ERR_BAD_ARGS
+        if (ntr | nmv | nmover) and (self.c1_load is None
+                                     or self.c1_load['phase'] != 'done'):
+            return ERR_BAD_ARGS
+        err, blk = self.blob_read(space, addr, out_off)
+        if err != ERR_OK:
+            return err
+        if (sum(blk[0:6]) + sum(blk[8:])) & 0xFFFF != blk[6] | (blk[7] << 8):
+            return ERR_BAD_ARGS
+
+        lib = None
+        if ntr or nmv:
+            lib = self.c1_clipmove_lib()
+            if lib is None:
+                return ERR_BAD_ARGS
+            lib.gpu64shim_trace_ents.restype = ctypes.c_int
+            lib.gpu64shim_trace_ents.argtypes = [
+                ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int)]
+
+        nhull = self.c1_load['lev'].nhull if nmover else 0
+        movers = (ctypes.c_int * (4 * max(nmover, 1)))()
+        for i in range(nmover):
+            r = blk[mover_off + i * self.CLIPMOVE_MOVER_BYTES:]
+            if r[0] >= nhull:
+                return ERR_BAD_ARGS
+            movers[i * 4] = r[0]
+            movers[i * 4 + 1:i * 4 + 4] = list(struct.unpack('<3i', bytes(r[4:16])))
+        for i in range(ntr):
+            if blk[tr_off + i * self.WTICK_TRACE_IN + 24] > 2:
+                return ERR_BAD_ARGS
+        for i in range(nmv):
+            if blk[mv_off + i * self.WTICK_MOVE_IN + 24] not in (1, 2):
+                return ERR_BAD_ARGS
+
+        sc = self.c1_scene_target()
+        refused = 0
+        applied = 0
+        for i in range(nact):
+            r = blk[act_off + i * self.WTICK_ACTOR:]
+            if self.c1_wtick_actor(sc, r):
+                applied += 1
+            else:
+                refused |= 1 << i
+
+        o = bytearray(out_len)
+        o[0] = self.WTICK_MAGIC_OUT
+        o[1] = hdr[5]
+        o[2] = applied
+        o[4:8] = struct.pack('<I', refused)
+        a = self.WTICK_OUT_HDR
+        out = (ctypes.c_int * 7)()
+        for i in range(ntr):
+            r = blk[tr_off + i * self.WTICK_TRACE_IN:]
+            six = (ctypes.c_int * 6)(*struct.unpack('<6i', bytes(r[0:24])))
+            if not lib.gpu64shim_trace_ents(six, r[24], movers, nmover, out):
+                return ERR_BAD_ARGS
+            o[a:a + 12] = struct.pack('<3i', out[0], out[1], out[2])
+            f = out[3]
+            o[a + 12:a + 14] = struct.pack('<H', 0xFFFF if f >= 0xFFFF else max(f, 0))
+            fl = 0
+            if f >= 0x10000 and not out[4] and not out[5]:
+                fl |= 0x01
+            if out[4]:
+                fl |= 0x02
+            if out[5]:
+                fl |= 0x04
+            o[a + 14] = fl
+            o[a + 15] = out[6] & 0xFF
+            a += self.WTICK_ANSWER
+        for i in range(nmv):
+            r = blk[mv_off + i * self.WTICK_MOVE_IN:]
+            six = (ctypes.c_int * 6)(*struct.unpack('<6i', bytes(r[0:24])))
+            if not lib.gpu64shim_move_ents(six, 0, r[24], r[25], movers,
+                                           nmover, out):
+                return ERR_BAD_ARGS
+            o[a:a + 12] = struct.pack('<3i', out[0], out[1], out[2])
+            for k in range(4):
+                o[a + 12 + k] = out[3 + k] & 0xFF
+            a += self.WTICK_ANSWER
+        o[a:a + 2] = struct.pack('<H', sum(o[:a]) & 0xFFFF)
+        o[a + 2] = self.WTICK_MAGIC_OUT
+        o[a + 3] = hdr[5]
+        err = self.blob_write(space, addr + out_off, o)
+        if err != ERR_OK:
+            return err
+        self.result = min(nact - applied, 255)
         return ERR_OK
 
     # --- LEVEL_ENT ($16) -------------------------------------------------
@@ -985,6 +1158,8 @@ class Class1Mixin:
             self.result = min(fixed, 255)
             return ERR_OK
 
+        if op == OP_WORLD_TICK:
+            return self.c1_world_tick(*self.a_blob(0))
         if op == OP_LEVEL_NODE:
             # gpu64_3d.h: put one level node back the way LEVEL_STEP built
             # it; ARG0 bit 0 also restores the file's position.
@@ -1006,7 +1181,7 @@ class Class1Mixin:
             fixed = 0
             if (n is None or n.type != NODE_OBJECT or n.mesh_id != mesh_id
                     or not n.visible or n.scale != FX8_ONE
-                    or n.yaw or n.pitch or n.roll):
+                    or n.yaw or n.pitch or n.roll or n.view_space):
                 keep = list(n.pos) if n is not None else [x, y, z]
                 if sc.have_active_camera and sc.active_camera_id == nid:
                     sc.have_active_camera = False

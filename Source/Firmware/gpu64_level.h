@@ -23,7 +23,7 @@
 
 // 'G','6','4','L' read as a little-endian u32: 0x47, 0x36, 0x34, 0x4c.
 #define GPU64_LEVEL_MAGIC	0x4c343647
-#define GPU64_LEVEL_VERSION	4
+#define GPU64_LEVEL_VERSION	5
 
 #define GPU64_LEVEL_HEADER_BYTES	36
 
@@ -34,15 +34,18 @@
 #define GPU64_LEVEL_NODE_STRIDE		16	// <HiiiH  meshIdx, x, y, z (16.16), modelIdx
 #define GPU64_LEVEL_ENT_STRIDE		44	// <6H2h3i3iBBH see gpu64_levelEnt below
 #define GPU64_LEVEL_PLANE_STRIDE	12	// <3hiBB  n (1.15), dist (16.16), type, pad
-#define GPU64_LEVEL_HULL_STRIDE		32	// <2i6i   head1, head2, mins[3], maxs[3]
+#define GPU64_LEVEL_HULL_STRIDE		36	// <2i6ii  head1, head2, mins[3], maxs[3], head0
 #define GPU64_LEVEL_CLIP_STRIDE		 8	// <HhhH   plane, child0, child1, pad
 
 // The file buffer. Read once at REU start-up by gpu64_levelPreload(), which
 // is the only moment the SD card is safe to touch: everything after it runs
 // inside reuUsingPolling(), where an EMMC transfer's MMIO traffic would wreck
-// core 0's per-C64-cycle bus timing (CLAUDE.md, "Multicore"). One megabyte
-// covers E1M1's 620 KB with room for a denser level.
-#define GPU64_LEVEL_MAX_BYTES	( 1024 * 1024 )
+// core 0's per-C64-cycle bus timing (CLAUDE.md, "Multicore"). Two megabytes:
+// E1M1's geometry is 620 KB, and milestone 20 adds the monsters' animation
+// frames, the view-model guns, the pickups and the status-bar art on top,
+// which took it past the one megabyte this used to be. It is BSS inside
+// KERNEL_MAX_SIZE's 160 MB, so the size is not a timing question.
+#define GPU64_LEVEL_MAX_BYTES	( 2 * 1024 * 1024 )
 
 #ifndef GPU64_HOSTSIM
 extern u8  gpu64LevelFile[ GPU64_LEVEL_MAX_BYTES ];
@@ -248,6 +251,11 @@ typedef struct
 {
 	s32		nHead[ 2 ];	// [0] is hull 1 (player), [1] is hull 2
 	Gpu64_LevelVec	mins, maxs;
+	// Hull 0, the point hull (v5): the level itself, not shrunk by any
+	// box. What a shot or a line of sight traces against. The converter
+	// builds it from the drawing BSP the way Quake's Mod_MakeHull0 does,
+	// and appends it to the clipnode table.
+	s32		nHead0;
 }
 Gpu64_LevelHull;
 
@@ -337,6 +345,20 @@ boolean gpu64_levelMoveEnts( const Gpu64_Level *pL, unsigned nModel, unsigned nH
 			     const Gpu64_LevelVec *pDelta,
 			     const Gpu64_LevelMover *pMovers, unsigned nMovers,
 			     Gpu64_LevelMove *pOut );
+
+// A straight sweep with no sliding, stepping or settling: Quake's SV_Move
+// for a bullet or a line of sight. nHull is 0 (the point hull), 1 or 2; the
+// movers block it exactly as they block gpu64_levelMoveEnts(). FALSE only for
+// arguments the level cannot satisfy, as there.
+//
+// *pHit (optional) is what the sweep ran into, as GPU64_CLIP_CONT_*: the
+// world's contents one Quake unit beyond the impact, so a shot into the sky
+// says SKY and makes no puff. EMPTY when nothing was hit; SOLID for a hit on
+// a mover, whose contents are always solid.
+boolean gpu64_levelTraceEnts( const Gpu64_Level *pL, unsigned nHull,
+			      const Gpu64_LevelVec *pStart, const Gpu64_LevelVec *pEnd,
+			      const Gpu64_LevelMover *pMovers, unsigned nMovers,
+			      Gpu64_LevelTrace *pTr, u8 *pHit );
 
 // Fills the buffer above from `SD:RAD/level.g64lev`. Call exactly once, from
 // the REU start-up path in rad_main.cpp, before reuUsingPolling().

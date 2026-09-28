@@ -55,7 +55,20 @@
 ;                                        SPACE   jump
 ;        F1 / F3 look up / down          F7      level the view
 ;        + / -   widen / narrow the field of view (30-110 degrees, 75 at start)
-;        RUN/STOP                        leave, and hand the screen back
+;        C= or B fire                    1-4     pick a weapon
+;
+;        Joystick 2: up / down walk, left / right turn, button fires.
+;        1351 mouse in port 1: sideways turns, forward / back looks up and
+;        down, the left button fires.
+;
+;        There is no way out: RUN/STOP is ignored, pressed or ghosted, and
+;        the machine is reset to leave. Only the PC simulator ends a run,
+;        through SIM_EXIT below.
+;
+;        If the C64 freezes, press RESTORE: row 0 then reads NMI, the
+;        address the 6502 was at, and a count of presses. A crash into a
+;        BRK prints BRK and its address there and stops, instead of dropping
+;        to READY.
 ;
 ;      Walk up to the first door of E1M1 and it opens, waits, and closes
 ;      behind you.
@@ -114,6 +127,7 @@
 ;
 
 	.include "gpu64_demo.inc"
+	.include "gpu64_quake_actors.inc"
 
 ; --- class 1 opcodes this program uses ---------------------------------
 OP_SCENE_RESET       = $00
@@ -130,13 +144,17 @@ OP_CLIP_MOVE         = $15
 OP_LEVEL_ENT         = $16
 OP_LEVEL_PALETTE     = $17
 OP_LEVEL_NODE        = $1C
+OP_CREATE_OBJECT     = $20
 OP_CREATE_CAMERA     = $21
 OP_SET_ACTIVE_CAMERA = $23
 OP_SET_VISIBLE       = $24
+OP_CREATE_SPRITE     = $25
+OP_SET_SPRITE        = $27
 OP_SET_POSITION      = $30
 OP_SET_ORIENTATION   = $31
 OP_SET_SCALE         = $35
 OP_GET_TRANSFORM     = $36
+OP_WORLD_TICK        = $6C
 
 KEY_DESTRUCTIVE = $a5
 KEY_CHECKED	= $d0		; | n, see stage2
@@ -227,10 +245,34 @@ KB_LSH  = $80		; left SHIFT: run
 KC_D    = $04
 KD_Q    = $40
 KD_SPC  = $10
-KD_STOP = $80
+KD_1    = $01		; weapons: 1 axe, 2 shotgun (column 7) ...
+KD_2    = $08
+KB_3    = $01		; ... 3 super shotgun, 4 nailgun (column 1)
+KB_4    = $08
+KD_CBM  = $20		; C= fires, as do B, joystick 2's button and the mouse's
+KF_B    = $10		; column 3's B; it is also the row joystick 1's fire pulls
+COL_F   = %11110111	; PA3: B
+KD_LARR = $02		; <- : the stage D test HURT key
 
-; Frames a key must be held before it acts (see readKeys). RUN/STOP ends
-; the session, so it waits longest; + and - then repeat every FOV_REPEAT.
+; The mouse: a 1351 in port 1. PA7:6 = 01 connects port 1's pots to the
+; SID, which finishes a measurement every 512 cycles, so readKeys waits
+; two of them after selecting it. One count of POT X turns 64/65536 of a
+; turn; POT Y is halved into camPitch's 1/256 turns.
+POT_X      = $d419
+POT_Y      = $d41a
+COL_POT1   = %01111111
+MOUSE_SHIFT = 6
+
+; RUN/STOP is ignored -- on the bench phantom RUN/STOPs, from ghosting
+; and from single bad samples, ended the game with nobody asking. Only
+; tools/prgsim/runsim.py can end a run: while its --stop-after schedule
+; holds RUN/STOP down it also writes SIM_EXIT_ON here, a byte nothing on a
+; real C64 writes after the program clears it.
+SIM_EXIT    = $02a7
+SIM_EXIT_ON = $a7
+
+; Frames a key must be held before it acts (see readKeys). The simulator's
+; exit waits longest; + and - then repeat every FOV_REPEAT.
 STOP_HOLD  = 4
 FOV_HOLD   = 3
 FOV_REPEAT = 8
@@ -441,15 +483,18 @@ HB_DTO   = 12
 HB_SLOW  = 16
 HB_FLIPS = 18
 
-; One window over every buffer the Pi writes into, so the four must stay
+; One window over every buffer the Pi writes into, so the five must stay
 ; adjacent and in this order.
-DMA_LEN = HB_LEN + CAM_BUF_LEN + CLIP_LEN + ENT_LEN
+DMA_LEN = HB_LEN + CAM_BUF_LEN + CLIP_LEN + ENT_LEN + WT_LEN
 
 HB_EVERY = 64
 
 	#basicStub
 
 	jsr dmInit
+	jsr trapInit
+	lda #0
+	sta SIM_EXIT
 
 	lda #0
 	jsr dmRow
@@ -483,6 +528,11 @@ HB_EVERY = 64
 	sta fovIx
 	lda #0
 	sta camPitch
+	jsr readKeys
+	lda potX
+	sta potOld
+	lda potY
+	sta potOld+1
 	jsr rgPersp
 	sta perErr
 
@@ -581,14 +631,27 @@ stepDone
 
 	jsr seedCamera
 
+	; The gun and the status bar take the first actor slots, so entScan's
+	; items and monsters are appended after them.
+	jsr actInit
+
 	; The entity lump, one record at a time. This is the part that makes
 	; the program a game rather than a walk, and it happens exactly once:
 	; after it, nothing in the frame loop reads the level file again.
 	jsr entScan
+	jsr combatInit
+	jsr combatCount
 
 	; And every level node's position, read back once so the ring below
 	; has something to put back -- see nodeScan.
 	jsr nodeMark
+
+	; Every actor's node, then three blocks to pose them all (a block
+	; carries thirty dirty records; the frame loop would get there too).
+	jsr actCreate
+	jsr worldTick
+	jsr worldTick
+	jsr worldTick
 
 	lda #0
 	sta ARG+0
@@ -693,10 +756,14 @@ frame
 	jsr gameSelect			; the nearest movers, for the trace
 	jsr clipMove			; the step, collided; updates cam
 	jsr gameTouch			; what the new position opens
+	jsr combatTouch			; what it picks up
 	jsr gameAnimate			; state machines, and the new ofs
 	ldx #MS_GAME
 	jsr clkLap
 	jsr sendMovers			; SET_POSITION for what moved
+	jsr combatFrame			; weapons, a shot's traces, the HUD
+	jsr actFrame			; animate, repair one, WORLD_TICK
+	jsr combatResolve		; the shot, from the traces' answers
 	jsr sendCamera
 	jsr sendView			; SET_PERSPECTIVE, if + or - moved it
 	jsr doRefresh			; one piece of retained state, re-sent
@@ -767,8 +834,8 @@ frNoHealth
 	jsr clkLap
 frDrawn
 
-	lda keyD
-	and #KD_STOP
+	lda SIM_EXIT
+	cmp #SIM_EXIT_ON
 	beq frStopKey
 	lda #0
 	sta stopHold
@@ -809,16 +876,18 @@ fnStopped
 	lda #1
 	jsr dmRow
 	jsr dmText
-	.text "STOPPED - RUN/STOP AGAIN TO EXIT"
+	.text "STOPPED"
 	.byte 0
 
+	; The simulator's release, then its second press: runsim counts the
+	; column-7 reads readKeys makes, so the schedule advances here too.
 -	jsr readKeys
-	lda keyD
-	and #KD_STOP
+	lda SIM_EXIT
+	cmp #SIM_EXIT_ON
 	beq -
 -	jsr readKeys
-	lda keyD
-	and #KD_STOP
+	lda SIM_EXIT
+	cmp #SIM_EXIT_ON
 	bne -
 	jsr $e544
 	rts
@@ -901,7 +970,9 @@ scFenced
 
 moveCamera
 	jsr readKeys
+	jsr deadKeys
 	jsr viewKeys
+	jsr mouseLook
 
 	lda #0
 	ldx #11
@@ -1516,11 +1587,18 @@ bmLoop
 	iny
 	jmp bmLoop
 
-; Bench run 38b: one bad sample of RUN/STOP ended the game with nobody
+; Bench run 38b: one bad sample of a key ended the game with nobody
 ; touching the keyboard -- the frozen HDMI "hang" -- and bad samples of
 ; MINUS narrowed the FOV twice. So each column is read twice and a key
 ; (a 0 bit) is down only if BOTH reads say so; the keys whose effect
-; lasts are also held for several frames first (frame, viewKeys).
+; lasts are also held for several frames first (viewKeys, combatFrame).
+;
+; Both control ports share the matrix. Port 1 (the mouse) drives the ROW
+; lines, so whatever it pulls low reads as held in every column: those
+; rows are masked out of every column below. Port 2 (the joystick) drives
+; the COLUMN lines, so a direction held with a key in its column ghosts
+; that key into every scan: while the stick is off centre the keyboard is
+; ignored and the stick alone steers.
 readKeys
 	sei
 	lda #$ff
@@ -1528,36 +1606,333 @@ readKeys
 	lda #$00
 	sta $dc03
 
+	; The mouse's pots first: port 1 selected, two full SID measurements.
+	lda #COL_POT1
+	sta CIA_PRA
+	ldx #0
+-	dex
+	bne -				; 256 x 5 = 1280 cycles
+	lda POT_X
+	sta potX
+	lda POT_Y
+	sta potY
+
+	; Port 1 with no column selected.
+	lda #$ff
+	sta CIA_PRA
+	lda CIA_PRB
+	sta port1
+	eor #$ff
+	sta p1Mask
+
 	lda #COL_B
 	sta CIA_PRA
 	lda CIA_PRB
 	ora CIA_PRB
+	ora p1Mask
 	sta keyB
 	lda #COL_C
 	sta CIA_PRA
 	lda CIA_PRB
 	ora CIA_PRB
+	ora p1Mask
 	sta keyC
 	lda #COL_D
 	sta CIA_PRA
-	lda CIA_PRB		; once: RUN/STOP has its own STOP_HOLD, and
-	sta keyD		; one column-7 read a frame is what runsim's
-				; --stop-after and check_game.py count by
+	lda CIA_PRB		; once: one column-7 read a frame is what
+	ora p1Mask		; runsim's --stop-after and check_game.py
+	sta keyD		; count by
 	lda #COL_A
 	sta CIA_PRA
 	lda CIA_PRB
 	ora CIA_PRB
+	ora p1Mask
 	sta keyA
 	lda #COL_E
 	sta CIA_PRA
 	lda CIA_PRB
 	ora CIA_PRB
+	ora p1Mask
 	sta keyE
+	lda #COL_F
+	sta CIA_PRA
+	lda CIA_PRB
+	ora CIA_PRB
+	ora p1Mask
+	sta keyF
 
 	lda #$ff
 	sta CIA_PRA
+	lda CIA_PRA		; joystick 2, with no column selected
+	sta joy2
 	cli
+
+	; The stick: off centre, it replaces the keyboard.
+	lda joy2
+	and #$0f
+	cmp #$0f
+	beq rkNoStick
+	lda #$ff
+	sta keyA
+	sta keyB
+	sta keyC
+	sta keyE
+	sta keyF
+	sta keyD
+	lda joy2
+	lsr a
+	bcs +
+	lda keyB
+	and #$ff ^ KB_W
+	sta keyB
++	lda joy2
+	and #$02
+	bne +
+	lda keyB
+	and #$ff ^ KB_S
+	sta keyB
++	lda joy2
+	and #$04
+	bne +
+	lda keyB
+	and #$ff ^ KB_A
+	sta keyB
++	lda joy2
+	and #$08
+	bne rkNoStick
+	lda keyC
+	and #$ff ^ KC_D
+	sta keyC
+rkNoStick
+
+	; Fire: the mouse's button, the stick's, B or C=. A key in a matrix
+	; can be a ghost -- three held keys on three corners of a rectangle
+	; make the fourth read as held -- so B and C= count only if they are
+	; alone in their column or alone in their row.
+	lda #0
+	sta fireDown
+	lda port1
+	and #$10
+	bne +
+	inc fireDown
++	lda joy2
+	and #$10
+	bne +
+	inc fireDown
++
+	lda keyF
+	and #KF_B
+	bne rkNoB
+	lda keyF
+	ora #KF_B
+	cmp #$ff
+	beq rkB
+	lda keyA
+	and keyB
+	and keyC
+	and keyD
+	and keyE
+	and #KF_B
+	beq rkNoB
+rkB	inc fireDown
+rkNoB
+	lda keyD
+	and #KD_CBM
+	bne rkNoCbm
+	lda keyD
+	ora #KD_CBM
+	cmp #$ff
+	beq rkCbm
+	lda keyA
+	and keyB
+	and keyC
+	and keyE
+	and keyF
+	and #KD_CBM
+	beq rkNoCbm
+rkCbm	inc fireDown
+rkNoCbm
 	rts
+
+; The mouse: turn by POT X, look up and down by POT Y. Nothing while dead,
+; like the keys (deadKeys).
+mouseLook
+	lda plDead
+	bne mlDone
+
+	ldx #0
+	lda potX
+	jsr mouseDelta
+	sta mdLo
+	ldy #0
+	cmp #$80
+	bcc +
+	dey
++	sty mdHi
+	ldx #MOUSE_SHIFT
+-	asl mdLo
+	rol mdHi
+	dex
+	bne -
+	clc
+	lda camYaw
+	adc mdLo
+	sta camYaw
+	lda camYaw+1
+	adc mdHi
+	sta camYaw+1
+
+	ldx #1
+	lda potY
+	jsr mouseDelta
+	cmp #$80			; halved, keeping the sign
+	ror a
+	clc
+	adc camPitch			; |sum| < 128: no overflow
+	bmi mlNeg
+	cmp #PITCH_LIM+1
+	bcc mlSet
+	lda #PITCH_LIM
+	bne mlSet
+mlNeg
+	cmp #256-PITCH_LIM
+	bcs mlSet
+	lda #256-PITCH_LIM
+mlSet
+	sta camPitch
+mlDone
+	rts
+
+; The 1351's own recipe. A = the new pot reading, X = 0 (X) or 1 (Y).
+; Bits 6-1 carry the position modulo 64 and bit 0 is noise, so the
+; difference is taken in seven bits, and its top bit is the sign. Returns
+; the signed movement in A; a reading that moved nothing is not kept, so
+; the noise bit cannot creep.
+mouseDelta
+	sta potNew
+	sec
+	sbc potOld,x
+	and #%01111111
+	cmp #%01000000
+	bcs mdNeg
+	lsr a
+	beq mdNone
+	bne mdKeep
+mdNeg
+	ora #%11000000
+	cmp #$ff
+	beq mdNone
+	sec
+	ror a
+mdKeep
+	tay
+	lda potNew
+	sta potOld,x
+	tya
+	rts
+mdNone
+	lda #0
+	rts
+
+; Freeze diagnostics. A BRK -- which is what a derailed 6502 usually runs
+; into, and what used to drop this program to READY -- prints BRK and its
+; address on row 0 and stops there. RESTORE prints NMI, the address the
+; 6502 was interrupted at and a count of presses, then carries on: pressed
+; a few times on a frozen screen, it says which loop the program is stuck
+; in. No answer to RESTORE at all means the 6502 is not running.
+trapInit
+	lda #<brkTrap
+	sta $0316
+	lda #>brkTrap
+	sta $0317
+	lda #<nmiTrap
+	sta $0318
+	lda #>nmiTrap
+	sta $0319
+	rts
+
+; Reached through the KERNAL's IRQ entry, which has pushed A, X and Y on
+; top of BRK's P and return address; the return address is the BRK + 2.
+brkTrap
+	tsx
+	sec
+	lda $0105,x
+	sbc #2
+	sta trapPc
+	lda $0106,x
+	sbc #0
+	sta trapPc+1
+	ldy #0
+	jsr trapShow
+-	jmp -
+
+; The KERNAL's NMI entry is SEI; JMP ($0318), nothing pushed, so after
+; the three pushes here the return address sits where brkTrap finds it.
+nmiTrap
+	pha
+	txa
+	pha
+	tya
+	pha
+	tsx
+	lda $0105,x
+	sta trapPc
+	lda $0106,x
+	sta trapPc+1
+	inc trapN
+	ldy #3
+	jsr trapShow
+	pla
+	tay
+	pla
+	tax
+	pla
+	rti
+
+trapShow
+	ldx #0
+-	lda trapTag,y
+	sta $0400,x
+	lda #1
+	sta $d800,x
+	iny
+	inx
+	cpx #3
+	bne -
+	lda #$20
+	sta $0403
+	sta $0408
+	ldx #4
+	lda trapPc+1
+	jsr trapHex
+	lda trapPc
+	jsr trapHex
+	ldx #9
+	lda trapN
+trapHex
+	pha
+	lsr a
+	lsr a
+	lsr a
+	lsr a
+	jsr trapNyb
+	pla
+	and #$0f
+trapNyb
+	cmp #10
+	bcc +
+	sbc #9				; carry set: 10-15 -> screen codes A-F
+	bne ++
++	ora #$30
++	sta $0400,x
+	lda #1
+	sta $d800,x
+	inx
+	rts
+
+trapTag		.byte 2, 18, 11, 14, 13, 9	; BRK, NMI in screen codes
+trapPc		.word 0
+trapN		.byte 0
 
 mcWalk
 	lda camYaw+1
@@ -1674,6 +2049,7 @@ sendCamera
 	sta stBuf,x
 	dex
 	bpl -
+	jsr camDrop
 	lda #OP_SET_POSITION
 	ldx #11
 	jsr stage2
@@ -2251,8 +2627,9 @@ entTake
 +	cmp #K_TRIG_1
 	bcc etNo
 	cmp #K_TRIG_2+1
-	bcs etNo
+	bcs +
 	jmp etTrig
++	jmp actTake			; items and monsters
 etNo
 	rts
 
@@ -4229,6 +4606,9 @@ sfPit
 	; and would have been the rest of the session (run 39). JMP counts
 	; jumps, G is 1 while standing. D is DRY: frames in a row, now and at
 	; worst, in which no CLIP_MOVE answer was taken -- see cmDry.
+	jsr showWorld
+	jsr showCombat
+
 	lda #19
 	jsr dmRow
 	jsr dmText
@@ -4373,6 +4753,10 @@ clipBlk		.fill CLIP_LEN, 0
 ; same window, so it is declared here beside the others and not down with
 ; the rest of the game's state.
 entBlk		.fill ENT_LEN, 0
+
+; The WORLD_TICK block (gpu64_game_world.inc): the answers are written into
+; its tail, so it is a readback and lives in the window too.
+wtBlk		.fill WT_LEN, 0
 
 ; The displacement this frame asks CLIP_MOVE for: twelve bytes in the same
 ; x, y, z 16.16 order as cam, because camAdd accumulates into it with the
@@ -4641,6 +5025,16 @@ lastNodeH	.byte 0
 ; The view keys and the refresh rings -- see doRefresh.
 keyA		.byte 0
 keyE		.byte 0
+keyF		.byte 0
+port1		.byte $ff
+p1Mask		.byte 0
+fireDown	.byte 0
+potX		.byte $ff
+potY		.byte $ff
+potOld		.byte $ff, $ff
+potNew		.byte 0
+mdLo		.byte 0
+mdHi		.byte 0
 camPitch	.byte 0
 fovIx		.byte 0
 fovDirty	.byte 0
@@ -4660,6 +5054,9 @@ lnIx		.byte 0
 lnI		.byte 0
 lnK		.byte 0
 lnFlag		.fill 256, 0
+
+	.include "gpu64_game_world.inc"
+	.include "gpu64_game_combat.inc"
 
 
 ; ----------------------------------------------------------------------

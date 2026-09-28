@@ -284,6 +284,124 @@
 // that is undefined in both classes or answers BUSY while the loop runs.
 #define GPU64_3D_OP_LEVEL_NODE		0x1C
 
+// gpu64 (milestone 20): WORLD_TICK, one block a frame for everything that
+// moves in a Quake game -- the monsters, the items, the gun and the status
+// bar -- plus every question the game's rules need answered: can this
+// monster see the player, where did this shot land, where does this monster
+// end up if it walks. project/milestone20_quake_combat_design.md has the
+// reasoning; in short, per-actor SET_POSITION/SET_ORIENTATION would be ~70
+// commands a frame, each one a chance for the bus to drop or flip it, and a
+// block is one DMA burst with a checksum.
+//
+// The actor records are applied to the scene exactly as SET_POSITION would
+// apply them -- through the shadow scene while the loop runs, so the op is
+// drain-exempt like SET_POSITION and never makes the C64 wait for a render.
+// They are absolute and applied only when the WHOLE input checks: a lost
+// block costs one frame of stale pose, never a wrong one. The queries read
+// the level file only, like CLIP_MOVE, and are answered into the same block.
+//
+// Unkeyed. Strict mode covers it like any other command that changes state,
+// so a program in strict mode sends it with the checked-command key.
+//
+// The number follows LEVEL_NODE's rule, more strictly: every one-bit flip of
+// $6C is undefined in class 1, and its class 0 twin (a lost CMD_HI) is
+// undefined too. $18 was the first choice and is one bit from SCENE_COMMIT
+// and UPLOAD_MESH -- this block is sent every frame, so it is the command
+// most exposed to a flip.
+#define GPU64_3D_OP_WORLD_TICK		0x6C
+
+// The block. ARG0-5 name it (space, 24-bit address, 16-bit length), and the
+// length must cover the output too. Every position is s32 16.16 world units
+// on gpu64 axes -- the format SET_POSITION and CLIP_MOVE already use.
+//
+// Header, 16 bytes:
+//      0   magic    GPU64_3D_WTICK_MAGIC_IN
+//      1   actors   0..GPU64_3D_WTICK_MAX_ACTORS
+//      2   traces   0..GPU64_3D_WTICK_MAX_TRACES
+//      3   moves    0..GPU64_3D_WTICK_MAX_MOVES
+//      4   movers   0..GPU64_3D_WTICK_MAX_MOVERS
+//      5   frame    anything; echoed back, so a stale answer is recognisable
+//    6-7   check    16-bit sum of bytes 0-5, 8-15 and every input record byte
+//   8-15   reserved, summed, not read
+//
+// Then the input records, back to back from byte 16 in this order:
+//
+// actor, GPU64_3D_WTICK_ACTOR_BYTES each
+//    +0-1  node      a node that already exists; WORLD_TICK creates nothing
+//    +2-3  resource  OBJECT: mesh id. SPRITE: texture id. $FFFF: unchanged.
+//                    LIGHT and CAMERA: must be $FFFF.
+//      +4  flags     GPU64_3D_WTICK_VISIBLE | GPU64_3D_WTICK_VIEWSPACE;
+//                    other bits refuse the record
+//      +5  yaw       a full turn is 256, as the high byte of SET_ORIENTATION's
+//      +6  pitch
+//      +7  roll
+//   +8-19  pos       x, y, z; relative to the eye when VIEWSPACE is set
+//
+// trace, GPU64_3D_WTICK_TRACE_IN_BYTES each -- a hitscan or line of sight
+//   +0-11  start
+//  +12-23  end
+//     +24  hull      0 = point (shots, sight), 1 = player, 2 = large monster
+//  +25-27  reserved, zero
+//
+// move, GPU64_3D_WTICK_MOVE_IN_BYTES each -- CLIP_MOVE for a monster
+//   +0-11  start     origin, or eye height with GPU64_CLIP_MODE_EYE
+//  +12-23  delta
+//     +24  hull      1 or 2
+//     +25  mode      GPU64_CLIP_MODE_* in gpu64_level.h
+//  +26-27  reserved, zero
+//
+// mover, GPU64_3D_CLIPMOVE_MOVER_BYTES each -- CLIP_MOVE's records exactly.
+// They block every trace and every move in the block.
+//
+// Output, written by the Pi from OUT = 16 + the input records' bytes:
+//   OUT+0  magic     GPU64_3D_WTICK_MAGIC_OUT
+//   OUT+1  frame     the header's, echoed
+//   OUT+2  applied   actor records applied
+//   OUT+3  reserved, zero
+// OUT+4-7  refused   bit n = actor record n was refused (no such node, a
+//                    resource of the wrong kind, a bad flag); little-endian
+// then one 16-byte answer per trace:
+//   +0-11  end       where the sweep stopped
+//  +12-13  frac      u16, 65535 = it went the whole way
+//     +14  flags     GPU64_3D_WTICK_TR_*
+//     +15  hit       GPU64_CLIP_CONT_* of what it hit; EMPTY for no hit
+// then one 16-byte answer per move, CLIP_MOVE's bytes 32-47 exactly:
+//   +0-11  end;  +12 flags;  +13 contents;  +14 frac;  +15 bumps
+// then the trailer, 4 bytes:
+//    +0-1  check     16-bit sum of every output byte before the trailer
+//      +2  magic     GPU64_3D_WTICK_MAGIC_OUT, again
+//      +3  frame     echoed again
+//
+// A magic at both ends because a block that only half arrived passes a
+// check at the front (gpu64-health-block-self-verifying). The Pi writes
+// nothing and changes nothing, and answers BAD_ARGS, if: the magic is wrong,
+// a count is over its maximum, the length does not cover input and output,
+// the check fails, a trace hull is not 0-2, a move hull is not 1-2, a mover
+// names a model the level does not have, or there are queries or movers and
+// no level has finished loading. Actor-only blocks need no level. The C64
+// sends it again.
+// RESULT is the number of refused actor records, saturated at 255.
+#define GPU64_3D_WTICK_MAGIC_IN		0xd8
+#define GPU64_3D_WTICK_MAGIC_OUT	0x8d
+#define GPU64_3D_WTICK_HDR_BYTES	16
+#define GPU64_3D_WTICK_ACTOR_BYTES	20
+#define GPU64_3D_WTICK_TRACE_IN_BYTES	28
+#define GPU64_3D_WTICK_MOVE_IN_BYTES	28
+#define GPU64_3D_WTICK_OUT_HDR_BYTES	8
+#define GPU64_3D_WTICK_ANSWER_BYTES	16
+#define GPU64_3D_WTICK_TRAILER_BYTES	4
+#define GPU64_3D_WTICK_MAX_ACTORS	32
+#define GPU64_3D_WTICK_MAX_TRACES	24
+#define GPU64_3D_WTICK_MAX_MOVES	24
+#define GPU64_3D_WTICK_MAX_MOVERS	16
+
+#define GPU64_3D_WTICK_VISIBLE		0x01
+#define GPU64_3D_WTICK_VIEWSPACE	0x02
+
+#define GPU64_3D_WTICK_TR_CLEAR		0x01	// reached the end untouched
+#define GPU64_3D_WTICK_TR_STARTSOLID	0x02
+#define GPU64_3D_WTICK_TR_ALLSOLID	0x04
+
 // Resources -- $10-$1F
 #define GPU64_3D_OP_UPLOAD_MESH		0x10
 #define GPU64_3D_OP_UPLOAD_TEXTURE	0x11

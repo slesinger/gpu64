@@ -33,8 +33,9 @@ LUMPS = ['entities','planes','miptex','vertices','visilist','nodes','texinfo',
 
 MAX_VERTS_PER_MESH = 256
 MAX_UV_SPAN        = 255
-LEVEL_VERSION      = 4      # 1 had no entities, 2 no collision,
-                            # 3 no entity kind and no mover travel
+LEVEL_VERSION      = 5      # 1 had no entities, 2 no collision,
+                            # 3 no entity kind and no mover travel,
+                            # 4 no point hull (hull 0)
 
 
 def read_pak(path):
@@ -103,6 +104,12 @@ class Bsp:
         o, l = self.lump['clipnodes']
         self.clipnodes = [struct.unpack_from('<i2h', data, o + i * 8)
                           for i in range(l // 8)]
+        o, l = self.lump['nodes']
+        self.nodes = [struct.unpack_from('<i2h', data, o + i * 24)
+                      for i in range(l // 24)]
+        o, l = self.lump['leaves']
+        self.leafcontents = [struct.unpack_from('<i', data, o + i * 28)[0]
+                             for i in range(l // 28)]
         self.textures = self._miptex()
 
     def _miptex(self):
@@ -714,7 +721,7 @@ def build_entities(bsp, stats):
 # ---------------------------------------------------------------------------
 
 PLANE_STRIDE = 12
-HULL_STRIDE  = 32
+HULL_STRIDE  = 36
 CLIP_STRIDE  = 8
 
 # Quake axis -> gpu64 axis, the same (x, z, y) swap to_gpu64() applies. A
@@ -739,6 +746,23 @@ def build_collision(bsp, stats):
                                   int(round(dist / QU_PER_WU * 65536)),
                                   AXIS_MAP[ty] if 0 <= ty < 3 else 3, 0))
 
+    # Hull 0, the point hull: what a bullet and a line of sight trace
+    # against. Quake has no clipnodes for it -- Mod_MakeHull0 builds them at
+    # load time from the drawing BSP, a node per node with each leaf child
+    # replaced by that leaf's contents -- so this does the same here and
+    # appends the result after the real clipnodes. Hulls 1 and 2 would do
+    # for walking but not for shooting: they are the level shrunk by a
+    # player's box, so a shot would stop 16 units short of every wall and a
+    # window narrower than 32 would block sight.
+    h0base = len(bsp.clipnodes)
+    if h0base + len(bsp.nodes) > 32767:
+        sys.exit('hull 0 does not fit s16 clipnode children')
+
+    def h0child(c):
+        if c >= 0:
+            return h0base + c
+        return bsp.leafcontents[-1 - c]
+
     hulls = []
     for m in bsp.models:
         lo = to_gpu64(m['mins'])
@@ -747,10 +771,12 @@ def build_collision(bsp, stats):
         # the box is rebuilt rather than carried across: mins that are not
         # minimal make every trace against that model miss.
         b = [(min(lo[k], hi[k]), max(lo[k], hi[k])) for k in range(3)]
-        hulls.append(struct.pack('<2i6i', m['headnode'][1], m['headnode'][2],
-                                 *[int(round(v * 65536))
-                                   for v in [b[0][0], b[1][0], b[2][0],
-                                             b[0][1], b[1][1], b[2][1]]]))
+        # head0 goes last, so the v4 fields keep their offsets.
+        hulls.append(struct.pack('<2i6ii', m['headnode'][1], m['headnode'][2],
+                                 *([int(round(v * 65536))
+                                    for v in [b[0][0], b[1][0], b[2][0],
+                                              b[0][1], b[1][1], b[2][1]]]
+                                   + [h0base + m['headnode'][0]])))
 
     clips = []
     for pn, c0, c1 in bsp.clipnodes:
@@ -761,6 +787,9 @@ def build_collision(bsp, stats):
         # both fit s16 and both are passed through unchanged, because the
         # trace's whole job is to tell those two apart.
         clips.append(struct.pack('<Hhh H', pn, c0, c1, 0))
+    for pn, c0, c1 in bsp.nodes:
+        clips.append(struct.pack('<Hhh H', pn, h0child(c0), h0child(c1), 0))
+    stats['hull0_nodes'] = len(bsp.nodes)
     return planes, hulls, clips
 
 
@@ -774,6 +803,11 @@ def main():
                          'see-through failure, not something a level needs')
     ap.add_argument('--worldspawn-only', action='store_true',
                     help='skip the 57 brush models (doors, platforms, buttons)')
+    ap.add_argument('--no-actors', action='store_true',
+                    help='the level alone, without milestone 20\'s monsters, '
+                         'guns, pickups and status bar')
+    ap.add_argument('--inc', default=None,
+                    help='write the actor catalogue as a 64tass include')
     a = ap.parse_args()
 
     f, ents = read_pak(a.pak)
@@ -856,6 +890,36 @@ def main():
         nodes.append((len(meshes) - 1, org, mi))
 
     entrecs, entstrs = build_entities(bsp, stats)
+
+    # Milestone 20: monsters, guns, pickups and the status bar, appended to
+    # the same tables so the loader builds them as ordinary resources. They
+    # get no nodes -- the game creates actor nodes itself. See quake_assets.py.
+    nLevelMeshes = len(meshes)
+    if not a.no_actors:
+        import quake_assets
+        atex, amesh, sym = quake_assets.build(
+            f, ents, pak_read, Bsp, collect, pal, len(texrecs), len(meshes),
+            stats)
+        for name, ws, hs, px in atex:
+            texrecs.append((0xffff, ws, hs, 0, len(px)))
+            texblobs.append(px)
+        meshes.extend(amesh)
+        # The catalogue record: the last entity, kind 9, spawnflags = a hash
+        # of every symbol in the include, p0/p1 = mesh and texture counts. A
+        # game built against another converter run refuses the level on it.
+        cat_hash = quake_assets.catalogue_hash(sym)
+        so = len(entstrs)
+        entstrs = entstrs + b'gpu64_catalog\0'
+        entrecs.append(struct.pack('<6H2h3i3iBBH', so, 0, cat_hash, 0, 0, 0,
+                                   min(32767, len(meshes)),
+                                   min(32767, len(texrecs)),
+                                   0, 0, 0, 0, 0, 0, 9, 0, 0))
+        stats['actor_meshes'] = len(amesh)
+        stats['actor_textures'] = len(atex)
+        if a.inc:
+            quake_assets.write_inc(a.inc, sym, len(entrecs) - 1, cat_hash)
+            print('  wrote %s (%d symbols, hash $%04x)'
+                  % (a.inc, len(sym), cat_hash))
     planes, hulls, clips = build_collision(bsp, stats)
 
     print('%s: %d faces, %d verts, %d textures, %d models'
@@ -897,7 +961,14 @@ def main():
         stro = put(entstrs)
         trec = [(t, ws, hs, put(texblobs[i]), ln)
                 for i, (t, ws, hs, _, ln) in enumerate(texrecs)]
-        mrec = [(put(v), len(v), put(fb), len(fb)) for v, fb in meshes]
+        # Animation frames share one face blob per model (quake_assets.py);
+        # the loader copies blobs into the arena, so sharing is free.
+        shared = {}
+        def put_shared(b):
+            if b not in shared:
+                shared[b] = put(b)
+            return shared[b]
+        mrec = [(put(v), len(v), put_shared(fb), len(fb)) for v, fb in meshes]
         tbl = b''.join(struct.pack('<HBBII', *r) for r in trec)
         mtb = b''.join(struct.pack('<IIII', *r) for r in mrec)
         ntb = b''.join(struct.pack('<HiiiH', n[0],

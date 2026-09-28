@@ -40,14 +40,14 @@
 // and the firmware loader will have to do it this way too.
 
 #define LEVEL_MAGIC	0x4c343647u	// 'G64L'
-#define LEVEL_VERSION	4
+#define LEVEL_VERSION	5
 
 #define TEX_STRIDE	12
 #define MESH_STRIDE	16
 #define NODE_STRIDE	16
 #define ENT_STRIDE	44
 #define PLANE_STRIDE	12
-#define HULL_STRIDE	32
+#define HULL_STRIDE	36
 #define CLIP_STRIDE	8
 
 static u8 *g_Lev;
@@ -397,6 +397,109 @@ static boolean buildScene( void )
 	return TRUE;
 }
 
+// Milestone 20's showcase: extra nodes from the command line, placed in the
+// level (or on an empty background with --no-level) so a model's axes,
+// winding and animation can be looked at before any firmware or 6502 code
+// exists to place it. An actor is FIRST[+COUNT]@x,y,z[,yawdeg] in level mesh
+// indices; with COUNT it steps through COUNT frames, one per rendered frame,
+// which is exactly the resource change WORLD_TICK will make. A sprite is
+// TEXID@x,y,z,w,h in world units. --view-actor= and --view-sprite= take the
+// same forms and set the node's viewSpace flag, as WORLD_TICK does for the
+// gun and the status bar: the position is then relative to the camera
+// (x right, y up, z forward) and the node is drawn over the level.
+#define MAX_EXTRA	64
+#define EXTRA_ID_BASE	400
+
+struct Extra
+{
+	boolean	bSprite, bView;
+	unsigned first, count;
+	double	x, y, z, yaw, w, h;
+};
+static Extra g_Extra[ MAX_EXTRA ];
+static unsigned g_nExtra;
+
+static boolean parseExtra( const char *p, boolean bSprite )
+{
+	if ( g_nExtra >= MAX_EXTRA )
+		return FALSE;
+	Extra &e = g_Extra[ g_nExtra ];
+	memset( &e, 0, sizeof( e ) );
+	e.bSprite = bSprite;
+	e.count = 1;
+	if ( bSprite )
+	{
+		if ( sscanf( p, "%u@%lf,%lf,%lf,%lf,%lf", &e.first, &e.x, &e.y, &e.z,
+			     &e.w, &e.h ) != 6 )
+			return FALSE;
+	}
+	else
+	{
+		const int n = strchr( p, '+' ) && strchr( p, '+' ) < strchr( p, '@' )
+			? sscanf( p, "%u+%u@%lf,%lf,%lf,%lf", &e.first, &e.count,
+				  &e.x, &e.y, &e.z, &e.yaw )
+			: sscanf( p, "%u@%lf,%lf,%lf,%lf", &e.first,
+				  &e.x, &e.y, &e.z, &e.yaw ) + 1;
+		if ( n < 5 || e.count == 0 )
+			return FALSE;
+	}
+	g_nExtra++;
+	return TRUE;
+}
+
+static Gpu64_3dNode *findNode( u16 nId )
+{
+	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
+		if ( g_Scene.node[ i ].type != GPU64_3D_NODE_NONE
+		  && g_Scene.node[ i ].id == nId )
+			return &g_Scene.node[ i ];
+	return 0;
+}
+
+static Gpu64_3dNode *findNode( u16 nId );
+
+static boolean buildExtras( void )
+{
+	for ( unsigned i = 0; i < g_nExtra; i++ )
+	{
+		const Extra &e = g_Extra[ i ];
+		const u16 id = (u16)( EXTRA_ID_BASE + i );
+		u8 res = e.bSprite
+			? gpu64_3dSceneCreateSprite( &g_Scene, id, (u16)e.first )
+			: gpu64_3dSceneCreateObject( &g_Scene, id,
+						     (u16)( MESH_ID_BASE + e.first ) );
+		if ( res != GPU64_3D_OK )
+		{
+			fprintf( stderr, "levelsim: extra node %u rejected (err %02x)\n",
+				 i, res );
+			return FALSE;
+		}
+		Gpu64_3dVec pos;
+		pos.x = (s32)( e.x * 65536.0 );
+		pos.y = (s32)( e.y * 65536.0 );
+		pos.z = (s32)( e.z * 65536.0 );
+		gpu64_3dSceneSetPosition( &g_Scene, id, &pos );
+		if ( e.bView )
+			findNode( id )->viewSpace = 1;
+		if ( e.bSprite )
+			gpu64_3dSceneSetSprite( &g_Scene, id, (u16)( e.w * 256.0 ),
+						(u16)( e.h * 256.0 ), 0 );
+		else
+			gpu64_3dSceneSetOrientation( &g_Scene, id,
+				(u16)(int)( e.yaw * 65536.0 / 360.0 ), 0, 0 );
+	}
+	return TRUE;
+}
+
+static void animateExtras( unsigned frame )
+{
+	for ( unsigned i = 0; i < g_nExtra; i++ )
+		if ( !g_Extra[ i ].bSprite && g_Extra[ i ].count > 1 )
+			if ( Gpu64_3dNode *pN = findNode( (u16)( EXTRA_ID_BASE + i ) ) )
+				pN->meshId = (u16)( MESH_ID_BASE + g_Extra[ i ].first
+						    + frame % g_Extra[ i ].count );
+}
+
 // Finds info_player_start and returns its eye position and yaw. The eye is
 // 22 Quake units above the entity origin -- Quake's own view_ofs -- which at
 // 32 units per world unit is not negligible: without it the camera sits at
@@ -450,7 +553,8 @@ int main( int argc, char **argv )
 	boolean bTurn = FALSE, bQuiet = FALSE, bHavePos = FALSE;
 	Gpu64_3dVec camPos = { 0, 0, 0 };
 	u16 camYaw = 0, camPitch = 0;
-	int nFovDeg = 0;
+	int nFovDeg = 0, nBg = 0;
+	boolean bNoLevel = FALSE;
 	double px = 0, py = 0, pz = 0;
 
 	for ( int i = 1; i < argc; i++ )
@@ -472,6 +576,25 @@ int main( int argc, char **argv )
 			camPitch = (u16)(int)( atof( argv[ i ] + 8 ) * 65536.0 / 360.0 );
 		else if ( !strncmp( argv[ i ], "--fov=", 6 ) )
 			nFovDeg = atoi( argv[ i ] + 6 );
+		else if ( !strcmp( argv[ i ], "--no-level" ) )
+			bNoLevel = TRUE;
+		else if ( !strncmp( argv[ i ], "--bg=", 5 ) )
+			nBg = atoi( argv[ i ] + 5 );
+		else if ( !strncmp( argv[ i ], "--actor=", 8 )
+		       || !strncmp( argv[ i ], "--sprite=", 9 )
+		       || !strncmp( argv[ i ], "--view-actor=", 13 )
+		       || !strncmp( argv[ i ], "--view-sprite=", 14 ) )
+		{
+			const boolean bView = argv[ i ][ 2 ] == 'v';
+			const char *p = argv[ i ] + ( bView ? 7 : 2 );
+			const boolean bSpr = p[ 0 ] == 's';
+			if ( !parseExtra( p + ( bSpr ? 7 : 6 ), bSpr ) )
+			{
+				fprintf( stderr, "levelsim: bad %s\n", argv[ i ] );
+				return 2;
+			}
+			g_Extra[ g_nExtra - 1 ].bView = bView;
+		}
 		else if ( !pLevel )
 			pLevel = argv[ i ];
 		else
@@ -482,7 +605,9 @@ int main( int argc, char **argv )
 	{
 		fprintf( stderr, "usage: levelsim <level.g64lev> [outdir]"
 				  " [--frames=N] [--turn] [--pos=x,y,z] [--yaw=DEG]"
-				  " [--pitch=DEG] [--fov=DEG] [--quiet]\n" );
+				  " [--pitch=DEG] [--fov=DEG] [--quiet] [--no-level] [--bg=IDX]"
+				  " [--actor=MESH[+N]@x,y,z[,yaw]] [--sprite=TEX@x,y,z,w,h]"
+				  " [--view-actor=...] [--view-sprite=...]\n" );
 		return 2;
 	}
 
@@ -504,13 +629,13 @@ int main( int argc, char **argv )
 	gpu64_3dSceneReset( &g_Scene );
 	memset( g_Res, 0, sizeof( g_Res ) );
 
-	if ( !buildResources() || !buildScene() )
+	if ( !buildResources() || ( !bNoLevel && !buildScene() ) || !buildExtras() )
 		return 1;
 
 	// The colormap is what makes the level lit rather than flat, and it is
 	// derived from the level's own palette -- same call BUILD_COLORMAP makes.
 	gpu64_3dBuildColormap( &g_State, g_Palette );
-	g_State.background = 0;
+	g_State.background = (u8)nBg;
 
 	if ( nFovDeg )
 	{
@@ -565,6 +690,7 @@ int main( int argc, char **argv )
 			: camYaw;
 		gpu64_3dSceneSetPosition( &g_Scene, CAMERA_ID, &camPos );
 		gpu64_3dSceneSetOrientation( &g_Scene, CAMERA_ID, yaw, camPitch, 0 );
+		animateExtras( frame );
 
 		gpu64_3dSceneRender( &g_Scene, &g_State, &target, &g_Scratch,
 				      lookupMesh, 0, lookupTexture, 0 );

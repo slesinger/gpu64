@@ -334,11 +334,17 @@ void gpu64_3dSceneApplyLights( const Gpu64_3dScene *pScene, Gpu64_3dState *pStat
 		// fuses the view and model rotations into one matrix, so there is no
 		// world-space vertex anywhere downstream for a world-space light to
 		// be compared against.
+		// A view-space light (milestone 20's muzzle flash) is there already.
 		Gpu64_3dVec rel, v;
-		rel.x = pN->pos.x - pState->viewPos.x;
-		rel.y = pN->pos.y - pState->viewPos.y;
-		rel.z = pN->pos.z - pState->viewPos.z;
-		gpu64_3dVecRotate( &v, &pState->viewRot, &rel );
+		if ( pN->viewSpace )
+			v = pN->pos;
+		else
+		{
+			rel.x = pN->pos.x - pState->viewPos.x;
+			rel.y = pN->pos.y - pState->viewPos.y;
+			rel.z = pN->pos.z - pState->viewPos.z;
+			gpu64_3dVecRotate( &v, &pState->viewRot, &rel );
+		}
 
 		Gpu64_3dPointLight *pL = &pState->lights[ n ];
 		pL->x = v.x >> 8;			// 16.16 -> 8.8
@@ -366,6 +372,78 @@ void gpu64_3dSceneApplyLights( const Gpu64_3dScene *pScene, Gpu64_3dState *pStat
 // Contract in gpu64_3d_scene.h. Extracted verbatim from stage 16's
 // gpu64_3dExecuteRenderScene() so the firmware and tools/hostsim run the
 // same node loop rather than two that agree by inspection.
+// Milestone 20: the nodes whose pose is relative to the eye -- the gun, the
+// status bar. Drawn last, over a z-buffer cleared for them, so nothing in the
+// world can cut into them however close the player stands to a wall; among
+// themselves they still depth-test, which is what lets the bar's digits sit
+// on its background tiles. The view transform is swapped for the identity
+// for the length of the pass and put back, rather than copying the state:
+// Gpu64_3dState carries a 4 KB colormap, and a copy of it would be a store
+// burst of its own on core 1. The point lights stay as they are -- they are
+// already in view space, which is exactly the space these nodes are in.
+//
+// The near plane is the state's own, so a view model's parked muzzle flash,
+// which sits behind the eye on its idle frames, is clipped away rather than
+// projected through the camera.
+static void renderViewSpace( const Gpu64_3dScene *pScene,
+			     Gpu64_3dState *pState,
+			     Gpu64_3dTarget *pTarget,
+			     Gpu64_3dScratch *pScratch,
+			     Gpu64_3dMeshLookup pMeshLookup, void *pMeshCtx,
+			     Gpu64_3dTextureLookup pTexLookup, void *pTexCtx )
+{
+	unsigned i;
+	for ( i = 0; i < GPU64_3D_MAX_NODES; i++ )
+	{
+		const Gpu64_3dNode *pN = &pScene->node[ i ];
+		if ( pN->viewSpace && pN->visible &&
+		     ( pN->type == GPU64_3D_NODE_OBJECT || pN->type == GPU64_3D_NODE_SPRITE ) )
+			break;
+	}
+	if ( i == GPU64_3D_MAX_NODES )
+		return;				// the common case costs one scan
+
+	gpu64_3dClearDepth( pState, pTarget );
+
+	const Gpu64_3dMat viewRot = pState->viewRot;
+	const Gpu64_3dVec viewPos = pState->viewPos;
+	gpu64_3dMatIdentity( &pState->viewRot );
+	pState->viewPos.x = pState->viewPos.y = pState->viewPos.z = 0;
+
+	for ( ; i < GPU64_3D_MAX_NODES; i++ )
+	{
+		const Gpu64_3dNode *pN = &pScene->node[ i ];
+		if ( pN->type != GPU64_3D_NODE_OBJECT || !pN->visible || !pN->viewSpace )
+			continue;
+
+		const Gpu64_3dMesh *pMesh =
+			pMeshLookup ? pMeshLookup( pMeshCtx, pN->meshId ) : 0;
+		if ( pMesh == 0 )
+			continue;
+
+		gpu64_3dDrawMesh( pState, pTarget, pScratch, pMesh,
+				   &pN->pos, &pN->rot, pN->scale,
+				   pTexLookup, pTexCtx );
+		GPU64_3D_YIELD();
+	}
+
+	for ( i = 0; i < GPU64_3D_MAX_NODES; i++ )
+	{
+		const Gpu64_3dNode *pN = &pScene->node[ i ];
+		if ( pN->type != GPU64_3D_NODE_SPRITE || !pN->visible || !pN->viewSpace )
+			continue;
+
+		gpu64_3dDrawSprite( pState, pTarget, &pN->pos,
+				     pN->spriteW, pN->spriteH, pN->texId,
+				     pN->yaw, pN->spriteFlags,
+				     pTexLookup, pTexCtx );
+		GPU64_3D_YIELD();
+	}
+
+	pState->viewRot = viewRot;
+	pState->viewPos = viewPos;
+}
+
 void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
 			   Gpu64_3dState *pState,
 			   Gpu64_3dTarget *pTarget,
@@ -388,7 +466,7 @@ void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
 	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
 	{
 		const Gpu64_3dNode *pN = &pScene->node[ i ];
-		if ( pN->type != GPU64_3D_NODE_OBJECT || !pN->visible )
+		if ( pN->type != GPU64_3D_NODE_OBJECT || !pN->visible || pN->viewSpace )
 			continue;
 
 		const Gpu64_3dMesh *pMesh =
@@ -416,7 +494,7 @@ void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
 	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
 	{
 		const Gpu64_3dNode *pN = &pScene->node[ i ];
-		if ( pN->type != GPU64_3D_NODE_SPRITE || !pN->visible )
+		if ( pN->type != GPU64_3D_NODE_SPRITE || !pN->visible || pN->viewSpace )
 			continue;
 
 		gpu64_3dDrawSprite( pState, pTarget, &pN->pos,
@@ -426,4 +504,7 @@ void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
 
 		GPU64_3D_YIELD();
 	}
+
+	renderViewSpace( pScene, pState, pTarget, pScratch,
+			 pMeshLookup, pMeshCtx, pTexLookup, pTexCtx );
 }

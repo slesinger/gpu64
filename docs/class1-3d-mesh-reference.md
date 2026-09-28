@@ -162,6 +162,12 @@ running.
 | $41 | `DRAW_MESH` | 14 | `ARG0-5` position x,y,z (8.8), `ARG6-11` orientation, `ARG12-13` scale; mesh resource in `ID` | Transforms, lights, clips and rasterises one mesh into the draw page's viewport, z-tested. Queues on core 1 and returns immediately — see "Deferred RESULT" below for what that means for reading the outcome back. Ignores the scene graph entirely — draws in world space unless a camera has been applied by a preceding `DRAW_NODE` call this session (`SET_PERSPECTIVE`'s projection still applies either way). `RESULT` = triangle count drawn, saturated to a byte — **a mesh that draws 0 triangles and a winding-order mistake that culls every face look identical**, so check `RESULT` after your first upload of any new mesh. |
 | $42 | `DRAW_NODE` | 0 | — | Draws the staged object node `ID` using its retained position/orientation/scale — no re-staging a transform, unlike `DRAW_MESH`. Queues on core 1 and returns immediately, same as `DRAW_MESH` — see "Deferred RESULT" below. Applies the active camera (if any) fresh on every call, so moving the camera between two `DRAW_NODE`s in one frame is seen by both — "every call" means every call as actually run on core 1, in the order queued, not the order a deferred `RESULT` is later read. `BAD_ID` if the staged `ID` is not a live object node (a camera `ID` included) — this much is still checked on core 0 before the call returns, since it can be. An invisible node (`SET_VISIBLE 0`) is skipped silently: `RESULT` = 0, `ERRCODE` = `OK`, same "0 is informative, not an error" convention `DRAW_MESH` uses for full culling. |
 
+### The world — $60-$6F
+
+| Op | Name | Bytes | Arguments | Effect |
+|---|---|---|---|---|
+| $6C | `WORLD_TICK` | 6 | `ARG0-5` descriptor of a block in C64 RAM or REU | One block a frame for a whole game. It poses up to 32 existing nodes (absolute position, yaw/pitch/roll, mesh or sprite texture, visible, view space), traces up to 24 shots or lines of sight, and moves up to 24 monsters through the level's hulls. Everything travels in the block, checked at both ends; see "A world in one block". `BAD_ARGS` and nothing changed if the block is malformed or does not check. `RESULT` = actor records refused, saturated at 255. Not keyed, not `BUSY` while the loop runs: the poses go to the shadow scene like `SET_POSITION`'s. Not strict-exempt. |
+
 ### Deferred RESULT
 
 As of stage 15b (2026-08-29), `CLEAR_VIEWPORT`/`DRAW_MESH`/`DRAW_NODE` queue
@@ -400,6 +406,9 @@ on, and from then on a class-1 command **without** a check is refused with
 - `LOOP_START` ($06), `ARENA_STATUS` ($09), `CLIP_MOVE` ($15),
   `LEVEL_ENT` ($16) and `GET_TRANSFORM` ($36). These only read state or are
   retried by design, so a phantom one does no lasting harm.
+
+`WORLD_TICK` ($6C) is **not** exempt, because it moves nodes. In strict mode,
+send it with the check like any `SET_*`.
 
 A keyed `SCENE_RESET`, a `FULL_RESET` or a C64 reset switches strict mode
 off again. A program that never checks its commits is unaffected. A program
@@ -848,6 +857,143 @@ that door.
 Both obligations are `CLIP_MOVE`'s, for the same reasons: check the output
 magic **and** checksum rather than `ERRCODE`, and set `SET_DMA_WINDOW` around
 the block.
+
+## A world in one block
+
+A Quake game has thirty-odd things moving at once: monsters, items, the gun,
+the status bar. Posing each one with `SET_POSITION` and `SET_ORIENTATION`
+would take about seventy commands a frame, and each one is a chance for the
+bus to drop or flip it. `WORLD_TICK` ($6C) takes all of them in one block,
+plus every geometric question the game's rules ask in that frame: *can this
+monster see me*, *where did this shot land*, *where does this monster end up
+if it walks*.
+
+The descriptor is `CLIP_MOVE`'s: `ARG0` space, `ARG1-3` address, `ARG4-5`
+length. The length must cover the input **and** the output, because gpu64
+writes the answers into the same block, straight after your input records.
+
+**Header, 16 bytes:**
+
+| Byte | Meaning |
+|---|---|
+| 0 | magic `$D8` |
+| 1 | actors, 0-32 |
+| 2 | traces, 0-24 |
+| 3 | moves, 0-24 |
+| 4 | movers, 0-16 |
+| 5 | frame: any value. It is echoed back, so you can recognise a stale answer |
+| 6-7 | check: 16-bit sum of bytes 0-5, bytes 8-15 and every input record byte |
+| 8-15 | reserved. Included in the sum, but not read |
+
+The input records follow from byte 16, back to back, in this order: actors,
+then traces, then moves, then movers.
+
+**Actor, 20 bytes.** It poses one node that already exists. `WORLD_TICK`
+never creates or destroys a node.
+
+| Bytes | Meaning |
+|---|---|
+| +0-1 | node id |
+| +2-3 | resource. An object takes a mesh id; a sprite takes a texture id. `$FFFF` leaves the resource unchanged. It must be `$FFFF` for a light or a camera |
+| +4 | flags: `$01` visible, `$02` view space. Any other bit refuses the record |
+| +5-7 | yaw, pitch, roll: the high byte of `SET_ORIENTATION`'s angles, so a full turn is 256 |
+| +8-19 | position x, y, z, s32 16.16. In view space it is relative to the eye |
+
+**Trace, 28 bytes.** One hitscan shot or line of sight.
+
+| Bytes | Meaning |
+|---|---|
+| +0-11 | start, s32 16.16 |
+| +12-23 | end |
+| +24 | hull: 0 is a point (use it for shots and sight), 1 the player's box, 2 the large one |
+| +25-27 | zero |
+
+**Move, 28 bytes.** `CLIP_MOVE` for a monster: +0-11 start, +12-23 delta,
++24 hull (1 or 2), +25 mode (`CLIP_MOVE`'s mode bits), +26-27 zero.
+
+**Mover, 16 bytes.** Exactly `CLIP_MOVE`'s door record. The doors you list
+block every trace and every move in the block.
+
+**Output.** gpu64 writes it from `OUT` = 16 + the bytes of all your input
+records:
+
+| Bytes | Meaning |
+|---|---|
+| OUT+0 | magic `$8D` |
+| OUT+1 | frame, echoed |
+| OUT+2 | actor records applied |
+| OUT+3 | zero |
+| OUT+4-7 | refused: bit *n* is set when actor record *n* was refused, little-endian |
+
+Then one 16-byte answer per trace:
+
+| Bytes | Meaning |
+|---|---|
+| +0-11 | where the trace stopped |
+| +12-13 | fraction, u16. 65535 means it went the whole way |
+| +14 | flags: `$01` clear (it reached the end untouched), `$02` it started in solid, `$04` it was solid all the way |
+| +15 | contents of what it hit, using `CLIP_MOVE`'s contents codes. 0 means no hit |
+
+Then one 16-byte answer per move. This is exactly `CLIP_MOVE`'s bytes 32-47:
+end, flags, contents, fraction, bumps.
+
+Then a 4-byte trailer: a 16-bit sum of every output byte before it, the
+magic `$8D` again and the frame again. The magic is at both ends because a
+block that only half arrived passes a check made only at the front.
+
+Line of sight is a hull-0 trace from the monster's eye to yours: it can see
+you when flag `$01` is set. A shot is a hull-0 trace from the muzzle to a
+point far along the aim. Compare its fraction against each monster's box on
+the C64; the level only knows walls and doors, not monsters.
+
+### What gets refused
+
+A malformed block is refused **whole**. gpu64 writes nothing, changes nothing
+and answers `BAD_ARGS` when any of these is true:
+
+- the magic is wrong;
+- a count is over its maximum;
+- the length does not cover the input and the output;
+- the check fails;
+- a trace hull is not 0-2, or a move hull is not 1-2;
+- a mover names a model the level does not have;
+- the block has traces, moves or movers and no level has finished loading.
+
+A block with only actors needs no level.
+
+Once the block has passed, a bad **actor record** is refused on its own and
+the rest are applied. That happens when the node does not exist, when the
+resource is the wrong kind for the node, or when a flag bit is undefined. The
+refused bitmap tells you which records failed, and `RESULT` tells you how
+many. Actor records are absolute and are applied only from a block that
+passed, so a lost block costs one frame of stale pose, never a wrong one.
+
+The obligations are `CLIP_MOVE`'s:
+
+- Check the output magics, the sum and the frame echo, not `ERRCODE`.
+- Poison the output half before each attempt.
+- Keep the block inside `SET_DMA_WINDOW`.
+- When it fails, send it again. The input half is untouched.
+- Bound every move answer by its question, as for the player.
+
+### View space: the gun and the status bar
+
+A node posed with flag `$02` is drawn in **view space**. Its position and
+angles are relative to the eye rather than to the world. gpu64 draws it after
+the whole world, over a cleared depth buffer, so it never sinks into a wall
+you are standing against. Use this for the gun and the HUD. The flag stays set
+until a `WORLD_TICK` clears it; `CREATE_*` and `LEVEL_NODE` also clear it.
+A camera never goes into view space: on a camera the flag is ignored and the rest of the record is applied.
+
+Two practical points:
+
+- **Place the gun forward of the eye.** A Quake view model is built around
+  the eye, and at z = 0 most of it is behind the near plane. About 0.3-0.4
+  world units forward, with a near plane of 0.1, puts it on screen.
+- **Mark HUD sprites unlit** (`SET_SPRITE` flag bit 3). View-space nodes are
+  lit, and the directional light is applied to them as if it turned with you.
+  A HUD sprite faces straight back at the eye, so unless the light happens to
+  shine along your view it is shaded dark.
 
 ## Lighting
 

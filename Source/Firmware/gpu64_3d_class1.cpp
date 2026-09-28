@@ -296,6 +296,8 @@ static boolean isShadowRedirectable( u8 op )
 	case GPU64_3D_OP_GET_TRANSFORM:
 	case GPU64_3D_OP_LEVEL_PALETTE:		// colormap via stateTargetForEdit()
 	case GPU64_3D_OP_LEVEL_NODE:		// scene via sceneTarget()
+	case GPU64_3D_OP_WORLD_TICK:		// scene via sceneTarget(); the rest
+						// is CLIP_MOVE's level-file reads
 		return TRUE;
 	default:
 		return FALSE;
@@ -1183,6 +1185,254 @@ static u8 opClipMove( void )
 	return GPU64_ERR_OK;
 }
 
+// WORLD_TICK: the layout, and why it is one block, are in gpu64_3d.h.
+//
+// The order below is the contract. Everything that can refuse the block is
+// decided before anything is applied: the magic, the counts, the length,
+// the checksum, and every query's hull and mover model. Only then are the
+// actors applied, and only then are the queries answered -- so a block is
+// either wholly refused with the scene untouched, or wholly accepted with a
+// per-record refusal mask for the one kind of error that cannot be seen
+// before looking at the scene: a node or resource that is not there.
+//
+// Static buffers rather than stack: the input can be 2.3 KB and the output
+// 0.8 KB, and this only ever runs on core 0 from a dispatch.
+#define WTICK_IN_MAX	( GPU64_3D_WTICK_HDR_BYTES + \
+			  GPU64_3D_WTICK_MAX_ACTORS * GPU64_3D_WTICK_ACTOR_BYTES + \
+			  GPU64_3D_WTICK_MAX_TRACES * GPU64_3D_WTICK_TRACE_IN_BYTES + \
+			  GPU64_3D_WTICK_MAX_MOVES  * GPU64_3D_WTICK_MOVE_IN_BYTES + \
+			  GPU64_3D_WTICK_MAX_MOVERS * GPU64_3D_CLIPMOVE_MOVER_BYTES )
+#define WTICK_OUT_MAX	( GPU64_3D_WTICK_OUT_HDR_BYTES + \
+			  ( GPU64_3D_WTICK_MAX_TRACES + GPU64_3D_WTICK_MAX_MOVES ) * \
+			  GPU64_3D_WTICK_ANSWER_BYTES + GPU64_3D_WTICK_TRAILER_BYTES )
+
+static u8 s_WtIn[ WTICK_IN_MAX ];
+static u8 s_WtOut[ WTICK_OUT_MAX ];
+
+// One actor record. FALSE refuses it, having changed nothing: every test is
+// made before the first write.
+static boolean worldTickActor( Gpu64_3dScene *pS, const u8 *r )
+{
+	const u16 id    = (u16)( r[ 0 ] | ( r[ 1 ] << 8 ) );
+	const u16 res   = (u16)( r[ 2 ] | ( r[ 3 ] << 8 ) );
+	const u8  flags = r[ 4 ];
+
+	if ( flags & ~( GPU64_3D_WTICK_VISIBLE | GPU64_3D_WTICK_VIEWSPACE ) )
+		return FALSE;
+
+	Gpu64_3dNode *pN = gpu64_3dSceneFind( pS, id, GPU64_3D_NODE_NONE );
+	if ( pN == 0 )
+		return FALSE;
+
+	// The resource is the animation frame or the HUD digit, so it has to be
+	// the right kind for the node. A wrong one is almost certainly a record
+	// aimed at the wrong node, and applying its pose would be worse than
+	// leaving the node where it was.
+	switch ( pN->type )
+	{
+	case GPU64_3D_NODE_OBJECT:
+		if ( res != 0xffff && resFind( res, GPU64_3D_RES_MESH ) == 0 )
+			return FALSE;
+		break;
+	case GPU64_3D_NODE_SPRITE:
+		if ( res != 0xffff && resFind( res, GPU64_3D_RES_TEXTURE ) == 0 )
+			return FALSE;
+		break;
+	case GPU64_3D_NODE_LIGHT:
+	case GPU64_3D_NODE_CAMERA:
+		if ( res != 0xffff )
+			return FALSE;
+		break;
+	default:
+		return FALSE;
+	}
+
+	if ( res != 0xffff )
+	{
+		if ( pN->type == GPU64_3D_NODE_OBJECT )
+			pN->meshId = res;
+		else
+			pN->texId = res;
+	}
+
+	pN->visible   = ( flags & GPU64_3D_WTICK_VISIBLE ) ? TRUE : FALSE;
+	pN->viewSpace = ( pN->type != GPU64_3D_NODE_CAMERA &&
+			  ( flags & GPU64_3D_WTICK_VIEWSPACE ) ) ? 1 : 0;
+
+	Gpu64_3dVec pos;
+	pos.x = blkS32( r + 8 );
+	pos.y = blkS32( r + 12 );
+	pos.z = blkS32( r + 16 );
+	gpu64_3dSceneSetPosition( pS, id, &pos );
+
+	const u16 yaw = (u16)( r[ 5 ] << 8 ), pitch = (u16)( r[ 6 ] << 8 ),
+		  roll = (u16)( r[ 7 ] << 8 );
+	if ( pN->yaw != yaw || pN->pitch != pitch || pN->roll != roll )
+		gpu64_3dSceneSetOrientation( pS, id, yaw, pitch, roll );
+	return TRUE;
+}
+
+static u8 opWorldTick( void )
+{
+	typedef char moverLimitsAgree[
+		GPU64_3D_WTICK_MAX_MOVERS == GPU64_LEVEL_MAX_MOVERS ? 1 : -1 ];
+	( void )sizeof( moverLimitsAgree );
+
+	u8 space;
+	u32 addr, len;
+	argBlob( 0, &space, &addr, &len );
+
+	if ( len < GPU64_3D_WTICK_HDR_BYTES )
+		return GPU64_ERR_BAD_ARGS;
+
+	u8 *in = s_WtIn;
+	u8 res = gpu64_blobRead( space, addr, GPU64_3D_WTICK_HDR_BYTES, in );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	const unsigned nAct = in[ 1 ], nTr = in[ 2 ], nMv = in[ 3 ], nMover = in[ 4 ];
+	if ( in[ 0 ] != GPU64_3D_WTICK_MAGIC_IN ||
+	     nAct > GPU64_3D_WTICK_MAX_ACTORS || nTr > GPU64_3D_WTICK_MAX_TRACES ||
+	     nMv > GPU64_3D_WTICK_MAX_MOVES || nMover > GPU64_3D_WTICK_MAX_MOVERS )
+		return GPU64_ERR_BAD_ARGS;
+
+	const unsigned actOff   = GPU64_3D_WTICK_HDR_BYTES;
+	const unsigned trOff    = actOff + nAct * GPU64_3D_WTICK_ACTOR_BYTES;
+	const unsigned mvOff    = trOff + nTr * GPU64_3D_WTICK_TRACE_IN_BYTES;
+	const unsigned moverOff = mvOff + nMv * GPU64_3D_WTICK_MOVE_IN_BYTES;
+	const unsigned outOff   = moverOff + nMover * GPU64_3D_CLIPMOVE_MOVER_BYTES;
+	const unsigned outLen   = GPU64_3D_WTICK_OUT_HDR_BYTES +
+				  ( nTr + nMv ) * GPU64_3D_WTICK_ANSWER_BYTES +
+				  GPU64_3D_WTICK_TRAILER_BYTES;
+	if ( len < outOff + outLen )
+		return GPU64_ERR_BAD_ARGS;
+
+	// Queries need a level; actors do not, so a program without one can
+	// still use the block for its scene.
+	if ( ( nTr | nMv | nMover ) != 0 && s_Load.phase != GPU64_LEVELPH_DONE )
+		return GPU64_ERR_BAD_ARGS;
+
+	if ( outOff > GPU64_3D_WTICK_HDR_BYTES )
+	{
+		res = gpu64_blobRead( space, addr + GPU64_3D_WTICK_HDR_BYTES,
+				      outOff - GPU64_3D_WTICK_HDR_BYTES,
+				      in + GPU64_3D_WTICK_HDR_BYTES );
+		if ( res != GPU64_ERR_OK ) return res;
+	}
+
+	u16 sum = 0;
+	for ( unsigned i = 0; i < outOff; i++ )
+		if ( i != 6 && i != 7 )
+			sum = (u16)( sum + in[ i ] );
+	if ( sum != (u16)( in[ 6 ] | ( in[ 7 ] << 8 ) ) )
+		return GPU64_ERR_BAD_ARGS;
+
+	// The queries' own arguments, before anything is applied.
+	Gpu64_LevelMover movers[ GPU64_3D_WTICK_MAX_MOVERS ];
+	for ( unsigned i = 0; i < nMover; i++ )
+	{
+		const u8 *r = in + moverOff + i * GPU64_3D_CLIPMOVE_MOVER_BYTES;
+		movers[ i ].nModel = r[ 0 ];
+		if ( r[ 0 ] >= s_Load.lev.nHull )
+			return GPU64_ERR_BAD_ARGS;
+		for ( unsigned k = 0; k < 3; k++ )
+			movers[ i ].ofs.v[ k ] = blkS32( r + 4 + k * 4 );
+	}
+	for ( unsigned i = 0; i < nTr; i++ )
+		if ( in[ trOff + i * GPU64_3D_WTICK_TRACE_IN_BYTES + 24 ] > 2 )
+			return GPU64_ERR_BAD_ARGS;
+	for ( unsigned i = 0; i < nMv; i++ )
+	{
+		const u8 h = in[ mvOff + i * GPU64_3D_WTICK_MOVE_IN_BYTES + 24 ];
+		if ( h < 1 || h > 2 )
+			return GPU64_ERR_BAD_ARGS;
+	}
+
+	// The actors.
+	Gpu64_3dScene *pS = sceneTarget();
+	u32 refused = 0;
+	unsigned nApplied = 0;
+	for ( unsigned i = 0; i < nAct; i++ )
+	{
+		if ( worldTickActor( pS, in + actOff + i * GPU64_3D_WTICK_ACTOR_BYTES ) )
+			nApplied++;
+		else
+			refused |= 1u << i;
+	}
+
+	// The answers.
+	u8 *out = s_WtOut;
+	memset( out, 0, outLen );
+	out[ 0 ] = GPU64_3D_WTICK_MAGIC_OUT;
+	out[ 1 ] = in[ 5 ];
+	out[ 2 ] = (u8)nApplied;
+	blkPutS32( out + 4, (s32)refused );
+
+	u8 *a = out + GPU64_3D_WTICK_OUT_HDR_BYTES;
+	for ( unsigned i = 0; i < nTr; i++, a += GPU64_3D_WTICK_ANSWER_BYTES )
+	{
+		const u8 *r = in + trOff + i * GPU64_3D_WTICK_TRACE_IN_BYTES;
+		Gpu64_LevelVec start, end;
+		for ( unsigned k = 0; k < 3; k++ )
+		{
+			start.v[ k ] = blkS32( r + k * 4 );
+			end.v[ k ]   = blkS32( r + 12 + k * 4 );
+		}
+		Gpu64_LevelTrace tr;
+		u8 hit = GPU64_CLIP_CONT_EMPTY;
+		if ( !gpu64_levelTraceEnts( &s_Load.lev, r[ 24 ], &start, &end,
+					    movers, nMover, &tr, &hit ) )
+			return GPU64_ERR_BAD_ARGS;	// checked above; kept as a guard
+
+		for ( unsigned k = 0; k < 3; k++ )
+			blkPutS32( a + k * 4, tr.end.v[ k ] );
+		const s32 f = tr.nFraction;
+		blkPut16( a + 12, (u16)( f >= 0xffff ? 0xffff : f < 0 ? 0 : f ) );
+		u8 fl = 0;
+		if ( tr.nFraction >= 0x10000 && !tr.bStartSolid && !tr.bAllSolid )
+			fl |= GPU64_3D_WTICK_TR_CLEAR;
+		if ( tr.bStartSolid ) fl |= GPU64_3D_WTICK_TR_STARTSOLID;
+		if ( tr.bAllSolid )   fl |= GPU64_3D_WTICK_TR_ALLSOLID;
+		a[ 14 ] = fl;
+		a[ 15 ] = hit;
+	}
+
+	for ( unsigned i = 0; i < nMv; i++, a += GPU64_3D_WTICK_ANSWER_BYTES )
+	{
+		const u8 *r = in + mvOff + i * GPU64_3D_WTICK_MOVE_IN_BYTES;
+		Gpu64_LevelVec start, delta;
+		for ( unsigned k = 0; k < 3; k++ )
+		{
+			start.v[ k ] = blkS32( r + k * 4 );
+			delta.v[ k ] = blkS32( r + 12 + k * 4 );
+		}
+		Gpu64_LevelMove mv;
+		if ( !gpu64_levelMoveEnts( &s_Load.lev, 0, r[ 24 ], r[ 25 ],
+					   &start, &delta, movers, nMover, &mv ) )
+			return GPU64_ERR_BAD_ARGS;
+
+		for ( unsigned k = 0; k < 3; k++ )
+			blkPutS32( a + k * 4, mv.end.v[ k ] );
+		a[ 12 ] = mv.nFlags;
+		a[ 13 ] = mv.nContents;
+		a[ 14 ] = mv.nFraction;
+		a[ 15 ] = mv.nBumps;
+	}
+
+	u16 osum = 0;
+	for ( u8 *p = out; p < a; p++ )
+		osum = (u16)( osum + *p );
+	blkPut16( a, osum );
+	a[ 2 ] = GPU64_3D_WTICK_MAGIC_OUT;
+	a[ 3 ] = in[ 5 ];
+
+	res = gpu64_blobWrite( space, addr + outOff, outLen, out );
+	if ( res != GPU64_ERR_OK ) return res;
+
+	unsigned nRefused = nAct - nApplied;
+	gpu64Regs.result = (u8)( nRefused > 255 ? 255 : nRefused );
+	return GPU64_ERR_OK;
+}
+
 static u8 opLevelPalette( void )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
@@ -1251,7 +1501,7 @@ static u8 opLevelNode( void )
 	u8 nFixed = 0;
 
 	if ( pN == 0 || pN->type != GPU64_3D_NODE_OBJECT || pN->meshId != meshId ||
-	     !pN->visible || pN->scale != GPU64_FX8_ONE ||
+	     !pN->visible || pN->viewSpace || pN->scale != GPU64_FX8_ONE ||
 	     pN->yaw != 0 || pN->pitch != 0 || pN->roll != 0 )
 	{
 		// A destroyed node has no position worth keeping.
@@ -1943,6 +2193,7 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_LEVEL_ENT:		return opLevelEnt();
 	case GPU64_3D_OP_LEVEL_PALETTE:		return opLevelPalette();
 	case GPU64_3D_OP_LEVEL_NODE:		return opLevelNode();
+	case GPU64_3D_OP_WORLD_TICK:		return opWorldTick();
 
 	case GPU64_3D_OP_CREATE_OBJECT:		return opCreateObject();
 	case GPU64_3D_OP_CREATE_CAMERA:		return opCreateCamera();

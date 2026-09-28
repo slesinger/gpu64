@@ -23,7 +23,7 @@ version.
 import struct
 
 MAGIC = b'G64L'
-VERSION = 4
+VERSION = 5
 
 HDR = '<4sHH4HHHI3I'
 HDR_LEN = struct.calcsize(HDR)          # 36
@@ -33,7 +33,8 @@ NODE_REC = '<HiiiH'                     # 16
 ENT_REC = '<6H2h3i3iBBH'                # 44
 ENT_STRIDE = struct.calcsize(ENT_REC)
 PLANE_REC = '<3hiBB'                    # 12
-HULL_REC = '<2i6i'                      # 32
+HULL_REC = '<2i6ii'                     # 36, head0 last (v5)
+HULL_STRIDE = struct.calcsize(HULL_REC)
 CLIP_REC = '<HhhH'                      #  8
 
 # Eye height above an entity origin, in Quake units. GPU64_LEVEL_EYE_QU in
@@ -71,7 +72,7 @@ class Level:
         self.node_off, off = off, off + self.nnode * 16
         self.ent_off, off = off, off + self.nent * ENT_STRIDE
         off += self.nplane * 12
-        self.hull_off, off = off, off + self.nhull * 32
+        self.hull_off, off = off, off + self.nhull * HULL_STRIDE
         off += self.nclip * 8
         # Equality, not "fits": a converter and a loader that disagree on a
         # stride still both land inside the file, and this is the only test
@@ -134,8 +135,8 @@ class Level:
         gpu64_levelHull(). Model 0 is the world."""
         if model >= self.nhull:
             raise LevelError('model %d of %d hulls' % (model, self.nhull))
-        f = struct.unpack_from(HULL_REC, self.d, self.hull_off + model * 32)
-        return {'head': (f[0], f[1]),
+        f = struct.unpack_from(HULL_REC, self.d, self.hull_off + model * HULL_STRIDE)
+        return {'head': (f[0], f[1]), 'head0': f[8],
                 'mins': (f[2], f[3], f[4]), 'maxs': (f[5], f[6], f[7])}
 
     def node_model(self, i):

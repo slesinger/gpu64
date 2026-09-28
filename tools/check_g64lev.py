@@ -10,7 +10,7 @@ passes here cannot be rejected for its shape.
 
   python3 tools/check_g64lev.py build/e1m1.g64lev
 """
-import struct, sys
+import os, struct, sys
 
 VERT_STRIDE = 6
 FACE_STRIDE = 12
@@ -24,7 +24,8 @@ NODE_REC = '<HiiiH'
 ENT_REC = '<6H2h3i3iBBH'
 ENT_STRIDE = struct.calcsize(ENT_REC)
 PLANE_REC = '<3hiBB'
-HULL_REC = '<2i6i'
+HULL_REC = '<2i6ii'
+HULL_STRIDE = struct.calcsize(HULL_REC)
 CLIP_REC = '<HhhH'
 
 
@@ -42,8 +43,8 @@ def main(path):
      base, palo, stro) = struct.unpack_from(HDR, d, 0)
     if magic != b'G64L':
         fail('magic is %r, not G64L' % magic)
-    if ver != 4:
-        fail('version %d is not 4' % ver)
+    if ver != 5:
+        fail('version %d is not 5' % ver)
     print('header  ver %d  scale %d qu/wu  tex %d  mesh %d  node %d  ent %d'
           % (ver, scale, ntex, nmesh, nnode, nent))
     print('        collision  %d planes  %d hulls  %d clipnodes'
@@ -55,7 +56,7 @@ def main(path):
     node_off, off = off, off + nnode * struct.calcsize(NODE_REC)
     ent_off, off = off, off + nent * ENT_STRIDE
     plane_off, off = off, off + nplane * struct.calcsize(PLANE_REC)
-    hull_off, off = off, off + nhull * struct.calcsize(HULL_REC)
+    hull_off, off = off, off + nhull * HULL_STRIDE
     clip_off, off = off, off + nclip * struct.calcsize(CLIP_REC)
     if off != base:
         fail('tables end at %d but the header says the blob area starts at %d'
@@ -141,6 +142,7 @@ def main(path):
     strend = len(d) - base
     names = {}
     unknown = set()
+    catalog = None
     for i in range(nent):
         (nameOff, yaw, sf, mdl, tgt, tnm, p0, p1, x, y, z,
          ox, oy, oz, kind, _pad, _rsv) = \
@@ -164,6 +166,8 @@ def main(path):
             fail('entity %d (%s, kind %d) is a mover with no travel' % (i, nm, kind))
         if kind == 0:
             unknown.add(nm)
+        if nm == 'gpu64_catalog':
+            catalog = (i, sf, p0, p1, kind)
     starts = names.get('info_player_start', 0)
     if starts != 1:
         fail('%d info_player_start entities; the game needs exactly one' % starts)
@@ -175,6 +179,44 @@ def main(path):
     if unknown:
         print('ent     %d classnames have kind 0: %s'
               % (len(unknown), ' '.join(sorted(unknown))))
+    # --- milestone 20's actor catalogue --------------------------------
+    #
+    # Optional: a --no-actors level has none. When present it must be the
+    # last entity and must describe this file, and when the game's include
+    # is at hand every id it compiles in must name something that exists --
+    # a stale include against a fresh level is a dog wearing a gun's frames.
+    if catalog is not None:
+        ci, chash, cmesh, ctex, ckind = catalog
+        if ci != nent - 1 or ckind != 9:
+            fail('gpu64_catalog is entity %d kind %d; it must be the last (%d) '
+                 'with kind 9' % (ci, ckind, nent - 1))
+        if (cmesh, ctex) != (nmesh, ntex):
+            fail('gpu64_catalog says %d meshes %d textures; the file has %d %d'
+                 % (cmesh, ctex, nmesh, ntex))
+        inc = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                           'Source', 'Demos', 'gpu64_quake_actors.inc')
+        if os.path.exists(inc):
+            sym = {}
+            for ln in open(inc):
+                ln = ln.split(';')[0].strip()
+                if '=' in ln:
+                    k, v = (t.strip() for t in ln.split('=', 1))
+                    sym[k] = int(v[1:], 16) if v.startswith('$') else int(v)
+            if sym.get('CAT_HASH') != chash or sym.get('CAT_ENT') != ci:
+                fail('%s is stale: hash $%04x ent %s, the level has $%04x ent %d'
+                     % (inc, sym.get('CAT_HASH', 0), sym.get('CAT_ENT'), chash, ci))
+            for k, v in sym.items():
+                if k.startswith('T_') and not v < ntex:
+                    fail('%s = %d is not a texture of this file' % (k, v))
+                if k.startswith('M_') and not v < nmesh:
+                    fail('%s = %d is not a mesh of this file' % (k, v))
+                if k.startswith('N_') and k.replace('N_', 'M_', 1) in sym \
+                        and sym[k.replace('N_', 'M_', 1)] + v > nmesh:
+                    fail('%s runs past the mesh table' % k)
+            print('actors  catalogue hash $%04x, %d include symbols in range  OK'
+                  % (chash, len(sym)))
+        else:
+            print('actors  catalogue hash $%04x (no include to cross-check)' % chash)
     # --- the collision hulls ------------------------------------------
     #
     # Shape checks first, then the one check that actually says the
@@ -206,7 +248,7 @@ def main(path):
                      % (i, c))
         if pad != 0:
             fail('clipnode %d has pad %d' % (i, pad))
-    hulls = [struct.unpack_from(HULL_REC, d, hull_off + i * 32)
+    hulls = [struct.unpack_from(HULL_REC, d, hull_off + i * HULL_STRIDE)
              for i in range(nhull)]
     for i, h in enumerate(hulls):
         for k in range(3):
@@ -253,6 +295,20 @@ def main(path):
              ' is not describing this level')
     print('trace   player start is empty (%d), 64qu below is solid (%d)  OK'
           % (c, cb))
+
+    # Hull 0, the point hull the shots trace against, is built by the
+    # converter rather than carried from the BSP, so it gets the same pair
+    # of tests at the eye: empty there, solid under the floor. The eye is
+    # 46 units above the floor, so 64 below the origin is inside it.
+    root0 = hulls[0][8]
+    if not 0 <= root0 < nclip:
+        fail('worldspawn hull 0 head %d is not a clipnode' % root0)
+    c0 = contents(root0, eye)
+    cb0 = contents(root0, below)
+    if c0 != -1 or cb0 == -1:
+        fail('hull 0: eye contents %d, below-floor contents %d' % (c0, cb0))
+    print('trace   hull 0: eye is empty (%d), 64qu below is solid (%d)  OK'
+          % (c0, cb0))
 
     print('PASS  %s (%.1f KB)' % (path, len(d) / 1024.0))
 

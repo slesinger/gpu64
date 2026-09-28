@@ -365,10 +365,14 @@ int main( int argc, char **argv )
 			continue;
 		}
 
-		if ( sscanf( line, "N %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+		// The 19th field, viewspace (milestone 20), is optional so a
+		// stream written before it still reads.
+		int nFields;
+		n[18] = 0;
+		if ( ( nFields = sscanf( line, "N %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
 			      &n[0], &n[1], &n[2], &n[3], &n[4], &n[5], &n[6], &n[7],
 			      &n[8], &n[9], &n[10], &n[11], &n[12], &n[13], &n[14],
-			      &n[15], &n[16], &n[17] ) == 18 )
+			      &n[15], &n[16], &n[17], &n[18] ) ) >= 18 )
 		{
 			if ( n[0] < 0 || n[0] >= (int)GPU64_3D_MAX_NODES )
 				continue;
@@ -396,6 +400,7 @@ int main( int argc, char **argv )
 			pN->spriteFlags   = (u8)n[15];
 			pN->lightStrength = (u8)n[16];
 			pN->lightRadius   = (u16)n[17];
+			pN->viewSpace     = n[18] ? 1 : 0;
 			// rot is derived from the angles, exactly as
 			// gpu64_3dSceneSetOrientation() does it -- the stream
 			// carries angles, never a matrix.

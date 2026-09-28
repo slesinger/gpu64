@@ -259,6 +259,7 @@ boolean gpu64_levelHull( const Gpu64_Level *pL, unsigned nModel, Gpu64_LevelHull
 	const u8 *p = pL->pHullTab + (u32)nModel * GPU64_LEVEL_HULL_STRIDE;
 	pH->nHead[ 0 ] = gpu64_levelRdS32( p );
 	pH->nHead[ 1 ] = gpu64_levelRdS32( p + 4 );
+	pH->nHead0     = gpu64_levelRdS32( p + 32 );
 	for ( unsigned k = 0; k < 3; k++ )
 	{
 		pH->mins.v[ k ] = gpu64_levelRdS32( p + 8  + k * 4 );
@@ -462,6 +463,66 @@ static void traceMulti( const Gpu64_Level *pL, s32 nHeadNode,
 		pTr->bAllSolid   = bAll;
 		pTr->bStartSolid = bStart;
 	}
+}
+
+static u8 contentsToByte( s16 nC );
+
+static inline s32 hullHead( const Gpu64_LevelHull *pH, unsigned nHull )
+{
+	return nHull == 0 ? pH->nHead0 : pH->nHead[ nHull - 1 ];
+}
+
+boolean gpu64_levelTraceEnts( const Gpu64_Level *pL, unsigned nHull,
+			      const Gpu64_LevelVec *pStart, const Gpu64_LevelVec *pEnd,
+			      const Gpu64_LevelMover *pMovers, unsigned nMovers,
+			      Gpu64_LevelTrace *pTr, u8 *pHit )
+{
+	if ( pL == 0 || pStart == 0 || pEnd == 0 || pTr == 0 || nHull > 2 )
+		return FALSE;
+	if ( nMovers > GPU64_LEVEL_MAX_MOVERS || ( nMovers != 0 && pMovers == 0 ) )
+		return FALSE;
+
+	Gpu64_LevelHull hull;
+	if ( !gpu64_levelHull( pL, 0, &hull ) )
+		return FALSE;
+
+	// Resolved as gpu64_levelMoveEnts() resolves them, and refused for the
+	// same reason: a door that stops blocking is a shot through a door.
+	Gpu64_LevelMoverHull mv[ GPU64_LEVEL_MAX_MOVERS ];
+	unsigned nMv = 0;
+	for ( unsigned i = 0; i < nMovers; i++ )
+	{
+		if ( pMovers[ i ].nModel == 0 )
+			continue;
+		Gpu64_LevelHull mh;
+		if ( !gpu64_levelHull( pL, pMovers[ i ].nModel, &mh ) )
+			return FALSE;
+		mv[ nMv ].nHead = hullHead( &mh, nHull );
+		mv[ nMv ].ofs   = pMovers[ i ].ofs;
+		nMv++;
+	}
+
+	const s32 nHead = hullHead( &hull, nHull );
+	traceMulti( pL, nHead, mv, nMv, pStart, pEnd, pTr );
+
+	if ( pHit != 0 )
+	{
+		*pHit = GPU64_CLIP_CONT_EMPTY;
+		if ( pTr->bHitPlane && pTr->nFraction < 0x10000 )
+		{
+			// The normal faces back at the sweep, so behind the surface
+			// is end - n. One Quake unit clears the trace's back-off.
+			const s32 nQu = gpu64_levelQU( pL, 1 );
+			Gpu64_LevelVec p;
+			for ( unsigned k = 0; k < 3; k++ )
+				p.v[ k ] = pTr->end.v[ k ] -
+					   (s32)( ( (s64)pTr->nPlaneN[ k ] * nQu ) >> 16 );
+			*pHit = contentsToByte( gpu64_levelPointContents( pL, nHead, &p ) );
+			if ( *pHit == GPU64_CLIP_CONT_EMPTY )
+				*pHit = GPU64_CLIP_CONT_SOLID;	// a mover's face
+		}
+	}
+	return TRUE;
 }
 
 // --- the move ------------------------------------------------------------

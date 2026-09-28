@@ -40,6 +40,14 @@ struct Gpu64_3dNode
 	u8	type;
 	u8	visible;		// SET_VISIBLE; nonzero = drawn
 
+	// milestone 20: the pose is relative to the active camera, not to the
+	// world. Only WORLD_TICK sets it; every CREATE_* clears it. OBJECT and
+	// SPRITE nodes with it set draw in a pass of their own after the world,
+	// over a cleared depth buffer, so a gun or a status bar is never
+	// cut by a wall it is standing in. A LIGHT with it set lights from a
+	// point fixed to the eye -- the muzzle flash. Ignored on a CAMERA.
+	u8	viewSpace;
+
 	u16	meshId;			// OBJECT only -- resolved by the caller
 
 	// SPRITE only. texId is the base texture; with

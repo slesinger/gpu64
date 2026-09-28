@@ -9711,3 +9711,119 @@ demos. That would close the remaining unchecked exposures, including the
 - Stunt, the game and Nighthawk run as before, with no new blinking.
 - Watch whether anything changes about the hang or the game's rare vertical
   jump.
+
+## 76. Milestone 20 stages A-B: Quake combat assets and `WORLD_TICK` (2026-09-28)
+
+The goal is monsters, shooting and guns in the E1M1 demo. The design and the
+user's decisions are in
+[milestone20_quake_combat_design.md](milestone20_quake_combat_design.md):
+real MDL meshes, one batched block opcode for actors and queries, the E1M1
+weapon set, the HUD and gun on HDMI, simplified Quake AI and normal skill,
+with SID effects, death and restart, keys and counters, and muzzle lights.
+
+**Stage A (2026-09-27, PC only).** The converter writes every monster, view
+model, pickup and HUD graphic into `e1m1.g64lev` as ordinary mesh and texture
+records, one mesh per animation frame. `Source/Demos/gpu64_quake_actors.inc`
+gives the C64 the ids. The gate is `tools/check_g64lev.py` and
+`tools/actorsheet.py`.
+
+**Stage B (2026-09-28, PC only).**
+- `WORLD_TICK` ($6C) poses up to 32 nodes, and answers up to 24 traces and
+  24 monster moves, in one checksummed block a frame. It goes through the
+  shadow scene, so the C64 never waits for a render.
+- Level file v5 adds Quake's point hull 0 for shots and sight. **The firmware
+  refuses v4**: the new `build/e1m1.g64lev` must go to `SD:RAD/level.g64lev`
+  along with the firmware.
+- View-space nodes (the gun and the HUD) are drawn after the world, over a
+  cleared depth buffer.
+- **Gates:**
+  - `tools/worldticktest.py`: 32 checks on E1M1.
+  - levelsim `--view-actor=` and `--view-sprite=` renders.
+  - hulltest and actorsheet.
+  - `demos.sh` regression.
+- `opWorldTick()` itself cannot be compiled on a PC. Its agreement with
+  prgsim's model is by review, so a disagreement would first show on the
+  bench as rejected blocks.
+
+The API is in `docs/class1-3d-mesh-reference.md` under "A world in one block".
+Next is stage C: the C64 side (actor table, the block builder with retry,
+animation).
+
+## 77. Milestone 20 stages C-D: the actor table, the HUD, and combat (2026-09-28)
+
+**Stage C (PC, then deployed).**
+- The C64 keeps an 80-slot actor table: the gun, the HDMI status bar and
+  crosshair, and E1M1's 48 world actors. All of them are posed through one
+  `WORLD_TICK` block a frame.
+- Only dirty slots are sent, plus two slots a frame from a refresh ring.
+- Blocks are retried up to 4 times against a poisoned output area.
+- Idle animation and pickup rotation run at a quarter rate.
+- Row 20 is the telemetry.
+- The gate found a `sum16` carry bug, which made every block disagree.
+
+Details are in [milestone20_quake_combat_design.md](milestone20_quake_combat_design.md),
+"Stage C as built".
+
+**Stage D (PC only).** Weapons, hitscan, pickups, player damage, death and
+restart, in `Source/Demos/gpu64_game_combat.inc`.
+- A shot asks `WORLD_TICK` for a point trace to each of the 3 nearest
+  monsters in its cone. The pellets are resolved on the 6502.
+- The four weapons and their Quake damage and fire rates, items with their
+  Quake rules, and armour absorption.
+- The player can die and restart.
+- Keys: 1–4 select a weapon, CTRL or joystick fire shoots, and ← is a
+  test hurt.
+- Rows 21 and 22 are the telemetry.
+
+Three bugs were found before any bench run:
+- `quadDmg`'s `beq ++` made every hit 255 damage.
+- The long-branch rewrite's anonymous labels captured earlier branches.
+- The press that restarted also fired.
+
+The pickup scan cost 10 ms a frame until a whole-unit prefilter cut it to 4.
+
+Gate: `tools/check_combat.py`, 12 checks, now part of `tools/demos.sh
+game`. The kill run survives `drop:300`, `data:300` and `addr:300` with the
+same end state and `LOST000`.
+
+Not exercised on a PC: the health, armour, ammo, super shotgun, quad and
+suit pickup branches.
+
+Next is stage E, monster AI. It needs a spawn-position backup for restart,
+because monsters will move.
+
+## 78. Stage D bench feedback: inputs, no exit, freeze traps (2026-09-28)
+
+The first bench photo of "stage D" was the stage C build: the card's
+`gpu64_demo_game.prg` md5 differed from the one built. Deploys are checked
+by md5 from here on.
+
+- **RUN/STOP ignored.** The runs that dropped to READY were phantom
+  RUN/STOPs, both ghosted (SHIFT+A+CTRL completes the RUN/STOP rectangle)
+  and single bad samples. The game has no exit on hardware. runsim still
+  ends a run: while its `--stop-after` schedule holds RUN/STOP it writes
+  `$A7` to `$02A7` (`SIM_EXIT`), which the game polls instead.
+- **Fire is C= or B**, not CTRL. Each is trusted only when it is alone in its
+  matrix column or alone in its row, since three held keys on a rectangle
+  ghost the fourth. Also joystick 2's button and the 1351's left button;
+  all four become `fireDown` in `readKeys`.
+- **Joystick 2** walks, turns and fires. While it is off centre the keyboard
+  is ignored: the stick drives the column lines, so any key in a held
+  direction's column would ghost into every scan.
+- **1351 mouse, port 1**: `$DC00`=`$7F` selects port 1's pots, then a
+  1280-cycle wait (two SID measurements) before `$D419`/`$D41A` are read.
+  The deltas use the 1351's own modulo-64 recipe. X turns at 64/65536 turn
+  per count; Y, halved, feeds `camPitch`. The port drives the ROW lines, so
+  whatever it pulls low is masked out of every column read.
+- **Freeze traps**: `$0316` BRK prints `BRK` and its address on row 0 and
+  halts; `$0318` NMI (RESTORE) prints `NMI`, the interrupted PC and a press
+  count, then returns. No answer to RESTORE means the 6502 is not running:
+  either it has hit a JAM opcode or the Pi is holding DMA.
+- Freeze investigation: the readback fence covers every buffer the Pi
+  writes into (`healthBuf` .. `wtBlk`), and every wait in the frame loop is
+  bounded. Four 450-frame prgsim runs from the start position with injected
+  faults (data 1/97 and 1/400, drop+addr 1/250, phantom 1/600) all ran to
+  the end, so the freeze does not reproduce on a PC.
+- runsim: `CBM` key, `--mouse=DX,DY[,FIRE]:FIRST-LAST`. check_combat's
+  three kill shots are now B, C= and the mouse, and the restart is
+  joystick 2's button. All green.
