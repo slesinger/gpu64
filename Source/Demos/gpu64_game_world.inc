@@ -457,9 +457,14 @@ afLoop
 	bcs afFix
 	lda acAnN,x
 	beq afRot
+	ldy #ANIM_MASK			; an awake monster at Quake's 10 Hz
+	lda acAi,x
+	beq +
+	ldy #AI_ANIM_MASK
++	sty acMask
 	txa				; each slot every ANIM_MASK+1 frames, staggered
 	eor wtFrame
-	and #ANIM_MASK
+	and acMask
 	bne afRot
 	lda acAnF,x
 	clc
@@ -470,7 +475,7 @@ afLoop
 	beq afWrap
 	cmp #AM_HOLD
 	beq afRot
-	jsr acStand			; pain over
+	jsr aiAnimEnd			; pain or an attack over
 	jmp afRot
 afWrap
 	lda #0
@@ -664,21 +669,29 @@ wtrNext
 wtrDone
 	stx wtRefIx
 
-	; A shot's traces and the movers they are traced against.
+	; A shot's traces, the monsters' traces and moves, and the movers
+	; they are all traced against. Every query answers in 16 bytes and
+	; the trailer's offset is a byte: wtQN <= 15 (CB_NCAND + AI_MAXTR +
+	; AI_MAXMV).
 	lda #0
 	sta wtTrOk
 	sta wtMvN
+	clc
 	lda wtTrN
+	adc aiTrN
+	sta wtQTr
+	adc aiMvN
+	sta wtQN
 	beq +
 	jsr wtTraces
 +
 	lda wtN
 	sta wtLastN
-	ora wtTrN
+	ora wtQN
 	bne +
 	rts
 +
-	lda wtTrN			; the answer: 8 + 16 per trace + 4
+	lda wtQN			; the answer: 8 + 16 per query + 4
 	asl a
 	asl a
 	asl a
@@ -694,12 +707,13 @@ wtrDone
 	sta wtBlk+0
 	lda wtN
 	sta wtBlk+1
-	lda wtTrN
+	lda wtQTr
 	sta wtBlk+2
+	lda aiMvN
+	sta wtBlk+3
 	lda wtMvN
 	sta wtBlk+4
 	lda #0
-	sta wtBlk+3
 	sta wtBlk+6
 	sta wtBlk+7
 	lda wtFrame
@@ -990,6 +1004,7 @@ showWorld
 nAct		.byte 0
 actDrop		.byte 0
 acI		.byte 0
+acMask		.byte 0
 acJ		.byte 0
 hudFov		.byte 0
 hnTex		.byte 0
@@ -999,6 +1014,8 @@ hnD		.fill 3, 0
 wtN		.byte 0
 wtTrN		.byte 0			; traces this block (combatFrame's)
 wtMvN		.byte 0
+wtQTr		.byte 0			; traces: the shot's, then the monsters'
+wtQN		.byte 0			; and every query, moves included
 wtTrOk		.byte 0			; the block verified: its answers are real
 wtTrail		.byte 0			; the trailer's offset in the answer
 wtOutLen	.byte 0

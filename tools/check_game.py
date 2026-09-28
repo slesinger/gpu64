@@ -58,7 +58,7 @@ def main():
             # must be back where it started. Without it a door that opens
             # and never closes passes every check here.
             shut = True
-        elif a.startswith('--key=') or a == '--demo':
+        elif a.startswith('--key=') or a in ('--demo', '--notarget'):
             keys.append(a)
         else:
             sys.exit('check_game.py: unknown argument %s' % a)

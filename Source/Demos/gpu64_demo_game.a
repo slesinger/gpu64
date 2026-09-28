@@ -270,6 +270,16 @@ MOUSE_SHIFT = 6
 ; real C64 writes after the program clears it.
 SIM_EXIT    = $02a7
 SIM_EXIT_ON = $a7
+; And the same for runsim.py --notarget: the monsters never wake, so a
+; route check is not also a fight (gpu64_game_ai.inc).
+SIM_NOTARGET    = $02a8
+SIM_NOTARGET_ON = $a8
+; And runsim.py --warp: a start position (eye, 16.16 x y z, then a 16-bit
+; yaw) at SIM_WARP_POS, armed by SIM_WARP_ON. The game restarts there, once,
+; so a check can begin beside the monsters it is about (tools/check_ai.py).
+SIM_WARP     = $02a9
+SIM_WARP_ON  = $a9
+SIM_WARP_POS = $02b0
 
 ; Frames a key must be held before it acts (see readKeys). The simulator's
 ; exit waits longest; + and - then repeat every FOV_REPEAT.
@@ -495,6 +505,8 @@ HB_EVERY = 64
 	jsr trapInit
 	lda #0
 	sta SIM_EXIT
+	sta SIM_NOTARGET
+	sta SIM_WARP
 
 	lda #0
 	jsr dmRow
@@ -641,6 +653,7 @@ stepDone
 	jsr entScan
 	jsr combatInit
 	jsr combatCount
+	jsr aiInit
 
 	; And every level node's position, read back once so the ring below
 	; has something to put back -- see nodeScan.
@@ -752,6 +765,7 @@ setupShown
 ; ======================================================================
 frame
 	jsr clkFrame
+	jsr simWarp
 	jsr moveCamera			; keys -> mov, the requested step
 	jsr gameSelect			; the nearest movers, for the trace
 	jsr clipMove			; the step, collided; updates cam
@@ -762,8 +776,10 @@ frame
 	jsr clkLap
 	jsr sendMovers			; SET_POSITION for what moved
 	jsr combatFrame			; weapons, a shot's traces, the HUD
+	jsr aiFrame			; monsters think; their traces and moves
 	jsr actFrame			; animate, repair one, WORLD_TICK
 	jsr combatResolve		; the shot, from the traces' answers
+	jsr aiResolve			; the monsters', from theirs
 	jsr sendCamera
 	jsr sendView			; SET_PERSPECTIVE, if + or - moved it
 	jsr doRefresh			; one piece of retained state, re-sent
@@ -4608,6 +4624,7 @@ sfPit
 	; worst, in which no CLIP_MOVE answer was taken -- see cmDry.
 	jsr showWorld
 	jsr showCombat
+	jsr showAi
 
 	lda #19
 	jsr dmRow
@@ -5057,6 +5074,7 @@ lnFlag		.fill 256, 0
 
 	.include "gpu64_game_world.inc"
 	.include "gpu64_game_combat.inc"
+	.include "gpu64_game_ai.inc"
 
 
 ; ----------------------------------------------------------------------

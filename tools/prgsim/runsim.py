@@ -111,6 +111,12 @@ Options:
         counts a frame (Y positive is away from you) and, with FIRE, hold
         the left button, which grounds $dc01 bit 4 as on hardware. Without
         it $d419/$d41a read $ff, an empty port. Repeatable.
+    --notarget      gpu64_demo_game.a: the monsters never notice the
+                    player, as Quake's notarget cheat. Route checks that are
+                    about doors, not fights, run with it.
+    --warp=F:X,Y,Z,YAW  gpu64_demo_game.a: at frame F restart the game with
+                    the eye at X Y Z (world units) facing YAW (0..255), so
+                    a check can start beside what it is about.
     --demo          do not require a VERDICT line. The conformance suite
                     judges itself and exit status follows its verdict; a
                     demo has nothing to judge, so returning cleanly is the
@@ -203,7 +209,8 @@ def screen_to_ascii(c):
 class Machine:
     def __init__(self, calibrated=True, stop_after=4, frame_log=False,
                  ppm_frames=None, key_script=None, c1_stream=None,
-                 level=None, joy_script=None, mouse_script=None):
+                 level=None, joy_script=None, mouse_script=None,
+                 notarget=False, warp=None):
         self.mem = bytearray(65536)
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
@@ -220,6 +227,9 @@ class Machine:
         self.key_script = list(key_script or [])
         self.joy_script = list(joy_script or [])
         self.mouse_script = list(mouse_script or [])
+        self.notarget = notarget
+        self.warp = warp
+        self.warped = False
         # A class-1 program never issues PAGE_FLIP: the autonomous loop owns
         # the framebuffer, and its frame boundary is the accepted
         # SCENE_COMMIT the model reports here instead.
@@ -373,6 +383,24 @@ class Machine:
             # a simulated run is this byte, set while the schedule below
             # holds RUN/STOP down. Nothing else here uses $02a7.
             self.mem[0x02A7] = 0xA7 if self.stop_in_matrix() else 0
+            # --notarget: the game's monsters never notice the player
+            # (Quake's cheat of that name), so a route check is not also a
+            # fight. The game clears $02a8 at start; only this sets it.
+            self.mem[0x02A8] = 0xA8 if self.notarget else 0
+            # --warp=F:x,y,z,yaw: from frame F the game restarts with its
+            # eye at x y z (world units) facing yaw (0..255). It clears
+            # $02a9 when it has taken it; this writes it once.
+            if self.warp and not self.warped and self.frame >= self.warp[0]:
+                self.warped = True
+                vals = [int(round(v * 65536)) & 0xFFFFFFFF
+                        for v in self.warp[1:4]]
+                for i, v in enumerate(vals):
+                    for b in range(4):
+                        self.mem[0x02B0 + i * 4 + b] = (v >> (8 * b)) & 0xFF
+                yaw = int(self.warp[4]) & 0xFF
+                self.mem[0x02BC] = 0
+                self.mem[0x02BD] = yaw
+                self.mem[0x02A9] = 0xA9
         pra = self.cia_pra & ~self.joy()
         rows = 0xFF
         if self.mouse_fire():
@@ -722,11 +750,20 @@ def main(argv):
                 return 2
             clip_fault = int(n, 0)
     chain = [o.split('=', 1)[1] for o in opts if o.startswith('--chain=')]
+    warp = None
+    for o in opts:
+        if o.startswith('--warp='):
+            f, xyz = o.split('=', 1)[1].split(':', 1)
+            warp = [int(f)] + [float(v) for v in xyz.split(',')]
+            if len(warp) != 5:
+                print('--warp=F:X,Y,Z,YAW')
+                return 2
 
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
                 key_script=key_script, c1_stream=c1_stream, level=level,
-                joy_script=joy_script, mouse_script=mouse_script)
+                joy_script=joy_script, mouse_script=mouse_script,
+                notarget='--notarget' in opts, warp=warp)
     m.gpu.c1_clip_fault = clip_fault
     for o in opts:
         if o.startswith('--log-rows='):

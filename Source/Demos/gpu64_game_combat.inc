@@ -438,6 +438,8 @@ fire
 +	rts
 
 fiGun
+	lda #1				; a gunshot: aiFrame wakes whoever heard it
+	sta aiLoud
 	lda #CB_RANGE
 	sta cbMaxF
 	lda #0
@@ -700,7 +702,7 @@ wtTraces
 	ldx #0
 wttLoop
 	cpx wtTrN
-	beq wttMovers
+	beq wttAi
 	stx cbT
 	ldy #0
 -	lda cam,y
@@ -727,6 +729,8 @@ wttLoop
 	ldx cbT
 	inx
 	bne wttLoop
+wttAi
+	jsr aiEmit			; the monsters' traces, then their moves
 wttMovers
 	lda selCnt
 	sta wtMvN
@@ -934,6 +938,7 @@ monHurt
 	lda acState,x
 	cmp #AS_DEAD
 	beq mhRts			; a corpse
+	jsr aiHurt			; awake, and after the player
 	lda acHp,x
 	sec
 	sbc cbHd
@@ -1477,6 +1482,25 @@ phDie
 	sta acDirty+SL_GUN
 	rts
 
+; runsim.py --warp: a new start, then a restart onto it. Never on a C64.
+simWarp
+	lda SIM_WARP
+	cmp #SIM_WARP_ON
+	bne +
+	lda #0
+	sta SIM_WARP
+	ldx #11
+-	lda SIM_WARP_POS,x
+	sta startCam,x
+	dex
+	bpl -
+	lda SIM_WARP_POS+12
+	sta startYaw
+	lda SIM_WARP_POS+13
+	sta startYaw+1
+	jmp restart
++	rts
+
 ; ======================================================================
 ; Restart: the level as it was loaded. Nodes are not re-created -- every
 ; slot is re-posed from its own spawn state, which for a monster that never
@@ -1581,6 +1605,7 @@ monSpawn
 +	sta acHp,x
 	lda #AF_VIS
 	sta acFlags,x
+	jsr aiRespawn			; asleep, where the level put it
 	jmp acStand
 
 ; ======================================================================
@@ -1715,19 +1740,19 @@ ammoIcon	.byte 0, T_SB_SHELLS, T_SB_SHELLS, T_SB_NAILS
 ; X = slot. dd = acPos - cam per axis, bytes 1-3 of the 16.16 difference:
 ; fine units, signed 24-bit, x at dd+0, y at dd+3, z at dd+6. Preserves X.
 acDelta
-	.for a = 0, a < 3, a += 1
+	.for ax = 0, ax < 3, ax += 1
 	sec
-	lda acPos+(a*4+0)*MAX_ACT,x
-	sbc cam+a*4+0
-	lda acPos+(a*4+1)*MAX_ACT,x
-	sbc cam+a*4+1
-	sta dd+a*3+0
-	lda acPos+(a*4+2)*MAX_ACT,x
-	sbc cam+a*4+2
-	sta dd+a*3+1
-	lda acPos+(a*4+3)*MAX_ACT,x
-	sbc cam+a*4+3
-	sta dd+a*3+2
+	lda acPos+(ax*4+0)*MAX_ACT,x
+	sbc cam+ax*4+0
+	lda acPos+(ax*4+1)*MAX_ACT,x
+	sbc cam+ax*4+1
+	sta dd+ax*3+0
+	lda acPos+(ax*4+2)*MAX_ACT,x
+	sbc cam+ax*4+2
+	sta dd+ax*3+1
+	lda acPos+(ax*4+3)*MAX_ACT,x
+	sbc cam+ax*4+3
+	sta dd+ax*3+2
 	.next
 	rts
 

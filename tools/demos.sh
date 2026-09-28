@@ -86,9 +86,26 @@ for n in "${names[@]}"; do
 		continue
 	fi
 
-	if ! out=$( cd "$DEMODIR" && 64tass --cbm-prg -o "$prg" "$src" 2>&1 ); then
+	lst=$(mktemp)
+	if ! out=$( cd "$DEMODIR" && 64tass --cbm-prg -o "$prg" -L "$lst" "$src" 2>&1 ); then
 		echo "ASSEMBLE FAIL  $n"
 		echo "$out" | grep -v '^$' | tail -20
+		rm -f "$lst"
+		fail=1
+		continue
+	fi
+
+	# A `.for a = ...` loop leaves a symbol named `a` behind, and 64tass
+	# then assembles every later `lsr a` as `lsr $03` -- a zero-page shift
+	# that leaves A alone, with no warning. The game's rnd and mul8 ran
+	# like that through stage D. Any accumulator shift that did not come
+	# out as the one-byte opcode is that trap.
+	bad=$(grep -P "\t(lsr|asl|ror|rol) a\s*(;.*)?$" "$lst" |
+	      grep -vP "^\.[0-9a-f]+\t(4a|0a|6a|2a)\t")
+	rm -f "$lst"
+	if [ -n "$bad" ]; then
+		echo "ASSEMBLE FAIL  $n: 'a' is a symbol -- rename a .for a loop"
+		echo "$bad" | head -5
 		fail=1
 		continue
 	fi
@@ -174,7 +191,11 @@ for n in "${names[@]}"; do
 		# shut mover since run 39), lands back inside the button and
 		# presses it again. The route used to stay, and every earlier
 		# build then sat inside the shut door for the rest of the run.
-		extra=(--level="$REPO_ROOT/build/e1m1.g64lev"
+		#
+		# --notarget: the route is about doors, and since stage E the
+		# grunts by the button would otherwise shoot the player off it.
+		# tools/check_ai.py is the run where the monsters fight.
+		extra=(--level="$REPO_ROOT/build/e1m1.g64lev" --notarget
 		       --key=LSHIFT:20-426
 		       --key=W:20-43 --key=E:44-55
 		       --key=W:154-168 --key=Q:169-172
@@ -299,6 +320,22 @@ for n in "${names[@]}"; do
 				--prg="$prg" \
 				--level="$REPO_ROOT/build/e1m1.g64lev" 2>&1 ); then
 			echo "COMBAT CHECK FAIL  $n"
+			echo "$gout"
+			bad=1
+			fail=1
+		else
+			[ $verbose -eq 1 ] && echo "$gout"
+		fi
+	fi
+
+	# And stage E, the monsters' half, which everything above keeps asleep
+	# with --notarget: a grunt and a dog wake, run at the player on CLIP_MOVE
+	# answers and hurt them, and a restart puts them back, asleep.
+	if [ $bad -eq 0 ] && [ "$n" = "game" ]; then
+		if ! gout=$( python3 "$REPO_ROOT/tools/check_ai.py" \
+				--prg="$prg" \
+				--level="$REPO_ROOT/build/e1m1.g64lev" 2>&1 ); then
+			echo "AI CHECK FAIL  $n"
 			echo "$gout"
 			bad=1
 			fail=1

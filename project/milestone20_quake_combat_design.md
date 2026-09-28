@@ -511,6 +511,115 @@ attack; that is stage E.
   without a route search, and the one flooded route in `demos.sh` was not
   kept as a tool.
 
+## Stage E as built (2026-09-28)
+
+Monster AI for grunts and dogs, in `Source/Demos/gpu64_game_ai.inc`. The
+split is the same as for the shot: the Pi answers geometry, and the C64
+decides everything else.
+
+- **Two questions, both in the frame's `WORLD_TICK` block.**
+  - A **trace** from the monster's eye (origin + 25 QU) to the player's eye,
+    hull 0: can it see the player?
+  - A **move** from its origin, one step along its yaw, hull 1, in
+    `CLIP_MOVE`'s walk mode (slide, step, floor settle, no eye offset):
+    where does that step actually end?
+
+  The monsters' traces follow the shot's and its moves follow every trace.
+  `worldTick` sizes the block from `wtTrN + aiTrN + aiMvN`, which is at most
+  3 + 4 + 6 = 13. That is inside the 15 that the one-byte trailer offset
+  allows. Four monsters look per frame and six walk per frame. A
+  round-robin start rotates who gets the budget, and a monster left out
+  simply asks again on the next frame.
+- **Asleep.** A monster wakes on either of two events.
+  - **Sight:** on its think frame, the player is within 32 wu, in the
+    half-space it faces, and the trace comes back `TR_CLEAR`.
+  - **Noise:** any gunshot wakes every sleeper inside a 12 wu box.
+
+  Being hurt also wakes it. With `--notarget` (`SIM_NOTARGET`), or while the
+  player is dead, nothing wakes and nothing thinks.
+- **Awake.** It thinks every other frame, which is Quake's 10 Hz.
+  - Each think refreshes line of sight, turns at most 45° toward the
+    player, and makes the attack decision.
+  - It walks every frame: 40 fine a frame for a grunt, 72 for a dog.
+  - It stops short of the player: 64 QU for a grunt, 40 for a dog.
+    Monsters are not solid to each other or to the player.
+  - A step that covers less than 160/255 of what it asked for marks the
+    monster blocked. The next four thinks then detour 45° or 90° off the
+    ideal yaw, alternating sides. This is a cheap `SV_NewChaseDir`.
+  - A monster more than 64 wu away goes back to sleep.
+- **A move answer is refused** in three cases:
+  - it ends without `ONGROUND`;
+  - it has `STARTSOLID` or `ALLSOLID`;
+  - it ends more than one unit from where it started on any axis.
+
+  The floor settle probes only one step height down, so the first case is
+  Quake's "monsters do not walk off ledges" for free. The third is
+  [bound the answer](../docs/state-refresh.md) again: the checksum refuses a
+  corrupted block, and the bound refuses a nonsensical answer. `RF` on row
+  23 counts refusals. In every PC run it has been 0, including under
+  `drop:200`, `data:200` and `phantom:150`.
+- **Attacks, normal skill.**
+  - **Grunt** (Quake's `SoldierCheckAttack`). It needs to be in sight,
+    within 768 QU, and past its cooldown. The chance per think is 0.9
+    under 120 QU, 0.4 under 500 QU and 0.05 beyond.
+    - The shoot animation fires on its fifth frame: 4 pellets of 4 damage.
+    - A pellet hits when both `|crandom| × 0.1 × distance` offsets land
+      inside the player's box (±16 QU lateral, ±28 QU vertical).
+    - After the volley it rests 10 thinks.
+  - **Dog.**
+    - Within 80 QU it bites. On the attack animation's fourth frame the
+      bite does 8 + 0..7 damage if the player is still within 100 QU.
+    - Between 80 and 150 QU, in sight and past its cooldown, it leaps half
+      the time: 8 frames at 128 fine a frame. Coming within 50 QU does
+      10 + 0..7 damage once. A blocked leap ends where it hit.
+    - After an attack it rests 6 thinks.
+- **Animation.** Awake monsters animate every other frame (`AI_ANIM_MASK`)
+  and sleepers every fourth. The end of an `AM_ONCE` animation goes to
+  `aiAnimEnd`:
+  - pain returns to the chase;
+  - an attack sets the cooldown, then returns to the chase;
+  - a sleeper returns to stand.
+- **Restart.** `aiInit` saves each monster's spawn position and yaw once,
+  after `combatCount`. `monSpawn` calls `aiRespawn`, which puts the monster
+  back there, asleep.
+- **Telemetry, row 23.** `AWK` awake now, `WK` wakes ever, `SEE` awake
+  with a clear line, `BLK` blocked steps, `RF` refused moves, `HT` times a
+  monster hurt the player.
+- **The assembler trap stage D shipped with.** `acDelta`'s `.for a = 0 ...`
+  loop left a symbol named `a` = 3 behind. From then on 64tass assembled
+  every `lsr a`, `asl a`, `ror a` and `rol a` as a zero-page shift of `$03`,
+  which leaves A alone, and it gave no warning. Twenty-four were
+  mis-assembled, including all of `rnd`, `mul8` and `dmHexA`. Stage D's
+  "random" pellet spread was therefore a fixed sequence, and armour
+  absorption was wrong. The loop variable is `ax` now, and `tools/demos.sh`
+  fails any demo whose listing has an accumulator shift that did not
+  assemble to its one-byte opcode. It was found because the grunt's first
+  volleys missed 12 pellets out of 12.
+- **runsim `--warp=F:X,Y,Z,YAW`.** From frame F the game restarts with its
+  eye at X Y Z, facing YAW. runsim writes `SIM_WARP_ON` and the position to
+  `$02A9`/`$02B0`, and `simWarp` points `startCam` there, then calls
+  `restart`. Only runsim writes those bytes; the game clears them at start.
+  This is how a check reaches the dog room without a flooded route.
+- **Gate.** `tools/check_ai.py` (12 checks, about 65 s) runs in `tools/demos.sh
+  game` after `check_combat`. It has three runs:
+  - **grunt:** the door route. Grunt 245 must wake, leave its spawn point on
+    its own floor, and shoot the player down.
+  - **dog:** a warp beside dog 247. It must close from z 47.5 to about 41,
+    rising onto the room's 0.5 wu step exactly as the player does, and the
+    grunt beside it must wake too.
+  - **restart:** grunt 245 must be back on its spawn point and every
+    monster asleep.
+
+  Every other game run keeps `--notarget`, so it tests what it tested
+  before.
+- **Not modelled.**
+  - Monsters never open doors.
+  - A monster's move is traced only against the movers selected near the
+    player.
+  - Monster-versus-monster infighting.
+  - Spawnflag 1 (ambush: sight only, deaf).
+  - Pain chance: every hit that does not kill plays pain, as in stage D.
+
 ## Risks
 
 - **Frame rate.** The game renders at about 32 fps on the bench. A room of

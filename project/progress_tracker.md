@@ -9827,3 +9827,41 @@ by md5 from here on.
 - runsim: `CBM` key, `--mouse=DX,DY[,FIRE]:FIRST-LAST`. check_combat's
   three kill shots are now B, C= and the mouse, and the restart is
   joystick 2's button. All green.
+
+## 79. Milestone 20 stage E: monster AI (2026-09-28, PC only)
+
+Grunts and dogs wake, chase and attack, in `Source/Demos/gpu64_game_ai.inc`.
+- Each awake monster asks the frame's `WORLD_TICK` block two things: a
+  line-of-sight trace, and a one-step walk move through `CLIP_MOVE`'s hull
+  1. Every other decision is made on the 6502.
+- Budgets: 4 traces and 6 moves a frame, round-robin. Together with the
+  shot's 3 that makes 13 of the 15 answers a block can carry.
+- The attacks follow Quake at normal skill:
+  - grunt volleys of 4 pellets, fired with a chance that depends on
+    distance;
+  - dog bite;
+  - dog leap.
+- A move that ends off the floor, in solid, or more than a unit away is
+  not taken.
+- Restart puts every monster back on its spawn point, asleep.
+- Row 23 is the telemetry.
+
+**An old bug found on the way.** Since stage D, `acDelta`'s `.for a` loop
+variable had turned every later `lsr/asl/ror/rol a` into a shift of zero
+page `$03`: 24 instructions, including all of `rnd` and `mul8`. Stage D's
+pellet spread and armour absorption were wrong on the bench too. The loop
+variable is `ax` now, and `tools/demos.sh` lints each listing for the trap.
+
+New runsim option `--warp=F:X,Y,Z,YAW` restarts the game at a chosen eye
+position, through `$02A9`/`$02B0`, which only runsim writes.
+
+Gate: `tools/check_ai.py`, 12 checks: the grunt run, the dog run, and a
+restart. It runs in `tools/demos.sh game` and is green, together with
+`check_game` and `check_combat`. Faulted runs (`drop:200`, `data:200`,
+`phantom:150`) in the dog room and on the door route end with `RF000`. The
+judge flags only `CLIP_MOVE` queries, as it did before this stage.
+
+Details are in [milestone20_quake_combat_design.md](milestone20_quake_combat_design.md),
+"Stage E as built". Next is stage F: counters, exit and stats screen, SID,
+lights.
+

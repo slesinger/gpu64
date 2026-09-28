@@ -24,6 +24,10 @@ Two scripted runs, each driven from the start of the level:
            full health, the gun back -- and the press that restarted must
            NOT also fire. A later B fires normally.
 
+Both run with --notarget: the monsters never wake on their own, so the
+grunt is where its entity says and the only damage is the <- key's.
+tools/check_ai.py is the run where they fight back.
+
 Usage: tools/check_combat.py --prg=... --level=build/e1m1.g64lev
 """
 
@@ -65,7 +69,7 @@ def consts(path):
 def run(prg, level, frame, keys):
     cmd = [sys.executable, os.path.join(HERE, 'prgsim', 'runsim.py'), prg,
            '--demo', '--stop-after=%d' % frame, '--level=' + level,
-           '--dump-scene'] + keys
+           '--dump-scene', '--notarget'] + keys
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.stdout.write(r.stdout)
