@@ -195,7 +195,12 @@ for n in "${names[@]}"; do
 		# --notarget: the route is about doors, and since stage E the
 		# grunts by the button would otherwise shoot the player off it.
 		# tools/check_ai.py is the run where the monsters fight.
+		#
+		# --frame-ms=32: the game scales its motion by the measured
+		# frame time, so the route only walks where it was flooded on a
+		# clock that reads the 32ms the constants were tuned at.
 		extra=(--level="$REPO_ROOT/build/e1m1.g64lev" --notarget
+		       --frame-ms=32
 		       --key=LSHIFT:20-426
 		       --key=W:20-43 --key=E:44-55
 		       --key=W:154-168 --key=Q:169-172
@@ -336,6 +341,53 @@ for n in "${names[@]}"; do
 				--prg="$prg" \
 				--level="$REPO_ROOT/build/e1m1.g64lev" 2>&1 ); then
 			echo "AI CHECK FAIL  $n"
+			echo "$gout"
+			bad=1
+			fail=1
+		else
+			[ $verbose -eq 1 ] && echo "$gout"
+		fi
+	fi
+
+	# Water, slime and the suit: CLIP_MOVE's waterlevel turned into
+	# swimming, drowning and liquid damage (gpu64_game_env.inc).
+	if [ $bad -eq 0 ] && [ "$n" = "game" ]; then
+		if ! gout=$( python3 "$REPO_ROOT/tools/check_env.py" \
+				--prg="$prg" \
+				--level="$REPO_ROOT/build/e1m1.g64lev" 2>&1 ); then
+			echo "ENV CHECK FAIL  $n"
+			echo "$gout"
+			bad=1
+			fail=1
+		else
+			[ $verbose -eq 1 ] && echo "$gout"
+		fi
+	fi
+
+	# The SID: runsim's --sid-log decoded back into effect names, so the
+	# scripted shots, pains, doors, splashes and the jump each made theirs
+	# (gpu64_game_sfx.inc).
+	if [ $bad -eq 0 ] && [ "$n" = "game" ]; then
+		if ! gout=$( python3 "$REPO_ROOT/tools/check_sfx.py" \
+				--prg="$prg" \
+				--level="$REPO_ROOT/build/e1m1.g64lev" 2>&1 ); then
+			echo "SFX CHECK FAIL  $n"
+			echo "$gout"
+			bad=1
+			fail=1
+		else
+			[ $verbose -eq 1 ] && echo "$gout"
+		fi
+	fi
+
+	# Stage F: the three-button counter and its wait -1 door, the exit's
+	# intermission and the way back out of it, and the muzzle flash
+	# (gpu64_game_exit.inc).
+	if [ $bad -eq 0 ] && [ "$n" = "game" ]; then
+		if ! gout=$( python3 "$REPO_ROOT/tools/check_exit.py" \
+				--prg="$prg" \
+				--level="$REPO_ROOT/build/e1m1.g64lev" 2>&1 ); then
+			echo "EXIT CHECK FAIL  $n"
 			echo "$gout"
 			bad=1
 			fail=1

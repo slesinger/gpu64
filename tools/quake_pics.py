@@ -1,0 +1,107 @@
+"""
+quake_pics.py - the level file's picture section (format v7).
+
+Full-screen and menu pictures for the title, the skill menu and the
+intermission, drawn on the HDMI screen by LEVEL_PICTURE ($1A) straight
+into a class 0 page. Each is w x h palette indices in the Quake palette;
+255 is transparent to a keyed draw, as in Quake's own .lmp files.
+
+The picture indices become PIC_* symbols in the game's include, and are
+part of the catalogue hash, so a level from another converter run is
+refused rather than showing the wrong picture.
+"""
+import struct
+from collections import OrderedDict
+
+import hondani
+import quake_assets
+
+KEY = 255
+
+LMPS = [('CONBACK', 'gfx/conback.lmp'),     # 320x200, the Quake title
+        ('QPLAQUE', 'gfx/qplaque.lmp'),     # 32x144, the menu's left plaque
+        ('TTL_SGL', 'gfx/ttl_sgl.lmp'),     # 128x24, "SINGLE PLAYER"
+        ('LOADING', 'gfx/loading.lmp'),     # 144x24
+        ('COMPLETE', 'gfx/complete.lmp'),   # 192x24, intermission heading
+        ('INTER', 'gfx/inter.lmp')]         # 160x144, time/secrets/kills
+DOTS = 6                                    # gfx/menudot1..6, 16x24
+WAD_PICS = ['NUM_%d' % i for i in range(10)] + ['NUM_COLON', 'NUM_SLASH']
+SKILLS = ['EASY', 'NORMAL', 'HARD', 'NIGHTMARE']
+
+
+def lmp(data):
+    w, h = struct.unpack_from('<ii', data, 0)
+    return w, h, bytes(data[8:8 + w * h])
+
+
+def conchars(wad_data):
+    """The 128x128 console font. It is gfx.wad's one raw lump (type 0x44),
+    which quake_assets.read_wad skips; index 0 is its transparent colour."""
+    magic, n, dirofs = struct.unpack_from('<4sii', wad_data, 0)
+    for i in range(n):
+        fp, dsz, sz, ty, cmp, _, nm = struct.unpack_from('<iiibbh16s',
+                                                         wad_data,
+                                                         dirofs + i * 32)
+        if nm.split(b'\0')[0].upper() == b'CONCHARS':
+            return wad_data[fp:fp + 128 * 128]
+    raise ValueError('gfx.wad has no CONCHARS')
+
+
+def text(font, s, scale=2, gold=True):
+    """s in the console font at `scale`, transparent (KEY) background. The
+    gold half (char + 128) is what Quake's menus print with."""
+    w, h = 8 * len(s) * scale, 8 * scale
+    out = bytearray([KEY]) * (w * h)
+    for i, ch in enumerate(s):
+        c = ord(ch) + (128 if gold else 0)
+        sx, sy = (c & 15) * 8, (c >> 4) * 8
+        for y in range(8):
+            for x in range(8):
+                v = font[(sy + y) * 128 + sx + x]
+                if v == 0:
+                    continue
+                for dy in range(scale):
+                    row = (y * scale + dy) * w + (i * 8 + x) * scale
+                    for dx in range(scale):
+                        out[row + dx] = v
+    return w, h, bytes(out)
+
+
+def build(pak_f, pak_ents, pak_read):
+    """Returns ([(w, h, pixels)], OrderedDict of PIC_* symbols)."""
+    pics, sym = [], OrderedDict()
+
+    def add(name, pic):
+        sym['PIC_' + name] = len(pics)
+        pics.append(pic)
+
+    add('HONDANI', hondani.hdmi_pixels())
+    for name, path in LMPS:
+        add(name, lmp(pak_read(pak_f, pak_ents, path)))
+    # What Quake's menus are drawn over: the console background through
+    # Draw_FadeScreen, which blacks out every other pixel in a checkerboard.
+    w, h, px = pics[sym['PIC_CONBACK']]
+    add('CONFADE', (w, h, bytes(0 if (x ^ y) & 1 else px[y * w + x]
+                                for y in range(h) for x in range(w))))
+    for i in range(DOTS):
+        p = lmp(pak_read(pak_f, pak_ents, 'gfx/menudot%d.lmp' % (i + 1)))
+        add('DOT%d' % i, p)
+    wad_data = pak_read(pak_f, pak_ents, 'gfx.wad')
+    wad = quake_assets.read_wad(wad_data)
+    for name in WAD_PICS:
+        add(name, wad[name])
+    font = conchars(wad_data)
+    for s in SKILLS:
+        add('SK_' + s, text(font, s))
+    sym['PIC_COUNT'] = len(pics)
+    # Where the logo sits on both screens, and its palette base.
+    sym['LOGO_X'], sym['LOGO_Y'] = hondani.X, hondani.Y
+    sym['LOGO_BASE'] = hondani.LOGO_BASE
+    return pics, sym
+
+
+def section(pics, put):
+    """Lay the pixels out with put() and return the section's bytes:
+    u16 count, u16 0, then count x <HHI> w, h, blob offset."""
+    tab = [struct.pack('<HHI', w, h, put(px)) for w, h, px in pics]
+    return struct.pack('<HH', len(pics), 0) + b''.join(tab)

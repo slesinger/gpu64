@@ -33,9 +33,10 @@ LUMPS = ['entities','planes','miptex','vertices','visilist','nodes','texinfo',
 
 MAX_VERTS_PER_MESH = 256
 MAX_UV_SPAN        = 255
-LEVEL_VERSION      = 5      # 1 had no entities, 2 no collision,
+LEVEL_VERSION      = 7      # 1 had no entities, 2 no collision,
                             # 3 no entity kind and no mover travel,
-                            # 4 no point hull (hull 0)
+                            # 4 no point hull (hull 0), 5 no visibility,
+                            # 6 no pictures
 
 
 def read_pak(path):
@@ -311,7 +312,9 @@ def subdivide(pts, uvs, depth=0):
             subdivide([mp, pts[b], pts[c]], [mu, uvs[b], uvs[c]], depth + 1))
 
 
-def collect(bsp, model, flip_winding, stats):
+def collect(bsp, model, flip_winding, stats, owner=None):
+    """owner, when given, is filled with id(triangle) -> BSP face index, which
+    is what build_vis() needs to say which leaves a chunk's faces live in."""
     tris = []
     for fi in range(model['firstface'], model['firstface'] + model['numfaces']):
         f = bsp.faces[fi]
@@ -364,6 +367,8 @@ def collect(bsp, model, flip_winding, stats):
                              tuple((int(round(u)) & 0xff, int(round(v)) & 0xff)
                                    for u, v in su),
                              ti[2], flags))
+                if owner is not None:
+                    owner[id(tris[-1])] = fi
     return tris
 
 
@@ -793,6 +798,122 @@ def build_collision(bsp, stats):
     return planes, hulls, clips
 
 
+# ---------------------------------------------------------------------------
+# Visibility (v6).
+#
+# The Pi frustum-culls each mesh by its bounding sphere and nothing else, so
+# standing in E1M1's first corridor and looking down it, every chunk of the
+# level that happens to lie in that direction was drawn -- rooms behind two
+# walls included. Quake solved exactly this at compile time: vis.exe stores,
+# for every leaf of the drawing BSP, the set of leaves that could possibly be
+# seen from anywhere inside it (the PVS). This bakes that down to the only
+# granularity gpu64 draws at, the chunk:
+#
+#   row[leaf] bit j = world node j has a face in some leaf of leaf's PVS
+#
+# and carries the drawing BSP itself, with its leaf numbers intact, so the
+# firmware can find which leaf the camera is in. Hull 0 cannot be reused for
+# that: it replaced every leaf by its contents, which is all a trace needs.
+#
+# Measured over every open leaf of E1M1 and eight headings: the frustum alone
+# leaves a mean of 6156 triangles (p90 12007, max the whole level); frustum
+# plus this, 2439 (p90 4235, max 5883).
+#
+# Only the world (model 0) is culled. Brush models move, and a mover's chunk
+# is small; it is always drawn, exactly as before.
+#
+# Section layout, little-endian, in the blob area:
+#   <6H   nLeafs, nRowBytes, nWorldNodes, nVisNodes, headNode, 0
+#   nVisNodes x <HhhH  plane, child0, child1, 0   child < 0 is leaf -1-child
+#   nLeafs x nRowBytes rows; leaf 0 (the shared solid leaf) is all ones
+# ---------------------------------------------------------------------------
+
+VIS_HDR = '<6H'
+VIS_NODE = '<HhhH'
+
+
+def bsp_leaves(bsp):
+    o, l = bsp.lump['leaves']
+    out = []
+    for i in range(l // 28):
+        c, vo = struct.unpack_from('<ii', bsp.d, o + i * 28)
+        fm, nm = struct.unpack_from('<2H', bsp.d, o + i * 28 + 20)
+        out.append((c, vo, fm, nm))
+    return out
+
+
+def bsp_pvs(bsp, leaves, nvis, li):
+    """Leaf li's PVS as a set of leaf indices, decompressed the way Quake's
+    Mod_DecompressVis does: a zero byte is followed by a run length."""
+    vo = leaves[li][1]
+    if vo < 0:
+        return set(range(1, nvis + 1))
+    o, l = bsp.lump['visilist']
+    vis = bsp.d[o:o + l]
+    p, b, row, out = vo, 0, (nvis + 7) // 8, set()
+    while b < row:
+        c = vis[p]; p += 1
+        if c == 0:
+            b += vis[p]; p += 1
+            continue
+        for k in range(8):
+            if c & (1 << k):
+                out.add(1 + b * 8 + k)
+        b += 1
+    return out
+
+
+def build_vis(bsp, world_chunks, owner, stats):
+    leaves = bsp_leaves(bsp)
+    o, l = bsp.lump['marksurf']
+    mark = struct.unpack_from('<%dH' % (l // 2), bsp.d, o)
+    nvis = struct.unpack_from('<i', bsp.d, bsp.lump['models'][0] + 52)[0]
+    nleafs = nvis + 1
+    if len(bsp.nodes) > 32767 or len(leaves) > 32767:
+        sys.exit('the drawing BSP does not fit s16 children')
+
+    face_leaves = defaultdict(set)
+    for li in range(nleafs):
+        _, _, fm, nm = leaves[li]
+        for k in range(nm):
+            face_leaves[mark[fm + k]].add(li)
+
+    nw = len(world_chunks)
+    row_bytes = max(1, (nw + 7) // 8)
+    always = set()
+    chunk_leaves = []
+    for j, c in enumerate(world_chunks):
+        s = set()
+        for t in c.tris:
+            fl = face_leaves.get(owner.get(id(t)))
+            if not fl:
+                always.add(j)       # a face no leaf claims: never cull it
+                break
+            s |= fl
+        chunk_leaves.append(s)
+    stats['vis_chunks_uncullable'] = len(always)
+
+    rows = bytearray(b'\xff' * row_bytes)          # leaf 0, solid
+    frac = []
+    for li in range(1, nleafs):
+        pv = bsp_pvs(bsp, leaves, nvis, li) | {li}
+        r = bytearray(row_bytes)
+        for j in range(nw):
+            if j in always or chunk_leaves[j] & pv:
+                r[j >> 3] |= 1 << (j & 7)
+        rows += r
+        if leaves[li][0] == -1:
+            frac.append(sum(bin(x).count('1') for x in r) / float(nw))
+    stats['vis_leafs'] = nleafs
+    stats['vis_mean_pct_chunks'] = int(round(100 * sum(frac) / len(frac)))
+
+    nodes = b''.join(struct.pack(VIS_NODE, pn, c0, c1, 0)
+                     for pn, c0, c1 in bsp.nodes)
+    hdr = struct.pack(VIS_HDR, nleafs, row_bytes, nw, len(bsp.nodes),
+                      bsp.models[0]['headnode'][0], 0)
+    return hdr + nodes + bytes(rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pak', default='quake/ID1/PAK0.PAK')
@@ -849,10 +970,11 @@ def main():
     # cannot be written until the textures have been given their dense ids.
     chunks = []
     used_tex = set()
+    owner = {}
     for mi, m in enumerate(models):
         if mi in invisible:
             continue
-        tris = collect(bsp, m, a.flip_winding, stats)
+        tris = collect(bsp, m, a.flip_winding, stats, owner)
         if not tris:
             continue
         for c in split_chunks(tris):
@@ -895,11 +1017,18 @@ def main():
     # the same tables so the loader builds them as ordinary resources. They
     # get no nodes -- the game creates actor nodes itself. See quake_assets.py.
     nLevelMeshes = len(meshes)
+    pics = []
     if not a.no_actors:
         import quake_assets
         atex, amesh, sym = quake_assets.build(
             f, ents, pak_read, Bsp, collect, pal, len(texrecs), len(meshes),
             stats)
+        # Format 7: title, menu and intermission pictures, drawn by
+        # LEVEL_PICTURE. Their indices hash into the catalogue with the rest.
+        import quake_pics
+        pics, psym = quake_pics.build(f, ents, pak_read)
+        sym.update(psym)
+        stats['pictures'] = len(pics)
         for name, ws, hs, px in atex:
             texrecs.append((0xffff, ws, hs, 0, len(px)))
             texblobs.append(px)
@@ -921,6 +1050,12 @@ def main():
             print('  wrote %s (%d symbols, hash $%04x)'
                   % (a.inc, len(sym), cat_hash))
     planes, hulls, clips = build_collision(bsp, stats)
+
+    # The world's chunks are the first nodes, because main() emits chunks
+    # model by model and model 0 first; the vis rows index nodes by that.
+    world = [c for c, mi in chunks if mi == 0]
+    assert all(mi == 0 for _, mi in chunks[:len(world)])
+    vis = build_vis(bsp, world, owner, stats)
 
     print('%s: %d faces, %d verts, %d textures, %d models'
           % (a.map, len(bsp.faces), len(bsp.verts), len(bsp.textures),
@@ -959,6 +1094,7 @@ def main():
             o = len(blob); blob.extend(b); return o
         palo = put(pal[:768])
         stro = put(entstrs)
+        viso = put(vis)
         trec = [(t, ws, hs, put(texblobs[i]), ln)
                 for i, (t, ws, hs, _, ln) in enumerate(texrecs)]
         # Animation frames share one face blob per model (quake_assets.py);
@@ -969,6 +1105,11 @@ def main():
                 shared[b] = put(b)
             return shared[b]
         mrec = [(put(v), len(v), put_shared(fb), len(fb)) for v, fb in meshes]
+        pico, picl = 0, 0
+        if pics:
+            import quake_pics
+            sec = quake_pics.section(pics, put)
+            pico, picl = put(sec), len(sec)
         tbl = b''.join(struct.pack('<HBBII', *r) for r in trec)
         mtb = b''.join(struct.pack('<IIII', *r) for r in mrec)
         ntb = b''.join(struct.pack('<HiiiH', n[0],
@@ -981,21 +1122,21 @@ def main():
         htb = b''.join(hulls)
         ctb = b''.join(clips)
 
-        # 36-byte header, then seven tables, then the blob area everything
+        # 52-byte header, then seven tables, then the blob area everything
         # else offsets into. `base` is absolute; every other offset in the
         # file is relative to it, so the loader adds it exactly once.
-        hdr = struct.pack('<4sHH' '4H' 'HHI' '3I',
+        hdr = struct.pack('<4sHH' '4H' 'HHI' '5I' '2I',
                           b'G64L', LEVEL_VERSION, int(QU_PER_WU),
                           len(trec), len(mrec), len(nodes), len(entrecs),
                           len(planes), len(hulls), len(clips),
-                          0, palo, stro)
+                          0, palo, stro, viso, len(vis), pico, picl)
         base = (len(hdr) + len(tbl) + len(mtb) + len(ntb) + len(etb)
                 + len(ptb) + len(htb) + len(ctb))
-        hdr = struct.pack('<4sHH' '4H' 'HHI' '3I',
+        hdr = struct.pack('<4sHH' '4H' 'HHI' '5I' '2I',
                           b'G64L', LEVEL_VERSION, int(QU_PER_WU),
                           len(trec), len(mrec), len(nodes), len(entrecs),
                           len(planes), len(hulls), len(clips),
-                          base, palo, stro)
+                          base, palo, stro, viso, len(vis), pico, picl)
         out = bytearray(hdr) + tbl + mtb + ntb + etb + ptb + htb + ctb + blob
         open(a.out, 'wb').write(out)
         print('  wrote %s (%.1f KB)' % (a.out, len(out) / 1024.0))

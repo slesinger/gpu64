@@ -12,9 +12,10 @@
 ;
 ; Asleep, a monster looks: the player within AI_SIGHT, in the half-space
 ; it faces, and a clear trace wakes it. A gunshot wakes every sleeper
-; inside an AI_NOISE box, and so does being hurt. Awake, it thinks every
-; other frame (10 Hz, as Quake's monsters do): it turns toward the player
-; at most AI_TURN a think, walks along its yaw every frame, keeps its line
+; inside an AI_NOISE box, and so does being hurt. Awake, it acts every
+; other frame (15 Hz at 30 fps; Quake's monsters think at 10), staggered by
+; slot so half of them act on each frame: it turns toward the player at
+; most AI_TURN a think, takes a double step along its yaw, keeps its line
 ; of sight fresh, and attacks when Quake's CheckAttack would. A step that
 ; comes back short marks it blocked, and the next thinks detour 45-135
 ; degrees off the ideal yaw, alternating sides, before trying straight at
@@ -49,6 +50,7 @@ AI_BITE   = 3
 AI_LEAP   = 4
 
 AI_ANIM_MASK = 1		; awake: an animation frame every 2nd frame
+AI_LOOK_MASK = 3		; asleep: looks every 4th frame
 AI_MAXTR  = 4			; traces a frame (with CB_NCAND and AI_MAXMV,
 AI_MAXMV  = 6			; moves a frame   at most 15 answers a block)
 AI_MAXMON = 32
@@ -59,11 +61,15 @@ AI_TURN   = 32			; yaw per think: 45 degrees
 AI_DETOUR = 4			; thinks a detour lasts
 AI_BLOCK  = 160			; a step covering less than 160/255 is blocked
 AI_WAKE_COOL = 4		; thinks before a new monster's first attack
+AI_MAXAWAKE = 8			; sight and noise wake no more than this many;
+				; a hurt monster wakes regardless
 
+; Per DT_REF frame; an awake monster moves every other frame, and
+; aiMoveReq doubles the step for it.
 GR_STEP   = 40			; fine per frame: ~110 QU/s, Quake's run
 DOG_STEP  = 72			; ~200 QU/s
 LEAP_STEP = 128			; ~350 QU/s, Quake's leap is 300 forward
-LEAP_FRAMES = 8
+LEAP_FRAMES = 4			; acting frames, i.e. every other frame
 
 GR_STOP_F   = 512		; fine: a grunt closes to 64 QU ...
 DOG_STOP_F  = 320		; ... a dog to 40 QU
@@ -88,11 +94,12 @@ DOG_BITE_AF = 3			; the attack animation frame that bites
 ; restart can put it back.
 ; ======================================================================
 aiInit
-	lda #SL_WORLD
+	lda #0
 	sta aiRR
 	lda #0
 	sta aiLoud
 	sta aiMon
+	sta aiNL
 	sta aiWakes
 	sta aiBlocks
 	sta aiRefs
@@ -105,6 +112,10 @@ aiiLoop
 	sta acAi,x
 	jsr aiIsMon
 	bcc aiiNext
+	ldy aiNL			; every monster, saved or not, is on the list
+	txa
+	sta aiList,y
+	inc aiNL
 	lda aiMon
 	cmp #AI_MAXMON
 	bcs aiiNext			; not saved: respawns where it fell
@@ -192,9 +203,14 @@ ahRts
 
 ; X = monster slot: awake and running at the player. Preserves X.
 aiWake
+	lda #SFX_SIGHT
+	jsr sfxPlay
 	inc aiWakes
 	bne +
 	dec aiWakes
++	lda aiAwN			; counted: one more
+	bmi +
+	inc aiAwN
 +	lda #1
 	sta acSee,x
 	lda #AI_WAKE_COOL
@@ -253,48 +269,63 @@ aiFrame
 	sta aiNoisy
 	lda #0
 	sta aiLoud
+	lda #$ff			; the awake count: unknown until a wake
+	sta aiAwN			; asks (aiCanWake)
 	jsr aiOff
 	bcc +
 	rts
-+	lda nAct
-	sec
-	sbc #SL_WORLD
++	lda aiNL
 	beq afiRts
-	bcc afiRts
 	sta aiCnt
-	ldx aiRR
-	inx
-	cpx nAct
-	bcs afiWrap
-	cpx #SL_WORLD
-	bcs afiGo
-afiWrap
-	ldx #SL_WORLD
-afiGo
-	stx aiRR
+	ldy aiRR
+	iny
+	cpy aiNL
+	bcc +
+	ldy #0
++	sty aiRR
 afiLoop
+	sty aiI
+	ldx aiList,y
 	stx aiX
 	jsr aiOne
-	ldx aiX
-	inx
-	cpx nAct
+	ldy aiI
+	iny
+	cpy aiNL
 	bcc +
-	ldx #SL_WORLD
+	ldy #0
 +	dec aiCnt
 	bne afiLoop
 afiRts
 	rts
 
-; X = slot.
+; X = slot, a monster's (aiList).
 aiOne
-	jsr aiIsMon
-	bcs +
-	rts
-+	lda acState,x
+	lda acState,x
 	cmp #AS_IDLE			; in pain or dead: nothing to decide
 	beq +
 	rts
-+	jsr acDelta			; dd = monster - eye, fine
++	lda acAi,x
+	beq aoAsleep
+	txa				; awake: acts on every other frame,
+	eor wtFrame			; the one actFrame does not animate it on
+	and #1
+	beq aoGeom
+	rts
+aoAsleep
+	lda aiNoisy			; asleep: nothing to hear, and not its
+	bne aoSlNear			; frame to look -- no geometry at all
+	txa
+	eor wtFrame
+	and #AI_LOOK_MASK
+	beq aoSlNear
+	rts
+aoSlNear
+	.cerror ANIM_NEAR < AI_SIGHT, "the prefilter must reach AI_SIGHT"
+	jsr acNearWu			; 32 wu out on x or z: past AI_SIGHT and
+	bcc aoGeom			; AI_NOISE, so nothing to compute
+	rts
+aoGeom
+	jsr acDelta			; dd = monster - eye, fine
 	jsr aiGeom
 	ldx aiX
 	lda acAi,x
@@ -313,11 +344,13 @@ aoSleep
 	lda aiAdz+1
 	cmp #AI_NOISE
 	bcs aoLook
+	jsr aiCanWake
+	bcs aoLook
 	jmp aiWake
 aoLook
-	txa				; looks 10 times a second
+	txa				; looks every AI_LOOK_MASK+1 frames
 	eor wtFrame
-	and #1
+	and #AI_LOOK_MASK
 	bne aoRts
 	lda aiFar
 	bne aoRts
@@ -328,8 +361,37 @@ aoLook
 	ldy acYaw,x
 	jsr aiFacing
 	bmi aoRts
+	jsr aiCanWake			; no trace a wake could not use
+	bcs aoRts
 	jmp aiLosReq
 aoRts
+	rts
+
+; C clear if one more monster may wake: fewer than AI_MAXAWAKE alive and
+; awake. Counted at most once a frame, and only when a sleeper could
+; wake. Preserves X.
+aiCanWake
+	lda aiAwN
+	bpl acwCmp
+	stx aiT2
+	lda #0
+	sta aiAwN
+	ldy aiNL
+	beq acwDone
+-	ldx aiList-1,y
+	lda acAi,x
+	beq +
+	lda acState,x
+	cmp #AS_DEAD
+	beq +
+	inc aiAwN
++	dey
+	bne -
+acwDone
+	ldx aiT2
+	lda aiAwN
+acwCmp
+	cmp #AI_MAXAWAKE
 	rts
 
 ; --- awake -------------------------------------------------------------
@@ -339,13 +401,8 @@ aoAwake
 	lda #AI_SLEEP			; lost: over 64 units away
 	sta acAi,x
 	jmp acStand
-+	txa
-	eor wtFrame
-	and #1
-	bne aoAct
-	jsr aiThink
++	jsr aiThink
 	ldx aiX
-aoAct
 	lda acAi,x
 	cmp #AI_CHASE
 	beq aoChase
@@ -382,6 +439,8 @@ aoShoot
 	bne aosRts
 	lda #1
 	sta acFired,x
+	lda #SFX_GRUNT
+	jsr sfxPlay
 	jmp aiVolley
 aosRts
 	rts
@@ -394,6 +453,8 @@ aoBite
 	bne aobRts
 	lda #1
 	sta acFired,x
+	lda #SFX_BITE
+	jsr sfxPlay
 	ldy #<DOG_BITE_F
 	lda #>DOG_BITE_F
 	jsr aiDistLt
@@ -432,7 +493,9 @@ aolRts
 	rts
 
 ; A think, 10 Hz: line of sight, an attack, or where to run. X = slot.
+; aiGeom's max/min/signs are still this monster's: aiIdeal from them now.
 aiThink
+	jsr aiAtan			; preserves X
 	lda acAtkT,x
 	beq +
 	dec acAtkT,x
@@ -474,6 +537,8 @@ atNoBite
 	bcc atSteer
 	jsr rnd				; preserves X
 	bmi atNoLeap			; half the time
+	lda #SFX_LEAP
+	jsr sfxPlay
 	lda #LEAP_FRAMES
 	sta acLeapT,x
 	ldy #M_DOG_LEAP
@@ -701,7 +766,7 @@ agDist
 	lda aiMax+1
 	adc aiT+1
 	sta aiDist+1
-	jmp aiAtan
+	rts
 
 ; X = 0 (x) or 2 (z): aiAdx+X = |aiDx+X|.
 agAbs
@@ -899,15 +964,22 @@ aiLosReq
 	inc aiTrN
 	rts
 
-; X = slot, A = step in fine: its origin plus the step along its yaw,
-; hull 1, walking. Nothing if the budget is spent.
+; X = slot, A = step in fine per DT_REF frame: its origin plus twice the
+; step (it moves every other frame), scaled by the frame time, along its
+; yaw, hull 1, walking. At most 2 x 240 fine, inside aiBound's two units.
+; Nothing if the budget is spent.
 aiMoveReq
+	jsr dtMul			; preserves X
 	ldy aiMvN
 	cpy #AI_MAXMV
 	bcc +
 	rts
 +
+	asl a
 	sta aiStep
+	lda #0
+	rol a
+	sta aiStep+1
 	txa
 	sta aiMvSl,y
 	lda aiMvOfs,y
@@ -938,7 +1010,7 @@ aiMoveReq
 	sta mS+1
 	lda aiStep
 	sta mA
-	lda #0
+	lda aiStep+1
 	sta mA+1
 	jsr mulTrig
 	ldy aiT
@@ -955,7 +1027,7 @@ aiMoveReq
 	sta mS+1
 	lda aiStep
 	sta mA
-	lda #0
+	lda aiStep+1
 	sta mA+1
 	jsr mulTrig
 	ldy aiT
@@ -1078,6 +1150,8 @@ arTrLoop
 	lda acState,x
 	cmp #AS_IDLE
 	bne arTrNext
+	jsr aiCanWake
+	bcs arTrNext
 	jsr aiWake
 	jmp arTrNext
 arSee
@@ -1165,7 +1239,8 @@ aiAnsOfs
 	rts
 
 ; X = slot, aiAns = the move's end at (DST),Y. C clear if the end is less
-; than a unit from acPos on every axis. Preserves X.
+; than two units from acPos on every axis (a double step is at most 1.9).
+; Preserves X.
 aiBound
 	.for ax = 0, ax < 3, ax += 1
 	ldy aiAns
@@ -1183,14 +1258,17 @@ aiBound
 	lda (DST),y
 	sbc acPos+(ax*4+3)*MAX_ACT,x
 	sta aiT+1
-	; the whole-unit byte -1 or 0, and the top byte its sign
+	; top:whole in -2..1
+	clc
 	lda aiT
-	cmp aiT+1
+	adc #2
+	sta aiT
+	lda aiT+1
+	adc #0
 	beq +
 	jmp abFar
-+	clc
-	adc #1
-	cmp #2
++	lda aiT
+	cmp #4
 	bcc +
 	jmp abFar
 +	lda aiAns
@@ -1329,15 +1407,18 @@ aiTrN		.byte 0
 aiMvN		.byte 0
 aiLoud		.byte 0
 aiNoisy		.byte 0
+aiAwN		.byte $ff	; awake and alive, $ff unknown
 aiRR		.byte 0
 aiCnt		.byte 0
 aiX		.byte 0
 aiI		.byte 0
 aiMon		.byte 0
+aiNL		.byte 0
+aiList		.fill MAX_ACT, 0
 aiFar		.byte 0
 aiIdeal		.byte 0
 aiChance	.byte 0
-aiStep		.byte 0
+aiStep		.word 0
 aiAnN		.byte 0
 aiTr0		.byte 0
 aiFrac		.byte 0

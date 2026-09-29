@@ -430,8 +430,11 @@ class Gpu64Model(Class1Mixin):
                 # inside its DMA hold, which is what this line models.
                 if self.c1_ready_deferred:
                     self.c1_ready_deferred = False
-                    self.status |= ST_FRAME_READY
-                    self.result = self.c1_frame_page
+                    if self.c1_render_us and self.now_us < self.c1_done_us:
+                        self.c1_ready_on_disp = True    # finishes after it
+                    else:
+                        self.status |= ST_FRAME_READY
+                        self.result = self.c1_frame_page
 
     def _prepare_flip(self):
         """The half of a flip CGpu64FrameBuffer::PrepareFlip() performs.
@@ -683,6 +686,7 @@ class Gpu64Model(Class1Mixin):
     # --- dispatch ---------------------------------------------------------
     def dispatch(self, op):
         self.dispatches += 1
+        self.c1_harvest()
         c = self.cmd_hi if self.cmd_hi in (0, 1, 2) else 3
         self.class_disp[c] += 1
         self.class_writes[c] += self.pending_writes
@@ -759,6 +763,18 @@ class Gpu64Model(Class1Mixin):
                 # class 1 command whose CMD_HI arrived as 0 -- is refused,
                 # as gpu64_apiDispatch() now does.
                 res = ERR_BUSY
+            elif (self.strict and op in (0x07, 0x09, 0x0B) and
+                  self.api_key != KEY_DESTRUCTIVE and (self.api_key & 0xF0) != KEY_CHECKED and
+                  getattr(self, 'c1_loop_running', False) and
+                  getattr(self, 'c1_last_commit_us', None) is not None and
+                  self.now_us - self.c1_last_commit_us < 500000):
+                # gpu64 (2026-09-28): gpu64_apiDispatch()'s class 0 phantom
+                # guard. A strict program committing frames never sends
+                # these three unkeyed; a new program taking over does so
+                # after half a second without a commit.
+                self.key_refused += 1
+                self.key_refused_op = op
+                res = ERR_BAD_ARGS
             else:
                 res = self.execute(op)
         except IndexError:
@@ -802,6 +818,7 @@ class Gpu64Model(Class1Mixin):
             # orphaned and SCENE_COMMIT answers BUSY forever.
             self.c1_loop_stop(5)                    # GPU64_LOOPSTOP_FULL_RESET
             self.c1_ready_deferred = False
+            self.c1_ready_on_disp = False
             self.mode = MODE_GRAPHICS
             for i, rgb in enumerate(C64_PALETTE):
                 self.palette[i * 3:i * 3 + 3] = bytes(rgb)

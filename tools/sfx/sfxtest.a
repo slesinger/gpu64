@@ -1,0 +1,87 @@
+; sfxtest.a - every game sound effect in turn, for a listen on a PC.
+;
+; No gpu64 needed: this is the game's own player (gpu64_game_sfx.inc) on a
+; bare C64, so VICE can play it and tools/sfx/sfxwav.sh can record it. The
+; effects play in SFX_* order, each on its own with a gap after it, the
+; number on screen; then three at once, the way a fight sounds (shotgun,
+; monster pain, a door), then the nailgun held for a second. Then silence.
+
+	* = $0801
+	.word +, 10
+	.null $9e, format("%d", start)
++	.word 0
+
+start
+	jsr sfxInit
+	cli
+	ldx #0
+stLoop
+	stx stI
+	lda stI
+	clc
+	adc #1
+	jsr putDec
+	ldx stI
+	txa
+	jsr sfxPlay
+	lda #WAIT
+	jsr waitJ
+	ldx stI
+	inx
+	cpx #SFX_COUNT
+	bne stLoop
+
+	; A fight: three voices at once.
+	lda #SFX_DOOR
+	jsr sfxPlay
+	lda #SFX_SHOT
+	jsr sfxPlay
+	lda #SFX_MPAIN
+	jsr sfxPlay
+	lda #WAIT
+	jsr waitJ
+
+	; The nailgun held: a nail every 6 ticks, as wpWait fires it.
+	lda #10
+	sta stI
+-	lda #SFX_NAIL
+	jsr sfxPlay
+	lda #6
+	jsr waitJ
+	dec stI
+	bne -
+	lda #WAIT
+	jsr waitJ
+
+	; Done: a white border says so.
+	lda #1
+	sta $d020
+-	jmp -
+
+WAIT = 75				; jiffies between effects
+
+; A = jiffies to wait, on the KERNAL's clock (its IRQ still runs: the
+; player chains to it).
+waitJ
+	clc
+	adc $a2
+-	cmp $a2
+	bne -
+	rts
+
+; A = 1..99 at the top left.
+putDec
+	ldx #$30
+-	cmp #10
+	bcc +
+	sbc #10
+	inx
+	bne -
++	ora #$30
+	sta $0401
+	stx $0400
+	rts
+
+stI	.byte 0
+
+	.include "../../Source/Demos/gpu64_game_sfx.inc"

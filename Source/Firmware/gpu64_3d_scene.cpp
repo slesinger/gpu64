@@ -449,7 +449,8 @@ void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
 			   Gpu64_3dTarget *pTarget,
 			   Gpu64_3dScratch *pScratch,
 			   Gpu64_3dMeshLookup pMeshLookup, void *pMeshCtx,
-			   Gpu64_3dTextureLookup pTexLookup, void *pTexCtx )
+			   Gpu64_3dTextureLookup pTexLookup, void *pTexCtx,
+			   Gpu64_3dVisLookup pVisLookup, void *pVisCtx )
 {
 	gpu64_3dClearViewport( pState, pTarget );
 
@@ -463,11 +464,26 @@ void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
 	// just set. Once per frame, not once per node.
 	gpu64_3dSceneApplyLights( pScene, pState );
 
+	// After the camera too: the row is for the leaf the camera is in now.
+	u16 nVisFirst = 0, nVisCount = 0, nVisMesh = 0;
+	const u8 *pVisRow = pVisLookup
+		? pVisLookup( pVisCtx, &pState->viewPos, &nVisFirst, &nVisCount, &nVisMesh )
+		: 0;
+
 	for ( unsigned i = 0; i < GPU64_3D_MAX_NODES; i++ )
 	{
 		const Gpu64_3dNode *pN = &pScene->node[ i ];
 		if ( pN->type != GPU64_3D_NODE_OBJECT || !pN->visible || pN->viewSpace )
 			continue;
+
+		if ( pVisRow != 0 )
+		{
+			const u16 k = (u16)( pN->id - nVisFirst );	// wraps below the range
+			if ( k < nVisCount
+			     && pN->meshId == (u16)( nVisMesh + k )
+			     && ( pVisRow[ k >> 3 ] & ( 1 << ( k & 7 ) ) ) == 0 )
+				continue;
+		}
 
 		const Gpu64_3dMesh *pMesh =
 			pMeshLookup ? pMeshLookup( pMeshCtx, pN->meshId ) : 0;

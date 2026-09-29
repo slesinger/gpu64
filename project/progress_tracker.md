@@ -9865,3 +9865,490 @@ Details are in [milestone20_quake_combat_design.md](milestone20_quake_combat_des
 "Stage E as built". Next is stage F: counters, exit and stats screen, SID,
 lights.
 
+
+## 80. Milestone 20: the game made faster (2026-09-28, PC only)
+
+At the bench the game "feels slow". The Pi is not the bottleneck
+(`waitReady` is about 0), the 6502 is, and every step was per frame, so a
+slow frame was also slow motion. This section is two changes: less 6502
+work per frame, and motion scaled by real time.
+
+**Profile.** A scratch profiler monkeypatches runsim's CPU with a 6502
+cycle table and charges cycles to the main loop's phases and labels. On
+the `check_ai` grunt route, 400 frames:
+
+| stage | cycles/frame | ms |
+|---|---|---|
+| stage E as committed | ~79000 | 80 |
+| items 1-4 below | ~47000 | 48 |
+| + micro-optimisations | 41385 | 42.0 |
+
+**What changed:**
+1. AI.
+   - Only monster slots are visited, from a list built by `aiInit`.
+   - A sleeping monster looks for the player every 4th frame
+     (`AI_LOOK_MASK`), staggered by slot. A noise still wakes it at once.
+   - `aiAtan` runs only on a think.
+2. Actor block.
+   - An actor more than `ANIM_NEAR` (32) units away is not animated and not
+     turned. Idle grunts had been most of each frame's records: 9.7 fell to
+     3.6 a frame, and 266 bytes to 144.
+   - The fix-up scan runs every 4th frame.
+   - `sum16`'s tail has no compare in its loop.
+3. Level checks.
+   - `gameSelect` runs every other frame.
+   - Movers and triggers are pre-filtered on whole units (`mvFar`/`trFar`)
+     before the exact box tests.
+   - `CLIP_MOVE`'s mover checksum is XORed while `buildMovers` copies the
+     records, instead of in a second loop.
+4. Telemetry. The C64-screen rows are drawn in 11 slices, one every other
+   frame. Drawn whole, they had been a ~40000-cycle hitch every 8th frame.
+5. Mouse. The 1280-cycle SID pot wait is paid only once a 1351 has been
+   seen. Without one, the pots are probed every 64th frame: nothing in port
+   1 reads $ff, and a 1351 never does.
+6. **Delta time.** `dtFrame` clamps the measured frame period to 8..60 ms
+   (`dtMs`) and scales these steps by `dtMs / 32` through tables:
+   - walk and run;
+   - turn and pitch;
+   - gravity and the vertical move;
+   - door travel;
+   - the monsters' walk and leap steps.
+
+   The constants were tuned at the bench's ~32 frames a second, so at 32 ms
+   nothing moves differently. Frames longer than 60 ms move as 60 ms, so
+   below ~17 frames a second the game slows down again. Timers are still
+   counted in frames: think cadence, cooldowns and door waits.
+
+**Checks stay deterministic.** The game now reads the CIA2 millisecond
+clock for motion. runsim's default clock is an instruction-count estimate,
+so every run would walk a little differently. New runsim option
+`--frame-ms=N` locks the clock to N ms per frame. The game's route,
+`check_game`, `check_combat` and `check_ai` all pass `--frame-ms=32`.
+Scaling checked by hand:
+- 10 frames of W walk 1.33 / 2.66 / 3.98 units at 16 / 32 / 48 ms. At 64 ms
+  the clamp to 60 ms gives 4.96.
+- A jump reaches the same ceiling at 32 and 60 ms and falls the same
+  distance per millisecond.
+
+**Not done: suggestion 6, the Pi computing monster distance and angle.**
+The C64-side geometry it would replace (`acDelta`, `aiGeom`, `agDist`,
+`agAbs`) measures about 2100 cycles a frame, 5%. The answers would still
+have to be read back over the bus and verified. That is too little for a
+firmware change and a bench round; it is parked, not rejected.
+
+Remaining top costs (cycles/frame):
+- `actFrame` 9556: emit, checksum, verify, the movers' records.
+- `aiFrame` 5177.
+- `gameTouch` 4993.
+- `clipMove` 3585.
+- `combatTouch` 2853.
+- `gameSelect` 2817.
+
+Gate: `tools/demos.sh -v game`, all three checks green. Bench: read row 9
+`MS/FRAME`; it should be well under the old figure.
+
+## 81. Milestone 20: water, slime and the suit (2026-09-28, PC only)
+
+Requests: lava/slime should hurt, and E1M1's water secrets should be
+reachable by swimming.
+
+**Firmware.** CLIP_MOVE's contents byte used to come from the move's own
+hull (1). Hulls 1 and 2 carry only SOLID/EMPTY, so it could never report a
+liquid. `gpu64_levelMoveEnts` now tests hull 0 (`nHead0`, level v5):
+- Byte 45 is now the contents at the feet (origin −23 QU).
+- The new `nWaterLevel` field applies Quake's SV_CheckWater: feet, then
+  waist (+4), then eyes (+22). It travels in CLIP_MOVE bytes 50/51 as the
+  value and its complement.
+- Those bytes are outside the old checksum, so old firmware answers 0/0 and
+  the C64 never gets wet.
+- WORLD_TICK's move answers are unchanged.
+- E1M1 has water (33 leaves) and slime (112 leaves). It has no lava; lava
+  first appears in E1M6.
+
+**C64: `gpu64_game_env.inc`.** It uses Quake's WaterMove rules, timed in
+dtMs:
+- Drowning: after 12 s of air, a hit every second of 4, 6, … 14, then back
+  to 10.
+- Slime: 4×waterlevel per second.
+- Lava: 10×waterlevel per 0.2 s, or per second in the suit.
+- The suit lasts 30 s and stops slime and drowning.
+- The first touch of a liquid hurts at once.
+
+Swimming, at waterlevel ≥ 2:
+- The step is 0.6875 of normal.
+- Speed eases toward a target: SPACE swims up, no W/S sinks, otherwise
+  hold depth.
+- W/S follow the pitch.
+- No gravity, no floor settle (clip mode `$0b`), no void count.
+- Water jump: waist deep with W and SPACE against a wall.
+
+Found on the way: a swimmer touching the bottom took the walker's landing,
+which set `velY` to the fall probe every frame, so SPACE could never lift
+them. `cmSwimFloor` only stops the sink.
+
+Row 24: `WL CT SW AIR SUIT EH`. AIR and SUIT are in 256 ms steps.
+
+**Gate:** `tools/check_env.py`, wired into `tools/demos.sh game`. All green,
+along with the door, combat and AI checks. Its five runs:
+- drown: 12 s with no hit, then 4 and 6.
+- SPACE surfaces the player and the air returns.
+- slime: 12 at once, then 12 per second.
+- suit: pick up, jump into the slime, nothing hurts.
+- swimout: from the pool onto secret 45's ledge.
+
+Bench needs the new `kernel_rad.img` and the PRG.
+
+## 82. Milestone 20: the second speed pass (2026-09-28, PC only)
+
+Bench feedback on section 80: MS/FRAME is about 31 ms. The user wants
+margin under the 33 ms vsync step, because it sometimes drops to 50 ms.
+Asked for: A-D below, plus the "free wins".
+
+| stage | cycles/frame | sim ms |
+|---|---|---|
+| section 81 as built | 41476 | 42.1 |
+| A, telemetry off | 39290 | 39.9 |
+| + B-D, mouse, gameTouch parity | 35022 | 35.6 |
+| + actor-block scans, mover skip, sleeper prefilter | 30952 | 31.4 |
+
+The sim has read about 1.35x the bench, so the bench should land near
+23 ms.
+
+**What changed:**
+- **A. Telemetry is off by default.** F5 toggles it; it acts once per
+  press, after `TELE_HOLD` frames. Off, it skips `showSlice` and `clkLap`,
+  and row 2 reads `TELEMETRY OFF - F5 SHOWS IT`. Every check reads those
+  rows, so runsim forces telemetry on through `$02AA = $AA`
+  (`SIM_TELE`). `--telemetry-off` turns that off, for profiling.
+- **B. Awake monsters act every other frame, with a double step.** They
+  are staggered by slot: `(slot ^ wtFrame) & 1`. `aiStep` became a word.
+  `aiBound` accepts the doubled delta. `LEAP_FRAMES` went from 8 to 4.
+  Animation runs on the opposite parity, so no frame is skipped.
+- **C. Pickup and combat touches run at half rate.** `gameTouch` runs on
+  odd frames; the other frames only call `fireDrain`. `combatTouch` runs
+  on even frames. The margins allow it: the touch box is 32 QU and a
+  trigger grows by 16 QU per side, against 21 QU per two frames at a run.
+- **D. At most `AI_MAXAWAKE` (8) monsters awake.** `aiCanWake` counts once
+  per frame, lazily. It gates the noise wake, the sight LOS request and the
+  resolved sight wake.
+- **Mouse.** The 1280-cycle pot wait is gone. The SID's pots are left
+  selected on port 1 for the whole frame, set right after the joystick 2
+  read, so the pot reading is already settled next frame.
+- **Actor block.**
+  - `afLoop` visits only the slots of this frame's parity. Every
+    animation and turn test needs that parity anyway.
+  - The dirty scan runs downward in two tight segments, and a full block
+    resumes where it stopped. The old scan was one loop with a wrap test.
+- **Movers.** `buildMovers` skips the copy and XOR when nothing moved
+  (`bmStale`, set by `mulOfs`, `gameSelect` and the level loader).
+- **Sleepers.** A sleeping monster beyond `ANIM_NEAR` skips its geometry.
+  `.cerror` keeps `ANIM_NEAR >= AI_SIGHT`, so the skip can never hide a
+  monster that could have seen the player.
+
+Remaining top costs (cycles/frame):
+- `actFrame` 7733.
+- `aiFrame` 3306.
+- `clipMove` 2892.
+- `gameSelect` 2821.
+- `gameTouch` 2518.
+
+Gate: `tools/demos.sh -v game`. All green: doors, combat, AI and env.
+Bench: F5, then read row 9 `MS/FRAME`.
+
+**Bench, same day: slow looking down the first corridor, fast facing
+back.** The photo showed `STALLS 0031` (49 stalls, the first at frame 5)
+and `MS MAX WAIT 255`. The cause is a hole left by the 2026-09-08 fix
+(`gpu64-frame-ready-dispatch-gated`).
+- FRAME_READY is raised in `gpu64_vsyncCommitFlip()`'s hold only when the
+  frame is already done by the flip.
+- Otherwise it rises only at the top of the next dispatch.
+- The faster C64 now reaches `waitReady` before a heavy view is rendered,
+  and nothing dispatches from there. Each such frame waited out
+  `READY_WAIT`, about 0.7 s.
+
+The fix is C64-only, so no new kernel is needed. While waiting,
+`waitReady` sends `SET_BACKGROUND 0` (`rgBackground`) every `WR_PUMP_MS`
+(2) ms, which pumps the harvest.
+- It is drain-exempt, changes nothing, and is checked.
+- It costs about 7 commands in a 45 ms wait.
+
+runsim gained `--render-ms=N`, which models core 1's frame time and the
+firmware's real FRAME_READY gating. Use it without `--frame-ms`. At 45 ms,
+300 frames:
+- The bench PRG stalled on 303 of 303 frames.
+- The fix: 0 stalls, 41 ms/frame.
+
+Still open in firmware: the contract in
+`docs/class1-3d-mesh-reference.md` says a program polling STATUS sees
+FRAME_READY as soon as it is true. That holds only if the render beats the
+flip. The proper fix is a harvest hold at each vsync while a frame is
+pending, and it needs a bench round. **Closed 2026-09-29, not built:** see
+section 88.
+
+## 83. Milestone 20: the level culls itself by Quake's PVS (2026-09-28, PC only)
+
+Bench feedback after the waitReady pump: much better (`STALLS 0000`,
+`MS/FRAME` CUR 28, MIN 8, MAX 123), but views with a lot of geometry
+hidden behind walls are still slow. The cause is that there was no
+occlusion culling at all: every world node in the frustum was drawn.
+
+**Fix: Quake's PVS, baked to world-node granularity. It is invisible to the API.**
+- **Level file v6.** The 44-byte header gains the visibility section's
+  offset and length at 36 and 40.
+- **The section** (`gen_quakelevel.py build_vis`) holds:
+  - the drawing BSP's nodes, with their leaf indices intact (hull 0 cannot
+    serve, because it replaced its leaves with contents);
+  - one row per Quake leaf, with one bit per world node.
+- **What a bit means.** It is set if any face of that chunk lies in a leaf
+  of this leaf's PVS, or in the leaf itself. Leaf 0 (solid) is all ones.
+- **E1M1:** 1149 leafs × 7 bytes, 2750 BSP nodes and 51 world nodes. On
+  average 26% of the chunks are visible from a leaf; the start leaf sees
+  6 of 51.
+- **Firmware.**
+  - `gpu64_levelVisRow()` walks the eye to its leaf.
+  - `gpu64_3dSceneRender()` takes a lookup callback, and class 1 passes
+    `levelVisLookup`, which is live only while the load phase is DONE.
+  - A node is skipped only when all three hold:
+    - its id is in the level's world-node range;
+    - it still instances its own level mesh (so a phantom or retargeted
+      node is drawn);
+    - its bit is clear.
+  - Movers, actors and sprites are never culled. A camera outside the map
+    (solid leaf or no leaf) culls nothing.
+  - The parser disables vis if world node j is not mesh j.
+- **scenesim** loads the level on the stream's new `LEVEL` line and has
+  `--no-vis` for A/B comparisons.
+
+**PC results** (game stream, 1504 frames):
+- Render mean: 4410 µs without vis, 2549 µs with it.
+- Culled: 38.5 of 51 world chunks per frame.
+- Picture differences: 207 pixels over 64 frames, every one a single-pixel
+  triangle-seam crack. Without vis, hidden far geometry leaked through the
+  crack; with vis, the clear colour (179 of them) or a different far
+  surface shows instead. No visible surface was lost.
+
+Gates: `check_g64lev` (the vis section checks), hulltest, levelsim (bumped
+to v6), and `demos.sh` and `testprg.sh`. Bench: this needs the new
+`kernel_rad.img` and the v6 `RAD/level.g64lev`, together. A v5 kernel
+refuses a v6 file, and vice versa.
+
+## 84. Milestone 20: black flashes were a phantom FULL_RESET (2026-09-28)
+
+**Bench symptom (after the §83 PVS deploy):** the speed was fine, but now and
+then HDMI went fully black, "like powered off", for a fraction of a second.
+Telemetry: STALLS 0003 (first at frame $00C1), MS/FRAME MAX 255, CAM max
+115 ms, six other SCENE_COMMIT errors with last code $0C (WORKER_TIMEOUT),
+and three UNSUPPORTED.
+
+**Diagnosis.** Whole-screen black plus border black plus a waitReady stall
+is exactly what `FULL_RESET` ($0B) does:
+- it clears every page;
+- it sets the border to 0;
+- it stops the loop (cause 5);
+- the loop stays stopped until the next SCENE_COMMIT self-restarts it,
+  which the game only reaches after its ~0.6 s READY_WAIT stall.
+
+A phantom $0B has two routes:
+- `GET_HEALTH` ($0A) with bit 0 flipped;
+- an ARG byte of $0B written while CMD_HI was still 0 after `cmdClass0`,
+  which the bus services as a CMD_LO write.
+
+Class 0 is outside strict mode (strict covers sCmdHi==1 only), and $0B is
+one of the ops the loop guard lets through. The speed pass (§80, §82) and
+the 2 ms waitReady pump raised the command rate, which plausibly explains
+why this is new.
+
+**Ruled out on the PC:**
+- the PVS cull (clean at every reachable eye);
+- render-time outliers;
+- vsync calibration loss;
+- core 1 oversleep;
+- the class-0 display ops (already refused under the loop).
+
+**Fix.**
+- **Firmware** (`gpu64_apiDispatch`): in strict mode, while the loop is
+  running and a SCENE_COMMIT succeeded within the last 500 ms
+  (`gpu64_3dCommitsLive()`), class-0 $07, $09 and $0B are refused with
+  BAD_ARGS unless they carry $A5 or a checked key. The refusal is counted
+  in keyRefused and keyRefusedOp. A program taking over from a strict one
+  still gets its FULL_RESET, because it sends it after commits stop.
+- **Game** (`cmdClass0`): CMD_HI goes back to 1 straight after the class-0
+  command, which closes the ARG-byte route at its source.
+- **Model:** gpu64model.py and gpu64class1.py mirror the guard.
+
+**PC verification.** A runsim run injected an unkeyed class-0 $0B in
+place of every 3000th class-1 dispatch.
+- **Guard off:** loop stop cause 5, STALLS 0002, the bench signature.
+- **Guard on:** both injections refused with BAD_ARGS, and STALLS 0000.
+- The game gates and `demos.sh` / `testprg.sh` are green.
+
+Note: the earlier "no loop stops under bus-fault injection" result was
+void, because the scratch harness called `runsim.main()` without argv[0],
+so runsim printed its usage and did nothing.
+
+Still open: the six WORKER_TIMEOUTs and three UNSUPPORTED on the bench
+photo. WORKER_TIMEOUT means the dispatch-top drain waited over 50 ms, which
+fits CAM max 115 ms.
+
+## 85. Milestone 20: title screens, skill menu, title music (2026-09-29, PC only)
+
+**Asked for:**
+- the HONDANI logo ("(c)" style, from the Doom port's ilogo6) on both
+  screens, with the light sweep on both;
+- then Quake's title;
+- then a Doom-style skill menu from the pak's own art;
+- music from the C64's SID.
+
+The design as built is in `milestone20_quake_combat_design.md`, "Title
+screens as built".
+
+**Built:**
+- **Level format v7** adds a picture section; `tools/quake_pics.py` builds
+  it. There are 30 pictures, and E1M1 is now 1606 KB.
+- **Firmware:** `LEVEL_PICTURE` ($1A, class 1) blits a picture onto the
+  class-0 draw page from the preloaded level file. It answers BUSY under
+  the loop.
+- **Game:** a new file, `gpu64_game_title.inc`, holds the logo, the sweep,
+  the title, the menu, the loading plaque and the music IRQ. `actTake`
+  filters entities by skill spawnflags.
+- **PRG layout:**
+  - three SID tunes at $A000, $A900 and $B300;
+  - the RLE logo at $C484;
+  - `.cerror` guards between them;
+  - the PRG ends at $CBDC.
+- **runsim** skips the title by default at skill 1. `--title` runs it, and
+  `--skill=N` picks the skill. `--title` refuses `--frame-ms`.
+
+**PC verification** (runsim with `--title --demo`; frames are flips):
+- Frame 2 is the logo.
+- Frame 3 is the title: CONBACK, and the C64 prompt.
+- The next frames are the menu, with the dot animating and the cursor
+  following W/S.
+- Then the LOADING plaque over CONFADE, and the level loads.
+- `sweepshot.py` rendered the HDMI palette and the C64 colour RAM at steps
+  10, 22 and 34. The light column is the same on both.
+- Skill filter: the kill total `K000/n` reads 10 on Easy, 23 on Normal and
+  40 on Hard and Nightmare.
+
+**Deploy:** the kernel and `RAD/level.g64lev` go together; v6 and v7 refuse
+each other.
+
+**Bench to-do:**
+- Check that the sweep looks right on both screens at speed.
+- Check that the music plays and stops cleanly at LOADING, with no SID
+  hang note.
+- Check that a joystick and the keyboard both work in the menu.
+- Check that Easy visibly removes monsters.
+
+## 86. Milestone 20: SID sound effects (2026-09-29, PC only)
+
+The game now makes Quake's noises on the C64's SID. The design as built is
+in `milestone20_quake_combat_design.md`, "Sound effects as built".
+
+**Built:**
+- **`gpu64_game_sfx.inc`:** 21 effects on three voices, played from the
+  KERNAL's 60 Hz IRQ, chained ahead of $EA31. It uses no zero page, because
+  $FB-$FE is the game's SRC/DST. `sfxPlay` spends only A.
+- **Hooks:**
+  - weapons: AXE, SHOT, SSHOT and NAIL;
+  - monsters: MPAIN, MDIE, SIGHT, GRUNT, BITE and LEAP;
+  - the player: PAIN (not on the fatal hit), DIE, JUMP and SPLASH (in and
+    out of liquid);
+  - pickups: HEALTH, WEAPON, POWER and ITEM;
+  - DOOR, BUTTON and SECRET.
+- **runsim** emulates the IRQ once $0314 leaves $EA31. `--sid-log=PATH`
+  records every SID write as `frame tick reg val`.
+- **`tools/check_sfx.py`** decodes that log through the include's own
+  `SOUNDS` table, over five scripted runs: kill, respawn, dog, swim and
+  jump. Every started voice must also release its gate. demos.sh runs it
+  for the game (`SFX CHECK FAIL`).
+- **`tools/sfx/sfxtest.prg`** is a listener that plays all 21 effects, then
+  a small fight. VICE renders it to WAV only with its GUI up; under
+  `-console` the WAV stays at 44 bytes.
+
+**PC verification:** check_sfx passes, and the full demos.sh run is EXIT 0
+with the SFX build.
+
+**Bench to-do:**
+- Listen to the effects in play.
+- Check that the 60 Hz IRQ does not disturb the bus: phantoms, MISSED and
+  the frame rate should be as they were in the build before it.
+
+## 87. Milestone 20 stage F: counter, exit, intermission, muzzle flash (2026-09-29, PC only)
+
+E1M1 can now be finished. The design as built is in
+`milestone20_quake_combat_design.md`, "Stage F as built". The code is
+`gpu64_game_exit.inc`, plus small hooks in the game and combat files.
+
+**Built:**
+- **trigger_counter** (entity 214, count 3). Each of buttons 211-213 fires
+  t9 once, and the counter prints "ONLY 2 MORE TO GO..." and so on on C64
+  row 3. The third press prints "SEQUENCE COMPLETED!" and fires t10, which
+  opens door 215. Counters are not touch triggers; they are a small table
+  of their own (4 slots) searched by `fireTarget`.
+- **wait -1 movers.** A door or button whose `wait` is -1 stays open or
+  pressed for good (`mvStay`). In E1M1 these are 83, 139, 215, 221-224 and
+  234. START_OPEN is still not handled.
+- **trigger_changelevel** (entity 345) ends the level in an intermission:
+  - the loop is stopped;
+  - the pak's COMPLETE and INTER pictures and the numbers are drawn with
+    LEVEL_PICTURE, laid out as in Quake: time m:ss, secrets n/6, kills n/23;
+  - E-Quake tune 1 plays;
+  - after about 2 s, FIRE, SPACE or RETURN restarts the level with kills,
+    secrets and the clock reset.
+- **Secrets are counted** (`secFound` of `secTotal`, taken from the
+  entities).
+- **Muzzle flash.** Every non-axe shot lights point light 90 at the camera
+  for two frames: strength 6, radius 25 (Quake's 200). It is re-created if
+  a phantom or a reset loses it.
+- **runsim:**
+  - `--hop=F:x,y,z,yaw` moves the eye without restarting, so one run can
+    press buttons rooms apart;
+  - `--log-light=ID` appends a light node's strength and radius to every
+    `--frame-log` line.
+- **`tools/check_exit.py`** runs five scenarios: one button, three buttons
+  with the wait -1 door still open 200 frames later, the exit's stats,
+  leaving the stats with FIRE, and the flash. demos.sh runs it for the game
+  (`EXIT CHECK FAIL`).
+
+**Two traps found on the way, both runsim-only:**
+- The intermission's matrix scan reads column 7 up to 500 times per tick,
+  which runs the whole `--stop-after` RUN/STOP schedule through at once.
+  As a result, `finish` waited forever for a release. On SIM_EXIT the
+  intermission now goes straight to `finish`, which skips its key waits
+  (`fnQuick`).
+- The message row was first row 12, which telemetry overwrites every
+  frame. It is now row 3.
+
+**Bench to-do:**
+- Press the three buttons and see door 215 open and stay open.
+- Walk into the exit and check the stats screen and its music; leave it
+  with FIRE.
+- See the flash light the corridor.
+
+## 88. The per-vsync FRAME_READY harvest is not worth building (2026-09-29)
+
+Section 82 left one firmware item open: a harvest hold at each vsync while a
+loop frame is outstanding. It would close the documented hole, which is that
+a render finishing after the flip is seen only at the next dispatch. The
+assessment did not build it.
+- **It is slower than the C64-side pump.** The harvest could only happen at
+  the next vsync, V1. The C64 would then send SCENE_COMMIT after V1, and the
+  flip would land at V2. With the pump the bit rises within `WR_PUMP_MS`
+  (2 ms), the commit is in before V1, and the flip lands at V1. So the vsync
+  harvest shows every late frame one refresh (16.7 ms) later.
+- **Its only gain is bus traffic:** about 7 pump commands per 45 ms wait.
+- **Its cost is in the polling loop:**
+  - a new condition at the vsync due point;
+  - a flip-less commit hold through the hold gate, once a vsync for as long
+    as the render is outstanding;
+  - a `gpu64_commitFlip()` guard inside it.
+
+  All of this is exactly what CLAUDE.md's rules exist for, and it would need
+  a bench round of its own.
+
+`docs/class1-3d-mesh-reference.md` now states the behaviour as it ships: the
+bit rises at the flip's vblank or at the next dispatch, and a waiting program
+pumps a no-op `SET_BACKGROUND`. It had promised a pure read-only poll was
+always enough.
+

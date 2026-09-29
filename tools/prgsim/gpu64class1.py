@@ -42,6 +42,7 @@ OP_LEVEL_STEP = 0x14
 OP_CLIP_MOVE = 0x15
 OP_LEVEL_ENT = 0x16
 OP_LEVEL_PALETTE = 0x17
+OP_LEVEL_PICTURE = 0x1A
 OP_LEVEL_NODE = 0x1C
 OP_WORLD_TICK = 0x6C
 LEVEL_DONE = 0xFF
@@ -303,6 +304,16 @@ class Class1Mixin:
         self.c1_arena_used = 0
         self.c1_frames = 0
         self.c1_ready_deferred = False
+        # --render-ms: how long core 1 takes over a frame. 0 is the old
+        # model, an instant render. Non-zero, FRAME_READY rises only where
+        # the firmware raises it: in the flip's hold if the frame is done
+        # by then, otherwise at the top of the next dispatch after it is
+        # (pollLoopFrame()). A program that only polls STATUS meanwhile
+        # waits for nothing -- the 2026-09-28 corridor stall.
+        self.c1_render_us = 0
+        self.c1_done_us = 0
+        self.c1_ready_on_disp = False
+        self.c1_commit_drains = 0
         # The page the frame now in flight is rendering into. pollLoopFrame()
         # publishes it as RESULT at the moment it raises FRAME_READY, which is
         # what the C64 reads back after a SCENE_COMMIT -- without this the
@@ -417,6 +428,48 @@ class Class1Mixin:
                             n.sprite_flags, n.light_strength, n.light_radius,
                             1 if n.view_space else 0))
         self.c1_emit("ENDFRAME")
+
+    # --- LEVEL_PICTURE ----------------------------------------------------
+    #
+    # gpu64_3d.h: draw one of the level file's pictures into the class 0
+    # draw page, which PAGE_FLIP then shows. Needs the file, not a loaded
+    # level -- the title runs before LOAD_LEVEL.
+    def c1_level_picture(self):
+        from gpu64model import ERR_OK, ERR_BAD_ARGS, ERR_BUSY, FB_W, FB_H
+        import gpu64level
+
+        if self.c1_loop_running:
+            return ERR_BUSY
+        flags = self.arg[5]
+        if flags & ~3:
+            return ERR_BAD_ARGS
+        if self.c1_level_data is None:
+            return ERR_BAD_ARGS
+        try:
+            w, h, px = gpu64level.Level(self.c1_level_data).pic(self.arg[0])
+            pal = gpu64level.Level(self.c1_level_data).palette
+        except gpu64level.LevelError:
+            return ERR_BAD_ARGS
+        if flags & 2 and bytes(self.palette) != bytes(pal):
+            # No colormap: nothing renders through it until LOAD_LEVEL.
+            self.palette[:] = pal
+            self.c1_emit_palette()
+        x0, y0 = self.a_s16(1), self.a_s16(3)
+        page = self.page()
+        for sy in range(h):
+            dy = y0 + sy
+            if not 0 <= dy < FB_H:
+                continue
+            row = px[sy * w:(sy + 1) * w]
+            if not flags & 1 and x0 >= 0 and x0 + w <= FB_W:
+                page[dy * FB_W + x0:dy * FB_W + x0 + w] = row
+                continue
+            for sx in range(w):
+                dx = x0 + sx
+                if 0 <= dx < FB_W and not (flags & 1 and row[sx] == 255):
+                    page[dy * FB_W + dx] = row[sx]
+        self.result = 0
+        return ERR_OK
 
     # --- LOAD_LEVEL / LEVEL_STEP -----------------------------------------
     #
@@ -581,7 +634,7 @@ class Class1Mixin:
             movers[i * 4 + 1] = ox
             movers[i * 4 + 2] = oy
             movers[i * 4 + 3] = oz
-        out = (ctypes.c_int * 7)()
+        out = (ctypes.c_int * 8)()
         if not lib.gpu64shim_move_ents(sixin, blk[26], blk[24], blk[25],
                                        movers, nmv, out):
             return ERR_BAD_ARGS
@@ -625,6 +678,8 @@ class Class1Mixin:
         for b in o[:17]:
             x ^= b
         o[17] = x
+        o[18] = out[7] & 0xFF               # water level, outside the check
+        o[19] = 0xFF - o[18]
 
         err = self.blob_write(space, addr + self.CLIPMOVE_OUT_OFF, o)
         if err != ERR_OK:
@@ -762,7 +817,7 @@ class Class1Mixin:
         o[2] = applied
         o[4:8] = struct.pack('<I', refused)
         a = self.WTICK_OUT_HDR
-        out = (ctypes.c_int * 7)()
+        out = (ctypes.c_int * 8)()
         for i in range(ntr):
             r = blk[tr_off + i * self.WTICK_TRACE_IN:]
             six = (ctypes.c_int * 6)(*struct.unpack('<6i', bytes(r[0:24])))
@@ -972,6 +1027,13 @@ class Class1Mixin:
             budget -= nbytes
 
         if ld['phase'] == 'done':
+            # The firmware culls the level's world chunks by the level file's
+            # PVS from here on (levelVisLookup). scenesim runs the same C, so
+            # it needs the same file and the same two id bases; a RESET line
+            # ends it, as levelLoadAbort() does on the Pi.
+            self.c1_emit("LEVEL %d %d %s"
+                         % (ld['node_base'], ld['mesh_base'],
+                            self.c1_write_blob('level', self.c1_level_data)))
             self.result = LEVEL_DONE
             return ERR_OK
         pct = ld['done'] * 100 // ld['total'] if ld['total'] else 0
@@ -1160,6 +1222,8 @@ class Class1Mixin:
 
         if op == OP_WORLD_TICK:
             return self.c1_world_tick(*self.a_blob(0))
+        if op == OP_LEVEL_PICTURE:
+            return self.c1_level_picture()
         if op == OP_LEVEL_NODE:
             # gpu64_3d.h: put one level node back the way LEVEL_STEP built
             # it; ARG0 bit 0 also restores the file's position.
@@ -1387,6 +1451,12 @@ class Class1Mixin:
                 self.commit_no_loop += 1
                 self.c1_refuse(op)
                 return self.c1_loop_start_armed()
+            if self.c1_ready_on_disp:
+                # SCENE_COMMIT is not drain-exempt: the C64 is halted until
+                # core 1 finishes, and then the frame is harvested.
+                self.c1_commit_drains += 1
+                self.advance(max(0, self.c1_done_us - self.now_us))
+                self.c1_harvest()
             if not (self.status & ST_FRAME_READY):
                 return ERR_BUSY
             if not self.calibrated:
@@ -1405,6 +1475,7 @@ class Class1Mixin:
             self.status |= ST_BUSY
             self.status &= ~ST_FRAME_READY
             self.c1_push_frame()
+            self.c1_last_commit_us = self.now_us
             return ERR_OK
 
         return ERR_BAD_OPCODE
@@ -1437,8 +1508,19 @@ class Class1Mixin:
         """
         self.c1_emit_frame(self.draw_page)
         self.c1_frame_page = self.draw_page
+        self.c1_done_us = self.now_us + self.c1_render_us
         if self.flip_pending:
             self.c1_ready_deferred = True
+        elif self.c1_render_us:
+            self.c1_ready_on_disp = True
         else:
+            self.status |= ST_FRAME_READY
+            self.result = self.c1_frame_page
+
+    def c1_harvest(self):
+        """pollLoopFrame() at the top of a dispatch: a frame core 1 has
+        finished since the flip becomes FRAME_READY only here."""
+        if self.c1_ready_on_disp and self.now_us >= self.c1_done_us:
+            self.c1_ready_on_disp = False
             self.status |= ST_FRAME_READY
             self.result = self.c1_frame_page

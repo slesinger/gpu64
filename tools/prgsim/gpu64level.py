@@ -23,10 +23,10 @@ version.
 import struct
 
 MAGIC = b'G64L'
-VERSION = 5
+VERSION = 7
 
-HDR = '<4sHH4HHHI3I'
-HDR_LEN = struct.calcsize(HDR)          # 36
+HDR = '<4sHH4HHHI5I2I'                  # v6 added visOff, visLen, v7 pics
+HDR_LEN = struct.calcsize(HDR)          # 52
 TEX_REC = '<HBBII'                      # 12
 MESH_REC = '<IIII'                      # 16
 NODE_REC = '<HiiiH'                     # 16
@@ -58,7 +58,8 @@ class Level:
             raise LevelError('shorter than its header')
         (magic, ver, self.scale, self.ntex, self.nmesh, self.nnode, self.nent,
          self.nplane, self.nhull, self.nclip, self.base, self.palo,
-         self.stro) = struct.unpack_from(HDR, data, 0)
+         self.stro, self.viso, self.visl, self.pico,
+         self.picl) = struct.unpack_from(HDR, data, 0)
         if magic != MAGIC:
             raise LevelError('magic %r is not %r' % (magic, MAGIC))
         if ver != VERSION:
@@ -83,6 +84,20 @@ class Level:
         if self.base > len(data):
             raise LevelError('blob area starts past the end of the file')
         self.palette = self.blob(self.palo, 768)
+        # v7: pictures, validated whole here as the firmware does.
+        self.pics = []
+        if self.picl:
+            sec = self.blob(self.pico, self.picl)
+            n = struct.unpack_from('<H', sec, 0)[0] if self.picl >= 4 else -1
+            if n < 0 or 4 + n * 8 != self.picl:
+                raise LevelError('picture section length %d does not match'
+                                 % self.picl)
+            for i in range(n):
+                w, h, o = struct.unpack_from('<HHI', sec, 4 + i * 8)
+                if not w or not h:
+                    raise LevelError('picture %d is empty' % i)
+                self.blob(o, w * h)
+                self.pics.append((w, h, o))
 
     # --- the blob area ---------------------------------------------------
     def blob(self, off, length):
@@ -90,6 +105,13 @@ class Level:
             raise LevelError('blob %d+%d runs past the %d-byte blob area'
                              % (off, length, len(self.d) - self.base))
         return self.d[self.base + off: self.base + off + length]
+
+    def pic(self, i):
+        """(w, h, pixels) of picture i -- LEVEL_PICTURE's source."""
+        if not 0 <= i < len(self.pics):
+            raise LevelError('picture %d of %d' % (i, len(self.pics)))
+        w, h, o = self.pics[i]
+        return w, h, self.blob(o, w * h)
 
     def string(self, off):
         p = self.base + self.stro + off

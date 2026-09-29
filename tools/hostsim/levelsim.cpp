@@ -40,7 +40,7 @@
 // and the firmware loader will have to do it this way too.
 
 #define LEVEL_MAGIC	0x4c343647u	// 'G64L'
-#define LEVEL_VERSION	5
+#define LEVEL_VERSION	7
 
 #define TEX_STRIDE	12
 #define MESH_STRIDE	16
@@ -259,7 +259,7 @@ static boolean checkAgainstFirmwareParser( void )
 
 static boolean parseHeader( void )
 {
-	if ( g_LevLen < 36 || rd32( 0 ) != LEVEL_MAGIC )
+	if ( g_LevLen < 52 || rd32( 0 ) != LEVEL_MAGIC )
 	{
 		fprintf( stderr, "levelsim: not a G64L file\n" );
 		return FALSE;
@@ -282,7 +282,7 @@ static boolean parseHeader( void )
 	g_L.palOff = rd32( 28 );
 	g_L.strOff = rd32( 32 );
 
-	g_L.texTab   = 36;
+	g_L.texTab   = 52;		// 36-51: visibility and pictures, unused here
 	g_L.meshTab  = g_L.texTab   + (u32)g_L.nTex   * TEX_STRIDE;
 	g_L.nodeTab  = g_L.meshTab  + (u32)g_L.nMesh  * MESH_STRIDE;
 	g_L.entTab   = g_L.nodeTab  + (u32)g_L.nNode  * NODE_STRIDE;

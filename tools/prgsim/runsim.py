@@ -114,9 +114,47 @@ Options:
     --notarget      gpu64_demo_game.a: the monsters never notice the
                     player, as Quake's notarget cheat. Route checks that are
                     about doors, not fights, run with it.
+    --telemetry-off gpu64_demo_game.a: leave its C64-screen telemetry off,
+                    as on hardware until F5. Without it runsim turns the
+                    rows on ($02aa), because the checks read them.
     --warp=F:X,Y,Z,YAW  gpu64_demo_game.a: at frame F restart the game with
                     the eye at X Y Z (world units) facing YAW (0..255), so
                     a check can start beside what it is about.
+    --hop=F:X,Y,Z,YAW   the same, but nothing restarts: only the eye moves,
+                    doors, counters and kills keep their state. Repeatable,
+                    so one run can visit rooms that are far apart.
+    --title         gpu64_demo_game.a: run the title (logo sweep, Quake
+                    title, skill menu) instead of skipping it. Frames are
+                    its page flips; the sweep flips none. Not with
+                    --frame-ms, and give it a --stop-after large enough
+                    for the menu's column-7 reads.
+    --skill=N       the skill the skipped menu returns: 0 easy, 1 normal
+                    (default), 2 hard, 3 nightmare.
+    --sid-log=PATH  write every SID register write ($D400-$D418) to PATH,
+                    one line each: frame, IRQ count, register, value.
+
+    IRQs: once a program points $0314 anywhere but the KERNAL's $EA31, the
+    sim raises an IRQ every (CIA1 timer A latch / 4) instructions while the
+    I flag is clear, entering the handler the way the KERNAL's $FF48 does
+    (A, X, Y pushed) and returning through $EA31/$EA81, which pull them and
+    RTI. Nothing else of the KERNAL's IRQ runs. A program that never hooks
+    $0314 sees no change.
+    --frame-ms=N    lock the CIA2 millisecond clock to the frame count: it
+                    reads N ms per frame and never moves within one, so a
+                    program that scales its motion by the measured frame
+                    time (gpu64_demo_game.a) moves the same on every run and
+                    every build. The game's checks pass 32, the frame time
+                    its constants were tuned at, i.e. a scale of exactly 1;
+                    another N is how the scaling itself is checked. Without
+                    it the clock is the default instruction-count estimate.
+    --render-ms=N   core 1 takes N ms over each class-1 loop frame instead
+                    of none, and FRAME_READY rises only where the firmware
+                    raises it: in the flip's hold if the frame is done by
+                    then, else at the next dispatch. A program that only
+                    polls STATUS while a frame finishes late waits out its
+                    whole timeout, as gpu64_demo_game.a did at the bench on
+                    2026-09-28. Use it without --frame-ms, whose clock does
+                    not move within a frame.
     --demo          do not require a VERDICT line. The conformance suite
                     judges itself and exit status follows its verdict; a
                     demo has nothing to judge, so returning cleanly is the
@@ -131,6 +169,8 @@ Options:
                     page's non-zero pixel count, and the two status rows the
                     demo prints. This is what turns "it blinks" into a frame
                     number and a delta.
+    --log-light=ID  append scene node ID's light strength/radius to every
+                    --frame-log line, as [L<ID> s/r] (- while it is absent)
     --log-rows=A-B  the screen rows a --frame-log line quotes (default
                     20-24), for a demo whose interesting rows are elsewhere
     --ppm-frame=N:PATH
@@ -162,7 +202,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cpu6502 import Cpu6502                                   # noqa: E402
+from cpu6502 import Cpu6502, FLAG_I, FLAG_U, FLAG_B              # noqa: E402
 import gpu64model                                              # noqa: E402
 import gpu64class1                                            # noqa: E402
 from gpu64model import Gpu64Model                             # noqa: E402
@@ -210,8 +250,20 @@ class Machine:
     def __init__(self, calibrated=True, stop_after=4, frame_log=False,
                  ppm_frames=None, key_script=None, c1_stream=None,
                  level=None, joy_script=None, mouse_script=None,
-                 notarget=False, warp=None):
+                 notarget=False, warp=None, hops=(), frame_ms=None,
+                 telemetry=True, title=False, skill=1, sid_log=None):
         self.mem = bytearray(65536)
+        self.mem[0x0314], self.mem[0x0315] = 0x31, 0xEA
+        self.irq_wait = 0
+        self.irqs = 0
+        self.sid_log = open(sid_log, 'w') if sid_log else None
+        # gpu64_demo_game.a's title (logo, Quake title, skill menu) runs
+        # only with --title. Otherwise $02ab says "skip it" and $02ac is
+        # the skill the menu would have returned; the game clears $02ab
+        # once read. Nothing else reads either byte.
+        if not title:
+            self.mem[0x02AB] = 0xAB
+        self.mem[0x02AC] = skill & 3
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
         self.stop_polls = 0
@@ -221,6 +273,7 @@ class Machine:
         self.final = None
         self.frame_log = frame_log
         self.log_rows = (20, 25)
+        self.log_light = None
         self.ppm_frames = ppm_frames or {}
         self.frame = 0
         self.cia_pra = 0xFF
@@ -228,8 +281,11 @@ class Machine:
         self.joy_script = list(joy_script or [])
         self.mouse_script = list(mouse_script or [])
         self.notarget = notarget
+        self.telemetry = telemetry
+        self.frame_ms = frame_ms
         self.warp = warp
         self.warped = False
+        self.hops = sorted(hops)
         # A class-1 program never issues PAGE_FLIP: the autonomous loop owns
         # the framebuffer, and its frame boundary is the accepted
         # SCENE_COMMIT the model reports here instead.
@@ -346,7 +402,10 @@ class Machine:
         # its clamp and its minimum actually execute here; a run that read a
         # constant would exercise none of them and the numbers it printed
         # would be zeroes either way.
-        ms = (self.cpu.cycles * 4) // 985
+        if self.frame_ms is not None:
+            ms = self.frame * self.frame_ms
+        else:
+            ms = (self.cpu.cycles * 4) // 985
         v = (0xFFFF - ms) & 0xFFFF
         return v & 0xFF if addr == 0xDD06 else v >> 8
 
@@ -387,20 +446,30 @@ class Machine:
             # (Quake's cheat of that name), so a route check is not also a
             # fight. The game clears $02a8 at start; only this sets it.
             self.mem[0x02A8] = 0xA8 if self.notarget else 0
+            # Telemetry: the game's C64-screen rows, off on hardware until
+            # F5, forced on here unless --telemetry-off.
+            self.mem[0x02AA] = 0xAA if self.telemetry else 0
             # --warp=F:x,y,z,yaw: from frame F the game restarts with its
             # eye at x y z (world units) facing yaw (0..255). It clears
             # $02a9 when it has taken it; this writes it once.
+            go = None
             if self.warp and not self.warped and self.frame >= self.warp[0]:
                 self.warped = True
+                go = (self.warp, 0xA9)
+            elif (self.hops and self.frame >= self.hops[0][0] and
+                  self.mem[0x02A9] == 0):
+                go = (self.hops.pop(0), 0xAB)
+            if go:
+                where, arm = go
                 vals = [int(round(v * 65536)) & 0xFFFFFFFF
-                        for v in self.warp[1:4]]
+                        for v in where[1:4]]
                 for i, v in enumerate(vals):
                     for b in range(4):
                         self.mem[0x02B0 + i * 4 + b] = (v >> (8 * b)) & 0xFF
-                yaw = int(self.warp[4]) & 0xFF
+                yaw = int(where[4]) & 0xFF
                 self.mem[0x02BC] = 0
                 self.mem[0x02BD] = yaw
-                self.mem[0x02A9] = 0xA9
+                self.mem[0x02A9] = arm
         pra = self.cia_pra & ~self.joy()
         rows = 0xFF
         if self.mouse_fire():
@@ -474,7 +543,31 @@ class Machine:
             else:
                 self.gpu.write_reg(off, val)
             return
+        if self.sid_log is not None and 0xD400 <= addr <= 0xD418:
+            self.sid_log.write('%d %d %02x %02x\n' % (
+                self.frame, self.irqs, addr - 0xD400, val & 0xFF))
         self.mem[addr] = val & 0xFF
+
+    # One IRQ, if one is due: see "IRQs" in the usage text.
+    def irq(self):
+        c = self.cpu
+        vec = self.mem[0x0314] | self.mem[0x0315] << 8
+        if vec == 0xEA31 or c.p & FLAG_I:
+            return
+        self.irq_wait += 1
+        latch = self.mem[0xDC04] | self.mem[0xDC05] << 8 or 0x4025
+        if self.irq_wait < latch // 4:
+            return
+        self.irq_wait = 0
+        self.irqs += 1
+        c.push(c.pc >> 8)
+        c.push(c.pc & 0xFF)
+        c.push((c.p | FLAG_U) & ~FLAG_B)
+        c.p |= FLAG_I
+        c.push(c.a)
+        c.push(c.x)
+        c.push(c.y)
+        c.pc = vec
 
     # One dispatch, judged against self.intent. Only a dispatch that answers
     # OK is counted: every refusal -- the check, strict mode, a bad class,
@@ -534,6 +627,13 @@ class Machine:
         rows = self.screen()
         status = ' | '.join(r.strip() for r in rows[self.log_rows[0]:self.log_rows[1]]
                             if r.strip())
+        if self.log_light is not None:
+            lit = [n for n in self.gpu.c1_scene.node
+                   if n.type != 0 and n.id == self.log_light]
+            status += '  [L%d %s]' % (self.log_light,
+                                      '%d/%d' % (lit[0].light_strength,
+                                                 lit[0].light_radius)
+                                      if lit else '-')
         print("frame %4d  ink %6d  %s" % (self.frame, ink, status))
 
     def load_prg(self, path):
@@ -546,6 +646,15 @@ class Machine:
     def kernal(self):
         """Intercept the two KERNAL entry points the harness uses."""
         pc = self.cpu.pc
+        if pc in (0xEA31, 0xEA81):          # the end of an IRQ handler
+            c = self.cpu
+            c.y = c.pop()
+            c.x = c.pop()
+            c.a = c.pop()
+            c.p = (c.pop() | FLAG_U) & ~FLAG_B
+            lo = c.pop()
+            c.pc = lo | c.pop() << 8
+            return True
         if pc == 0xFFE1:                    # STOP key
             # Report "not pressed" a few times so a caller that expects to
             # wait actually waits, then report pressed so the run finishes.
@@ -601,6 +710,7 @@ class Machine:
             # does not matter: nothing in the suite measures time, it only
             # waits for a signal that must eventually arrive.
             self.gpu.advance(4)
+            self.irq()
             n += 1
         return self.done, n
 
@@ -749,26 +859,58 @@ def main(argv):
                 print('--clip-fault kind must be x, solid or void')
                 return 2
             clip_fault = int(n, 0)
-    chain = [o.split('=', 1)[1] for o in opts if o.startswith('--chain=')]
-    warp = None
+    frame_ms = None
     for o in opts:
-        if o.startswith('--warp='):
-            f, xyz = o.split('=', 1)[1].split(':', 1)
-            warp = [int(f)] + [float(v) for v in xyz.split(',')]
-            if len(warp) != 5:
-                print('--warp=F:X,Y,Z,YAW')
+        if o.startswith('--frame-ms='):
+            frame_ms = int(o.split('=', 1)[1])
+    chain = [o.split('=', 1)[1] for o in opts if o.startswith('--chain=')]
+    title = '--title' in opts
+    skill = 1
+    for o in opts:
+        if o.startswith('--skill='):
+            skill = int(o.split('=', 1)[1])
+            if not 0 <= skill <= 3:
+                print('--skill is 0 (easy) .. 3 (nightmare)')
                 return 2
+    if title and frame_ms is not None:
+        # --frame-ms clocks the CIA2 counter off page flips, and the logo's
+        # light sweep paces itself on that clock without flipping a page.
+        print('--title cannot be combined with --frame-ms: the logo sweep '
+              'would wait forever')
+        return 2
+    warp = None
+    hops = []
+    for o in opts:
+        if o.startswith('--warp=') or o.startswith('--hop='):
+            f, xyz = o.split('=', 1)[1].split(':', 1)
+            w = [int(f)] + [float(v) for v in xyz.split(',')]
+            if len(w) != 5:
+                print('--warp=F:X,Y,Z,YAW / --hop=F:X,Y,Z,YAW')
+                return 2
+            if o.startswith('--warp='):
+                warp = w
+            else:
+                hops.append(w)
 
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
                 key_script=key_script, c1_stream=c1_stream, level=level,
                 joy_script=joy_script, mouse_script=mouse_script,
-                notarget='--notarget' in opts, warp=warp)
+                notarget='--notarget' in opts, warp=warp, hops=hops,
+                frame_ms=frame_ms, telemetry='--telemetry-off' not in opts,
+                title=title, skill=skill,
+                sid_log=next((o.split('=', 1)[1] for o in opts
+                              if o.startswith('--sid-log=')), None))
     m.gpu.c1_clip_fault = clip_fault
+    for o in opts:
+        if o.startswith('--render-ms='):
+            m.gpu.c1_render_us = int(o.split('=', 1)[1]) * 1000
     for o in opts:
         if o.startswith('--log-rows='):
             a, b = o.split('=', 1)[1].split('-')
             m.log_rows = (int(a), int(b) + 1)
+        if o.startswith('--log-light='):
+            m.log_light = int(o.split('=', 1)[1])
     m.gpu.c1_clip_fault_kind = clip_fault_kind
     m.bus_fault_kind = bus_fault_kind
     if bus_fault_kind:
@@ -810,6 +952,9 @@ def main(argv):
             print("%2d| %s" % (i, r))
     print("--- %d dispatches, %d register writes ---"
           % (m.gpu.dispatches, m.gpu.reg_writes))
+    if m.gpu.c1_render_us:
+        print("--- render %d ms: %d commits drained a late frame ---"
+              % (m.gpu.c1_render_us // 1000, m.gpu.c1_commit_drains))
     print("--- by class: %s ---"
           % "  ".join("c%d %d/%dw" % (c, m.gpu.class_disp[c], m.gpu.class_writes[c])
                       for c in range(4) if m.gpu.class_disp[c]))

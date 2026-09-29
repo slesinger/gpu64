@@ -60,6 +60,8 @@ def main():
             shut = True
         elif a.startswith('--key=') or a in ('--demo', '--notarget'):
             keys.append(a)
+        elif a.startswith('--frame-ms='):
+            pass                    # always 32 here, see run()
         else:
             sys.exit('check_game.py: unknown argument %s' % a)
     if not (prg and level and ent is not None):
@@ -81,7 +83,8 @@ def main():
         sys.exit('check_game.py: entity %d has no nodes to draw' % ent)
 
     cmd = [sys.executable, os.path.join(HERE, 'prgsim', 'runsim.py'), prg,
-           '--demo', '--stop-after=%d' % frame, '--level=' + level,
+           '--demo', '--frame-ms=32', '--stop-after=%d' % frame,
+           '--level=' + level,
            '--dump-scene'] + [k for k in keys if k != '--demo']
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

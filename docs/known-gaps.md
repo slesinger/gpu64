@@ -15,6 +15,10 @@ register writes regardless of level size) — but there is no PVS, no portal
 culling, and no frustum culling done for you. `DRAW_WORLD`'s `first`/`count`
 range is drawn exactly as given; picking *which* range is visible from the
 current camera position is still your problem, on the 6502, this session.
+The one exception is a level loaded from the Pi's SD card (`LOAD_LEVEL`):
+its world nodes are culled by the level file's baked PVS, with no work on
+your side. See "Loading a level from the Pi's SD card" in
+[class1-3d-mesh-reference.md](class1-3d-mesh-reference.md).
 See [level-scale-visibility.md](level-scale-visibility.md) for the frozen
 requirements this was scoped against, and size your level (or your own
 coarse cell/room culling) accordingly rather than assuming gpu64 will skip

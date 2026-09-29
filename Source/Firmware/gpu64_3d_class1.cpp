@@ -108,6 +108,8 @@ static Gpu64_3dScene	s_ShadowScene;
 static Gpu64_3dState	s_ShadowState;
 
 static boolean s_LoopRunning;
+static boolean s_CommitSeen;	// a SCENE_COMMIT was accepted since boot
+static u32     s_LastCommitUs;	// gpu64_vsyncNow() of the last one
 
 // gpu64 (2026-09-10): the loop stopping is one of the four things that makes
 // SCENE_COMMIT answer UNSUPPORTED for the rest of a run, and it is the only
@@ -360,6 +362,14 @@ void gpu64_3dInit( void )
 boolean gpu64_3dLoopRunning( void )
 {
 	return s_LoopRunning;
+}
+
+#define GPU64_3D_COMMITS_LIVE_US	500000
+
+boolean gpu64_3dCommitsLive( void )
+{
+	return s_LoopRunning && s_CommitSeen &&
+	       gpu64_vsyncNow() - s_LastCommitUs < GPU64_3D_COMMITS_LIVE_US;
 }
 
 void gpu64_3dLoopFullReset( void )
@@ -879,6 +889,30 @@ static void levelLoadAbort( void )
 	s_Load.phase = GPU64_LEVELPH_IDLE;
 }
 
+// The Gpu64_3dVisLookup for a loaded level: its PVS row for the camera's
+// leaf, over the world chunks LOAD_LEVEL created. Runs on core 1, reading
+// s_Load, which only LOAD_LEVEL/LEVEL_STEP write -- and both refuse while the
+// loop is running, so nothing writes it while a frame renders.
+static const u8 *levelVisLookup( void *, const Gpu64_3dVec *pEye,
+				 u16 *pFirstId, u16 *pnNodes, u16 *pFirstMesh )
+{
+	if ( s_Load.phase != GPU64_LEVELPH_DONE )
+		return 0;
+
+	Gpu64_LevelVec e;
+	e.v[ 0 ] = pEye->x;
+	e.v[ 1 ] = pEye->y;
+	e.v[ 2 ] = pEye->z;
+
+	const u8 *pRow = gpu64_levelVisRow( &s_Load.lev, &e, pnNodes );
+	if ( pRow == 0 )
+		return 0;
+
+	*pFirstId   = s_Load.nNodeBase;
+	*pFirstMesh = s_Load.nMeshBase;
+	return pRow;
+}
+
 static u8 opLoadLevel( void )
 {
 	// Keyed by the gate in execute(), like SCENE_RESET -- this wipes the
@@ -1173,6 +1207,11 @@ static u8 opClipMove( void )
 	out[ 15 ] = mv.nBumps;
 	out[ 16 ] = GPU64_3D_CLIPMOVE_MAGIC_OUT;
 	out[ 17 ] = blkXor( out, 17 );
+	// Outside the checksum, which predates them, so they carry their own:
+	// the water level and its complement. A client that sees 0/0 is talking
+	// to firmware that does not report it.
+	out[ 18 ] = mv.nWaterLevel;
+	out[ 19 ] = (u8)( 0xff - mv.nWaterLevel );
 
 	res = gpu64_blobWrite( space, addr + GPU64_3D_CLIPMOVE_OUT_OFF,
 			       GPU64_3D_CLIPMOVE_OUT_BYTES, out );
@@ -1466,6 +1505,57 @@ static u8 opLevelPalette( void )
 	}
 
 	gpu64Regs.result = (u8)( nFixed > 255 ? 255 : nFixed );
+	return GPU64_ERR_OK;
+}
+
+// LEVEL_PICTURE: see gpu64_3d.h. Parses the preloaded file on every call
+// rather than borrowing s_Load.lev, because the title runs before any
+// LOAD_LEVEL; a parse is a header walk and costs microseconds.
+static u8 opLevelPicture( void )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 )
+		return GPU64_ERR_UNSUPPORTED;
+	if ( s_LoopRunning )
+		return GPU64_ERR_BUSY;
+	const u8 nFlags = sArg[ 5 ];
+	if ( nFlags & ~3 )
+		return GPU64_ERR_BAD_ARGS;
+
+	Gpu64_Level lev;
+	if ( gpu64LevelFileBytes == 0
+	     || !gpu64_levelParse( &lev, gpu64LevelFile, gpu64LevelFileBytes ) )
+		return GPU64_ERR_BAD_ARGS;
+
+	unsigned w, h;
+	const u8 *pPic = gpu64_levelPic( &lev, sArg[ 0 ], &w, &h );
+	if ( pPic == 0 )
+		return GPU64_ERR_BAD_ARGS;
+
+	if ( nFlags & 2 )
+	{
+		const u8 *pPal = gpu64_levelBlob( &lev, lev.nPalOff, 768 );
+		const u8 *pNow = pFB->GetPaletteRGB();
+		boolean bChanged = FALSE;
+		for ( unsigned i = 0; i < 256; i++ )
+		{
+			const u8 *p = pPal + i * 3;
+			const u8 *q = pNow + i * 3;
+			if ( p[ 0 ] == q[ 0 ] && p[ 1 ] == q[ 1 ] && p[ 2 ] == q[ 2 ] )
+				continue;
+			pFB->SetPaletteEntry( (u8)i, p[ 0 ], p[ 1 ], p[ 2 ] );
+			bChanged = TRUE;
+		}
+		// No colormap: nothing renders through it until LOAD_LEVEL,
+		// which installs the palette and builds the colormap itself.
+		if ( bChanged )
+			pFB->CommitPalette();
+	}
+
+	pFB->Blit( pPic, (s16)( sArg[ 1 ] | ( sArg[ 2 ] << 8 ) ),
+		   (s16)( sArg[ 3 ] | ( sArg[ 4 ] << 8 ) ), w, h,
+		   ( nFlags & 1 ) ? 255 : -1 );
+	gpu64Regs.result = 0;
 	return GPU64_ERR_OK;
 }
 
@@ -2024,7 +2114,8 @@ void gpu64_3dExecuteRenderScene( Gpu64_3dCmd *pCmd )
 	}
 
 	gpu64_3dSceneRender( &s_Scene, &s_State, &target, &s_Scratch,
-			      lookupMesh, 0, lookupTexture, 0 );
+			      lookupMesh, 0, lookupTexture, 0,
+			      levelVisLookup, 0 );
 
 	cleanViewport( pCmd->page );
 
@@ -2193,6 +2284,7 @@ static u8 execute( u8 op )
 	case GPU64_3D_OP_LEVEL_ENT:		return opLevelEnt();
 	case GPU64_3D_OP_LEVEL_PALETTE:		return opLevelPalette();
 	case GPU64_3D_OP_LEVEL_NODE:		return opLevelNode();
+	case GPU64_3D_OP_LEVEL_PICTURE:		return opLevelPicture();
 	case GPU64_3D_OP_WORLD_TICK:		return opWorldTick();
 
 	case GPU64_3D_OP_CREATE_OBJECT:		return opCreateObject();
@@ -2325,6 +2417,8 @@ static u8 execute( u8 op )
 		if ( !pushLoopFrame() )
 			return GPU64_ERR_QUEUE_FULL;
 
+		s_CommitSeen   = TRUE;
+		s_LastCommitUs = gpu64_vsyncNow();
 		return GPU64_ERR_OK;
 	}
 	}

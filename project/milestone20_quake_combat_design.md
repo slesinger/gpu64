@@ -620,6 +620,210 @@ decides everything else.
   - Spawnflag 1 (ambush: sight only, deaf).
   - Pain chance: every hit that does not kill plays pain, as in stage D.
 
+## Performance pass (2026-09-28)
+
+This was bench feedback on stage E: the game felt slow. The 6502 is the
+bottleneck, not the Pi. The pass is recorded in progress_tracker section 80.
+These are the decisions later stages have to keep:
+
+- **Motion is per millisecond, not per frame.** A per-frame step is what
+  one 32 ms frame moves. `dtFrame` scales it by the previous frame's
+  measured period, clamped to 8..60 ms. A new moving thing must take its
+  step through `dtMul` (a byte) or `dtMulS` (signed 16 to 24 bits), or
+  through a `dtMs`-indexed table. If it doesn't, it will run at a
+  different speed from everything else.
+- **Timers stay in frames**: think cadence, attack cooldowns, `OPEN_WAIT`,
+  `LEAP_FRAMES`, `VOID_FRAMES`. At low frame rates they run long in real
+  time. Scale them the same way if that ever matters.
+- **Every runsim run of the game passes `--frame-ms=32`.** It makes motion
+  exactly what it was before delta time, so the flooded routes and the
+  checks' frame numbers still hold. A new check that drives the game must
+  pass it too.
+- **Distance culls.** Actors beyond `ANIM_NEAR` are not animated, and a
+  sleeper looks for the player every 4th frame. Stage F lights and sounds
+  must not assume that an out-of-range actor's pose is current.
+- **Telemetry is sliced.** A new row goes in `SHOW_TAB` as its own slice,
+  not into another slice's code.
+
+## Title screens as built (2026-09-29)
+
+Asked for by the user: the HONDANI logo from the Doom port (`ilogo6`,
+"(c)" style) on both screens with the light sweep on both, Quake's title,
+and a Doom-style skill menu built from the pak's own art. The music comes
+from the C64's SID. Progress tracker section 85 has the run log.
+
+**Level format v7: pictures.**
+- A picture table (`u16 count, u16 0`, then `count` x `<HHI>` w, h, blob
+  offset) holds palette-index images. `tools/quake_pics.py` builds it:
+  - HONDANI (296x96);
+  - conback, and CONFADE, which is conback through `Draw_FadeScreen`'s
+    checkerboard, baked so the C64 never draws it;
+  - qplaque, ttl_sgl, loading, complete, inter;
+  - menudot1-6;
+  - gfx.wad's NUM_0-9, NUM_COLON and NUM_SLASH;
+  - the four skill names in the gold half of conchars, at 2x.
+- The indices are `PIC_*` symbols in the game include, inside CAT_HASH.
+- v6 files are refused by the new kernel and v7 files by the old one. The
+  two deploy together.
+
+**`LEVEL_PICTURE` $1A** (class 1) blits a picture onto the class-0 draw page.
+- It parses the *preloaded* file on every call, so it works before
+  `LOAD_LEVEL`.
+- ARG5 bit 1 installs the level palette. It does not build a colormap,
+  because LOAD_LEVEL does that.
+- It answers BUSY while the loop runs. That is the whole phantom story: a
+  flipped $1A in a game draws nothing.
+- The title sends it checked through stage2 (`stBuf[0..5]`, `stId=0`,
+  X=5). That works whether or not an earlier launch left strict mode
+  latched.
+
+**The sweep is palette animation on HDMI and colour RAM on the C64.**
+- The HDMI logo's lit pixels are index `LOGO_BASE`(192) + C64 cell column,
+  so a 40-entry `PAL_LOAD` per step moves the light column by column.
+- The C64 recolours only the columns whose ramp colour changed. It uses the
+  nibble mask of the screen byte, so no copy of the original is kept.
+- The ramp is WHITE, WHITE, YELLOW, YELLOW, LTRED, LTRED, then RED, at
+  index step−column. There are 46 steps of 20 ms, paced by the CIA2
+  millisecond clock. Both screens therefore move in step, and a flip is
+  never needed for it.
+
+**C64 memory.** The PRG loads contiguously from $0801 to $CBDC:
+
+| Range | Contents |
+|---|---|
+| up to about $85xx | code; `.cerror` above $A000 |
+| $A000 | tune 2 |
+| $A900 | tune 1 |
+| $B300 | Quake.sid (init $B300, play $B303) |
+| $C484 | the RLE logo |
+
+- The logo unpacks into VIC bank 3: bitmap $E000, screen $CC00.
+- `$01=$36` for the whole run (BASIC out, KERNAL in), and `finish`
+  restores $37.
+- The two further tunes are loaded for stage F and the music loop, not yet
+  played.
+
+**Music IRQ.** $0314 goes to `tiIrq`, on CIA1 timer A at 50 Hz (19704 PAL,
+20454 NTSC, chosen by $02A6).
+- The tunes' zero page overlaps the game's SRC/DST at $FB-$FE, so the IRQ
+  swaps $FA-$FF in and out around the play call.
+- Music off restores the timer, the vector, and silences $D400-$D418.
+- The music stops before the level loads. Gameplay's only IRQ cost is the
+  sound effects' tick (below).
+
+**Skill.**
+- `skill` is 0..3, and `skillMask` is the Quake `NOT_EASY/NOT_MEDIUM/
+  NOT_HARD` bit in the high byte of spawnflags ($01, $02, $04, $04).
+- `actTake` refuses an entity whose spawnflags carry the mask. Nightmare is
+  Hard's set, as in Quake.
+
+**runsim.**
+- It skips the title by default, poking `$02AB = $AB` and
+  `$02AC = --skill` (default 1), so every existing check starts where it
+  did.
+- `--title` runs it. It refuses `--frame-ms`, which would freeze the
+  title's millisecond waits.
+
+## Sound effects as built (2026-09-29)
+
+The user asked for the game's audio to come from the C64's SID. The code
+is in `Source/Demos/gpu64_game_sfx.inc`. Progress tracker section 86 has
+the run log.
+
+**Player.**
+- It runs on the KERNAL's own 60 Hz IRQ. `sfxIrq` sits on $0314 ahead of
+  $EA31: it is installed after `title` returns (the music IRQ is already
+  gone) and removed in `finish`.
+- It uses no zero page, because $FB-$FE is the game's SRC/DST, and no
+  self-modifying code. Its tables are column-major and indexed by one byte.
+- An effect is a priority, AD, SR, a pulse-width high byte and a run of
+  segments `(ticks, control, frequency, slide per tick)`. A zero-duration
+  row ends the run, and the gate is dropped so the release plays out.
+  Slides clamp at 0 and $FFFF rather than wrap.
+- The tables are generated by 64tass `.for` loops from Python-like tuple
+  lists (`SG_*`, `SOUNDS`). 64tass cannot continue an expression across
+  lines, so each list is one line. `.cerror` guards the count and the
+  256-row limit.
+
+**Voice choice** (`sfxPlay`, A = `SFX_*`; X, Y and the flags survive):
+1. the voice already playing the same effect restarts it, so a nailgun or
+   a chain of doors takes one voice;
+2. otherwise a free voice;
+3. otherwise the lowest-priority voice, if the new effect's priority is at
+   least as high;
+4. otherwise the effect is dropped.
+
+**Hooks** (only where A is dead):
+
+| Event | Where | Effect |
+|---|---|---|
+| fire | `fire`, per weapon via `wpSfx` | AXE, SHOT, SSHOT, NAIL |
+| monster pain / death | `monHurt` / `mhDie` | MPAIN / MDIE |
+| pickup | `ctLoop` via `pickSfx`, by kind | HEALTH, WEAPON, POWER, ITEM |
+| player hurt / death | `plHurt` (after the death test) / `phDie` | PAIN / DIE |
+| wake | `aiWake` | SIGHT |
+| grunt volley, dog bite, dog leap | `aoShoot`, `aoBite`, the leap | GRUNT, BITE, LEAP |
+| mover opens | `openMover`, by `mvKind` | BUTTON or DOOR |
+| secret trigger | `gtTrg` | SECRET |
+| jump | the SPACE jump | JUMP |
+| feet in/out of liquid | `setWater` | SPLASH |
+
+A fatal hit plays DIE only: PAIN is sent after the death test.
+
+**runsim.** It now emulates the IRQ. Once $0314 points anywhere but $EA31
+and I is clear, it enters the handler every latch/4 instructions, and it
+intercepts $EA31/$EA81 as the KERNAL's return. `--sid-log` records every
+SID write with the frame and the tick. `tools/check_sfx.py` decodes that
+log back into effect names through the include's own `SOUNDS` table.
+
+## Stage F as built (2026-09-29)
+
+The level can be finished. The code is in `Source/Demos/gpu64_game_exit.inc`
+plus a few hooks. Progress tracker section 87 has the run log.
+
+**trigger_counter.** Its entity is consumed at scan time (`etTrig` sends
+kind 26 to `cntTake`), not kept as a touch volume: the counter has a model,
+but in Quake it is never touched. It is a table of up to four (targetname,
+target, count, left) rows. `fireTarget` ends in `cntFire`, which finds a
+row whose targetname was fired, decrements it, and at zero pushes its
+target into the same fire queue buttons use. The messages go to C64 row 3,
+which is the one row no telemetry writes. They are cleared after
+MSG_FRAMES.
+
+**wait -1.** `exStayTake` reads the mover's `wait` (P1 = $FFFF) at scan
+time into `mvStay`. The door state machine's open-wait countdown skips a
+staying mover, so it never closes. Only doors and buttons take it.
+
+**Exit and intermission.** A trigger of kind 25 sets `exitHit`. The frame
+loop tests it after the frame is shown, and then `intermission`:
+- stops the loop (LOOP_STOP x8, as `finish` does);
+- starts E-Quake tune 1 through the title's `tiMusicAt`;
+- draws the pak's COMPLETE and INTER pictures with LEVEL_PICTURE, and the
+  numbers from the pak's digit pictures, at Quake's own coordinates. Totals
+  are right-aligned in three 24-pixel cells.
+- prints the same stats on the C64 screen;
+- after IM_ARM ticks, lets FIRE, SPACE or RETURN leave. Leaving restarts
+  the level, and `exReset` clears the secrets, the clock and the counters.
+
+Each tick is bounded by both 100 ms and 500 matrix polls, because runsim's
+`--frame-ms` clock only advances on page flips. The play clock is kept in
+`exFrame` from the same milliseconds the delta-time motion uses.
+
+**Muzzle flash.** This is point light 90 (CREATE_LIGHT $26). `mfShot` arms
+it for FLASH_FRAMES = 2 on every weapon but the axe. On its first lit frame
+`mfFrame` moves it to the camera and sets strength 6, radius 25 wu (Quake's
+200). The frame after, it sets strength 0. An ERR_BAD_ID (a phantom
+FULL_RESET or CREATE) marks it lost, and it is re-created on the next frame.
+
+**Testing it.**
+- runsim gained `--hop` (move the eye, keep the level's state) and
+  `--log-light` (a light node per `--frame-log` line).
+- `tools/check_exit.py` covers the counter, the wait -1 door, the stats
+  text, leaving the stats and the flash.
+- A run parked in the intermission ends through `imSimExit`, straight into
+  `finish` with its RUN/STOP waits skipped. Its matrix scans run the whole
+  `--stop-after` schedule through at once.
+
 ## Risks
 
 - **Frame rate.** The game renders at about 32 fps on the bench. A room of

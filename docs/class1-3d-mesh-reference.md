@@ -110,6 +110,7 @@ class 0, and every opcode reads exactly the byte count in its row.
 | $15 | `CLIP_MOVE` | 6 | `ARG0-5` descriptor of a 56-byte block in C64 RAM or REU | Asks where a move actually ends: you send a position and the displacement you want, and gpu64 traces it against the level's Quake clip hulls and answers with the position you end up in. Everything travels in the block, checksummed both ways — see "Walking in a level". `BAD_ARGS` if `len < 56`, if no level is loaded, if the block's magic or checksum is wrong, or if the hull or model is not one this level has. **Not** keyed and **not** `BUSY` while the loop runs: it changes no gpu64 state, so it answers mid-frame. |
 | $16 | `LEVEL_ENT` | 6 | `ARG0-5` descriptor of a 96-byte block in C64 RAM or REU | Hands back one entity of the loaded level — where it is, what kind of thing it is, which scene nodes draw it, and how far it travels if it is a door. Same block discipline as `CLIP_MOVE`: input bytes 0-3, output 16-95, magic and checksum both ways. `RESULT` = the entity's `kind`. `BAD_ARGS` if `len < 96`, if no level is loaded, or if the block's magic or checksum is wrong; `OUT_OF_RANGE` past the last entity. Also not keyed and not `BUSY` while the loop runs. |
 | $17 | `LEVEL_PALETTE` | 0 | — | Puts the loaded level's palette back. Compares the live palette with the level file's and rewrites only the entries that differ; if any did, pushes the palette to the display and rebuilds the colormap. `RESULT` = entries repaired, saturated at 255 — 0 is the normal answer and costs nothing but the compare. For a refresh ring: the level's palette is the one piece of state your program never held a copy of. `BAD_ARGS` until a level load has finished. Not keyed; fine while the loop runs. |
+| $1A | `LEVEL_PICTURE` | 6 | `ARG0` picture index, `ARG1-2` x, `ARG3-4` y (signed, clipped), `ARG5` flags: bit 0 = keyed (index 255 is transparent), bit 1 = install the level file's palette first; other bits must be 0 | Draws one of the level file's 2D pictures (title, menu and intermission art — see "Pictures" below) onto the **class 0 draw page**; `PAGE_FLIP` shows it. Reads the level file the Pi preloaded at boot, so it works **before** `LOAD_LEVEL`, which is what a title screen needs. `BAD_ARGS` for an index past the table, bad flag bits, or a card with no level file. `BUSY` while the loop is running — the loop owns the pages — which also makes a phantom one harmless mid-game. Not keyed. |
 | $1C | `LEVEL_NODE` | 1 | `ARG0` bit 0 = also restore the position; other bits must be 0 | Puts one level node back the way `LEVEL_STEP` built it: an object, instancing the level's own mesh, visible, scale 1.0, no rotation — and, with bit 0, at the level file's position. Leave bit 0 clear for a node you move yourself (a door). Staged `ID` = the node id. `RESULT` bit 0 = the node itself was wrong, bit 1 = its position was; 0 is the normal answer. `BAD_ID` past the level's last node, which is also how a program finds where the run ends; `BAD_ARGS` until a level load has finished. If the node had become the active camera, it is not one any more. Not keyed; fine while the loop runs. |
 
 ### Scene nodes — $20-$2F
@@ -272,13 +273,22 @@ frame loop must poll is `FRAME_READY` **set and `BUSY` clear**:
 ```
 
 `STATUS` bit4 (`GPU64_STATUS_FRAME_READY`) goes high once core 1 has finished
-a frame. Both bits are updated on the **frame clock**, inside the same vblank
-handler that retires the flip — not only when the C64 happens to send a
-command — so a read-only poll loop is enough and no command traffic is needed
-to make progress. (Before 2026-09-08 the bit really was raised only on a
-dispatch, which made this loop stall for its whole timeout on any frame where
-core 1 finished after the last command of the frame; if you are running older
-firmware, that is the symptom.) Bit4 says nothing about the page flip the
+a frame **and** gpu64 has looked. It looks at two moments: inside the vblank
+handler that retires the previous flip, and at the start of every command
+dispatch. A frame that finishes *before* that flip retires is therefore seen
+on the frame clock with no command traffic at all. A frame that finishes
+*after* it — a heavy view that takes longer than one vblank — is seen only at
+the next command. A read-only poll loop then waits for its whole timeout.
+
+**While waiting, send a cheap command every ~2 ms.** Any class 1 command
+harvests the frame; `SET_BACKGROUND` with the colour you already use
+changes nothing and does not drain the ring. The Quake game does exactly this
+(`waitReady`, `WR_PUMP_MS`): about 7 extra commands in a 45 ms wait.
+A per-vblank harvest in firmware would not be better: it would raise the
+bit only at the *next* vblank, so the commit would miss that vblank and the
+frame would be shown one refresh later than with the pump.
+
+Bit4 says nothing about the page flip the
 *previous*
 `SCENE_COMMIT` armed: that flip only retires at the next vblank, and until it
 does, `SCENE_COMMIT` answers `BUSY` rather than arming a second flip over an
@@ -409,6 +419,15 @@ on, and from then on a class-1 command **without** a check is refused with
 
 `WORLD_TICK` ($6C) is **not** exempt, because it moves nodes. In strict mode,
 send it with the check like any `SET_*`.
+
+Strict mode also guards three class-0 opcodes. While the loop is running
+and a `SCENE_COMMIT` succeeded in the last half second, `LOG_ENABLE` ($07),
+`VBLANK_SYNC` ($09) and `FULL_RESET` ($0B) are refused with `BAD_ARGS`
+unless they carry the `$A5` key or a check. A phantom `FULL_RESET` blanks
+every page and the border and stops the loop, which looks like the monitor
+switching off for half a second; the bench saw exactly that. A program that
+takes over from a strict one is unaffected, because it sends its
+`FULL_RESET` after commits have stopped.
 
 A keyed `SCENE_RESET`, a `FULL_RESET` or a C64 reset switches strict mode
 off again. A program that never checks its commits is unaffected. A program
@@ -639,6 +658,52 @@ Four things the split implies:
 - **Neither opcode works while the loop is running.** Both answer `BUSY`.
   Load first, then `LOOP_START` — or `LOOP_STOP` before reloading.
 
+A loaded level also culls itself. The file carries Quake's own
+potentially-visible set, baked down to the level's world nodes, and every
+frame gpu64 finds the leaf the active camera stands in and skips the world
+nodes that cannot be seen from there. Nothing in the API changes and nothing
+is asked of you. What it covers:
+
+- **Only the level's own world nodes**, and only while each one still
+  instances its own level mesh. Doors and other brush movers, your actors,
+  sprites and anything you created are always drawn.
+- **A camera outside the map culls nothing**: everything is drawn, as
+  before.
+- **A level file without the section**, or one whose world nodes were
+  renumbered, loads and draws everything.
+
+### Pictures
+
+A level file can also carry 2D pictures: the art for a title screen, a menu
+and an intermission. A 320x200 background is 64 KB, which is more than a C64
+has to send it from, so the pictures travel on the Pi's card with the level,
+and `LEVEL_PICTURE` ($1A) draws one by index onto the class 0 draw page.
+
+```
+        lda #PIC_CONFADE : sta ARG+0    ; which picture
+        lda #0 : sta ARG+1 : sta ARG+2  ; x
+        sta ARG+3 : sta ARG+4           ; y
+        lda #2 : sta ARG+5              ; opaque, level palette first
+        cmd $1a
+        ...                             ; more pictures, keyed (ARG5 bit 0)
+        cmd class0 PAGE_FLIP
+```
+
+- **The indices come from the converter.** `tools/gen_quakelevel.py --inc`
+  writes them into your include as `PIC_*` symbols (`PIC_CONBACK`,
+  `PIC_LOADING`, `PIC_NUM_0`…), and they are part of the catalogue hash, so a
+  program built against another conversion refuses the file instead of
+  drawing the wrong picture.
+- **Pixels are palette indices.** Bit 1 of `ARG5` installs the level file's
+  palette first, so a title that has been cycling colours gets Quake's back
+  without a level loaded. Index 255 is the hole in Quake's own `.lmp` art, and
+  a keyed draw (bit 0) leaves it untouched.
+- **It is a title-screen command.** It answers `BUSY` while the loop runs,
+  because the loop owns the pages. Draw your intermission after `LOOP_STOP`.
+- **The format is versioned.** A firmware accepts one level format — v7, the
+  first with pictures — and refuses any other at boot, so a level file and a
+  kernel are deployed together.
+
 Nothing above stops the camera leaving the map — placing it is your job, and
 `CLIP_MOVE` below is how you ask whether a place is legal.
 
@@ -686,12 +751,14 @@ be two dozen independent chances to lose one.
 | 30-31 | — | reserved, not read, not summed |
 | 32-43 | out | `end` x, y, z — where the move really ended |
 | 44 | out | flags, below. Also copied to `RESULT` |
-| 45 | out | contents at `end`: 0 empty, 1 solid, 2 water, 3 slime, 4 lava, 5 sky, 255 unknown |
+| 45 | out | contents at the **feet** of `end` (23 Quake units below the origin), from the level's point hull, so water, slime and lava are reported: 0 empty, 1 solid, 2 water, 3 slime, 4 lava, 5 sky, 255 unknown |
 | 46 | out | fraction 0-255 of the *horizontal* displacement actually covered |
 | 47 | out | bumps: slide iterations used, 0-4. Diagnostic |
 | 48 | out | magic `$5C` |
 | 49 | out | check: XOR of bytes 32-48 |
-| 50-55 | out | zero |
+| 50 | out | water level, as Quake's `waterlevel`: 0 dry, 1 feet in a liquid, 2 waist deep (swim), 3 eyes under (drowning). The liquid is byte 45 |
+| 51 | out | `$FF` minus byte 50. Bytes 50-51 are **outside** the checksum: take byte 50 only if byte 51 is its complement, and keep last frame's value otherwise. Firmware older than the water level answers 0/0, which fails the test |
+| 52-55 | out | zero |
 
 **Mode** (bitwise): `$01` slide along walls instead of stopping dead, `$02`
 step up over obstacles up to 18 Quake units, `$04` settle onto the floor and
@@ -699,7 +766,8 @@ report standing, `$08` the position you send and get back is the **eye**, not
 the feet — gpu64 subtracts the 22-unit view offset on the way in and adds it
 back on the way out, so you can hand it your camera's position unchanged.
 `$07` (slide + step + floor) is ordinary walking; `$0f` is ordinary walking
-with a camera-height position.
+with a camera-height position. A swimmer drops the floor settle (`$0b`):
+the settle traces 18 units down and would pin them to the bottom.
 
 **Flags**: `$01` standing on ground, `$02` hit a wall, `$04` hit a ceiling,
 `$08` the move needed a step up, `$10` the *start* was already inside solid

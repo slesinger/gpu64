@@ -87,6 +87,7 @@ extern "C" int gpu64shim_move_ents( const int *pIn, int nModel, int nHull,
 	pOut[ 4 ] = mv.nContents;
 	pOut[ 5 ] = mv.nFraction;
 	pOut[ 6 ] = mv.nBumps;
+	pOut[ 7 ] = mv.nWaterLevel;
 	return 1;
 }
 

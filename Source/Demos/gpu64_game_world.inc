@@ -53,6 +53,7 @@ GUN_Y     = round( GUN_LIFT * 65536 )
 ; them a frame. Every record is ~25 cycles a byte of 6502 time (build, sum).
 ANIM_MASK :?= 3
 ROT_STEP  = 2 * ( ANIM_MASK + 1 )
+ANIM_NEAR = 32			; wu: idle loops and spinning pickups inside this
 
 WT_MAGIC  = $d8
 WT_OMAGIC = $8d
@@ -262,12 +263,14 @@ aiSign
 +	rts
 
 ; ======================================================================
-; entTake's branch for kinds 30 and up: an item or a monster. Normal skill,
-; so spawnflags bit 9 (NOT_IN_MEDIUM) leaves the entity out.
+; entTake's branch for kinds 30 and up: an item or a monster. The skill the
+; title menu picked decides which of spawnflags bits 8-10 (NOT_IN_EASY,
+; NOT_IN_MEDIUM, NOT_IN_HARD) leaves the entity out: skillMask is that bit,
+; high byte, and nightmare filters as hard does, as it does in Quake.
 ; ======================================================================
 actTake
 	lda entBlk+ENT_SPAWN+1
-	and #$02
+	and skillMask
 	bne atNo
 	lda entBlk+ENT_KIND
 	cmp #31
@@ -451,10 +454,21 @@ actFrame
 	inc wtFrame
 	jsr hudFovCheck
 
-	ldx #SL_WORLD
+	; Only the slots of this frame's parity: every test below needs
+	; (slot ^ wtFrame) & 1 == 0 (both masks are odd), so the other half
+	; cannot do anything this frame and is not visited.
+	.cerror ( ANIM_MASK & AI_ANIM_MASK & 1 ) == 0, "afLoop steps by two"
+	lda wtFrame
+	eor #SL_WORLD
+	and #1
+	clc
+	adc #SL_WORLD
+	tax
 afLoop
 	cpx nAct
-	bcs afFix
+	bcc +
+	jmp afFix
++
 	lda acAnN,x
 	beq afRot
 	ldy #ANIM_MASK			; an awake monster at Quake's 10 Hz
@@ -466,7 +480,12 @@ afLoop
 	eor wtFrame
 	and acMask
 	bne afRot
-	lda acAnF,x
+	lda acAi,x			; idling asleep: only near the player
+	ora acAnMode,x
+	bne +
+	jsr acNearWu
+	bcs afRot
++	lda acAnF,x
 	clc
 	adc #1
 	cmp acAnN,x
@@ -498,6 +517,8 @@ afRot
 	eor wtFrame
 	and #ANIM_MASK
 	bne afNext
+	jsr acNearWu			; a pickup spins only near the player
+	bcs afNext
 	lda acYaw,x
 	clc
 	adc #ROT_STEP
@@ -506,10 +527,15 @@ afRot
 	sta acDirty,x
 afNext
 	inx
-	bne afLoop
+	inx
+	jmp afLoop
 
 afFix
-	ldx #0
+	lda wtFrame			; repairs are rare: look every 4th frame
+	and #3
+	beq +
+	jmp worldTick
++	ldx #0
 -	lda acFix,x
 	bne afDoFix
 	inx
@@ -527,6 +553,41 @@ afDoFix
 	bne +
 	dec wtFixCt
 +	jmp worldTick
+
+; X = slot. C clear if it is within ANIM_NEAR whole units of the eye on
+; both x and z. Preserves X. What only decorates -- an idle loop, a pickup
+; spinning -- is not worth a record a frame across the map: every one is
+; 20 bytes in the WORLD_TICK block, its checksum, and the Pi's time.
+acNearWu
+	sec
+	lda acPos+2*MAX_ACT,x
+	sbc cam+2
+	tay
+	lda acPos+3*MAX_ACT,x
+	sbc cam+3
+	jsr anwAxis
+	bcs anwRts
+	sec
+	lda acPos+10*MAX_ACT,x
+	sbc cam+10
+	tay
+	lda acPos+11*MAX_ACT,x
+	sbc cam+11
+anwAxis				; A:Y a signed whole-unit delta
+	beq anwPos
+	cmp #$ff
+	bne anwFar
+	tya
+	eor #$ff
+	cmp #ANIM_NEAR
+	rts
+anwPos
+	cpy #ANIM_NEAR
+	rts
+anwFar
+	sec
+anwRts
+	rts
 
 ; The status bar's plane follows the FOV (see hudZLo).
 hudFovCheck
@@ -619,31 +680,60 @@ worldTick
 	lda #0
 	sta wtN
 
-	; Every dirty slot, from where the last full block stopped.
-	lda nAct
-	sta wtCnt
+	; Every dirty slot, downward from where the last full block stopped
+	; (normally the top) and round. Two tight loops rather than one with
+	; a wrap test in it: this scan visits every actor every frame.
 	ldx wtStart
 	cpx nAct
-	bcc wdLoop
-	ldx #0
-wdLoop
-	lda acDirty,x
-	beq wdNext
-	lda acFix,x
-	bne wdNext
-	lda wtN
-	cmp #WT_DIRTY_MAX
 	bcc +
+	ldx nAct
+	dex
++	stx wdFirst
+wdSeg1					; wdFirst down to 0
+	lda acDirty,x
+	bne wdHit1
+wdCont1
+	dex
+	bpl wdSeg1
+	ldx nAct			; then the top down to wdFirst + 1
+	dex
+	cpx wdFirst
+	beq wdAll
+wdSeg2
+	lda acDirty,x
+	bne wdHit2
+wdCont2
+	dex
+	cpx wdFirst
+	bne wdSeg2
+wdAll
+	lda #$ff			; the whole ring fitted: next from the top
+	sta wtStart
+	jmp wdRefresh
+wdHit1
+	jsr wdTake
+	bcc wdCont1
+	bcs wdFull
+wdHit2
+	jsr wdTake
+	bcc wdCont2
+wdFull
 	stx wtStart			; full: this one leads the next block
 	jmp wdRefresh
-+	jsr wtEmit
-wdNext
-	inx
-	cpx nAct
-	bcc +
-	ldx #0
-+	dec wtCnt
-	bne wdLoop
+
+; X = a dirty slot: its record, unless it waits for a repair. C set when
+; the block is full and it was not taken. Preserves X.
+wdTake
+	lda acFix,x
+	bne wdtOk
+	lda wtN
+	cmp #WT_DIRTY_MAX
+	bcs wdtRts
+	jsr wtEmit
+wdtOk
+	clc
+wdtRts
+	rts
 
 	; And two clean ones, round-robin: the refresh ring.
 wdRefresh
@@ -919,7 +1009,7 @@ wtEmit
 +	rts
 
 ; 16-bit sum of the X*256 + A bytes at (SRC). Result in wsLo/wsHi; SRC is
-; moved past the whole pages.
+; destroyed.
 sum16
 	sta wsRem
 	lda #0
@@ -940,14 +1030,30 @@ s16Page
 	dex
 	jmp s16Page
 s16Rem
-	cpy wsRem
+	; The last partial page, with SRC moved back 256 - wsRem bytes so that
+	; Y runs from 256 - wsRem up to the wrap: the INY ends the loop and
+	; there is no compare in it.
+	ldy wsRem
 	beq s16Done
-	adc (SRC),y
+	pha
+	tya
+	clc
+	adc SRC
+	sta SRC
+	bcs +
+	dec SRC+1			; SRC + wsRem - 256
++	lda #0
+	sec
+	sbc wsRem
+	tay
+	pla
+	clc
+-	adc (SRC),y
 	bcc +
 	inc wsHi
 	clc
 +	iny
-	jmp s16Rem
+	bne -
 s16Done
 	sta wsLo
 	rts
@@ -1023,6 +1129,7 @@ wtLastN		.byte 0
 wtCnt		.byte 0
 wtCnt2		.byte 0
 wtStart		.byte 0
+wdFirst		.byte 0
 wtRefIx		.byte 0
 wtFrame		.byte 0
 wtTry		.byte 0

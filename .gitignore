@@ -26,3 +26,6 @@ __pycache__/
 
 # converted levels, rebuilt from PAK0.PAK by tools/gen_quakelevel.py
 /build/
+
+# Quake sounds extracted from PAK0.PAK for auditioning, not part of the project
+/loops/

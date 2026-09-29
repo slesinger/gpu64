@@ -192,11 +192,27 @@ void gpu64_3dSceneApplyLights( const Gpu64_3dScene *pScene, Gpu64_3dState *pStat
 // maintenance: the caller owns the target and what has to be flushed after.
 typedef const Gpu64_3dMesh *( *Gpu64_3dMeshLookup )( void *pCtx, u16 nId );
 
+// Occlusion culling for a loaded level (gpu64_level.h, gpu64_levelVisRow()).
+// Called once per frame, after the camera is applied, with the camera's
+// world position. A non-zero answer is a bit row over *pnNodes consecutive
+// node ids from *pFirstId: an OBJECT node in that range whose bit is clear
+// is not drawn -- provided its mesh is still *pFirstMesh + its offset in the
+// range, i.e. it is still the level chunk the row was computed for and not
+// something a program later created under a reused id. 0 culls nothing.
+//
+// Invisible in the picture by construction: the row is Quake's own PVS, and
+// a chunk it clears is behind walls from anywhere in the camera's leaf. It
+// changes only how long the frame takes.
+typedef const u8 *( *Gpu64_3dVisLookup )( void *pCtx, const Gpu64_3dVec *pEye,
+					   u16 *pFirstId, u16 *pnNodes,
+					   u16 *pFirstMesh );
+
 void gpu64_3dSceneRender( const Gpu64_3dScene *pScene,
 			   Gpu64_3dState *pState,
 			   Gpu64_3dTarget *pTarget,
 			   Gpu64_3dScratch *pScratch,
 			   Gpu64_3dMeshLookup pMeshLookup, void *pMeshCtx,
-			   Gpu64_3dTextureLookup pTexLookup, void *pTexCtx );
+			   Gpu64_3dTextureLookup pTexLookup, void *pTexCtx,
+			   Gpu64_3dVisLookup pVisLookup = 0, void *pVisCtx = 0 );
 
 #endif

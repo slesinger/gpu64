@@ -8,8 +8,9 @@
 //
 // Written by tools/gen_quakelevel.py and validated by tools/check_g64lev.py;
 // the same bytes are rendered on a PC by tools/hostsim/levelsim.cpp before
-// any of it goes near the bench. Format version 3 -- version 1 had no
-// entities, version 2 no collision.
+// any of it goes near the bench. Format version 7 -- version 1 had no
+// entities, 2 no collision, 3 no entity kind, 4 no hull 0, 5 no visibility,
+// 6 no pictures.
 //
 // This header is deliberately free of every gpu64 subsystem: it parses and
 // range-checks, and says nothing about resources, scenes or the arena. The
@@ -23,9 +24,9 @@
 
 // 'G','6','4','L' read as a little-endian u32: 0x47, 0x36, 0x34, 0x4c.
 #define GPU64_LEVEL_MAGIC	0x4c343647
-#define GPU64_LEVEL_VERSION	5
+#define GPU64_LEVEL_VERSION	7
 
-#define GPU64_LEVEL_HEADER_BYTES	36
+#define GPU64_LEVEL_HEADER_BYTES	52
 
 // The seven table strides, all of which tools/gen_quakelevel.py packs with
 // struct's '<' so none of them carries padding.
@@ -77,6 +78,17 @@ typedef struct
 
 	u32		nPalOff;	// 768 RGB triples, the level's own palette
 	u32		nStrOff;	// entity string pool, NUL-terminated
+
+	// Visibility (v6); see gpu64_levelVisRow(). nVisLeafs == 0 means the
+	// file carries none and nothing is culled.
+	u16		nVisLeafs, nVisRowBytes, nVisWorldNodes, nVisNodes, nVisHead;
+	const u8	*pVisNodes;	// nVisNodes x <HhhH> plane, child0, child1
+	const u8	*pVisRows;	// nVisLeafs x nVisRowBytes
+
+	// Pictures (v7): full-screen and menu art that is not a texture --
+	// the title, the menu, the intermission. See gpu64_levelPic().
+	u16		nPic;
+	const u8	*pPicTab;	// nPic x <HHI> w, h, blob offset
 }
 Gpu64_Level;
 
@@ -90,6 +102,12 @@ boolean gpu64_levelParse( Gpu64_Level *pL, const u8 *pFile, u32 nBytes );
 // A range-checked pointer into the blob area, or 0 if [nOff, nOff+nLen) is
 // not wholly inside it.
 const u8 *gpu64_levelBlob( const Gpu64_Level *pL, u32 nOff, u32 nLen );
+
+// Picture nIndex: its pixels (w*h palette indices, row-major) and size, or
+// 0 if there is no such picture. The size and the range were checked by
+// gpu64_levelParse(), so a non-zero answer is safe to read in full.
+const u8 *gpu64_levelPic( const Gpu64_Level *pL, unsigned nIndex,
+			  unsigned *pW, unsigned *pH );
 
 // A NUL-terminated string from the entity string pool, or 0 if the pool's
 // bytes run out before the terminator does.
@@ -180,6 +198,10 @@ boolean gpu64_levelEnt( const Gpu64_Level *pL, unsigned nIndex, Gpu64_LevelEnt *
 // getting E1M1's.
 #define GPU64_LEVEL_STEP_UP_QU		18
 #define GPU64_LEVEL_EYE_QU		22
+// Quake's player box runs from 24 below the origin to 32 above it;
+// SV_CheckWater tests the feet at mins+1 and the waist at the box's middle.
+#define GPU64_LEVEL_FEET_QU		23
+#define GPU64_LEVEL_WAIST_QU		4
 
 // Quake units to 16.16 world units. 18 -> 36864 and 22 -> 45056 at the
 // converter's current 32.
@@ -222,6 +244,26 @@ typedef struct
 	s32	v[ 3 ];
 }
 Gpu64_LevelVec;
+
+// --- visibility ----------------------------------------------------------
+//
+// Quake's PVS, baked by tools/gen_quakelevel.py's build_vis() down to the
+// granularity gpu64 draws at: for each leaf of the drawing BSP, one bit per
+// world node (the level's first nVisWorldNodes nodes, the chunks of brush
+// model 0) saying whether any face of that chunk lies in a leaf that can be
+// seen from somewhere inside this one. Conservative by construction -- a
+// chunk it clears is one Quake itself would not have drawn from there.
+//
+// Returns that row for the leaf containing pEye (16.16, gpu64 axes, the
+// camera's own position) and its bit count in *pnNodes, or 0 when nothing
+// may be culled: no vis section, a walk that hit its bound, or an eye in
+// the shared solid leaf 0 -- a camera outside the map, which is exactly
+// when a player is trying to see what went wrong.
+//
+// A pure function of the immutable level file, like the traces below, so
+// core 1 may call it while rendering.
+const u8 *gpu64_levelVisRow( const Gpu64_Level *pL, const Gpu64_LevelVec *pEye,
+			     u16 *pnNodes );
 
 // One placed chunk of level geometry: which mesh, where, and which Quake
 // brush model it came from -- 0 for the world itself, and otherwise the same
@@ -299,9 +341,10 @@ typedef struct
 {
 	Gpu64_LevelVec	end;
 	u8		nFlags;		// GPU64_CLIP_* above
-	u8		nContents;	// GPU64_CLIP_CONT_* at the end position
+	u8		nContents;	// GPU64_CLIP_CONT_* at the end position's feet
 	u8		nFraction;	// 0..255 of the requested displacement
 	u8		nBumps;		// slide iterations used, diagnostic
+	u8		nWaterLevel;	// Quake's waterlevel: 0 dry, 1 feet, 2 waist, 3 eyes
 }
 Gpu64_LevelMove;
 

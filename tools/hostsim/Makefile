@@ -38,7 +38,8 @@ SCENESRCS := scenesim.cpp \
         $(FW)/gpu64_3d_raster.cpp \
         $(FW)/gpu64_3d_colormap.cpp \
         $(FW)/gpu64_3d_render.cpp \
-        $(FW)/gpu64_3d_scene.cpp
+        $(FW)/gpu64_3d_scene.cpp \
+        $(FW)/gpu64_level.cpp
 
 HDRS := $(FW)/gpu64_3d_render.h $(FW)/gpu64_3d_math.h $(FW)/gpu64_3d_scene.h
 

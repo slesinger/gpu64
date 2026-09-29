@@ -139,7 +139,78 @@ boolean gpu64_levelParse( Gpu64_Level *pL, const u8 *pFile, u32 nBytes )
 	if ( (u64)pL->nStrOff > (u64)pL->nBlobBytes )
 		return FALSE;
 
+	// Visibility. Absent is allowed and means "cull nothing"; present but
+	// inconsistent is refused, for the same reason the tables are: a
+	// section whose header disagrees with its own length is a converter
+	// and a loader that no longer agree on the layout.
+	const u32 nVisOff = gpu64_levelRd32( pFile + 36 );
+	const u32 nVisLen = gpu64_levelRd32( pFile + 40 );
+	if ( nVisLen != 0 )
+	{
+		const u8 *pV = gpu64_levelBlob( pL, nVisOff, nVisLen );
+		if ( pV == 0 || nVisLen < 12 )
+			return FALSE;
+		pL->nVisLeafs      = gpu64_levelRd16( pV + 0 );
+		pL->nVisRowBytes   = gpu64_levelRd16( pV + 2 );
+		pL->nVisWorldNodes = gpu64_levelRd16( pV + 4 );
+		pL->nVisNodes      = gpu64_levelRd16( pV + 6 );
+		pL->nVisHead       = gpu64_levelRd16( pV + 8 );
+		if ( 12 + (u64)pL->nVisNodes * 8
+		        + (u64)pL->nVisLeafs * pL->nVisRowBytes != nVisLen
+		     || (u32)pL->nVisRowBytes * 8 < pL->nVisWorldNodes
+		     || pL->nVisWorldNodes > pL->nNode
+		     || pL->nVisHead >= pL->nVisNodes )
+			return FALSE;
+		pL->pVisNodes = pV + 12;
+		pL->pVisRows  = pL->pVisNodes + (u32)pL->nVisNodes * 8;
+
+		// The renderer matches a node to its bit by id *and* by mesh, and
+		// the mesh half assumes world node j draws level mesh j. The
+		// converter builds them that way; a file that does not gets no
+		// culling rather than the wrong culling.
+		for ( unsigned j = 0; j < pL->nVisWorldNodes; j++ )
+			if ( gpu64_levelRd16( pL->pNodeTab + j * GPU64_LEVEL_NODE_STRIDE ) != j )
+				pL->nVisLeafs = 0;
+	}
+
+	// Pictures (v7): u16 count, u16 zero, then count x <HHI> w, h, offset.
+	// Every picture is range-checked here, once, so that drawing one is a
+	// straight copy -- and a section that disagrees with its own length is
+	// refused like the visibility section above, for the same reason.
+	const u32 nPicOff = gpu64_levelRd32( pFile + 44 );
+	const u32 nPicLen = gpu64_levelRd32( pFile + 48 );
+	if ( nPicLen != 0 )
+	{
+		const u8 *pP = gpu64_levelBlob( pL, nPicOff, nPicLen );
+		if ( pP == 0 || nPicLen < 4 )
+			return FALSE;
+		const u16 n = gpu64_levelRd16( pP );
+		if ( 4 + (u64)n * 8 != nPicLen )
+			return FALSE;
+		for ( unsigned i = 0; i < n; i++ )
+		{
+			const u8 *r = pP + 4 + i * 8;
+			const u32 w = gpu64_levelRd16( r ), h = gpu64_levelRd16( r + 2 );
+			if ( w == 0 || h == 0
+			     || gpu64_levelBlob( pL, gpu64_levelRd32( r + 4 ), w * h ) == 0 )
+				return FALSE;
+		}
+		pL->nPic    = n;
+		pL->pPicTab = pP + 4;
+	}
+
 	return TRUE;
+}
+
+const u8 *gpu64_levelPic( const Gpu64_Level *pL, unsigned nIndex,
+			  unsigned *pW, unsigned *pH )
+{
+	if ( nIndex >= pL->nPic )
+		return 0;
+	const u8 *r = pL->pPicTab + nIndex * 8;
+	*pW = gpu64_levelRd16( r );
+	*pH = gpu64_levelRd16( r + 2 );
+	return pL->pBlob + gpu64_levelRd32( r + 4 );
 }
 
 const u8 *gpu64_levelBlob( const Gpu64_Level *pL, u32 nOff, u32 nLen )
@@ -292,6 +363,41 @@ s16 gpu64_levelPointContents( const Gpu64_Level *pL, s32 nNum, const Gpu64_Level
 	}
 
 	return (s16)nNum;
+}
+
+const u8 *gpu64_levelVisRow( const Gpu64_Level *pL, const Gpu64_LevelVec *pEye,
+			     u16 *pnNodes )
+{
+	if ( pL == 0 || pL->nVisLeafs == 0 )
+		return 0;
+
+	s32 nNum = pL->nVisHead;
+	unsigned nSteps = 0;
+	while ( nNum >= 0 )
+	{
+		if ( (u32)nNum >= pL->nVisNodes || ++nSteps > GPU64_LEVEL_TRACE_MAXDEPTH )
+			return 0;
+
+		const u8 *pN = pL->pVisNodes + (u32)nNum * 8;
+		const u16 nPl = gpu64_levelRd16( pN );
+		if ( nPl >= pL->nPlane )
+			return 0;
+
+		s32 n[ 3 ], nDist;
+		u8  nType;
+		planeRead( pL, nPl, n, &nDist, &nType );
+
+		nNum = ( planeDist( n, nType, nDist, pEye->v ) < 0 )
+			? gpu64_levelRdS16( pN + 4 )
+			: gpu64_levelRdS16( pN + 2 );
+	}
+
+	const s32 nLeaf = -1 - nNum;
+	if ( nLeaf <= 0 || nLeaf >= pL->nVisLeafs )
+		return 0;
+
+	*pnNodes = pL->nVisWorldNodes;
+	return pL->pVisRows + (u32)nLeaf * pL->nVisRowBytes;
 }
 
 // The sweep, on the segment [p1f, p2f] of the caller's original line. Returns
@@ -839,7 +945,34 @@ boolean gpu64_levelMoveEnts( const Gpu64_Level *pL, unsigned nModel, unsigned nH
 			nFlags &= (u8)~GPU64_CLIP_ONGROUND;
 	}
 
-	pOut->nContents = contentsToByte( gpu64_levelPointContents( pL, nHead, &down ) );
+	// What the player is standing in. Not against nHead: the clip hulls
+	// are the level grown by the player's box, and qbsp keeps only solid
+	// and empty in them, so water, slime and lava are simply not there.
+	// Hull 0 has them. Quake's SV_CheckWater, point for point: the type is
+	// the feet's, and the level counts how far up the body the same kind
+	// of liquid reaches.
+	{
+		const s32 nHead0 = hull.nHead0;
+		Gpu64_LevelVec p = down;
+		p.v[ 1 ] -= gpu64_levelQU( pL, GPU64_LEVEL_FEET_QU );
+		const s16 nFeet = gpu64_levelPointContents( pL, nHead0, &p );
+		pOut->nContents = contentsToByte( nFeet );
+		if ( nFeet <= GPU64_LEVEL_CONTENTS_WATER &&
+		     nFeet >= GPU64_LEVEL_CONTENTS_LAVA )
+		{
+			pOut->nWaterLevel = 1;
+			p = down;
+			p.v[ 1 ] += gpu64_levelQU( pL, GPU64_LEVEL_WAIST_QU );
+			if ( gpu64_levelPointContents( pL, nHead0, &p ) == nFeet )
+			{
+				pOut->nWaterLevel = 2;
+				p = down;
+				p.v[ 1 ] += nEyeOfs;
+				if ( gpu64_levelPointContents( pL, nHead0, &p ) == nFeet )
+					pOut->nWaterLevel = 3;
+			}
+		}
+	}
 
 	if ( nMode & GPU64_CLIP_MODE_EYE )
 		down.v[ 1 ] += nEyeOfs;

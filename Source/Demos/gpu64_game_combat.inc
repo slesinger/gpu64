@@ -70,6 +70,7 @@ wpGun		.byte M_V_AXE, M_V_SHOT, M_V_SHOT2, M_V_NAIL
 wpGunN		.byte 5, N_V_SHOT, N_V_SHOT2, N_V_NAIL	; axe: its first swing only
 wpWait		.byte 11, 11, 15, 2			; 0.5, 0.5, 0.7, 0.1 s
 wpPel		.byte 1, 6, 14, 1
+wpSfx		.byte SFX_AXE, SFX_SHOT, SFX_SSHOT, SFX_NAIL
 wpDmg		.byte 20, 4, 4, 9
 wpSx2		.byte 0, 20, 72, 0	; 2 * spread * 256: 0.04, 0.14
 wpSy2		.byte 0, 20, 41, 0	;                   0.04, 0.08
@@ -137,6 +138,7 @@ plReset
 	lda #1
 	sta acDirty+SL_GUN
 	jsr gunPose
+	jsr envReset
 	jmp hudStats
 
 ; entScan's count of monsters, for the K row. Called once after it.
@@ -410,6 +412,9 @@ fire
 	bne +
 	dec cbShots
 +
+	lda wpSfx,x
+	jsr sfxPlay
+	jsr mfShot			; the muzzle flash (not the axe)
 	lda wpPel,x
 	sta cbPel
 	lda wpDmg,x
@@ -950,6 +955,8 @@ monHurt
 	beq mhRts			; already flinching
 	lda #AS_PAIN
 	sta acState,x
+	lda #SFX_MPAIN
+	jsr sfxPlay
 	lda #AM_ONCE
 	sta cbMode
 	lda acKind,x
@@ -970,6 +977,8 @@ mhDie
 	lda #AS_DEAD
 	sta acState,x
 	inc kills
+	lda #SFX_MDIE
+	jsr sfxPlay
 	lda #AM_HOLD
 	sta cbMode
 	stx cbX
@@ -1102,11 +1111,16 @@ dpNone
 
 ; ======================================================================
 ; Pickups: every visible item the player's box overlaps, after clipMove.
+; Every other frame, opposite gameTouch: the touch box is 32 QU across and
+; two frames of running are 21 QU.
 ; ======================================================================
 combatTouch
+	lda wtFrame
+	and #1
+	bne +
 	lda plDead
-	beq +
-	rts
+	beq ++
++	rts
 +	ldx #SL_WORLD
 ctLoop
 	stx cbX
@@ -1214,6 +1228,7 @@ ctBox
 	jsr pickup
 	bcc ctNext
 	ldx cbX
+	jsr pickSfx
 	lda #0
 	sta acFlags,x
 	sta acRot,x
@@ -1344,7 +1359,11 @@ puNotArmour
 	rts
 +	cmp #K_SUIT
 	bne +
-	sec				; nothing in E1M1 hurts through it yet
+	lda #<SUIT_MS			; slime, lava and drowning: see
+	sta plSuit			; gpu64_game_env.inc
+	lda #>SUIT_MS
+	sta plSuit+1
+	sec
 	rts
 +	cmp #K_SHELLS
 	bne +
@@ -1468,9 +1487,13 @@ phTake
 	bcc phDie
 	beq phDie
 	sta plHp
+	lda #SFX_PAIN
+	jmp sfxPlay
 phRts
 	rts
 phDie
+	lda #SFX_DIE
+	jsr sfxPlay
 	lda #0
 	sta plHp
 	lda #1
@@ -1482,9 +1505,36 @@ phDie
 	sta acDirty+SL_GUN
 	rts
 
+; The pickup's sound, X = its slot. X and Y survive.
+pickSfx
+	lda acKind,x
+	cmp #K_HEALTH
+	beq psHealth
+	cmp #K_SSG
+	beq psWeapon
+	cmp #K_NAILGUN
+	beq psWeapon
+	cmp #K_QUAD
+	beq psPower
+	cmp #K_SUIT
+	beq psPower
+	lda #SFX_ITEM
+	jmp sfxPlay
+psHealth
+	lda #SFX_HEALTH
+	jmp sfxPlay
+psWeapon
+	lda #SFX_WEAPON
+	jmp sfxPlay
+psPower
+	lda #SFX_POWER
+	jmp sfxPlay
+
 ; runsim.py --warp: a new start, then a restart onto it. Never on a C64.
 simWarp
 	lda SIM_WARP
+	cmp #SIM_HOP_ON
+	beq swHop
 	cmp #SIM_WARP_ON
 	bne +
 	lda #0
@@ -1500,6 +1550,22 @@ simWarp
 	sta startYaw+1
 	jmp restart
 +	rts
+; --hop: the eye alone moves, the level and its counters keep their state,
+; so one run can press buttons that are rooms apart (tools/check_exit.py).
+swHop
+	lda #0
+	sta SIM_WARP
+	ldx #11
+-	lda SIM_WARP_POS,x
+	sta cam,x
+	sta lastGood,x
+	dex
+	bpl -
+	lda SIM_WARP_POS+12
+	sta camYaw
+	lda SIM_WARP_POS+13
+	sta camYaw+1
+	rts
 
 ; ======================================================================
 ; Restart: the level as it was loaded. Nodes are not re-created -- every
@@ -1593,6 +1659,7 @@ rsDirty
 rsActDone
 	lda #0
 	sta kills
+	jsr exReset			; secrets, time, counters, the exit
 	jmp plReset
 
 ; X = monster slot: alive, standing, at full health. Preserves X.

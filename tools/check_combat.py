@@ -68,7 +68,8 @@ def consts(path):
 
 def run(prg, level, frame, keys):
     cmd = [sys.executable, os.path.join(HERE, 'prgsim', 'runsim.py'), prg,
-           '--demo', '--stop-after=%d' % frame, '--level=' + level,
+           '--demo', '--frame-ms=32', '--stop-after=%d' % frame,
+           '--level=' + level,
            '--dump-scene', '--notarget'] + keys
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

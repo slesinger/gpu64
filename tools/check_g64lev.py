@@ -16,7 +16,7 @@ VERT_STRIDE = 6
 FACE_STRIDE = 12
 MAX_VERTS = 256
 
-HDR = '<4sHH4HHHI3I'
+HDR = '<4sHH4HHHI5I2I'
 HDR_LEN = struct.calcsize(HDR)
 TEX_REC = '<HBBII'
 MESH_REC = '<IIII'
@@ -40,11 +40,11 @@ def main(path):
         fail('file is shorter than its header')
 
     (magic, ver, scale, ntex, nmesh, nnode, nent, nplane, nhull, nclip,
-     base, palo, stro) = struct.unpack_from(HDR, d, 0)
+     base, palo, stro, viso, visl, pico, picl) = struct.unpack_from(HDR, d, 0)
     if magic != b'G64L':
         fail('magic is %r, not G64L' % magic)
-    if ver != 5:
-        fail('version %d is not 5' % ver)
+    if ver != 7:
+        fail('version %d is not 7' % ver)
     print('header  ver %d  scale %d qu/wu  tex %d  mesh %d  node %d  ent %d'
           % (ver, scale, ntex, nmesh, nnode, nent))
     print('        collision  %d planes  %d hulls  %d clipnodes'
@@ -309,6 +309,72 @@ def main(path):
         fail('hull 0: eye contents %d, below-floor contents %d' % (c0, cb0))
     print('trace   hull 0: eye is empty (%d), 64qu below is solid (%d)  OK'
           % (c0, cb0))
+
+    # --- visibility (v6) ------------------------------------------------
+    #
+    # gen_quakelevel.py's build_vis() has the layout. The one check that
+    # says it is right: the drawing BSP puts the player-start eye in an open
+    # leaf, and that leaf's row is neither empty (the firmware would draw
+    # nothing) nor all ones (it would cull nothing).
+    if visl == 0:
+        fail('no visibility section')
+    if viso + visl > len(d) - base:
+        fail('visibility section %d+%d runs past the blob area' % (viso, visl))
+    vo = base + viso
+    nleafs, rowb, nworld, nvn, head, vpad = struct.unpack_from('<6H', d, vo)
+    if 12 + nvn * 8 + nleafs * rowb != visl:
+        fail('visibility section is %d bytes, its header adds up to %d'
+             % (visl, 12 + nvn * 8 + nleafs * rowb))
+    if rowb * 8 < nworld or nworld > nnode or head >= nvn:
+        fail('visibility header: rows %d B for %d world nodes of %d, head %d/%d'
+             % (rowb, nworld, nnode, head, nvn))
+    for j in range(nworld):
+        if struct.unpack_from('<H', d, node_off + j * 16 + 14)[0] != 0:
+            fail('node %d is covered by the vis rows but is not the world' % j)
+    vnodes = [struct.unpack_from('<HhhH', d, vo + 12 + i * 8)
+              for i in range(nvn)]
+    for i, (pn, a0, a1, _) in enumerate(vnodes):
+        if pn >= nplane or a0 >= nvn or a1 >= nvn:
+            fail('vis node %d out of range: plane %d children %d %d'
+                 % (i, pn, a0, a1))
+    n, steps = head, 0
+    while n >= 0 and steps < 96:
+        pn, a0, a1, _ = vnodes[n]
+        nx, ny, nz, dist, _, _ = planes[pn]
+        n = a1 if ((nx * eye[0] + ny * eye[1] + nz * eye[2]) >> 15) - dist < 0 \
+            else a0
+        steps += 1
+    leaf = -1 - n
+    if n >= 0 or not 0 < leaf < nleafs:
+        fail('the player-start eye is in no visible leaf (%d)' % n)
+    row = d[vo + 12 + nvn * 8 + leaf * rowb:][:rowb]
+    seen = sum(1 for j in range(nworld) if row[j >> 3] & (1 << (j & 7)))
+    if not 0 < seen < nworld:
+        fail('the player start sees %d of %d world chunks' % (seen, nworld))
+    print('vis     %d leafs x %d B, %d BSP nodes; start leaf %d sees %d of %d'
+          ' world chunks  OK' % (nleafs, rowb, nvn, leaf, seen, nworld))
+
+    # --- pictures (v7) --------------------------------------------------
+    #
+    # The firmware's own rule: the section's length is exactly its table,
+    # and every picture's w*h lies inside the blob area. LEVEL_PICTURE then
+    # draws with a straight copy.
+    if picl:
+        sec = blob(pico, picl, 'picture section')
+        npic = struct.unpack_from('<H', sec, 0)[0]
+        if 4 + npic * 8 != picl:
+            fail('picture section is %d bytes, %d pictures need %d'
+                 % (picl, npic, 4 + npic * 8))
+        px = 0
+        for i in range(npic):
+            w, h, o = struct.unpack_from('<HHI', sec, 4 + i * 8)
+            if not w or not h:
+                fail('picture %d is %dx%d' % (i, w, h))
+            blob(o, w * h, 'picture %d' % i)
+            px += w * h
+        print('pics    %d pictures, %d B of pixels  OK' % (npic, px))
+    else:
+        print('pics    none (a level built with --no-actors)')
 
     print('PASS  %s (%.1f KB)' % (path, len(d) / 1024.0))
 

@@ -28,6 +28,7 @@
 */
 #include "gpu64_3d_render.h"
 #include "gpu64_3d_scene.h"
+#include "gpu64_level.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,6 +161,37 @@ static Gpu64_3dState  g_State;
 static Gpu64_3dScene  g_Scene;
 static Gpu64_3dScratch g_Scratch;
 
+// --- level visibility --------------------------------------------------
+// The LEVEL line prgsim emits when a LOAD_LEVEL finishes: the same file and
+// the same two id bases gpu64_3d_class1.cpp's levelVisLookup() works from,
+// through the same gpu64_levelVisRow(). A RESET ends it, as
+// levelLoadAbort() does on the Pi.
+static Gpu64_Level g_Level;
+static u8 *g_pLevelFile;
+static boolean g_bLevel;
+static u16 g_LevelNodeBase, g_LevelMeshBase;
+static unsigned long g_VisCulled;
+
+static const u8 *visLookup( void *, const Gpu64_3dVec *pEye,
+			    u16 *pFirstId, u16 *pnNodes, u16 *pFirstMesh )
+{
+	if ( !g_bLevel )
+		return 0;
+	Gpu64_LevelVec e;
+	e.v[ 0 ] = pEye->x;
+	e.v[ 1 ] = pEye->y;
+	e.v[ 2 ] = pEye->z;
+	const u8 *pRow = gpu64_levelVisRow( &g_Level, &e, pnNodes );
+	if ( pRow == 0 )
+		return 0;
+	*pFirstId   = g_LevelNodeBase;
+	*pFirstMesh = g_LevelMeshBase;
+	for ( unsigned k = 0; k < *pnNodes; k++ )
+		if ( !( pRow[ k >> 3 ] & ( 1 << ( k & 7 ) ) ) )
+			g_VisCulled++;
+	return pRow;
+}
+
 int main( int argc, char **argv )
 {
 	// The firmware's rad.cfg GPU64_BURST_BYTES, for proving a budget
@@ -174,6 +206,7 @@ int main( int argc, char **argv )
 	unsigned nPicks = 0;
 	boolean bQuiet = FALSE;
 	boolean bTime = FALSE;
+	boolean bNoVis = FALSE;		// A/B: the picture must not change
 	double tSum = 0, tMax = 0;
 
 	for ( int i = 1; i < argc; i++ )
@@ -189,6 +222,8 @@ int main( int argc, char **argv )
 			bQuiet = TRUE;
 		else if ( !strcmp( argv[ i ], "--time" ) )
 			bTime = TRUE;
+		else if ( !strcmp( argv[ i ], "--no-vis" ) )
+			bNoVis = TRUE;
 		else if ( !pStream )
 			pStream = argv[ i ];
 		else
@@ -263,6 +298,25 @@ int main( int argc, char **argv )
 			// docs/class1-3d-mesh-reference.md's Resource lifecycle.
 			gpu64_3dStateDefaults( &g_State );
 			gpu64_3dSceneReset( &g_Scene );
+			g_bLevel = FALSE;
+			continue;
+		}
+
+		if ( sscanf( line, "LEVEL %u %u %255s", &a, &b, name ) == 3 )
+		{
+			u32 len;
+			free( g_pLevelFile );
+			g_pLevelFile = readFile( name, &len );
+			if ( !g_pLevelFile
+			     || !gpu64_levelParse( &g_Level, g_pLevelFile, len ) )
+			{
+				fprintf( stderr, "scenesim: level %s does not parse\n", name );
+				bFail = TRUE;
+				break;
+			}
+			g_LevelNodeBase = (u16)a;
+			g_LevelMeshBase = (u16)b;
+			g_bLevel = !bNoVis;
 			continue;
 		}
 
@@ -415,7 +469,8 @@ int main( int argc, char **argv )
 			const unsigned long nYield0 = gpu64_3dYieldCount;
 			clock_gettime( CLOCK_MONOTONIC, &t0 );
 			gpu64_3dSceneRender( &g_Scene, &g_State, &target, &g_Scratch,
-					      lookupMesh, 0, lookupTexture, 0 );
+					      lookupMesh, 0, lookupTexture, 0,
+					      visLookup, 0 );
 			clock_gettime( CLOCK_MONOTONIC, &t1 );
 			double us = ( t1.tv_sec - t0.tv_sec ) * 1e6
 				  + ( t1.tv_nsec - t0.tv_nsec ) / 1e3;
@@ -471,6 +526,9 @@ int main( int argc, char **argv )
 	if ( bTime && nFrames )
 		printf( "scenesim: render mean %.0f us, max %.0f us (this machine)\n",
 			tSum / nFrames, tMax );
+	if ( nFrames )
+		printf( "scenesim: level vis culled %.1f world chunks/frame%s\n",
+			(double)g_VisCulled / nFrames, bNoVis ? " (--no-vis)" : "" );
 	printf( "scenesim: %u frames, %u PPMs in %s/\n", nFrames, nWritten, pOut );
 	return nFrames ? 0 : 1;
 }

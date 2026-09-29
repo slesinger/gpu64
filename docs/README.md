@@ -36,8 +36,10 @@ be written as if they were settled:
   free-running.
 - **Class 2** is frozen, not removed. It still works; it gets no new
   opcodes.
-- **Visibility** (PVS, frustum culling) is not in v1 at all. Size levels
-  accordingly — see [known-gaps.md](known-gaps.md) and
+- **Visibility** is not part of the v1 API. A level loaded with
+  `LOAD_LEVEL` culls its own world nodes by the level file's PVS, which is
+  invisible to your program. Everything else is drawn as given; see
+  [known-gaps.md](known-gaps.md) and
   [level-scale-visibility.md](level-scale-visibility.md).
 
 Two v1 rules are not optional for a program that runs for more than a few

@@ -137,12 +137,16 @@
 //   30..31        reserved, not read, not summed
 //   32..43  out   end     x, y, z   s32 16.16, where the move actually ended
 //      44   out   flags   GPU64_CLIP_* in gpu64_level.h -- also in RESULT
-//      45   out   cont    GPU64_CLIP_CONT_* at the end position
+//      45   out   cont    GPU64_CLIP_CONT_* at the end position's feet,
+//                         from hull 0 -- the only hull that knows liquids
 //      46   out   frac    0..255 of the horizontal displacement covered
 //      47   out   bumps   slide iterations used, diagnostic
 //      48   out   magic   GPU64_3D_CLIPMOVE_MAGIC_OUT
 //      49   out   check   XOR of bytes 32..48
-//   50..55  out   zero
+//      50   out   wlevel  Quake's waterlevel 0..3 (dry, feet, waist, eyes)
+//      51   out   ~wlevel 0xff - byte 50; outside the checksum, which
+//                         predates them, so they carry their own check
+//   52..55  out   zero
 //
 // Then `movers` records of 16 bytes each, the first at byte 56. Each one is a
 // brush model standing somewhere in the world: a closed door, a lowered
@@ -257,6 +261,29 @@
 // Unkeyed, idempotent, and exempt from the pre-execute drain: core 1 reads
 // neither the palette nor the shadow state.
 #define GPU64_3D_OP_LEVEL_PALETTE	0x17
+
+// gpu64 (milestone 20, title screens): LEVEL_PICTURE, draw one of the level
+// file's pictures onto the class 0 draw page.
+//
+// The title, the skill menu and the intermission are Quake's own 2D art --
+// a 320x200 console background alone is 64 KB, which is more than the C64
+// has to send it from. So the art rides in the level file (v7 "pictures",
+// see gpu64_level.h) and the C64 names it by index, like a texture.
+//
+// ARG0 picture index, ARG1-2 x and ARG3-4 y (signed, clipped like BLIT),
+// ARG5 flags: bit 0 = keyed, index 255 is transparent (Quake's own hole);
+// bit 1 = install the level file's palette first -- a title that played
+// with the palette gets Quake's colours back without a level being loaded.
+// Other ARG5 bits are BAD_ARGS, as is an index past the table or a card
+// with no level file. The picture lands on the draw page; PAGE_FLIP shows it.
+//
+// Works before LOAD_LEVEL -- it reads the preloaded file, not the loaded
+// level -- and only while the class 1 loop is stopped: the loop owns the
+// pages, so a LEVEL_PICTURE against a running loop answers BUSY and draws
+// nothing. That is also what makes a phantom one harmless in a game. The
+// number keeps LEVEL_NODE's rule: every one-bit flip of $1A is undefined in
+// class 1 or keyed ($12), and its class 0 twin is undefined.
+#define GPU64_3D_OP_LEVEL_PICTURE	0x1A
 
 // gpu64 (milestone 18, bench run 38): LEVEL_NODE, put one level node back the
 // way LEVEL_STEP built it.
@@ -455,6 +482,13 @@ boolean gpu64_3dLoopRunning( void );
 // of answering BUSY forever -- see the case 0x0B comment in gpu64_api.cpp.
 // Call only after a drain (gpu64_apiFullReset() has one).
 void gpu64_3dLoopFullReset( void );
+
+// gpu64 (2026-09-28): is a program committing frames right now -- the loop
+// running and a SCENE_COMMIT accepted within the last half second? The
+// class 0 phantom guard in gpu64_apiDispatch() uses it to tell a running
+// game (whose FULL_RESET can only be a phantom) from a new program taking
+// over a loop the last one left running (whose FULL_RESET is real).
+boolean gpu64_3dCommitsLive( void );
 
 // Executes one class 1 command from core 0, exactly as doSystem()/doDraw()
 // do for class 0: returns a GPU64_ERR_* code, having already pushed

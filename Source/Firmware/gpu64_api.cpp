@@ -1813,6 +1813,27 @@ void gpu64_apiDispatch( u8 op )
 	     op != 0x0A && op != 0x0B && op != 0x0C )
 		res = GPU64_ERR_BUSY;
 	else
+	// gpu64 (2026-09-28, bench: "the screen was completely dark, like
+	// powered off"): of the class 0 ops left legal above, three change what
+	// is on the screen -- FULL_RESET blacks every page and stops the loop,
+	// LOG_ENABLE paints the log over it, VBLANK_SYNC halts the C64 for up
+	// to a frame. Strict mode never covered them (it is a class 1 rule),
+	// and class 0 is where a phantom finds CMD_HI 0: GET_HEALTH $0A with
+	// bit 0 flipped, or any ARG byte of $0B written after a class 0 command
+	// and before the next class 1 one rewrites CMD_HI. A strict program
+	// that is committing frames never sends any of the three unkeyed, so
+	// one that arrives is not its own. A new program taking over a loop
+	// the last one left running is unaffected: no commit has arrived for
+	// the half second it took to load.
+	if ( sStrict && ( op == 0x07 || op == 0x09 || op == 0x0B ) &&
+	     !gpu64_apiKeyed() && ( gpu64ApiKey & 0xF0 ) != GPU64_KEY_CHECKED &&
+	     gpu64_3dCommitsLive() )
+	{
+		gpu64_apiDiagBump( &gpu64ApiDiag.keyRefused );
+		gpu64ApiDiag.keyRefusedOp = op;
+		res = GPU64_ERR_BAD_ARGS;
+	}
+	else
 #endif
 	if ( op < 0x10 )
 		res = doSystem( op );
