@@ -309,7 +309,9 @@ Two independent pieces of follow-through, staged together only because
 both are "make the already-working thing better" rather than "make the
 next thing work":
 
-- **Free-running mode (mode 1)**: the loop renders and flips on its own
+- **Free-running mode (mode 1) -- DROPPED 2026-09-30 by the user's
+  decision; not to be built.** Kept below only as the record of what was
+  proposed. The loop renders and flips on its own
   schedule, never waiting on the C64 — the "C64 goes off and does BASIC
   while the HDMI scene keeps rendering" case from milestone6_3d_design.md's
   Philosophy section. `SCENE_COMMIT` still publishes updates atomically;

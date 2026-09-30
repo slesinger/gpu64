@@ -687,21 +687,20 @@ from the C64's SID. Progress tracker section 85 has the run log.
   millisecond clock. Both screens therefore move in step, and a flip is
   never needed for it.
 
-**C64 memory.** The PRG loads contiguously from $0801 to $CBDC:
+**C64 memory.** The PRG loads contiguously from $0801:
 
 | Range | Contents |
 |---|---|
 | up to about $85xx | code; `.cerror` above $A000 |
-| $A000 | tune 2 |
-| $A900 | tune 1 |
-| $B300 | Quake.sid (init $B300, play $B303) |
-| $C484 | the RLE logo |
+| $A000 | E-Quake tune 1, the only tune (title and intermission) |
+| $AA00 | the RLE logo, then the controls and pause menus |
+| $C400 | the pause menu's save of the C64 game screen |
 
 - The logo unpacks into VIC bank 3: bitmap $E000, screen $CC00.
 - `$01=$36` for the whole run (BASIC out, KERNAL in), and `finish`
   restores $37.
-- The two further tunes are loaded for stage F and the music loop, not yet
-  played.
+- One tune only (decided 2026-09-30). The other two tunes and Quake.sid
+  were dropped on purpose.
 
 **Music IRQ.** $0314 goes to `tiIrq`, on CIA1 timer A at 50 Hz (19704 PAL,
 20454 NTSC, chosen by $02A6).

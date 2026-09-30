@@ -10841,3 +10841,57 @@ The second puzzle is 10467 commits at a BASIC prompt.
 **Verified on the bench 2026-09-30** (src:08ff57f8, C64U): "Colors are ok"
 with the C64U powered on after the Pi. The corruption mechanism itself is
 still not identified.
+
+## 94. C64U start-up closed; the $FFFF decode's status (2026-09-30)
+
+**Start-up: closed.** The user reports that with src:08ff57f8 on the C64U
+at 1 MHz (cartridge powered first, then the C64U), BASIC shows on HDMI in a
+few seconds without touching anything. This is the "Open: several minutes
+of power cycles" item from 89a. Likely cause: the reset storm fixed in 93.
+The idle loop took each single low sample of /RESET as a reset and ran
+`gpu64_apiFullReset()` thousands of times. That, together with 89b's
+unconfirmed holds on lone $FFFF reads, kept the machine from starting.
+
+**The $FFFF decode ("Open: V 1275089029" from 89a): handled by design, not
+yet confirmed by numbers.**
+- On the C64U the cartridge port shows a read of $FFFF on cycles that are
+  not vector fetches, and it shows no $FFFE/$FFFF vector pair. The likely
+  reason is that the FPGA puts only external-relevant cycles on the port
+  and the rest read as a pulled-up bus.
+- The breadbin keeps the real jiffy clock (the pair, 89b).
+- The C64U uses the substitute clock:
+  - `GPU64_MIRROR_LONE_INTERVAL` in `reuUsingPolling()`;
+  - the 4/s wall-clock fallback in `gpu64_mirrorIdleLoop()` (89d).
+- Both machines now show the mirror, start up unattended, and run the game.
+- What is not confirmed: the V/VX counts on the current build. They
+  appear on the SNIFF line while `gpu64_probe_ultimate.prg` runs. The
+  expectation is VX large and V = 0 on the C64U, and V about 60 and VX = 0
+  on the breadbin. One photo per machine closes this.
+- The known remaining limitation on the C64U is that the mirror's IRQ
+  watchdog never runs. With no vector pair, `gpu64MirrorAwaitIrq` stays set,
+  so the mirror is never retired for lack of an IRQ. It keeps snapshotting at
+  4/s under any program that does not use gpu64. That is harmless, and no
+  change is planned.
+
+## 95. Closed items; GPU64_SNIFF_ENABLED off (2026-09-30)
+
+**Closed by the user, 2026-09-30:**
+- The C64U HDMI colours (93). Verified on the bench with src:08ff57f8.
+- The C64U start-up (89a, 94). A few seconds, unattended.
+- The $FFFF decode (89a, 94). Closed as handled by the substitute clock,
+  and the V/VX confirmation photo is waived. The mirror watchdog never runs
+  on the C64U, and that is accepted.
+- The pause menu on ← and the H health cheat (92). Verified on the bench.
+- The short-board breadbin. It runs today's build well.
+- Scope: free-running mode (gap_filling_plan stage 18) is dropped. The game
+  keeps only E-Quake tune 1, and the other tunes' deletion is intentional.
+
+**`GPU64_SNIFF_ENABLED` is off** (`gpu64_sniff.h`). The sniff code is
+compiled out of the polling loop, the IO2 write path and the register
+decode. `gpu64_probe_ultimate.prg` no longer gets answers from
+`$DF6A-$DF6F`.
+- Build `8d5b94d6-dirty src:e6771622`, kernel md5
+  `09b8f74e1db078ddf634b0e43c367b65`. It is built but not deployed; it goes
+  onto the card as `kernel_rad.img`.
+- Bench check: a sanity run on each machine. The expected result is the
+  same behaviour as src:08ff57f8.

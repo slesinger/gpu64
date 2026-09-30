@@ -48,7 +48,7 @@
 
 #include <circle/types.h>
 
-#define GPU64_SNIFF_ENABLED
+//#define GPU64_SNIFF_ENABLED		// off since 2026-09-30 (tracker 95)
 
 #define GPU64_SNIFF_CONST_A		0x6A		// reads $A5
 #define GPU64_SNIFF_CONST_B		0x6B		// reads $5A
