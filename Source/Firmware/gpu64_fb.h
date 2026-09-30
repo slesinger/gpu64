@@ -157,6 +157,8 @@ public:
 	// mode could not be programmed, in which case the old one is still up.
 	u8 GetMode( void ) const		{ return m_nMode; }
 	boolean SetMode( u8 nMode );
+	// Graphics mode re-sent to the VideoCore whole, pages cleared.
+	boolean Reprogram( void );
 
 	// Top-left of the 640x400 text surface, border excluded -- 0 unless the
 	// display is in text mode. Text mode has one page and no flip: the
@@ -217,6 +219,7 @@ private:
 	// Programs the VideoCore for whichever of the two framebuffers is
 	// named, re-reads its base address and pitch, and repaints the border.
 	boolean ActivateGraphics( void );
+	void FreshGraphics( void );
 	boolean ActivateText( void );
 	void PaintTextBorder( void );
 

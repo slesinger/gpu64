@@ -56,6 +56,8 @@
 ;        F1 / F3 look up / down          F7      level the view
 ;        + / -   widen / narrow the field of view (30-110 degrees, 75 at start)
 ;        C= or B fire                    1-4     pick a weapon
+;        <-      pause (RESUME / CONTROLS; <- again resumes)
+;        H       health cheat: +100, at most 250, for testing levels
 ;
 ;        Joystick 2: up / down walk, left / right turn, button fires.
 ;        1351 mouse in port 1: sideways turns, forward / back looks up and
@@ -276,7 +278,8 @@ KF_B    = $10		; column 3's B; it is also the row joystick 1's fire pulls
 COL_F   = %11110111	; PA3: B
 COL_G   = %11101111	; PA4 and PA6: only for keys the controls menu
 COL_H   = %10111111	; may bind (gpu64_game_controls.inc)
-KD_LARR = $02		; <- : the stage D test HURT key
+KD_LARR = $02		; <- : the pause menu (gpu64_game_pause.inc)
+KF_H    = $20		; H: the health cheat
 
 ; The mouse: a 1351 in port 1. PA7:6 = 01 connects port 1's pots to the
 ; SID, which finishes a measurement every 512 cycles, so readKeys waits
@@ -306,6 +309,12 @@ SIM_WARP     = $02a9
 SIM_WARP_ON  = $a9
 SIM_HOP_ON   = $ab			; --hop: the eye moves, nothing restarts
 SIM_WARP_POS = $02b0
+; And runsim.py --hurt: 20 damage to the player, once per arming -- what
+; the <- key did before it became the pause menu (tools/check_combat.py
+; dies by it).
+SIM_HURT     = $02ad
+SIM_HURT_ON  = $ad
+SIM_HURT_DMG = 20
 ; And telemetry: the C64 screen's rows are off by default (they cost ~2000
 ; cycles a frame), F5 turns them on. runsim.py writes SIM_TELE_ON here
 ; unless --telemetry-off, because every check reads its verdict off them.
@@ -546,6 +555,7 @@ HB_EVERY = 64
 	sta SIM_NOTARGET
 	sta SIM_WARP
 	sta SIM_TELE
+	sta SIM_HURT
 
 	; The HONDANI logo, the Quake title and the skill menu
 	; (gpu64_game_title.inc). It leaves BASIC banked out for good: the
@@ -946,7 +956,7 @@ frNoShow
 	lda exitHit
 	beq +
 	jsr intermission		; the exit: stats, then the level again
-+
++	jsr pauseCheck			; <-: the pause menu
 	lda SIM_EXIT
 	cmp #SIM_EXIT_ON
 	beq frStopKey
@@ -5844,4 +5854,5 @@ sinHi
 	; The controls menu and the key remap, also under BASIC -- which is
 	; banked out from `title` to `finish`, the only span that calls them.
 	.include "gpu64_game_controls.inc"
-	.cerror * > LOGO_SCREEN, "the logo and the controls run into the logo's screen"
+	.include "gpu64_game_pause.inc"
+	.cerror * > PM_SCR, "the logo, the controls and the pause menu run into the pause's screen save"

@@ -239,7 +239,9 @@ void gpu64_apiReset( void );
 // flags. Separate from gpu64_apiReset() because it must not touch the
 // register file: FULL_RESET ($0B) calls it from inside a dispatch. See its
 // definition in gpu64_api.cpp.
-void gpu64_apiFullReset( void );
+// bReprogram (tracker 93): also re-send the VideoCore's whole display set-up,
+// not just the palette. For resets the C64 never asked for over the bus.
+void gpu64_apiFullReset( boolean bReprogram = FALSE );
 
 // Executes one command. Heavy and unbounded-ish by design: the caller holds
 // the bus across it (see the CMD_LO case in reuUsingPolling()).

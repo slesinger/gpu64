@@ -576,6 +576,8 @@ static u8 gpu64MirrorD018 = 0x15;
 // is ~1ms -- two orders of magnitude below the ~50ms a finger holds a button,
 // and far above any settling transient on the multiplexed pin.
 #define GPU64_BUTTON_DEBOUNCE 1000
+// Idle-loop passes the reset line must read low before its release counts.
+#define GPU64_IDLE_RESET_MIN 1000
 
 // gpu64 2026-09-10: DO NOT add a settling delay between SET_GPIO( bMPLEX_SEL )
 // and the g3 read below. It was tried, at the bench, and it killed the bus
@@ -828,7 +830,7 @@ void gpu64_mirrorSnapshot()
 // when the power went off.
 void gpu64_deadClockEnter( void )
 {
-	gpu64_apiFullReset();
+	gpu64_apiFullReset( TRUE );
 	gpu64_showHoldingScreen();
 }
 
@@ -839,7 +841,7 @@ void gpu64_deadClockEnter( void )
 // and the reset branch's own one-shot will simply find nothing left to do.
 void gpu64_deadClockLeave( void )
 {
-	gpu64_apiFullReset();
+	gpu64_apiFullReset( TRUE );
 }
 
 // gpu64: what the boot idle loop saw, printed onto the HDMI log whenever
@@ -1086,12 +1088,21 @@ mirrorIdleLoop:
 		// Holding the watchdog clear for the duration and arming when the
 		// machine actually restarts avoids having to reason about which of
 		// the two wins.
+		//
+		// Debounced (tracker 93): the edge counts only after the line read
+		// low on GPU64_IDLE_RESET_MIN consecutive passes (~1 ms; a real
+		// press or power-up pulse lasts far longer). On the C64U a single
+		// low sample was enough, and the bench counted 3306 display resets
+		// at one BASIC prompt.
 		if ( CPU_RESET )
 		{
-			resetCount = 1;
+			if ( resetCount < GPU64_IDLE_RESET_MIN )
+				resetCount++;
 			gpu64MirrorIrqWatchdog = 0;
 		} else
-		if ( resetCount )
+		if ( resetCount < GPU64_IDLE_RESET_MIN )
+			resetCount = 0;			// a glitch, not a reset
+		else
 		{
 			resetCount = 0;
 			gpu64MirrorEnabled = 1;
@@ -1106,7 +1117,7 @@ mirrorIdleLoop:
 			// taken during REU emulation. Free here -- nothing is being
 			// emulated at radIsWaiting, so the VideoCore work this may do
 			// has nobody waiting on it.
-			gpu64_apiFullReset();
+			gpu64_apiFullReset( TRUE );
 		}
 
 		// gpu64: the liveness timer, same as the REU loop's. Without the
@@ -1846,7 +1857,7 @@ reuEmulationMainLoop:
 				// by the C64's own reset circuit. There is no bus deadline
 				// to miss, nothing to serve, and no rule-7 exposure,
 				// because there is no cycle in flight to corrupt.
-				gpu64_apiFullReset();
+				gpu64_apiFullReset( TRUE );
 			}
 		} else
 			resetCount = 0;

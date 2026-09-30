@@ -204,7 +204,26 @@ boolean CGpu64FrameBuffer::SetMode( u8 nMode )
 		return FALSE;
 
 	m_nMode = GPU64_MODE_GRAPHICS;
+	FreshGraphics();
+	return TRUE;
+}
 
+// gpu64 (tracker 93): the whole graphics set-up sent to the VideoCore again,
+// as at boot -- see gpu64_apiFullReset( TRUE ).
+boolean CGpu64FrameBuffer::Reprogram( void )
+{
+	if ( !m_bInitialized )
+		return FALSE;
+	if ( m_nMode != GPU64_MODE_GRAPHICS )
+		return SetMode( GPU64_MODE_GRAPHICS );
+	if ( !ActivateGraphics() )
+		return FALSE;
+	FreshGraphics();
+	return TRUE;
+}
+
+void CGpu64FrameBuffer::FreshGraphics( void )
+{
 	// Same reasoning as the text side: the pages have just been reallocated,
 	// so their contents mean nothing. Repaint the border from the colour the
 	// display already had, put the paging state back to page 0 drawn and
@@ -215,7 +234,6 @@ boolean CGpu64FrameBuffer::SetMode( u8 nMode )
 	SetBorder( m_nBorder );
 	DrawLogOverlay( 0 );
 	CleanPage( 0 );
-	return TRUE;
 }
 
 u8 *CGpu64FrameBuffer::TextSurface( void )

@@ -740,8 +740,8 @@ void CRAD::Run( void )
 		// (bench 2026-09-29). The C64 program is being thrown away anyway:
 		// the menu always ends in a C64 reset.
 		{
-			extern void gpu64_apiFullReset( void );
-			gpu64_apiFullReset();
+			extern void gpu64_apiFullReset( boolean bReprogram );
+			gpu64_apiFullReset( TRUE );
 		}
 
 		res = hijackC64( false );			// after hijackC64 the CPU is still halted by DMA

@@ -497,7 +497,7 @@ static void healthReset( void )
 // purpose: resetREU() also runs on every fresh entry into REU emulation, and
 // blanking the display there would wipe the mirror the moment the user
 // switches the RAD menu to REU.
-void gpu64_apiFullReset( void )
+void gpu64_apiFullReset( boolean bReprogram )
 {
 	CGpu64FrameBuffer *pFB = g_pGpu64FB;
 
@@ -520,6 +520,12 @@ void gpu64_apiFullReset( void )
 		// this reprograms the VideoCore, which is the expensive path and
 		// the reason the callers below are all edge-triggered.
 		pFB->SetMode( GPU64_MODE_GRAPHICS );
+		// Tracker 93: on the C64U, when the machine powers on after the Pi,
+		// the palette the VideoCore scans out goes wrong entry by entry,
+		// and 3306 SET_PALETTEs never put it right. Re-sending the whole
+		// set-up is what boot does, and boot's colours are right.
+		if ( bReprogram )
+			pFB->Reprogram();
 		pFB->ResetPalette();
 		pFB->ResetPages();
 		// ClearAllPages() memsets the border band too, so SetBorder() has

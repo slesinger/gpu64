@@ -18,14 +18,14 @@ Two scripted runs, each driven from the start of the level:
            each, so every fire input is exercised.
            Pain after the first (24 < 30 hp), dead after the second, the
            third finds nothing, and the backpack is worth exactly 5.
-  respawn  the <- test key five times: 100 hp in 20s, so dead on the
+  respawn  runsim --hurt five times: 100 hp in 20s, so dead on the
            fifth. Dead means HP 0, one death, and the gun node hidden.
            Then joystick 2's button restarts -- camera back on the start,
            full health, the gun back -- and the press that restarted must
            NOT also fire. A later B fires normally.
 
 Both run with --notarget: the monsters never wake on their own, so the
-grunt is where its entity says and the only damage is the <- key's.
+grunt is where its entity says and the only damage is --hurt's.
 tools/check_ai.py is the run where they fight back.
 
 Usage: tools/check_combat.py --prg=... --level=build/e1m1.g64lev
@@ -52,9 +52,8 @@ TO_GRUNT = ['--key=LSHIFT:20-207', '--key=W:20-43', '--key=E:44-55',
 KILL = TO_GRUNT + ['--key=B:250-253', '--key=CBM:270-273',
                    '--mouse=0,0,FIRE:290-293',
                    '--key=LSHIFT:300-316', '--key=W:300-316']
-RESPAWN = ['--key=B:25-27'] + [
-    '--key=ARROWLEFT:%d-%d' % (f, f + 3) for f in (50, 60, 70, 80, 90)] + [
-    '--joy=FIRE:130-140', '--key=B:160-163']
+RESPAWN = ['--key=B:25-27', '--hurt=50,60,70,80,90',
+           '--joy=FIRE:130-140', '--key=B:160-163']
 
 
 def consts(path):

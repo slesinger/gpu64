@@ -9771,8 +9771,9 @@ restart, in `Source/Demos/gpu64_game_combat.inc`.
 - The four weapons and their Quake damage and fire rates, items with their
   Quake rules, and armour absorption.
 - The player can die and restart.
-- Keys: 1–4 select a weapon, CTRL or joystick fire shoots, and ← is a
-  test hurt.
+- Keys: 1–4 select a weapon, CTRL or joystick fire shoots, and ← was a
+  test hurt (since section 92, ← pauses and runsim's `--hurt` does the
+  hurting).
 - Rows 21 and 22 are the telemetry.
 
 Three bugs were found before any bench run:
@@ -10694,3 +10695,149 @@ Section 90 used two SD files. Now:
 - `REU/quake.reu` (3be6e3bb…).
 - The fallback `RAD/level.g64lev` (feb1da57…) and `RAD/level2.g64lev`
   (a86a6ac4…).
+
+## 92. Pause menu on ←, H health cheat, C64U colour diagnostic (2026-09-30, PC only)
+
+**Bench report (C64U, section 91's deploy).** It boots, it is stable, and
+the game is playable. But the HDMI colours are consistently wrong in all
+three places: the mirror (yellow background, light-blue border), the RAD
+menu and the game. Also, ← took 10% health.
+
+**← is the pause menu** (`Source/Demos/gpu64_game_pause.inc`, under BASIC
+with the controls menu).
+- **Opening.** ← held for PAUSE_HOLD (3) frames sends LOOP_STOP, keyed and
+  retried like the intermission's, because LEVEL_PICTURE answers BUSY under
+  a running loop.
+- **The menu.** It draws Quake's menu over CONFADE: the plaque, `gfx/pause.lmp`,
+  RESUME, CONTROLS and the spinning dot. The whole menu is redrawn each tick,
+  so a lost picture is back a tick later.
+- **The C64 screen.** It shows the same menu in text. The game screen is
+  saved to $c400/$c800 first and restored on the way out.
+- **Resuming.** RESUME (fire or SPACE) or ← again sends LOOP_START and
+  re-marks the frame clock. LOOP_STOP leaves the retained scene intact, so
+  the next commit draws the level exactly where it was.
+- **Debouncing.** Both ← edges are debounced over 16 scans, and ← stays
+  latched after a resume until it is released. A pick waits up to 10 ticks
+  for its key to be released, so the press that resumes neither fires nor
+  jumps.
+- **CONTROLS** is the skill menu's controls screen.
+- **New level pictures:** PIC_PAUSE and PIC_PM_RESUME, which change
+  CAT_HASH. The level files and `build/quake.reu` were regenerated to
+  match.
+
+**H is a health cheat.** Held KEY_HOLD frames, it gives +100 HP capped at
+250 (the megahealth cap), prints "CHEAT: HEALTH" and plays the health
+sound. ctResv reserves ← and H from rebinding.
+
+**The test hurt moved to runsim.** `runsim --hurt=F,...` sets $02ad
+(SIM_HURT) once per listed flip, and the game applies 20 damage per hurt.
+check_combat and check_ai use it instead of ←. A hurt that arrives while
+the player is dead is dropped, not kept for after the restart. check_ai's
+restart case caught that: two pending hurts left the respawn at HP 60.
+
+**PC verification.**
+- runsim, with ← at flips 30-35 and 50-53:
+  - the menu shows from flip 34 to flip 50;
+  - play resumes at 51;
+  - W then walks.
+- SPACE at 45-46 resumes at 48, with JMP 000 (the press did not jump), and
+  W reaches the same camera as a run without the pause.
+- H: HP 100 → 200.
+- The HDMI menu PPM matches Quake's pause screen.
+- **runsim note:** keys are scheduled in flips, but `--stop-after` counts
+  column-7 reads. The menu scans up to 500 times a tick, so schedule
+  menu keys by flip and give the run a generous `--stop-after`.
+- **Not in runsim:** CONTROLS from the pause menu. ctMenu's tick waits trust
+  the clock alone and hang there, as on the title.
+
+**Colours: `hdmi_pixel_encoding=2` did not help.** It was on the card for
+this bench run, so it has been taken back out of config.txt. The firmware
+now has a one-photo instrument:
+- **Palette readback.** CommitPalette reads the palette back with
+  PROPTAG_GET_PALETTE (0x0004000B). On a mismatch it re-sends once and
+  counts the repair.
+- **Mirror snapshot.** It keeps the raw $D020/$D021/$D800 bytes.
+- **The strip.** With GPU64_SNIFF_ENABLED, the mirror draws a strip in the
+  bottom border:
+  - sixteen swatches in palette entries 0-15, each labelled with its index;
+  - the raw `D020 D021 D018 D800` bytes;
+  - `PAL OK C<commits> SF<send fails> RF<read fails>`, or
+    `PAL BAD n FIX n I<index> G<got> W<want>`.
+- **Reading the photo:**
+  - If swatch 6 is not blue, the fault is in the display path.
+  - If swatch 6 is blue but D021 is not x6, the fault is in the bus read.
+  - PAL BAD means the VideoCore's palette is not the one we sent.
+
+**Deployed together (2026-09-30).**
+- `kernel_rad.img` src:8c72dea3, with the colour strip.
+- The PRG (md5 f4100b02…).
+- `REU/quake.reu` (458872c2…).
+- `RAD/level.g64lev` (404f48e2…) and `RAD/level2.g64lev` (643c2a8a…).
+- config.txt restored without `hdmi_pixel_encoding`.
+
+## 93. C64U colours: first strip photo, and a second instrument (2026-09-30)
+
+**Photo (src:8c72dea3).**
+- **The bus read is right:** D021 reads F6 (blue), and after
+  `POKE 53281,0` it reads F0.
+- **Swatches 0-15:** 0, 1, 3, 4, 5, A, D, E and F look right. These look
+  wrong:
+  - 2: dark;
+  - 6: light yellow, hence the "yellow background";
+  - 7: pink;
+  - 8: tan;
+  - 9: bright blue;
+  - B and C: greenish grey.
+- The border was E, and E is correct.
+- **Palette readback:** `PAL BAD 10467 FIX0`. Entry 1 reads back 030FF8,
+  but its swatch shows white. GET_PALETTE's answer is therefore not the
+  scanned-out palette, and "BAD" means nothing.
+- **The re-send never helped.** It is gone from CommitPalette.
+
+**Still open.** Two explanations remain:
+- the entries are wrong at their index (palette corruption);
+- the colours are changed on the way out (the link or the monitor). 89c's
+  gradients inside flat glyphs point this way.
+
+The second puzzle is 10467 commits at a BASIC prompt.
+
+**Instrument, src:51dd72a4 (GPU64_SNIFF_ENABLED only).**
+- **Top border, row 1:** entries 16-31 are loaded with the same sixteen
+  C64 colours and drawn as swatches.
+  - Wrong at 6 but right at 22 means the palette is at fault.
+  - Wrong at both means the link or the monitor.
+- **Top border, row 2:** entries 32-63 are eight-step ramps of pure R, G, B
+  and grey.
+- **Bottom line:** `FR<gpu64_apiFullReset count> C<commits> B<bad>
+  1:<readback> 6:<readback>`.
+
+**Second photo (src:51dd72a4), with the user's findings.**
+- **The palette is at fault, not the HDMI link.** Entries 16-31 hold the
+  same colours as 0-15 but show differently. A yellow/pink pair recurs at
+  6/7, 21/22, 36/37 and 51/52, so the garbage repeats every 15 entries.
+- **The readback carried no data.** GET_PALETTE returned our own
+  uninitialised buffer (1:00030FF8, 6:00010230). The tag is evidently
+  unsupported.
+- **The full resets are the commit storm.** `FR3306 C3306`: every commit
+  came from gpu64_apiFullReset.
+- **User:** the colours are right when the C64U is powered on together
+  with the cartridge. They go wrong only when it comes up late. Quake
+  played in the right colours earlier the same day.
+
+**Fix, src:08ff57f8 (deployed).**
+- **The idle loop's reset edge is debounced.** It needs 1000 consecutive
+  low passes. Before this, one low sample on GPIO 8 fired a full reset.
+- **Resets re-send the whole display set-up.** gpu64_apiFullReset(TRUE) now
+  calls the new CGpu64FrameBuffer::Reprogram(), which re-sends the complete
+  graphics set-up (ActivateGraphics, as at boot). That covers:
+  - the RAD menu;
+  - both reset edges;
+  - dead-clock enter/leave.
+
+  The C64's own $0B command still passes FALSE.
+- **The diagnostics are removed.** That covers the strip, the readback and
+  the ramps; the mirror snapshot masks again.
+
+**Verified on the bench 2026-09-30** (src:08ff57f8, C64U): "Colors are ok"
+with the C64U powered on after the Pi. The corruption mechanism itself is
+still not identified.

@@ -57,13 +57,12 @@ PEL_LOW   = 192			;   ... and 24 QU below its origin ...
 PEL_SPAN  = 512			;   ... to 40 QU above it: 64 QU = 512 fine
 
 FIRE_HOLD = 2			; frames fire must read down to start
-KEY_HOLD  = 2			; weapon keys and the test HURT key
+KEY_HOLD  = 2			; weapon keys and the health cheat
 RESPAWN_WAIT = 22		; ~1 s dead before fire restarts
 DROP_MAX  = 240			; fine: the eye sinks 30 QU when dead ...
 DROP_STEP = 40			; ... over six frames
 PAIN_FACE = 11			; ~0.5 s of the pain face
 QUAD_FRAMES = 650		; ~30 s at ~46 ms a frame
-HURT_TEST = 20			; what the <- key does to the player
 
 ; Per weapon: axe, shotgun, super shotgun, nailgun.
 wpGun		.byte M_V_AXE, M_V_SHOT, M_V_SHOT2, M_V_NAIL
@@ -201,31 +200,42 @@ cfKeyed
 	dec plQuad+1
 +	dec plQuad
 cfNoQuad
+	; runsim.py --hurt: damage no real C64 can ask for. Taken off the
+	; byte even while dead, so it is dropped there rather than kept for
+	; after the restart.
+	ldx SIM_HURT
+	lda #0
+	sta SIM_HURT
 	lda plDead
 	beq cfAlive
 	jmp cfDeadFrame
 cfAlive
+	cpx #SIM_HURT_ON
+	bne cfNoSimHurt
+	lda #SIM_HURT_DMG
+	jsr plHurt
+	lda plDead
+	beq cfNoSimHurt
+	jmp cfDeadFrame
+cfNoSimHurt
 
-	; The test HURT key (<-): stage E's monsters are what will call plHurt.
-	lda keyD
-	and #KD_LARR
+	; The health cheat (H), for testing levels. <- used to be a test HURT
+	; key from before the monsters; it is the pause menu now.
+	lda keyF
+	and #KF_H
 	beq +
 	lda #0
 	sta hurtHold
-	beq cfNoHurt
+	beq cfNoCheat
 +	lda hurtHold
 	cmp #KEY_HOLD
-	bcs cfNoHurt
+	bcs cfNoCheat
 	inc hurtHold
 	lda hurtHold
 	cmp #KEY_HOLD
-	bne cfNoHurt
-	lda #HURT_TEST
-	jsr plHurt
-	lda plDead
-	beq cfNoHurt
-	jmp cfDeadFrame
-cfNoHurt
+	bne cfNoCheat
+	jsr plCheat
+cfNoCheat
 
 	jsr weapKeys
 
@@ -1443,6 +1453,26 @@ armK		.byte 0, 77, 154, 205
 armValue	.byte 0, 100, 150, 200
 armWorthL	.byte 0, <(77*100), <(154*150), <(205*200)
 armWorthH	.byte 0, >(77*100), >(154*150), >(205*200)
+
+; ======================================================================
+; The health cheat: a megahealth's +100, at most 250, with its sound and a
+; line on the C64's message row.
+; ======================================================================
+plCheat
+	lda plHp
+	clc
+	adc #100
+	bcs +
+	cmp #250
+	bcc ++
++	lda #250
++	sta plHp
+	jsr msgRow
+	jsr dmText
+	.text "          CHEAT: HEALTH"
+	.byte 0
+	lda #SFX_HEALTH
+	jmp sfxPlay
 
 ; ======================================================================
 ; The player taking damage. A = damage. Quake's T_Damage for a client:

@@ -133,6 +133,8 @@ Options:
                     for the menu's column-7 reads.
     --skill=N       the skill the skipped menu returns: 0 easy, 1 normal
                     (default), 2 hard, 3 nightmare.
+    --hurt=F,F,...  gpu64_demo_game.a: 20 damage to the player at each frame
+                    listed (the old <- test key; <- is the pause menu now).
     --sid-log=PATH  write every SID register write ($D400-$D418) to PATH,
                     one line each: frame, IRQ count, register, value.
 
@@ -254,7 +256,7 @@ class Machine:
                  ppm_frames=None, key_script=None, c1_stream=None,
                  level=None, level2=None, reu=None, joy_script=None, mouse_script=None,
                  notarget=False, warp=None, hops=(), frame_ms=None,
-                 telemetry=True, title=False, skill=1, sid_log=None):
+                 telemetry=True, title=False, skill=1, sid_log=None, hurts=()):
         self.mem = bytearray(65536)
         self.mem[0x0314], self.mem[0x0315] = 0x31, 0xEA
         self.irq_wait = 0
@@ -289,6 +291,7 @@ class Machine:
         self.warp = warp
         self.warped = False
         self.hops = sorted(hops)
+        self.hurts = sorted(hurts)
         # A class-1 program never issues PAGE_FLIP: the autonomous loop owns
         # the framebuffer, and its frame boundary is the accepted
         # SCENE_COMMIT the model reports here instead.
@@ -497,6 +500,13 @@ class Machine:
                 self.mem[0x02BC] = 0
                 self.mem[0x02BD] = yaw
                 self.mem[0x02A9] = arm
+            # --hurt=F,...: 20 damage to the player once per frame listed,
+            # through $02ad, which the game clears as it takes it. What
+            # the <- key did before it became the pause menu.
+            if (self.hurts and self.frame >= self.hurts[0] and
+                    self.mem[0x02AD] == 0):
+                self.hurts.pop(0)
+                self.mem[0x02AD] = 0xAD
         pra = self.cia_pra & ~self.joy()
         rows = 0xFF
         if self.mouse_fire():
@@ -925,13 +935,16 @@ def main(argv):
             else:
                 hops.append(w)
 
+    hurts = [int(f) for o in opts if o.startswith('--hurt=')
+             for f in o.split('=', 1)[1].split(',')]
+
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
                 key_script=key_script, c1_stream=c1_stream, level=level, level2=level2, reu=reu,
                 joy_script=joy_script, mouse_script=mouse_script,
                 notarget='--notarget' in opts, warp=warp, hops=hops,
                 frame_ms=frame_ms, telemetry='--telemetry-off' not in opts,
-                title=title, skill=skill,
+                title=title, skill=skill, hurts=hurts,
                 sid_log=next((o.split('=', 1)[1] for o in opts
                               if o.startswith('--sid-log=')), None))
     m.gpu.c1_clip_fault = clip_fault

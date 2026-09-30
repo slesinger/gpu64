@@ -125,6 +125,12 @@ def build(pak_f, pak_ents, pak_read):
     add('CT_GRAB', text(font, '=', 1, gold=False))
     for i, s in enumerate(KEY_NAMES):
         add('KEY%d' % i, text(font, s, 1))
+    # The pause menu (<- in play): Quake's PAUSED plaque as the title, then
+    # RESUME and the skill menu's CONTROLS label, with the menu dot.
+    pause = lmp(pak_read(pak_f, pak_ents, 'gfx/pause.lmp'))
+    add('PAUSE', pause)
+    sym['PAUSE_X'] = (320 - pause[0]) // 2
+    add('PM_RESUME', text(font, 'RESUME'))
     sym['PIC_COUNT'] = len(pics)
     # Where the logo sits on both screens, and its palette base.
     sym['LOGO_X'], sym['LOGO_Y'] = hondani.X, hondani.Y

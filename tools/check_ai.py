@@ -17,7 +17,7 @@ Three scripted runs:
            the player's), stay on the floor (y no lower than its spawn),
            and hurt the player; the grunt beside it wakes too.
   restart  the grunt run again until it is awake and off its spawn point,
-           the <- test key five times to be sure of dying, joystick 2's
+           runsim --hurt five times to be sure of dying, joystick 2's
            button to restart. The level start is out of every monster's
            sight, so what the frame after shows is the restart's own work:
            the grunt back on its spawn point and every monster asleep, row
@@ -45,9 +45,7 @@ TO_GRUNT = ['--key=LSHIFT:20-207', '--key=W:20-43', '--key=E:44-55',
             '--key=Q:188-207', '--key=A:211-242']
 # The eye 7.5 units south of dog 247, on its floor (22 Quake units up).
 DOG_WARP = ['--warp=5:2.75,-5.5625,40,0']
-RESTART = TO_GRUNT + [
-    '--key=ARROWLEFT:%d-%d' % (f, f + 3) for f in (300, 310, 320, 330, 340)
-    ] + ['--joy=FIRE:380-390']
+RESTART = TO_GRUNT + ['--hurt=300,310,320,330,340', '--joy=FIRE:380-390']
 
 
 def run(prg, level, frame, keys):

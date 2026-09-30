@@ -18,8 +18,8 @@
 ;
 ; Only the eight movement actions are bindable. The keys the game already
 ; uses for something else are reserved and the menu ignores them: RETURN,
-; F1-F7, 1-4 (weapons), B and C= (fire), <- (test hurt), + and - (view),
-; and RUN/STOP. Binding a key another action already has swaps the two, so
+; F1-F7, 1-4 (weapons), B and C= (fire), <- (pause), H (health cheat),
+; + and - (view), and RUN/STOP. Binding a key another action already has swaps the two, so
 ; no key ever drives two actions and no action is ever left without a key.
 ; Bindings last for the session: they live in the program, so the second
 ; level and every restart keep them, and a reload of the PRG resets them.
@@ -524,7 +524,7 @@ bindKey		.byte 9, 13, 10, 18, 62, 14, 15, 60
 ctResv		.byte $7a		; RETURN F7 F1 F3 F5
 		.byte $09		; 3 4
 		.byte $00
-		.byte $10		; B
+		.byte $30		; B H
 		.byte $00
 		.byte $09		; + -
 		.byte $00
