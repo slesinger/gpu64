@@ -15,6 +15,7 @@
 #define _gpu64_api_h
 
 #include <circle/types.h>
+#include "gpu64_sniff.h"
 
 // --- register offsets within IO2 (i.e. $DFxx) ---------------------------
 //
@@ -259,6 +260,13 @@ static inline void gpu64_apiWriteReg( u8 addr, u8 data )
 		gpu64Regs.arg[ addr - GPU64_REG_ARG0 ] = data;
 	else if ( addr == GPU64_REG_SEQ )
 		gpu64Regs.seq = data;
+#ifdef GPU64_SNIFF_ENABLED
+	else if ( addr == GPU64_SNIFF_SYNC )
+	{
+		gpu64Sniff.syncs++;
+		gpu64Sniff.patIdx = 0;
+	}
+#endif
 	// Everything else in $DF21-$DFFF is reserved: writes are ignored.
 	// (CMD_LO never reaches here -- the caller dispatches it directly.)
 }
@@ -276,6 +284,17 @@ static inline u8 gpu64_apiReadReg( u8 addr )
 		return gpu64Regs.result;
 	if ( addr == GPU64_REG_SEQACK )
 		return gpu64Regs.seqAck;
+#ifdef GPU64_SNIFF_ENABLED
+	// After every real register, so none of them pays for these.
+	if ( addr == GPU64_SNIFF_CONST_A )
+		return 0xA5;
+	if ( addr == GPU64_SNIFF_CONST_B )
+		return 0x5A;
+	if ( addr == GPU64_SNIFF_SYNCS )
+		return (u8)gpu64Sniff.syncs;
+	if ( addr == GPU64_SNIFF_DATAS )
+		return (u8)gpu64Sniff.datas;
+#endif
 	return 0xFF;
 }
 

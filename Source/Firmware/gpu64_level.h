@@ -51,7 +51,30 @@
 #ifndef GPU64_HOSTSIM
 extern u8  gpu64LevelFile[ GPU64_LEVEL_MAX_BYTES ];
 extern u32 gpu64LevelFileBytes;		// 0 when no level file was found
+// Slot 1, SD:RAD/level2.g64lev: optional, the level LOAD_LEVEL changes to.
+extern u8  gpu64LevelFile2[ GPU64_LEVEL_MAX_BYTES ];
+extern u32 gpu64LevelFile2Bytes;
+
+// What LOAD_LEVEL and LEVEL_PICTURE actually read: slot N's file, wherever it
+// lives. A level pack selected as the REU image in the RAD menu (a .reu that
+// starts with GPU64_PACK_MAGIC, built by tools/pack_levels.py) fills every
+// slot straight out of reuMemory, with no copy; without one, slots 0 and 1
+// are the two SD files above. Bytes 0 = an empty slot.
+#define GPU64_LEVEL_SLOTS	8
+extern const u8 *gpu64LevelSlot[ GPU64_LEVEL_SLOTS ];
+extern u32       gpu64LevelSlotBytes[ GPU64_LEVEL_SLOTS ];
+extern u32       gpu64LevelSlotCount;	// slots filled, from 0 up
 #endif
+
+// The level pack (.reu image). Little-endian, at REU address 0:
+//   0  'G64P'   4  u16 version (1)   6  u16 count   8  u32 image bytes
+//   12 u32 FNV-1a of bytes 16..16+16*count
+//   16 count x { u32 offset, u32 bytes, u32 FNV-1a of the level, char name[4] }
+// Levels are 4 KB aligned. Every checksum is verified once, at start-up.
+#define GPU64_PACK_MAGIC	0x50343647	// "G64P"
+#define GPU64_PACK_VERSION	1
+#define GPU64_PACK_HEADER	16
+#define GPU64_PACK_ENTRY	16
 
 // Every offset in a .g64lev is relative to the blob area, which starts at
 // `base`; a parsed level therefore hands out pointers, never offsets, so that
@@ -403,7 +426,8 @@ boolean gpu64_levelTraceEnts( const Gpu64_Level *pL, unsigned nHull,
 			      const Gpu64_LevelMover *pMovers, unsigned nMovers,
 			      Gpu64_LevelTrace *pTr, u8 *pHit );
 
-// Fills the buffer above from `SD:RAD/level.g64lev`. Call exactly once, from
+// Fills the buffers above from `SD:RAD/level.g64lev` and, if present,
+// `SD:RAD/level2.g64lev`. Call exactly once, from
 // the REU start-up path in rad_main.cpp, before reuUsingPolling().
 #ifndef GPU64_HOSTSIM
 void gpu64_levelPreload( void );

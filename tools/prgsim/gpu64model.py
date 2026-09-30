@@ -250,6 +250,8 @@ class Gpu64Model(Class1Mixin):
         # a nonzero MISSED on hardware is then unambiguously the bus.
         self.seq = 0
         self.seqack = 0
+        self.sniff_syncs = 0
+        self.sniff_datas = 0
         self.seq_repeat = 0
         self.arg_dummy_reads = 0
         # Source/Firmware/gpu64_apidiag.h: why class 1 stopped accepting
@@ -526,6 +528,15 @@ class Gpu64Model(Class1Mixin):
             return self.result
         if off == REG_SEQACK:
             return self.seqack
+        # gpu64_sniff.h's constant registers (GPU64_SNIFF_ENABLED builds).
+        if off == 0x6A:
+            return 0xA5
+        if off == 0x6B:
+            return 0x5A
+        if off == 0x6C:
+            return self.sniff_syncs & 0xFF
+        if off == 0x6D:
+            return self.sniff_datas & 0xFF
         return 0xFF
 
     # --- fault injection (runsim.py --bus-fault) ------------------------
@@ -584,6 +595,10 @@ class Gpu64Model(Class1Mixin):
             self.arg[off - REG_ARG0] = val
         elif off == REG_SEQ:
             self.seq = val
+        elif off == 0x6E:                   # gpu64_sniff.h SNIFF_SYNC
+            self.sniff_syncs += 1
+        elif off == 0x6F:                   # gpu64_sniff.h SNIFF_DATA
+            self.sniff_datas += 1
 
     # --- argument decoding ----------------------------------------------
     def a_u16(self, i):

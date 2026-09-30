@@ -635,6 +635,33 @@ void CRAD::Run( void )
 	checkIfMachineRunning();		
 	DELAY( 1 << 27 );
 
+	// gpu64: a machine powered on after the Pi booted missed the reset pulse
+	// above -- it went out while the machine was off. On the C64 Ultimate
+	// that leaves both screens black until the user presses the cartridge's
+	// reset button (bench 2026-09-29), and that press is known to work. So
+	// do the same: give the machine ~2s to finish its own power-up (the
+	// clock appears before the C64U's core is settled), check the clock is
+	// still there, and pulse reset exactly as the boot pulse does. Never
+	// taken on a breadbin, whose clock is up before the Pi is.
+	{
+		extern u8 gpu64MachineCameLate;
+		if ( gpu64MachineCameLate )
+		{
+			const u64 settle = 2800000000ULL;
+			WAIT_CYCLES( settle );
+			checkIfMachineRunning();
+
+			OUT_GPIO( RESET_OUT );
+			CLR_GPIO( bRESET_OUT );
+			DELAY( 1 << 25 );
+			SET_GPIO( bRESET_OUT );
+			INP_GPIO( RESET_OUT );
+
+			checkIfMachineRunning();
+			DELAY( 1 << 27 );
+		}
+	}
+
 	while ( 1 )
 	{
 		prgSize = 0;
@@ -705,6 +732,17 @@ void CRAD::Run( void )
 		// goto menu
 		//
 		///////////////////////////////////////////////////////////////////////
+
+		// gpu64: the menu mirror paints C64 palette indices 0-15 into a
+		// graphics page. Whatever ran before the button press may have left
+		// the display in 80x50 text mode, a 256-colour level palette or a
+		// flipped page -- and then the menu reached HDMI in the wrong colours
+		// (bench 2026-09-29). The C64 program is being thrown away anyway:
+		// the menu always ends in a C64 reset.
+		{
+			extern void gpu64_apiFullReset( void );
+			gpu64_apiFullReset();
+		}
 
 		res = hijackC64( false );			// after hijackC64 the CPU is still halted by DMA
 

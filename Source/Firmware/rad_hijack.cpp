@@ -404,6 +404,16 @@ void setStatusMessage( char *msg, const char *tmp )
 
 #include "C64Side/ultimax_init.h"
 
+// gpu64: set when checkIfMachineRunning() had to wait more than ~2s for the
+// clock, i.e. the C64 was powered on after the Pi had booted. That never
+// happens on a breadbin, which powers the cartridge, but it is the normal
+// order on a C64 Ultimate with a separately powered cartridge -- and there the
+// boot-time reset pulse in CRAD::Run() went to a machine that was off. See
+// rad_main.cpp for what is done about it.
+u8 gpu64MachineCameLate = 0;
+// The longest wait so far, in ARM cycles, for the idle loop's HDMI report.
+u64 gpu64MachineWaited = 0;
+
 u8 checkIfMachineRunning()
 {
 	justBooted = 1;
@@ -428,6 +438,16 @@ u8 checkIfMachineRunning()
 		if ( duration > 1200000 && duration < 1600000)
 			running = true;
 	} while ( !running );
+
+	// The counter was reset on entry, so this is the whole wait.
+	u64 waited;
+	READ_CYCLE_COUNTER( waited );
+	// Sticky: CRAD::Run() calls this again after its late reset, and that
+	// second, short wait must not erase what the first one found.
+	if ( waited > 2800000000ULL )
+		gpu64MachineCameLate = 1;
+	if ( waited > gpu64MachineWaited )
+		gpu64MachineWaited = waited;
 
 	return 1;
 }

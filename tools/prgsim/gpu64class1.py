@@ -332,6 +332,7 @@ class Class1Mixin:
         # RAD/level.g64lev on it, which is what LOAD_LEVEL's BAD_ARGS means
         # and is worth being able to simulate.
         self.c1_level_data = None
+        self.c1_level_data2 = None      # --level2=, RAD/level2.g64lev
         self.c1_load = None
         self.c1_clip_lib = None
 
@@ -485,17 +486,26 @@ class Class1Mixin:
     # answer OUT_OF_MEMORY on the Pi at a size this side has no notion of.
     # That is a capacity question for tools/check_g64lev.py, not for a
     # protocol model.
-    def c1_load_level(self, mesh_base, node_base, camera_id):
+    def c1_load_level(self, mesh_base, node_base, camera_id, a6=0, a7=0):
         from gpu64model import ERR_OK, ERR_BAD_ARGS, ERR_BUSY
         import gpu64level
 
         if self.c1_loop_running:
             return ERR_BUSY             # a whole level will not fit the shadow
-        if self.c1_level_data is None:
+        # ARG6 is the slot, believed only with ARG7 = ARG6 ^ $5A; see
+        # opLoadLevel().
+        slot = a6 if (a6 ^ 0x5a) == a7 else 0
+        if slot > 1:
+            return ERR_BAD_ARGS
+        data = self.c1_level_data2 if slot else self.c1_level_data
+        if data is None:
             return ERR_BAD_ARGS         # no level file on the card
+        if data is not getattr(self, 'c1_level_cur', None):
+            self.c1_clip_lib = None     # reopened on the new file
+        self.c1_level_cur = data
 
         try:
-            lev = gpu64level.Level(self.c1_level_data)
+            lev = gpu64level.Level(data)
         except gpu64level.LevelError:
             return ERR_BAD_ARGS
 
@@ -555,6 +565,7 @@ class Class1Mixin:
             return self.c1_clip_lib
         if self.c1_level_data is None:
             return None
+        cur = getattr(self, 'c1_level_cur', None) or self.c1_level_data
 
         so = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           '..', 'hostsim', 'libclipmove.so')
@@ -571,7 +582,7 @@ class Class1Mixin:
                                             ctypes.POINTER(ctypes.c_int),
                                             ctypes.c_int,
                                             ctypes.POINTER(ctypes.c_int)]
-        blob = bytes(self.c1_level_data)
+        blob = bytes(cur)
         if not lib.gpu64shim_open(blob, len(blob)):
             raise RuntimeError("libclipmove.so refused the level file")
         self.c1_clip_lib = lib
@@ -1033,7 +1044,7 @@ class Class1Mixin:
             # ends it, as levelLoadAbort() does on the Pi.
             self.c1_emit("LEVEL %d %d %s"
                          % (ld['node_base'], ld['mesh_base'],
-                            self.c1_write_blob('level', self.c1_level_data)))
+                            self.c1_write_blob('level', self.c1_level_cur)))
             self.result = LEVEL_DONE
             return ERR_OK
         pct = ld['done'] * 100 // ld['total'] if ld['total'] else 0
@@ -1193,7 +1204,8 @@ class Class1Mixin:
             return ERR_OK
 
         if op == OP_LOAD_LEVEL:
-            return self.c1_load_level(u16(0), u16(2), u16(4))
+            return self.c1_load_level(u16(0), u16(2), u16(4),
+                                      a[6], a[7])
 
         if op == OP_LEVEL_STEP:
             return self.c1_level_step()

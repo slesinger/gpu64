@@ -108,6 +108,8 @@
 #define GPU64_GATE_COMMIT		1
 #define GPU64_GATE_MIRROR		2
 #define GPU64_GATE_DISPATCH		3
+#define GPU64_GATE_SNIFF		4		// gpu64_sniff.h, diagnostic builds only
+#define GPU64_GATE_MIRROR_IDLE	5		// the C64U's lone-$FFFF mirror clock (rad_reu.cpp)
 
 // What the previous pass sampled, packed with the low address byte so the
 // confirm's address test and the dispatch's ambiguity test are each a single

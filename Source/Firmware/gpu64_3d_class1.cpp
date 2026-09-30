@@ -908,8 +908,12 @@ static const u8 *levelVisLookup( void *, const Gpu64_3dVec *pEye,
 	if ( pRow == 0 )
 		return 0;
 
+	// World chunk k is node k and its mesh is node 0's plus k -- but node 0's
+	// mesh is not mesh 0: the actor catalogue comes first in the file
+	// (tools/gen_quakelevel.py), so its index is read, not assumed. Assuming
+	// it silently turned the whole cull off.
 	*pFirstId   = s_Load.nNodeBase;
-	*pFirstMesh = s_Load.nMeshBase;
+	*pFirstMesh = (u16)( s_Load.nMeshBase + gpu64_levelRd16( s_Load.lev.pNodeTab ) );
 	return pRow;
 }
 
@@ -920,12 +924,25 @@ static u8 opLoadLevel( void )
 	if ( s_LoopRunning )
 		return GPU64_ERR_BUSY;		// the shadow scene cannot take a whole level
 
-	if ( gpu64LevelFileBytes == 0 )
+	// ARG6 picks the preloaded level slot: the level pack's Nth level
+	// when the REU image is one, else 0 is SD:RAD/level.g64lev and 1 is
+	// level2.g64lev (gpu64_levelPreload). It counts only when ARG7 is its complement under $5A,
+	// so a program that never heard of slots -- and leaves whatever an
+	// earlier command put in ARG6/7 -- keeps loading slot 0.
+	u8 nSlot = 0;
+	if ( ( sArg[ 6 ] ^ 0x5A ) == sArg[ 7 ] )
+		nSlot = sArg[ 6 ];
+	if ( nSlot >= GPU64_LEVEL_SLOTS )
+		return GPU64_ERR_BAD_ARGS;
+	const u8 *pFile  = gpu64LevelSlot[ nSlot ];
+	u32       nBytes = gpu64LevelSlotBytes[ nSlot ];
+
+	if ( nBytes == 0 )
 		return GPU64_ERR_BAD_ARGS;	// no level file on the card
 
 	memset( &s_Load, 0, sizeof( s_Load ) );
 
-	if ( !gpu64_levelParse( &s_Load.lev, gpu64LevelFile, gpu64LevelFileBytes ) )
+	if ( !gpu64_levelParse( &s_Load.lev, pFile, nBytes ) )
 		return GPU64_ERR_BAD_ARGS;
 
 	s_Load.nMeshBase = argU16( 0 );
@@ -1523,8 +1540,8 @@ static u8 opLevelPicture( void )
 		return GPU64_ERR_BAD_ARGS;
 
 	Gpu64_Level lev;
-	if ( gpu64LevelFileBytes == 0
-	     || !gpu64_levelParse( &lev, gpu64LevelFile, gpu64LevelFileBytes ) )
+	if ( gpu64LevelSlotBytes[ 0 ] == 0
+	     || !gpu64_levelParse( &lev, gpu64LevelSlot[ 0 ], gpu64LevelSlotBytes[ 0 ] ) )
 		return GPU64_ERR_BAD_ARGS;
 
 	unsigned w, h;

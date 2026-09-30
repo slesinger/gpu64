@@ -658,6 +658,32 @@ Four things the split implies:
 - **Neither opcode works while the loop is running.** Both answer `BUSY`.
   Load first, then `LOOP_START` — or `LOOP_STOP` before reloading.
 
+### More than one level: slots and the level pack
+
+`LOAD_LEVEL` loads **slot N** when `ARG6` = N and `ARG7` = N EOR `$5A`.
+Without that pair, for example when `ARG6/7` still hold another command's
+arguments, it loads slot 0. A slot with no level answers `BAD_ARGS`.
+
+```
+        lda #1      : sta ARG+6     ; slot 1
+        lda #1^$5a  : sta ARG+7     ; ...confirmed
+```
+
+The slots are filled at power-on in one of two ways:
+
+- **Level pack (up to 8 levels).** Build a single REU image with
+  `tools/pack_levels.py quake.reu E1M1=e1m1.g64lev E1M2=e1m2.g64lev`. The
+  levels become slots 0, 1, … in the order you list them. In the RAD menu,
+  select the `.reu` as the REU image (RAD sizes the REU from the file), then
+  launch your program. The Pi uses each level directly from REU memory, so
+  **your program must not DMA into that part of the REU**.
+- **Without a pack, two SD files.** Slot 0 is `RAD/level.g64lev` and slot 1
+  is `RAD/level2.g64lev`.
+
+If a pack fails its checksums, none of it is used and the Pi falls back to
+the SD files. The Pi's boot log lists every slot, or says why the pack was
+refused.
+
 A loaded level also culls itself. The file carries Quake's own
 potentially-visible set, baked down to the level's world nodes, and every
 frame gpu64 finds the leaf the active camera stands in and skips the world

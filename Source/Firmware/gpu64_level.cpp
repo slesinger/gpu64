@@ -19,63 +19,164 @@
 #ifndef GPU64_HOSTSIM
 u8  gpu64LevelFile[ GPU64_LEVEL_MAX_BYTES ] __attribute__(( aligned( 64 ) ));
 u32 gpu64LevelFileBytes = 0;
+u8  gpu64LevelFile2[ GPU64_LEVEL_MAX_BYTES ] __attribute__(( aligned( 64 ) ));
+u32 gpu64LevelFile2Bytes = 0;
 
-static const char GPU64_LEVEL_DRIVE[]    = "SD:";
-static const char GPU64_LEVEL_FILENAME[] = "SD:RAD/level.g64lev";
+const u8 *gpu64LevelSlot[ GPU64_LEVEL_SLOTS ];
+u32       gpu64LevelSlotBytes[ GPU64_LEVEL_SLOTS ];
+u32       gpu64LevelSlotCount = 0;
 
-void gpu64_levelPreload( void )
+static const char GPU64_LEVEL_DRIVE[]     = "SD:";
+static const char GPU64_LEVEL_FILENAME[]  = "SD:RAD/level.g64lev";
+static const char GPU64_LEVEL_FILENAME2[] = "SD:RAD/level2.g64lev";
+
+// One file into one buffer; returns its size, or 0 if it was not loaded.
+static u32 levelPreloadOne( const char *pName, u8 *pBuf, boolean bRequired )
 {
 	extern CLogger *logger;
-
-	gpu64LevelFileBytes = 0;
 
 	// getFileSize() before readFile(), because readFile() reads f_stat's
 	// filesize into the buffer without ever comparing the two: handed a
 	// level larger than the buffer it would write straight past the end of
 	// it. This is the only guard there is.
 	u32 nBytes = 0;
-	if ( !getFileSize( logger, GPU64_LEVEL_DRIVE, GPU64_LEVEL_FILENAME, &nBytes ) )
+	if ( !getFileSize( logger, GPU64_LEVEL_DRIVE, pName, &nBytes ) )
 	{
-		logger->Write( "gpu64", LogNotice,
-			"Level: no %s -- LOAD_LEVEL will answer BAD_ARGS",
-			GPU64_LEVEL_FILENAME );
-		return;
+		if ( bRequired )
+			logger->Write( "gpu64", LogNotice,
+				"Level: no %s -- LOAD_LEVEL will answer BAD_ARGS", pName );
+		return 0;
 	}
 
 	if ( nBytes < GPU64_LEVEL_HEADER_BYTES || nBytes > GPU64_LEVEL_MAX_BYTES )
 	{
 		logger->Write( "gpu64", LogNotice,
 			"Level: %s is %u bytes, buffer holds %u -- not loaded",
-			GPU64_LEVEL_FILENAME, (unsigned)nBytes,
-			(unsigned)GPU64_LEVEL_MAX_BYTES );
-		return;
+			pName, (unsigned)nBytes, (unsigned)GPU64_LEVEL_MAX_BYTES );
+		return 0;
 	}
 
 	u32 nRead = 0;
-	if ( !readFile( logger, GPU64_LEVEL_DRIVE, GPU64_LEVEL_FILENAME,
-			 gpu64LevelFile, &nRead ) )
-		return;
+	if ( !readFile( logger, GPU64_LEVEL_DRIVE, pName, pBuf, &nRead ) )
+		return 0;
 
 	// Parse it here as well as at LOAD_LEVEL time. A level that is going to
 	// be refused should say so in the boot log, where there is room for a
 	// reason, rather than as a one-byte ERRCODE half an hour later at the
 	// bench.
 	Gpu64_Level lev;
-	if ( !gpu64_levelParse( &lev, gpu64LevelFile, nRead ) )
+	if ( !gpu64_levelParse( &lev, pBuf, nRead ) )
 	{
 		logger->Write( "gpu64", LogNotice,
 			"Level: %s (%u bytes) is not a valid .g64lev v%u -- not loaded",
-			GPU64_LEVEL_FILENAME, (unsigned)nRead, GPU64_LEVEL_VERSION );
-		return;
+			pName, (unsigned)nRead, GPU64_LEVEL_VERSION );
+		return 0;
 	}
 
-	gpu64LevelFileBytes = nRead;
 	logger->Write( "gpu64", LogNotice,
 		"Level: %s loaded, %u KB -- %u tex, %u meshes, %u nodes, %u ents,"
 		" %u planes, %u hulls, %u clipnodes, %u qu/wu",
-		GPU64_LEVEL_FILENAME, (unsigned)( nRead / 1024 ),
+		pName, (unsigned)( nRead / 1024 ),
 		lev.nTex, lev.nMesh, lev.nNode, lev.nEnt,
 		lev.nPlane, lev.nHull, (unsigned)lev.nClip, lev.nScale );
+	return nRead;
+}
+
+static u32 levelFnv( const u8 *p, u32 n )
+{
+	u32 h = 2166136261u;
+	while ( n-- )
+		h = ( h ^ *p++ ) * 16777619u;
+	return h;
+}
+
+// The level pack: every level in one .reu image, selected as the REU image
+// in the RAD menu, which rad_main.cpp has read into reuMemory by the time
+// this runs. The slots point straight into it -- the levels are used where
+// they lie, so a program that DMAs into REU space over them destroys them
+// (the game never touches the REU). Returns the slots filled, 0 when the
+// REU holds no pack or a broken one; a broken pack fills nothing, rather
+// than some levels, so a bad image is never half-believed.
+static u32 levelFromPack( void )
+{
+	extern CLogger *logger;
+	extern u8 *reuMemory;
+	extern u32 REU_SIZE_KB;
+
+	const u8 *pImg  = reuMemory;
+	const u32 nSize = REU_SIZE_KB * 1024;
+	if ( pImg == 0 || nSize < GPU64_PACK_HEADER
+	     || gpu64_levelRd32( pImg ) != GPU64_PACK_MAGIC )
+		return 0;
+
+	const u32 nVer   = gpu64_levelRd16( pImg + 4 );
+	const u32 nCount = gpu64_levelRd16( pImg + 6 );
+	const u32 nImg   = gpu64_levelRd32( pImg + 8 );
+	if ( nVer != GPU64_PACK_VERSION || nCount == 0 || nCount > GPU64_LEVEL_SLOTS
+	     || nImg > nSize
+	     || GPU64_PACK_HEADER + nCount * GPU64_PACK_ENTRY > nImg
+	     || levelFnv( pImg + GPU64_PACK_HEADER, nCount * GPU64_PACK_ENTRY )
+	        != gpu64_levelRd32( pImg + 12 ) )
+	{
+		logger->Write( "gpu64", LogNotice,
+			"Level pack: bad header (v%u, %u levels, %u bytes in a %u KB REU)"
+			" -- using the SD files", nVer, nCount, nImg, (unsigned)REU_SIZE_KB );
+		return 0;
+	}
+
+	for ( u32 i = 0; i < nCount; i++ )
+	{
+		const u8 *e    = pImg + GPU64_PACK_HEADER + i * GPU64_PACK_ENTRY;
+		const u32 nOfs = gpu64_levelRd32( e );
+		const u32 nLen = gpu64_levelRd32( e + 4 );
+		Gpu64_Level lev;
+		if ( nOfs > nImg || nLen > nImg - nOfs || ( nOfs & 63 )
+		     || levelFnv( pImg + nOfs, nLen ) != gpu64_levelRd32( e + 8 )
+		     || !gpu64_levelParse( &lev, pImg + nOfs, nLen ) )
+		{
+			logger->Write( "gpu64", LogNotice,
+				"Level pack: level %u (%.4s) is damaged -- using the SD files",
+				i, (const char *)( e + 12 ) );
+			return 0;
+		}
+	}
+
+	for ( u32 i = 0; i < nCount; i++ )
+	{
+		const u8 *e = pImg + GPU64_PACK_HEADER + i * GPU64_PACK_ENTRY;
+		gpu64LevelSlot[ i ]      = pImg + gpu64_levelRd32( e );
+		gpu64LevelSlotBytes[ i ] = gpu64_levelRd32( e + 4 );
+		logger->Write( "gpu64", LogNotice, "Level pack: slot %u = %.4s, %u KB",
+			i, (const char *)( e + 12 ), (unsigned)( gpu64LevelSlotBytes[ i ] / 1024 ) );
+	}
+	return nCount;
+}
+
+// Slot 1 is optional: it is the level a game changes to (E1M2), held in RAM
+// from boot for the same reason slot 0 is -- the card cannot be touched once
+// the polling loop runs. LOAD_LEVEL picks the slot (gpu64_3d_class1.cpp).
+// A level pack in the REU wins over both files, and they are then not read.
+void gpu64_levelPreload( void )
+{
+	gpu64LevelFileBytes  = 0;
+	gpu64LevelFile2Bytes = 0;
+	for ( u32 i = 0; i < GPU64_LEVEL_SLOTS; i++ )
+	{
+		gpu64LevelSlot[ i ]      = 0;
+		gpu64LevelSlotBytes[ i ] = 0;
+	}
+
+	gpu64LevelSlotCount = levelFromPack();
+	if ( gpu64LevelSlotCount )
+		return;
+
+	gpu64LevelFileBytes  = levelPreloadOne( GPU64_LEVEL_FILENAME, gpu64LevelFile, TRUE );
+	gpu64LevelFile2Bytes = levelPreloadOne( GPU64_LEVEL_FILENAME2, gpu64LevelFile2, FALSE );
+	gpu64LevelSlot[ 0 ]      = gpu64LevelFile;
+	gpu64LevelSlotBytes[ 0 ] = gpu64LevelFileBytes;
+	gpu64LevelSlot[ 1 ]      = gpu64LevelFile2;
+	gpu64LevelSlotBytes[ 1 ] = gpu64LevelFile2Bytes;
+	gpu64LevelSlotCount = 2;
 }
 
 #endif	// GPU64_HOSTSIM
@@ -165,11 +266,13 @@ boolean gpu64_levelParse( Gpu64_Level *pL, const u8 *pFile, u32 nBytes )
 		pL->pVisRows  = pL->pVisNodes + (u32)pL->nVisNodes * 8;
 
 		// The renderer matches a node to its bit by id *and* by mesh, and
-		// the mesh half assumes world node j draws level mesh j. The
-		// converter builds them that way; a file that does not gets no
-		// culling rather than the wrong culling.
+		// the mesh half assumes world node j draws node 0's mesh + j. Node
+		// 0's mesh is not mesh 0: the actor catalogue comes first in the
+		// file. The converter builds them that way; a file that does not
+		// gets no culling rather than the wrong culling.
+		const u16 nMesh0 = pL->nVisWorldNodes ? gpu64_levelRd16( pL->pNodeTab ) : 0;
 		for ( unsigned j = 0; j < pL->nVisWorldNodes; j++ )
-			if ( gpu64_levelRd16( pL->pNodeTab + j * GPU64_LEVEL_NODE_STRIDE ) != j )
+			if ( gpu64_levelRd16( pL->pNodeTab + j * GPU64_LEVEL_NODE_STRIDE ) != nMesh0 + j )
 				pL->nVisLeafs = 0;
 	}
 

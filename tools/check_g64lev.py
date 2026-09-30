@@ -202,7 +202,10 @@ def main(path):
                 if '=' in ln:
                     k, v = (t.strip() for t in ln.split('=', 1))
                     sym[k] = int(v[1:], 16) if v.startswith('$') else int(v)
-            if sym.get('CAT_HASH') != chash or sym.get('CAT_ENT') != ci:
+            # Only the hash: the actors come first in every level now, so
+            # one include serves E1M1 and E1M2 alike. CAT_ENT is the level's
+            # own entity count and differs between them; nothing reads it.
+            if sym.get('CAT_HASH') != chash:
                 fail('%s is stale: hash $%04x ent %s, the level has $%04x ent %d'
                      % (inc, sym.get('CAT_HASH', 0), sym.get('CAT_ENT'), chash, ci))
             for k, v in sym.items():

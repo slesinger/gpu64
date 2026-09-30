@@ -28,6 +28,21 @@ DOTS = 6                                    # gfx/menudot1..6, 16x24
 WAD_PICS = ['NUM_%d' % i for i in range(10)] + ['NUM_COLON', 'NUM_SLASH']
 SKILLS = ['EASY', 'NORMAL', 'HARD', 'NIGHTMARE']
 
+# The controls menu (Source/Demos/gpu64_game_controls.inc), laid out as
+# Quake's M_Keys_Draw: the actions in its bindnames wording, and a name for
+# every key of the C64's matrix, indexed column * 8 + row. The game carries
+# the same names for its own screen; keep the two lists in step.
+CT_ACTS = ['walk forward', 'backpedal', 'turn left', 'turn right',
+           'step left', 'step right', 'run', 'jump / swim up']
+KEY_NAMES = ['DEL', 'RETURN', 'CRSR RT', 'F7', 'F1', 'F3', 'F5', 'CRSR DN',
+             '3', 'W', 'A', '4', 'Z', 'S', 'E', 'L SHIFT',
+             '5', 'R', 'D', '6', 'C', 'F', 'T', 'X',
+             '7', 'Y', 'G', '8', 'B', 'H', 'U', 'V',
+             '9', 'I', 'J', '0', 'M', 'K', 'O', 'N',
+             '+', 'P', 'L', '-', '.', ':', '@', ',',
+             'POUND', '*', ';', 'HOME', 'R SHIFT', '=', 'UP ARROW', '/',
+             '1', 'LT ARROW', 'CTRL', '2', 'SPACE', 'C=', 'Q', 'RUN STOP']
+
 
 def lmp(data):
     w, h = struct.unpack_from('<ii', data, 0)
@@ -93,6 +108,23 @@ def build(pak_f, pak_ents, pak_read):
     font = conchars(wad_data)
     for s in SKILLS:
         add('SK_' + s, text(font, s))
+    add('SK_CONTROLS', text(font, 'CONTROLS'))     # the menu's fifth line
+    ttl = lmp(pak_read(pak_f, pak_ents, 'gfx/ttl_cstm.lmp'))
+    add('TTL_CSTM', ttl)
+    sym['TTL_CSTM_X'] = (320 - ttl[0]) // 2
+    add('CT_HINT0', text(font, 'RETURN or fire to change', 1))
+    add('CT_HINT1', text(font, 'Press a key, RETURN cancels', 1))
+    for i, s in enumerate(CT_ACTS):
+        add('CT_ACT%d' % i, text(font, s, 1))
+    add('CT_DEFAULTS', text(font, 'defaults', 1))
+    add('CT_DONE', text(font, 'done', 1))
+    # M_Keys_Draw's cursor: console characters 12/13 blinking, '=' while
+    # waiting for the key. Drawn with M_DrawCharacter, i.e. not gold.
+    add('CT_CUR0', text(font, chr(12), 1, gold=False))
+    add('CT_CUR1', text(font, chr(13), 1, gold=False))
+    add('CT_GRAB', text(font, '=', 1, gold=False))
+    for i, s in enumerate(KEY_NAMES):
+        add('KEY%d' % i, text(font, s, 1))
     sym['PIC_COUNT'] = len(pics)
     # Where the logo sits on both screens, and its palette base.
     sym['LOGO_X'], sym['LOGO_Y'] = hondani.X, hondani.Y

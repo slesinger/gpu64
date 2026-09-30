@@ -185,7 +185,7 @@ static const u8 *visLookup( void *, const Gpu64_3dVec *pEye,
 	if ( pRow == 0 )
 		return 0;
 	*pFirstId   = g_LevelNodeBase;
-	*pFirstMesh = g_LevelMeshBase;
+	*pFirstMesh = (u16)( g_LevelMeshBase + gpu64_levelRd16( g_Level.pNodeTab ) );
 	for ( unsigned k = 0; k < *pnNodes; k++ )
 		if ( !( pRow[ k >> 3 ] & ( 1 << ( k & 7 ) ) ) )
 			g_VisCulled++;

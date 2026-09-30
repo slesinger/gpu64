@@ -35,6 +35,7 @@
 #include "gpu64_holdgap.h"
 #include "gpu64_holdgate.h"
 #include "gpu64_busstats.h"
+#include "gpu64_fb.h"
 
 // gpu64: reaching CGpu64FrameBuffer::CommitFlip() from the bus-watch loop
 // without including gpu64_fb.h, which pulls in Circle's framebuffer and
@@ -101,6 +102,20 @@ static u8 gpu64MirrorSeenPrompt = 0;
 static u32 gpu64MirrorIrqWatchdog = 0;
 static u8 gpu64MirrorAwaitIrq = 1;
 static u8 gpu64MirrorJiffy = 0;
+
+// gpu64: the C64 Ultimate's fallback mirror clock (tracker 89d). At 64MHz
+// turbo the C64U runs from its own ROM copy and the cartridge port shows an
+// idle, pulled-up bus -- a lone "$FFFF read" -- on nearly every cycle, and
+// the $FFFE/$FFFF vector pair the mirror is clocked by never appears. So a
+// long run of lone $FFFF reads with no pair among them is taken as a
+// substitute clock: GPU64_MIRROR_LONE_INTERVAL of them (~0.25s, since a pass
+// is at most one C64 cycle) arm one snapshot. A pair resets the count, and a
+// breadbin shows a pair 60 times a second and a lone $FFFF read never, so it
+// cannot reach this.
+#define GPU64_MIRROR_LONE_INTERVAL 250000
+static u32 gpu64MirrorLone = 0;
+// Snapshots that got past the BLNSW probe and painted HDMI.
+static u32 gpu64MirrorPainted = 0;
 
 u32 REU_SIZE_KB = 1024;
 
@@ -279,6 +294,7 @@ void resetREU()
 	gpu64MirrorIrqWatchdog = 0;
 	gpu64MirrorAwaitIrq = 1;
 	gpu64MirrorJiffy = 0;
+	gpu64MirrorLone = 0;
 	// gpu64: the API register file resets with it -- a fresh REU session must
 	// not inherit a previous program's staged ARGs, sticky CMD_HI or error.
 	gpu64_apiReset();
@@ -792,6 +808,7 @@ void gpu64_mirrorSnapshot()
 	gpu64MirrorBackground = x & 0x0F;
 
 	gpu64_showMirror( g_pRAD, gpu64MirrorScreen, gpu64MirrorColor, gpu64MirrorBorder, gpu64MirrorBackground, gpu64MirrorD018 );
+	gpu64MirrorPainted++;
 }
 
 // gpu64: the C64 has stopped clocking the bus. With the Pi on its own supply
@@ -823,6 +840,105 @@ void gpu64_deadClockEnter( void )
 void gpu64_deadClockLeave( void )
 {
 	gpu64_apiFullReset();
+}
+
+// gpu64: what the boot idle loop saw, printed onto the HDMI log whenever
+// the mirror has not painted for two seconds (tracker 89d). The C64U's
+// start-up has failed three bench rounds in a row with nothing on either
+// screen to say why; this puts the answer on the one screen that works.
+typedef struct
+{
+	u32	passes, pairs, lone;			// this second
+	u32	noClocks, resets, snaps, fallbacks, autoResets;	// running totals
+	u32	seconds;
+} GPU64IDLESTATS;
+
+static GPU64IDLESTATS gpu64Idle;
+
+// Once per power session: set by the automatic reset, cleared when the C64's
+// clock comes back after being off.
+static u8 gpu64IdleAutoResetDone = 0;
+
+extern u8 gpu64MachineCameLate;
+extern u64 gpu64MachineWaited;
+
+static char *idleDec( char *p, u32 v )
+{
+	char t[ 12 ];
+	int n = 0;
+	do { t[ n++ ] = '0' + v % 10; v /= 10; } while ( v );
+	while ( n ) *p++ = t[ --n ];
+	return p;
+}
+
+static char *idleStr( char *p, const char *s )
+{
+	while ( *s ) *p++ = *s++;
+	return p;
+}
+
+// Two log lines, each inside the log's 40 columns:
+//   IDLE 12s P 985123 V 60 VX 0
+//   NC 0 R 1 SN 3/3 FB 0 AR 0 LATE 1 W 4.2
+// P passes, V $FFFE/$FFFF pairs, VX lone $FFFF reads -- all per second.
+// NC dead-clock episodes, R reset releases, SN snapshots taken/painted,
+// FB fallback (lone-$FFFF) snapshots, AR automatic resets, LATE/W whether
+// and how long (seconds) checkIfMachineRunning() waited for the clock.
+static void gpu64_idleReport( const char *pEvent )
+{
+	CGpu64FrameBuffer *pFB = g_pGpu64FB;
+	if ( pFB == 0 )
+		return;
+
+	static char line[ 160 ];
+	char *p = line;
+
+	if ( pEvent )
+	{
+		p = idleStr( p, pEvent );
+		*p++ = '\n';
+	} else
+	{
+		p = idleStr( p, "IDLE " ); p = idleDec( p, gpu64Idle.seconds );
+		p = idleStr( p, "s P " ); p = idleDec( p, gpu64Idle.passes );
+		p = idleStr( p, " V " ); p = idleDec( p, gpu64Idle.pairs );
+		p = idleStr( p, " VX " ); p = idleDec( p, gpu64Idle.lone );
+		*p++ = '\n';
+		p = idleStr( p, "NC " ); p = idleDec( p, gpu64Idle.noClocks );
+		p = idleStr( p, " R " ); p = idleDec( p, gpu64Idle.resets );
+		p = idleStr( p, " SN " ); p = idleDec( p, gpu64Idle.snaps );
+		*p++ = '/'; p = idleDec( p, gpu64MirrorPainted );
+		p = idleStr( p, " FB " ); p = idleDec( p, gpu64Idle.fallbacks );
+		p = idleStr( p, " AR " ); p = idleDec( p, gpu64Idle.autoResets );
+		p = idleStr( p, " LATE " ); p = idleDec( p, gpu64MachineCameLate );
+		u32 tenths = (u32)( gpu64MachineWaited / 140000000ULL );
+		p = idleStr( p, " W " ); p = idleDec( p, tenths / 10 );
+		*p++ = '.'; p = idleDec( p, tenths % 10 );
+		*p++ = '\n';
+	}
+
+	// Forced visible: the log may have been hidden by a program in an
+	// earlier session, and apiFullReset() clears the page without repainting
+	// it -- which is exactly the black HDMI this is here to explain.
+	pFB->LogEnable( TRUE );
+	pFB->LogWrite( line, (unsigned)( p - line ) );
+}
+
+// gpu64: pulse /RESET the way CRAD::Run()'s boot pulse does.
+static void gpu64_idlePulseReset( void )
+{
+	OUT_GPIO( RESET_OUT );
+	CLR_GPIO( bRESET_OUT );
+	DELAY( 1 << 25 );
+	SET_GPIO( bRESET_OUT );
+	INP_GPIO( RESET_OUT );
+}
+
+static inline u64 idleNow( void )
+{
+	u64 t;
+	asm volatile( "mrs %0, cntvct_el0" : "=r" ( t ) );
+	return t;
 }
 
 // gpu64: the boot-phase mirror. RAD spends everything between "the C64 is
@@ -863,6 +979,18 @@ void gpu64_mirrorIdleLoop( void )
 	register u32 ipl = 0;
 	register u32 noClock = 0;
 	register u32 noClockLatched = 0;
+	register u32 prevVecLo = 0;			// the previous pass sampled a read of $FFFE
+
+	// gpu64: wall-clock bookkeeping for the fallback clock, the HDMI report
+	// and the start-up supervisor (tracker 89d). CNTVCT_EL0 is a system
+	// register, not MMIO, and this loop has no per-cycle deadline anyway.
+	u64 frq;
+	asm volatile( "mrs %0, cntfrq_el0" : "=r" ( frq ) );
+	u64 armedAt = idleNow();			// entry, reset release or clock return
+	u64 lastPair = 0, lastFallback = 0;
+	u64 lastSecond = armedAt, lastPaint = armedAt;
+	u32 seenPair = 0;
+	u32 paintedSeen = gpu64MirrorPainted, paintedAtArm = gpu64MirrorPainted;
 
 	// gpu64: warm both this loop and the snapshot it calls. warmCache() runs
 	// on the way into REU emulation, which is *after* this -- nothing has
@@ -917,14 +1045,21 @@ mirrorIdleLoop:
 			if ( !noClockLatched )
 			{
 				noClockLatched = 1;
+				gpu64Idle.noClocks++;
 				gpu64_deadClockEnter();
 			}
+			prevVecLo = 0;
 			continue;
 		}
 		if ( noClockLatched )
 		{
 			noClockLatched = 0;
 			gpu64_deadClockLeave();
+			// A new power session: the start-up supervisor may act again.
+			gpu64IdleAutoResetDone = 0;
+			seenPair = 0;
+			armedAt = lastPaint = idleNow();
+			paintedAtArm = gpu64MirrorPainted;
 		}
 
 		// gpu64: same incremental i-cache refresh the REU loop does. The
@@ -964,6 +1099,8 @@ mirrorIdleLoop:
 			gpu64MirrorIrqWatchdog = 0;
 			gpu64MirrorAwaitIrq = 1;
 			gpu64MirrorJiffy = 0;
+			gpu64Idle.resets++;
+			armedAt = lastPaint = idleNow();
 			// gpu64: and the display back to its post-boot state, so a
 			// reset taken at the menu-idle mirror behaves exactly like one
 			// taken during REU emulation. Free here -- nothing is being
@@ -1026,8 +1163,30 @@ mirrorIdleLoop:
 		// If this loop ever gains a caller that runs with user code live,
 		// that second reason evaporates and this needs the real gate --
 		// which means moving the armPerC64 calibration ahead of it first.
-		if ( ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF &&
-				gpu64MirrorEnabled )
+		//
+		// Both reasons assume the gate sees only real vector fetches, and
+		// on the C64 Ultimate a bare $FFFF read does not mean one: its
+		// cartridge port shows $FFFF reads on cycles that are no fetch at
+		// all, in bulk. Firing a hold every 15 of those starved the booting
+		// KERNAL (~30s to READY), painted uninitialised screen RAM onto
+		// HDMI, and opened holds on cycles nothing was known about. So the
+		// fetch counts only when the previous pass read $FFFE -- the pair is
+		// the interrupt sequence's last two cycles, and a stray $FFFF is not
+		// preceded by it.
+		register u32 vecHi = ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF;
+		register u64 now = idleNow();
+		gpu64Idle.passes++;
+
+		if ( vecHi && prevVecLo )
+		{
+			gpu64Idle.pairs++;
+			seenPair = 1;
+			lastPair = now;
+		} else
+		if ( vecHi )
+			gpu64Idle.lone++;
+
+		if ( vecHi && prevVecLo && gpu64MirrorEnabled )
 		{
 			gpu64MirrorIrqWatchdog = 0;
 			gpu64MirrorAwaitIrq = 0;
@@ -1035,8 +1194,78 @@ mirrorIdleLoop:
 			if ( ++gpu64MirrorJiffy >= GPU64_MIRROR_JIFFY_INTERVAL )
 			{
 				gpu64MirrorJiffy = 0;
+				gpu64Idle.snaps++;
 				gpu64_mirrorSnapshot();
 			}
+		} else
+		// gpu64: the C64U's substitute clock (see GPU64_MIRROR_LONE_INTERVAL).
+		// Here it is timed in wall-clock rather than passes, since this loop
+		// has no deadline to protect: four snapshots a second, only while no
+		// pair has been seen for two seconds, and not in the first three
+		// seconds after a reset -- a snapshot before the KERNAL has cleared
+		// screen RAM paints garbage. The hold fires on the lone read itself,
+		// unconfirmed, like the pair's above. On the C64U that cycle is not a
+		// CPU cycle at all, and the first bench session there fired a hold
+		// every 15 of them without harming the machine.
+		if ( vecHi && gpu64MirrorEnabled &&
+				now - lastPair > 2 * frq && now - armedAt > 3 * frq &&
+				now - lastFallback > frq / 4 )
+		{
+			lastFallback = now;
+			gpu64Idle.snaps++;
+			gpu64Idle.fallbacks++;
+			gpu64_mirrorSnapshot();
+			vecHi = 0;					// the pass after a hold is not adjacent
+		}
+
+		prevVecLo = ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFE && !vecHi;
+
+		// gpu64: once a second -- the report, and the start-up supervisor.
+		if ( now - lastSecond >= frq )
+		{
+			lastSecond = now;
+			gpu64Idle.seconds++;
+
+			if ( gpu64MirrorPainted != paintedSeen )
+			{
+				paintedSeen = gpu64MirrorPainted;
+				lastPaint = now;
+			}
+
+			// The mirror has not painted for two seconds: say why, on HDMI.
+			// Silent while it works, so the report never fights the mirror.
+			if ( gpu64MirrorEnabled && now - lastPaint > 2 * frq )
+			{
+				gpu64_idleReport( 0 );
+				prevVecLo = 0;
+			}
+
+			// A machine that has shown neither an IRQ nor a prompt six
+			// seconds after it started is not running BASIC. On the C64U this
+			// is the power-on black screen (tracker 89c/89d): the machine
+			// comes up after the Pi's boot reset and stays dark until the
+			// user presses the cartridge's reset. Do that press for them,
+			// once per power session. A breadbin's IRQ is live ~2s after a
+			// reset, so it never gets here.
+			if ( !gpu64IdleAutoResetDone && !seenPair &&
+					gpu64MirrorPainted == paintedAtArm && now - armedAt > 6 * frq )
+			{
+				gpu64IdleAutoResetDone = 1;
+				gpu64Idle.autoResets++;
+				gpu64_idleReport( "AUTO RESET: no IRQ, no prompt in 6s" );
+				gpu64_idlePulseReset();
+
+				gpu64MirrorEnabled = 1;
+				gpu64MirrorSeenPrompt = 0;
+				gpu64MirrorIrqWatchdog = 0;
+				gpu64MirrorAwaitIrq = 1;
+				gpu64MirrorJiffy = 0;
+				armedAt = lastPaint = idleNow();
+				paintedAtArm = gpu64MirrorPainted;
+				prevVecLo = 0;
+			}
+
+			gpu64Idle.passes = gpu64Idle.pairs = gpu64Idle.lone = 0;
 		}
 	}
 }
@@ -1471,6 +1700,7 @@ u8 reuUsingPolling( int step )
 										//   GPU64_ANCHOR_* | low address byte
 	register u64 prevStamp = 0;			// armCycleCounter of the previous pass
 	register u32 gateSpan = 0;			// ARM cycles still counting as "next cycle"
+	register u32 prevVecLo = 0;			// the previous pass sampled a read of $FFFE
 
 	// gpu64: the loop's own base address, published so a dispatch can re-warm
 	// the window it just evicted (gpu64_apiWarmPollingLoop() below). The label
@@ -1567,6 +1797,7 @@ reuEmulationMainLoop:
 				noClockLatched = 1;
 				gpu64_deadClockEnter();
 			}
+			prevVecLo = 0;
 			continue;
 		}
 		if ( noClockLatched )
@@ -1806,10 +2037,30 @@ reuEmulationMainLoop:
 				SET_BANK2_INPUT
 				///SET_GPIO( bDIR_Dx );
 				CLR_GPIO( bOE_Dx );				// Dx = enable
+#ifdef GPU64_SNIFF_ENABLED
+				// gpu64: the write-data sweep (gpu64_sniff.h). Only
+				// SNIFF_DATA pays for it; every other write takes the
+				// single sample below, exactly as before.
+				if ( IO_ADDRESS == GPU64_SNIFF_DATA )
+				{
+					u32 sniffRaw[ GPU64_SNIFF_SLOTS ];
+					for ( u32 si = 0; si < GPU64_SNIFF_SLOTS; si++ )
+					{
+						WAIT_UP_TO_CYCLE( gpu64SniffT[ si ] );
+						sniffRaw[ si ] = read32( ARM_GPIO_GPLEV0 );
+					}
+					SET_GPIO( bOE_Dx );			// Dx = disable
+					SET_BANK2_OUTPUT
+					D = ( sniffRaw[ 4 ] >> D0 ) & 255;
+					gpu64_sniffScore( sniffRaw, D0, bIO2, bPHI );
+				} else
+#endif
+				{
 				WAIT_UP_TO_CYCLE( reu.WAIT_CYCLE_WRITEDATA );
 				D = ( read32( ARM_GPIO_GPLEV0 ) >> D0 ) & 255;
 				SET_GPIO( bOE_Dx );				// Dx = disable
 				SET_BANK2_OUTPUT
+				}
 			}
 
 			// gpu64: full 8-bit decode, not REU's own "& 0x1f" -- $DF50-$DFFF
@@ -2212,11 +2463,20 @@ reuEmulationMainLoop:
 		// write -- and it is closed the same way: arm here, confirm below.
 		// The watchdog and the jiffy counter are not part of the hold and
 		// still update on the access itself.
+		//
+		// And only a $FFFF read that directly follows a $FFFE read counts
+		// (prevVecLo) -- the interrupt sequence's two vector fetches. The C64
+		// Ultimate's cartridge port shows a read of $FFFF on cycles that are
+		// no vector fetch at all, in bulk: the sniffer counted 1.27e9 of them
+		// in one session. Each one was a jiffy here, and in the idle loop a
+		// snapshot hold every 15 of them. A lone $FFFF says nothing; the
+		// $FFFE/$FFFF pair is the vector fetch itself.
 		if ( ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF &&
-				!gpu64ApiActive && gpu64MirrorEnabled )
+				prevVecLo && !gpu64ApiActive && gpu64MirrorEnabled )
 		{
 			gpu64MirrorIrqWatchdog = 0;
 			gpu64MirrorAwaitIrq = 0;
+			gpu64MirrorLone = 0;
 
 			if ( ++gpu64MirrorJiffy >= GPU64_MIRROR_JIFFY_INTERVAL && !gateArmed )
 			{
@@ -2225,9 +2485,53 @@ reuEmulationMainLoop:
 				gateAge = 0;
 				gpu64HoldGate.armed++;
 			}
+		} else
+		// gpu64: the C64U's substitute clock -- a long run of lone $FFFF reads
+		// with no vector pair among them (GPU64_MIRROR_LONE_INTERVAL). It
+		// neither feeds the watchdog nor clears awaitIrq: those belong to the
+		// real IRQ. The arm is its own kind so the confirm below can accept
+		// the one pair of cycles an idle C64U port ever shows, $FFFF twice.
+		if ( ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF &&
+				!gpu64ApiActive && gpu64MirrorEnabled )
+		{
+			if ( ++gpu64MirrorLone >= GPU64_MIRROR_LONE_INTERVAL && !gateArmed )
+			{
+				gpu64MirrorLone = 0;
+				gateArmed = GPU64_GATE_MIRROR_IDLE;
+				gateAge = 0;
+				gpu64HoldGate.armed++;
+			}
 		}
 
+#ifdef GPU64_SNIFF_ENABLED
+		// gpu64: the sniff report rides the same vector-fetch arm as the
+		// mirror, once a second, and only while the HDMI log is showing --
+		// on a machine where commands work, the first dispatch hides the
+		// log and this never fires again. The mirror wins a tie; the
+		// report simply tries on the next fetch.
+		if ( ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF && !prevVecLo )
+			gpu64Sniff.vectorFakes++;
+		else
+		if ( ADDRESS_FFxx && !CPU_WRITES_TO_BUS && ADDRESS0to7 == 0xFF )
+		{
+			gpu64Sniff.vectorFetches++;
+			if ( ++gpu64Sniff.jiffy >= 60 && !gateArmed &&
+					g_pGpu64FB && g_pGpu64FB->LogEnabled() )
+			{
+				gpu64Sniff.jiffy = 0;
+				gateArmed = GPU64_GATE_SNIFF;
+				gateAge = 0;
+				gpu64HoldGate.armed++;
+			}
+		}
+#endif
+
 	noREUAccess:
+#ifdef GPU64_SNIFF_ENABLED
+		// gpu64: every sampled IO2 access, any address (gpu64_sniff.h).
+		if ( IO2_ACCESS )
+			gpu64_sniffNote( IO_ADDRESS, CPU_WRITES_TO_BUS, D );
+#endif
 		// gpu64: the hold gate's confirm. Every hold this loop opens that is
 		// not the CMD_LO dispatch opens here, and nowhere else.
 		//
@@ -2262,12 +2566,22 @@ reuEmulationMainLoop:
 		// waits -- through the rest of an inc $DF52, or through a whole REU
 		// transfer -- and fires on the first pair of cycles that qualifies.
 		// gateAge counts how long that took, in C64 cycles.
+		//
+		// GPU64_GATE_MIRROR_IDLE also accepts two adjacent lone $FFFF reads,
+		// which is what an idle C64U port shows on nearly every cycle and
+		// the four terms can never confirm, because the low byte does not
+		// change. On a real 6510 two adjacent $FFFF reads are a JAM, and that
+		// arm is only ever taken after a quarter of a million lone $FFFF
+		// reads with no IRQ vector pair among them, which a live 6510 never
+		// produces.
 		if ( gateArmed )
 		{
 			if ( prevAnchor &&
 					(u32)( armCycleCounter - prevStamp ) <= gateSpan &&
 					CPU_READS_FROM_BUS &&
-					ADDRESS0to7 != ( prevAnchor & 0xff ) )
+					( ADDRESS0to7 != ( prevAnchor & 0xff ) ||
+					  ( gateArmed == GPU64_GATE_MIRROR_IDLE && ADDRESS_FFxx &&
+					    prevAnchor == ( GPU64_ANCHOR_READ | 0xFF ) ) ) )
 			{
 				register u32 kind = gateArmed;
 				gateArmed = GPU64_GATE_NONE;
@@ -2284,10 +2598,32 @@ reuEmulationMainLoop:
 					gpu64Vsync.commitDue = 0;
 					gpu64_vsyncCommitFlip();
 				} else
-				if ( kind == GPU64_GATE_MIRROR )
+				if ( kind == GPU64_GATE_MIRROR || kind == GPU64_GATE_MIRROR_IDLE )
 				{
-					gpu64_mirrorSnapshot();
+					// An arm can wait; the API may have woken up since.
+					if ( !gpu64ApiActive && gpu64MirrorEnabled )
+						gpu64_mirrorSnapshot();
 				} else
+#ifdef GPU64_SNIFF_ENABLED
+				if ( kind == GPU64_GATE_SNIFF )
+				{
+					// Open and close inline, like the deferred dispatch
+					// below: the report itself is cold and slow, and only
+					// runs once the C64 is already stopped.
+					WAIT_FOR_CPU_HALFCYCLE
+					WAIT_FOR_VIC_HALFCYCLE
+					RESTART_CYCLE_COUNTER
+					WAIT_UP_TO_CYCLE( reu.TIMING_TRIGGER_DMA );
+					CLR_GPIO( bDMA_OUT );
+
+					gpu64_sniffReport();
+
+					WAIT_FOR_CPU_HALFCYCLE
+					WAIT_FOR_VIC_HALFCYCLE
+					RESTART_CYCLE_COUNTER
+					SET_GPIO( bDMA_OUT );
+				} else
+#endif
 				{
 					// The deferred dispatch. Same sequence as the inline one
 					// above, deliberately duplicated rather than shared: a
@@ -2338,6 +2674,7 @@ reuEmulationMainLoop:
 					? ( GPU64_ANCHOR_READ | 0xFF )
 					: 0;
 		prevStamp = armCycleCounter;
+		prevVecLo = ADDRESS_FFxx && CPU_READS_FROM_BUS && ADDRESS0to7 == 0xFE;
 
 		if ( reu.irqTriggered && !CPU_IRQ_LOW )
 		{

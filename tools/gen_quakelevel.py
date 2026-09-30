@@ -563,8 +563,10 @@ def open_ofs(e, mdl, bsp, stats):
         d = movedir_of(e)
         travel = abs(sum(d[k] * size[k] for k in range(3))) - lip
         if travel < 0.0:
+            # Quake keeps the sign: a lip deeper than the brush moves it a
+            # little backwards (E1M2's entity 511, a button). Clamping it to
+            # zero made a mover that could not move.
             stats['mover_travel_negative'] += 1
-            travel = 0.0
         return tuple(d[k] * travel for k in range(3))
 
     if cls == 'func_plat':
@@ -983,8 +985,38 @@ def main():
                 used_tex.add(t)
         stats['models_with_geometry'] += 1
 
+    # Milestone 20: monsters, guns, pickups and the status bar go FIRST in
+    # the texture and mesh tables, so their resource ids (the T_* and M_*
+    # symbols the game is assembled against) are the same in every level.
+    # They used to follow the level's own, which pinned the game's include
+    # to E1M1's texture and mesh counts; one PRG now plays E1M1 and E1M2.
+    # The level's textures and meshes follow at ids that vary by map, which
+    # nothing outside this file names. They get no nodes -- the game creates
+    # actor nodes itself. See quake_assets.py.
+    atex, amesh, sym, pics = [], [], None, []
+    if not a.no_actors:
+        import quake_assets
+        # Mesh index 0 is a placeholder nothing names: the game reads a mesh
+        # index of 0 as "none" (gpu64_game_world.inc's kindMesh), and with
+        # the actors first M_SOLDIER_STAND was 0 -- no grunt ever spawned.
+        # A copy of the smallest actor mesh keeps the loader's rules intact.
+        atex, amesh, sym = quake_assets.build(
+            f, ents, pak_read, Bsp, collect, pal, 0, 1, stats)
+        amesh.insert(0, min(amesh, key=lambda m: len(m[0]) + len(m[1])))
+        # Format 7: title, menu and intermission pictures, drawn by
+        # LEVEL_PICTURE. Their indices hash into the catalogue with the rest.
+        import quake_pics
+        pics, psym = quake_pics.build(f, ents, pak_read)
+        sym.update(psym)
+        stats['pictures'] = len(pics)
+        stats['actor_meshes'] = len(amesh)
+        stats['actor_textures'] = len(atex)
+
     # Textures, and the BSP-index -> resource-id map the face records need.
     texrecs, texblobs, texmap = [], [], {}
+    for name, ws, hs, px in atex:
+        texrecs.append((0xffff, ws, hs, 0, len(px)))
+        texblobs.append(px)
     for t in sorted(used_tex):
         tx = bsp.textures[t]
         if tx is None or not tx['px']:
@@ -1003,7 +1035,7 @@ def main():
         texrecs.append((t, ws, hs, len(b''.join(texblobs)), tx['w'] * tx['h']))
         texblobs.append(tx['px'][:tx['w'] * tx['h']])
 
-    meshes, nodes = [], []
+    meshes, nodes = list(amesh), []
     for c, mi in chunks:
         org, vb, fb = build_mesh(c, texmap, stats)
         if len(vb) // 6 > MAX_VERTS_PER_MESH:
@@ -1013,26 +1045,7 @@ def main():
 
     entrecs, entstrs = build_entities(bsp, stats)
 
-    # Milestone 20: monsters, guns, pickups and the status bar, appended to
-    # the same tables so the loader builds them as ordinary resources. They
-    # get no nodes -- the game creates actor nodes itself. See quake_assets.py.
-    nLevelMeshes = len(meshes)
-    pics = []
     if not a.no_actors:
-        import quake_assets
-        atex, amesh, sym = quake_assets.build(
-            f, ents, pak_read, Bsp, collect, pal, len(texrecs), len(meshes),
-            stats)
-        # Format 7: title, menu and intermission pictures, drawn by
-        # LEVEL_PICTURE. Their indices hash into the catalogue with the rest.
-        import quake_pics
-        pics, psym = quake_pics.build(f, ents, pak_read)
-        sym.update(psym)
-        stats['pictures'] = len(pics)
-        for name, ws, hs, px in atex:
-            texrecs.append((0xffff, ws, hs, 0, len(px)))
-            texblobs.append(px)
-        meshes.extend(amesh)
         # The catalogue record: the last entity, kind 9, spawnflags = a hash
         # of every symbol in the include, p0/p1 = mesh and texture counts. A
         # game built against another converter run refuses the level on it.
@@ -1043,8 +1056,6 @@ def main():
                                    min(32767, len(meshes)),
                                    min(32767, len(texrecs)),
                                    0, 0, 0, 0, 0, 0, 9, 0, 0))
-        stats['actor_meshes'] = len(amesh)
-        stats['actor_textures'] = len(atex)
         if a.inc:
             quake_assets.write_inc(a.inc, sym, len(entrecs) - 1, cat_hash)
             print('  wrote %s (%d symbols, hash $%04x)'

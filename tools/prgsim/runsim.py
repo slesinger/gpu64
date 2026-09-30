@@ -24,6 +24,9 @@ Options:
                         (default 50) to the end, and print writes/frame,
                         reads/frame and a per-opcode table to stderr --
                         which commands the bus budget is actually spent on
+    --level2=FILE       RAD/level2.g64lev: LOAD_LEVEL slot 1 (ARG6=1, ARG7=$5B)
+    --reu=FILE          a level pack (tools/pack_levels.py) as the REU image:
+                        its levels become slots 0 and 1, replacing --level/2
     --level=FILE        stand in for RAD/level.g64lev on the Pi's SD card, so
                         LOAD_LEVEL/LEVEL_STEP build a real level. Without it
                         LOAD_LEVEL answers BAD_ARGS, as it does on a card that
@@ -249,7 +252,7 @@ def screen_to_ascii(c):
 class Machine:
     def __init__(self, calibrated=True, stop_after=4, frame_log=False,
                  ppm_frames=None, key_script=None, c1_stream=None,
-                 level=None, joy_script=None, mouse_script=None,
+                 level=None, level2=None, reu=None, joy_script=None, mouse_script=None,
                  notarget=False, warp=None, hops=(), frame_ms=None,
                  telemetry=True, title=False, skill=1, sid_log=None):
         self.mem = bytearray(65536)
@@ -297,6 +300,18 @@ class Machine:
         if level:
             with open(level, 'rb') as f:
                 self.gpu.c1_level_data = f.read()
+        if level2:
+            with open(level2, 'rb') as f:
+                self.gpu.c1_level_data2 = f.read()
+        if reu:
+            # gpu64_levelPreload(): a pack in the REU wins over both files.
+            sys.path.insert(0, os.path.join(os.path.dirname(
+                os.path.abspath(__file__)), '..'))
+            import pack_levels
+            with open(reu, 'rb') as f:
+                slots = pack_levels.unpack(f.read())
+            self.gpu.c1_level_data = slots[0][1]
+            self.gpu.c1_level_data2 = slots[1][1] if len(slots) > 1 else None
         self.c1_stream = None
         if c1_stream:
             self.c1_stream = open(c1_stream, 'w')
@@ -403,7 +418,19 @@ class Machine:
         # constant would exercise none of them and the numbers it printed
         # would be zeroes either way.
         if self.frame_ms is not None:
-            ms = self.frame * self.frame_ms
+            # The clock moves only on a flip -- except that a program
+            # spinning on it (the game's clkPace frame limiter, when a loop
+            # pass did not flip) must still see time pass or it never
+            # returns. Past 32 reads within one frame, every further read
+            # is a millisecond. A loop that flips every pass never gets
+            # there, so its dt stays exactly frame_ms.
+            if self.frame != getattr(self, '_ms_frame', -1):
+                self._ms_frame = self.frame
+                self._ms_reads = 0
+            self._ms_reads += 1
+            if self._ms_reads > 32:
+                self._ms_extra = getattr(self, '_ms_extra', 0) + 1
+            ms = self.frame * self.frame_ms + getattr(self, '_ms_extra', 0)
         else:
             ms = (self.cpu.cycles * 4) // 985
         v = (0xFFFF - ms) & 0xFFFF
@@ -804,6 +831,8 @@ def main(argv):
     ppm_frames = {}
     c1_stream = None
     level = None
+    level2 = None
+    reu = None
     demo = '--demo' in opts
     key_script = []
     for o in opts:
@@ -852,6 +881,10 @@ def main(argv):
             c1_stream = o.split('=', 1)[1]
         if o.startswith('--level='):
             level = o.split('=', 1)[1]
+        if o.startswith('--level2='):
+            level2 = o.split('=', 1)[1]
+        if o.startswith('--reu='):
+            reu = o.split('=', 1)[1]
         if o.startswith('--clip-fault='):
             v = o.split('=', 1)[1]
             n, clip_fault_kind = (v.split(':', 1) + ['x'])[:2]
@@ -894,7 +927,7 @@ def main(argv):
 
     m = Machine(calibrated=calibrated, stop_after=stop_after,
                 frame_log=frame_log, ppm_frames=ppm_frames,
-                key_script=key_script, c1_stream=c1_stream, level=level,
+                key_script=key_script, c1_stream=c1_stream, level=level, level2=level2, reu=reu,
                 joy_script=joy_script, mouse_script=mouse_script,
                 notarget='--notarget' in opts, warp=warp, hops=hops,
                 frame_ms=frame_ms, telemetry='--telemetry-off' not in opts,

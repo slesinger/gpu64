@@ -10352,3 +10352,345 @@ bit rises at the flip's vblank or at the next dispatch, and a waiting program
 pumps a no-op `SET_BACKGROUND`. It had promised a pure read-only poll was
 always enough.
 
+
+## 89. C64 Ultimate bring-up: the IO2 sniffer (2026-09-29, branch `ultimate`, PC only)
+
+The first C64U session, with build a4a0f403:
+- The VIC was blank on the first power-on. On the second it showed BASIC and
+  the RAD menu, but with no colours; the HDMI mirror did have them.
+- The game's title screen and skill menu worked on the VIC.
+- F5 did nothing.
+- The HDMI still showed the boot log, with the level loaded.
+
+**Reading.** The boot log is hidden by the first successful dispatch, and
+the level is loaded at boot, not by a command. So **not one command landed.**
+The mirror, DMA and the $FFFF gate all worked, so the Pi can sample the bus
+and drive it. The path nothing had exercised is the C64 CPU writing IO2 and
+the Pi latching the address and data. It can fail in three places:
+1. IO2 is not routed to the cartridge port (a C64U setting);
+2. the address is wrong (the mux);
+3. the data sample is late or early, because `WAIT_CYCLE_WRITEDATA` 470
+   suits a breadbin and the FPGA's write timing differs.
+
+The missing RAD-menu colours are consistent with DMA writes to $D800 not
+being accepted. That is secondary: the menu works.
+
+**Instrument** (`GPU64_SNIFF_ENABLED` in `gpu64_sniff.h`, on for this branch
+only):
+- It counts every sampled IO2 access, keeps a histogram of the low address
+  byte, and records the first 16 accesses raw.
+- A write to `$DF6F` samples GPLEV0 at nine points (250-670 ARM cycles after
+  the anchor) and scores each against a fixed 16-byte pattern restarted by
+  `$DF6E`. This gives the machine's write-data window directly.
+- `$DF6A`/`$DF6B` read the constants $A5/$5A, and `$DF6C`/`$DF6D` read the
+  sync and data counts. That tests the read direction, and it lets the probe
+  score its own writes.
+- The report is painted onto the HDMI log from a DMA hold clocked by the
+  $FFFF vector, about once a second. It is painted only while the log is
+  visible and only when a number changed.
+
+`gpu64_probe_ultimate.prg` drives all of it, and its C64-side verdict is one
+of:
+- ALL OK;
+- READS OK, WRITES LOST (read the HDMI SWEEP rows);
+- NOTHING REACHES GPU64 (settings);
+- PARTIAL.
+
+In runsim it reports ALL OK with every count matching.
+
+**Bench recipe.** The C64U settings are: REU emulation off, Ultimate Audio
+off, and cartridge I/O2 external. In the RAD menu, press T until it reads
+REU. Run the probe for a few rounds, then photograph both screens.
+- The `OK` row gives the percentage correct per sample time.
+- `XB` gives the bits that were wrong.
+- `IO`/`PH` show whether IO2 and PHI2 were still asserted.
+- If the 470 column is poor and a neighbour is 100, move
+  `WAIT_CYCLE_WRITEDATA` to the middle of the good run.
+
+### 89a. Bench, 2026-09-29: the C64U works with the right settings
+
+- **Run A** (settings as in the first session): every IO2 read returned
+  `$FF`, including `$DF00`, and HDMI showed no SNIFF lines. Either REU mode
+  was not running or IO2 was not routed; the first sniff build printed
+  nothing when every count was zero. Fixed so the first report always
+  prints; the fix is not deployed yet.
+- **Run B** ("external cartridge" the only bus setting enabled): **VERDICT
+  ALL OK.**
+  - Reads 100/100, and every sync, data write and command was acknowledged.
+  - The REU answers at `$DF00` with `$10`.
+  - The sweep scored 36000 writes: 100% from 300 through 670, 6% at 250.
+    RAD's 470 is centred in a window of more than 370 ARM cycles, so there
+    is **no timing change**.
+  - On the C64U, IO2 releases at about 470 (23% still low) and PHI2 reads
+    low from about 350. The data stays valid after both: the FPGA holds the
+    bus.
+  - BADW/BADR/MUX are artefacts of the probe. The sniff registers and
+    `$DF1C-$DF1F` are outside the API's decode.
+- **Open: `V 1275089029`.** The $FFFF-read decode fired about 8.5M times a
+  second, which is far more than the 60/s IRQ vector fetch. On the C64U the
+  cartridge port must present `$FFFF` outside real vector fetches, perhaps
+  on idle or undriven cycles. The mirror jiffy clock and its watchdog rest
+  on that decode, so they are not trustworthy on the C64U yet.
+- **Open:** getting from power-on to the RAD menu takes the user several
+  minutes of power cycles and resets.
+
+So the first session's failure was **a C64U setting**.
+
+### 89b. The start sequence: count only real vector fetches (2026-09-29, PC build only)
+
+The user's report: the cartridge boots first, then the C64U powers on. Both
+screens stay black. After a cartridge reset, the VIC shows a slightly
+different black and HDMI shows garbage characters. BASIC appears on both
+after about 30 s. After that the RAD button works.
+
+**Reading.** `V 1275089029` from 89a is about 8.5M $FFFF reads a second,
+which is *faster than the C64's clock*. The loop was passing through its
+half-cycle waits without a real clock and sampling a bus held by pull-ups.
+That bus reads as $FFFF, R/W high. On the C64U this happens while it powers
+up and boots its core, and possibly at other times.
+
+`gpu64_mirrorIdleLoop()` is where the Pi sits during exactly that window.
+It counted every one of those samples as a jiffy and fired an *unconfirmed*
+snapshot hold every 15 of them. That explains all three symptoms:
+- **The black VIC.** The C64 is DMA-halted almost continuously, and holds
+  open on cycles nothing is known about.
+- **The garbage HDMI.** It is a snapshot of screen RAM before RAMTAS has
+  cleared it. On a real C64 the IRQ is masked until then, so the mirror never
+  sees it.
+- **The ~30 s boot.** The KERNAL runs a few cycles between holds.
+
+**Fix.** A $FFFF read counts as the vector fetch only when the *previous
+pass* sampled a read of $FFFE (`prevVecLo`). The two reads together are the
+interrupt sequence's last two cycles. A bus held by pull-ups never shows
+$FFFE, because bit 0 low needs a driver. Where the check applies:
+- `gpu64_mirrorIdleLoop()`: the jiffy, the watchdog clear and the snapshot.
+- `reuUsingPolling()`: the mirror arm, including the watchdog clear and
+  `gpu64MirrorAwaitIrq`.
+- The sniff clock.
+
+Per-pass cost is one register compare at the tail, after the sampling. No
+decode path gains per-write work. Both dead-clock branches clear
+`prevVecLo`.
+
+**Instrument.** The SNIFF line now prints `V <pairs> VX <lone $FFFF>`. On
+the C64U, expect VX to take the enormous count and V to grow at about
+60/s.
+
+**Risk to check on the bench.** The pair is only seen if the idle loop
+really samples consecutive C64 cycles. It should, because the loop is
+phase-locked and its body is short. If the HDMI mirror of the BASIC prompt
+stops working on the **breadbin**, this assumption is what failed.
+
+Build `1030c9ba-dirty src:cc06b2b8`, not deployed yet. Bench recipe, C64U:
+1. Boot the cartridge first, then power on the C64U. Expect BASIC on both
+   screens within a few seconds.
+2. Run `gpu64_probe_ultimate.prg` and read V/VX.
+
+Also recheck the HDMI mirror on the breadbin.
+
+### 89c. Bench: still black at power-on; an automatic reset for late machines (2026-09-29)
+
+**Bench result with src:cc06b2b8.** The probe verdict is ALL OK again. At
+C64U power-on both screens stay black until the cartridge's reset button is
+pressed. The photo of the HDMI RAD menu was reported as "wrong colours".
+That photo is gpu64's own menu mirror (`showMenuMirror()`), which paints
+each 8x8 cell in one flat C64 palette index. The photo shows colour
+gradients *inside* single glyphs, and the framebuffer cannot produce those.
+So the monitor or the HDMI link is changing the colours, not the palette.
+The open question is whether it happens only when the Pi boots before the
+monitor is showing its input.
+
+**Reading of the black screens.** The black HDMI follows from the C64 not
+running. The mirror has no IRQ to draw on, and `gpu64_deadClockLeave()` has
+cleared the pages. On the C64U the cartridge boots first, so RAD's boot
+reset pulse goes to a machine that is off. The user's reset press is known
+to recover it.
+
+**Change.** `checkIfMachineRunning()` now records whether it waited more
+than ~2 s (`gpu64MachineCameLate`). If it did, `CRAD::Run()` waits another
+~2 s for the C64U to settle, re-checks the clock, and pulses reset exactly
+as the boot pulse does. This path is never taken on a breadbin.
+
+Build `src:33a5ffe5`. The SNIFF `V/VX` numbers from 89b were not captured
+this round.
+
+### 89d. Bench: black after power-on and after reset; the idle loop supervises itself (2026-09-29, PC build only)
+
+**Bench result with src:33a5ffe5**, plus `hdmi_pixel_encoding=2` in
+config.txt. The user reports no change: after power-on both screens are
+black. A cartridge reset brings BASIC back on the VIC, but HDMI stays black.
+Only the RAD menu draws anything on HDMI, and its colours are wrong.
+
+**Reading.** The HDMI stays black while BASIC runs on the VIC, which means
+the mirror sees no $FFFE/$FFFF pair at all. It is not a matter of seeing
+the pairs late. This fits the C64U running its KERNAL from its own ROM copy
+(at 64 MHz turbo certainly, and possibly at 1 MHz too). The cartridge port
+then shows an idle, pulled-up bus: a lone "$FFFF read" on nearly every
+cycle, and never the vector pair. 89b made the pair mandatory, which is
+correct for a breadbin and removed the C64U's only clock.
+
+**Changes** (`gpu64_mirrorIdleLoop()`, rad_reu.cpp; `CRAD::Run()`,
+rad_main.cpp):
+- **Lone-$FFFF fallback clock.** Four snapshots a second, taken only when
+  no pair has been seen for 2 s and not within 3 s of arming (screen RAM
+  holds garbage until RAMTAS has run). A breadbin shows a pair 60 times a
+  second, so it never takes this path.
+- **Idle report on HDMI.** Once a second, but only when the mirror has not
+  painted for 2 s: `IDLE Ns P passes V pairs VX lone` and `NC R SN FB AR
+  LATE W`. A black HDMI screen now always explains itself, and the report
+  is silent while the mirror works.
+- **Automatic reset.** Once per power session: if 6 s after arming there
+  has been no IRQ pair and nothing has painted, pulse reset exactly as the
+  cartridge button does. This replaces the user's manual press.
+- **Re-arm and `gpu64_apiFullReset()` on the RESET release edge**, so a
+  reset always returns to a clean mirror.
+- **`gpu64_apiFullReset()` on entry to the RAD menu.** This fixes the menu
+  mirror's colours when a game had loaded a level palette.
+
+Build `1030c9ba-dirty src:b6e30a34`, not deployed yet. What to read on the
+bench:
+- On the C64U, VX should be large and V zero. FB should grow at 4/s and the
+  BASIC prompt should appear on HDMI within ~3 s of the VIC showing it.
+- On the breadbin, V should be about 60 and VX 0, and the mirror should
+  behave exactly as before.
+
+## 90. Milestone 20: E1M2, tune 1, realtime pacing, key bindings (2026-09-29, PC only)
+
+The user asked for four things in one message.
+
+**Tune.** The title music is now E-Quake_tune_1.sid, as
+`gpu64_tune_e1.bin` at $A000. The old tune binaries are no longer
+referenced.
+
+**Realtime at 64 MHz.** `clkPace` in the frame loop waits until 32 ms of
+the CIA2 millisecond clock have passed since the previous frame. The CIA
+runs from the system clock's divided time base, not the CPU clock, so a
+turbo C64U runs the game at the same speed as a breadbin. The delta-time
+motion scaling from section 82 stays in place for frames slower than 32 ms.
+
+**E1M2 "from the REU".** Interpreted as: the Pi preloads a second level
+file, `SD:RAD/level2.g64lev`, at boot into slot 1, the same way as slot 0.
+`LOAD_LEVEL` takes the slot from ARG6, but only when ARG7 == ARG6 ^ $5A.
+Otherwise it takes slot 0, so a phantom ARG6 cannot switch maps. E1M1's
+exit loads E1M2, and E1M2's exit loads E1M1. The game rebuilds all
+retained state on a level change.
+- `gen_quakelevel.py` now emits actors first, which keeps actor node ids
+  stable across maps.
+- A vis-cull `firstMesh` off-by-one showed up on E1M2 and is fixed in
+  firmware and scenesim.
+- E1M2 needs 32 movers, exactly MAX_MOV.
+- `runsim --level2=` loads slot 1.
+
+**Key bindings.** The skill menu has a fifth line, CONTROLS, which opens
+CUSTOMIZE CONTROLS. It lists eight actions and their keys, then DEFAULTS and
+DONE. The C64 draws the menu on the VIC as well as on HDMI.
+- **Binding a key.** RETURN or fire opens the grab. The next key held for
+  two ticks is bound. RETURN cancels. The keys the game already uses for
+  something fixed (RETURN, the F-keys, the weapon digits, RUN/STOP, and the
+  rest of `ctResv`) are refused. A key that another action
+  already has swaps with it.
+- **`kbRemap`** runs after the matrix scan and before the joystick
+  override. It rewrites only the eight default action bits, so every other
+  key and the joystick are untouched.
+- **Scope.** Bindings last for the power session only; nothing is saved.
+- **Level pictures.** `quake_pics.py` adds the gfx `ttl_cstm` title, the
+  labels and 64 key names, for 111 pictures in all.
+
+**A regression caught by check_ai.** Putting the actors first made
+`M_SOLDIER_STAND = 0`. `kindMesh` (gpu64_game_world.inc) reads mesh index 0
+as "not placed", so **no grunt spawned on either map**. `demos.sh game`
+still passed, because nothing in it looks for a grunt. The fix is in the
+generator: mesh index 0 is now a placeholder that nothing names (a copy of
+the smallest actor mesh), so the actors start at 1. Both levels were
+regenerated (CAT_HASH $6ca1). After the fix, every grunt and dog that
+spawns at every skill has a node on both maps, and check_ai, check_exit,
+check_env, check_sfx and check_combat all pass.
+
+**PC verification.**
+- runsim: title → skill menu → CONTROLS → bind WALK FORWARD to I → DONE →
+  NORMAL → game.
+- In the game, holding I moves the camera from Z $FFF5 to $0005, and
+  holding W afterwards leaves it where it is.
+- The HDMI page renders as expected (checked from a PPM).
+
+**Deploy together.** kernel_rad.img src:b6e30a34, the game PRG,
+`RAD/level.g64lev` (the new e1m1) and `RAD/level2.g64lev` (e1m2). The PRG
+needs the new picture ids, and the firmware needs slot 1.
+
+## 91. Time-bound game ticks up to 60 fps; the level pack (2026-09-30, PC only)
+
+**Question: "does the game keep real time at any overclock?"** Not
+entirely. Section 90's `clkPace` held every frame to at least 32 ms, so a
+fast C64 capped at ~31 fps. Movement was already scaled by frame ms, but
+every other timer counted frames. Two changes:
+
+- **`PACE_MS = 16`.** The floor now allows about 60 fps. HDMI vsync is the
+  real ceiling.
+- **Game ticks.** `tickFrame` (in dtFrame) accumulates real ms and raises
+  `tick` once per DT_REF (32) ms. A frame of 32 ms or more is always one
+  tick, carrying its whole dt, so a 1 MHz C64, and runsim at
+  `--frame-ms=32`, behave exactly as before.
+  - **Runs only on tick frames:**
+    - `tickLogic` sets `dtMs`/`doorStep` to the tick's dt.
+    - gameAnimate, combatFrame, aiFrame, actFrame, combatResolve and
+      aiResolve.
+    - The exMsg timer, the mfFrame flash countdown and the `airFrames`
+      void counter.
+  - **Runs on every frame, on the frame's real dt:** the player's own
+    movement and clip, touch, env, and every send and commit, which is
+    what makes 60 fps smooth.
+  - `wtFrame` counts in actFrame, so the half-rate gameSelect/gameTouch
+    parity now follows ticks too.
+- **PC check.** I ran the grunt fight at 32 ms × 400 frames and at 16 ms ×
+  800 frames, with the key schedule doubled for the second.
+  - The final camera is identical.
+  - The grunt hits about every 1150 ms in both runs (4 gaps over 4608 ms,
+    5 gaps over 5648 ms). The runs differ only in when the first hit lands,
+    which is chaotic divergence through LOS latency.
+  - At 32 ms, check_ai, check_exit, check_env, check_sfx and check_combat
+    all pass.
+
+**Question: "are all Quake levels in a single REU image?"** They were not.
+Section 90 used two SD files. Now:
+
+- **`tools/pack_levels.py OUT.reu NAME=file ...`** builds a **level pack**:
+  - A header: `G64P`, v1, count, size, and an FNV-1a hash of the
+    directory.
+  - A directory of up to 8 entries, each with offset, bytes, an FNV-1a hash
+    and a 4-character name.
+  - The levels, 4 KB aligned.
+  - `--list` verifies an image.
+  - `build/quake.reu` is 3.1 MB (E1M1 + E1M2), so RAD picks a 4 MB REU.
+- **Firmware** (`gpu64_levelPreload`):
+  - Before the SD files, it looks for the pack at REU address 0, which RAD
+    has just loaded from the menu's REU image selection.
+  - It verifies every checksum and parse. On success, the slots
+    (`gpu64LevelSlot[8]`) point straight into reuMemory, with no copy, and
+    the SD files are not read.
+  - Any failure uses none of the pack and falls back to
+    `RAD/level.g64lev` + `level2.g64lev`.
+- **LOAD_LEVEL** accepts slots 0-7, keyed as before (ARG7 = ARG6^$5A).
+  LEVEL_PICTURE reads slot 0.
+- **The REU must not be written over.** The levels are used where they lie
+  in REU memory. The game never touches the REU registers.
+- **`runsim --reu=FILE`** unpacks the pack into slots 0/1.
+  - The exit scenario (warp into the changelevel brush, FIRE on the stats
+    screen) runs 14000 column reads.
+  - Its output is **byte-identical** with `--reu=build/quake.reu` and with
+    `--level`/`--level2`.
+  - The camera after the exit is E1M2's info_player_start, so slot 1 came
+    from the pack.
+
+**Bench recipe.**
+1. In the RAD menu, T until it reads REU.
+2. Browse to `REU/quake.reu` and select it. The status line should say
+   `quake (REU 4096K)`.
+3. Launch `RAD_PRG/gpu64_demo_game.prg`.
+4. The boot log shows `Level pack: slot 0 = E1M1` / `slot 1 = E1M2`.
+
+**Deployed together (2026-09-30).**
+- `kernel_rad.img` src:ed933926.
+- The PRG (md5 9e9f1374…).
+- `REU/quake.reu` (3be6e3bb…).
+- The fallback `RAD/level.g64lev` (feb1da57…) and `RAD/level2.g64lev`
+  (a86a6ac4…).

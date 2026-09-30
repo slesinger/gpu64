@@ -1,0 +1,437 @@
+;
+;      gpu64 -- bring-up probe for a new machine (the C64 Ultimate).
+;
+;      WHY THIS EXISTS
+;
+;      On the C64 Ultimate the HDMI boot log was still on screen after the
+;      game had started, and the log is hidden by the first successful
+;      command -- so not one landed. DMA, the RAD menu and the mirror all
+;      worked there, and none of them uses the one path every command needs:
+;      the C64's CPU writing into IO2 and the Pi latching it.
+;
+;      This program exercises that path in both directions, separately, and
+;      needs a firmware built with GPU64_SNIFF_ENABLED (gpu64_sniff.h), which
+;      answers four constant registers and prints its own side of the story
+;      onto the HDMI log once a second.
+;
+;      WHAT IT DOES, EVERY ROUND
+;
+;        READ    256 reads each of $DF6A (the Pi answers $A5) and $DF6B
+;                ($5A). OK counts exact answers. Tests the Pi DRIVING the
+;                bus during a C64 read.
+;        SYNC/   15 x ( a write to $DF6E, then the 16-byte pattern to
+;        DATA    $DF6F ). The Pi counts both and reads the counts back at
+;                $DF6C/$DF6D: SENT and SEEN are the low bytes of the two
+;                sides' counters and should be equal. On HDMI the firmware
+;                prints, for nine sample points across the cycle, how many
+;                pattern bytes it latched correctly -- the write-data window.
+;        CMD     16 real dispatches: LOG_ENABLE with the invalid argument 2,
+;                which does nothing but answer ERRCODE $04 and leaves the
+;                HDMI log up. SEQACK must echo SEQ.
+;        RAW     plain reads of $DF00-$DF0A (REU), $DF1C-$DF1F (the
+;                Ultimate's command interface) and $DF50-$DF6F (gpu64).
+;
+;      HOW TO READ IT
+;
+;        The verdict line says which of three cases this is:
+;
+;        NOTHING REACHES GPU64   reads wrong AND nothing seen. The machine
+;                                is not passing IO2 to the cartridge port:
+;                                a machine setting, not firmware.
+;        READS OK, WRITES LOST   the Pi answers but never latches a write:
+;                                the HDMI sweep rows say when the data
+;                                is valid.
+;        ALL OK                  the bus works both ways; the fault is
+;                                elsewhere.
+;
+;      Photograph both screens after a few rounds.
+;
+;      Requires the RAD menu switched to REU mode with T.
+;
+;      Copyright (c) 2026 Honza Slesinger
+;
+;      This program is free software: you can redistribute it and/or modify
+;      it under the terms of the GNU General Public License as published by
+;      the Free Software Foundation, either version 3 of the License, or
+;      (at your option) any later version.
+;
+
+CMD_HI	= $df50
+CMD_LO	= $df51
+STATUS	= $df52
+ERRCODE	= $df53
+ARG0	= $df56
+SEQ	= $df67
+SEQACK	= $df68
+CONST_A	= $df6a
+CONST_B	= $df6b
+SYNCS	= $df6c
+DATAS	= $df6d
+SNSYNC	= $df6e
+SNDATA	= $df6f
+
+OP_LOG_ENABLE = $07
+ERR_BAD_ARGS  = $04
+
+CUR	= $fb			; screen cursor, 2 bytes
+STR	= $fd			; inline string pointer, 2 bytes
+
+JIFFY	= $a2
+
+* = $0801
+	.byte $0b, $08, $0a, $00, $9e
+	.text "2064"
+	.byte $00, $00, $00
+
+* = $0810
+
+	.enc "screen"
+
+; Print the inline string at row, col.
+prt	.macro row, col, txt
+	ldx #\col
+	ldy #\row
+	jsr setcur
+	jsr prinl
+	.null \txt
+	.endm
+
+; Print "x" / A as hex at row, col.
+hexat	.macro row, col, var
+	ldx #\col
+	ldy #\row
+	jsr setcur
+	lda \var
+	jsr prhex
+	.endm
+
+start
+	lda #0
+	sta $d020
+	sta $d021
+	ldx #0			; clear the screen and colour it green, directly --
+colfill				; no KERNAL, so the PC simulator draws it too
+	lda #$20
+	sta $0400,x
+	sta $0500,x
+	sta $0600,x
+	sta $0700,x
+	lda #5
+	sta $d800,x
+	sta $d900,x
+	sta $da00,x
+	sta $db00,x
+	inx
+	bne colfill
+
+	lda #0
+	sta round
+	sta sentSync
+	sta sentData
+	sta seqN
+
+	#prt 0, 0, "GPU64 PROBE - C64 ULTIMATE    ROUND"
+	#prt 2, 0, "READ $DF6A=A5 OK      /0100 LAST"
+	#prt 3, 0, "READ $DF6B=5A OK      /0100 LAST"
+	#prt 5, 0, "SYNC SENT    SEEN"
+	#prt 6, 0, "DATA SENT    SEEN"
+	#prt 8, 0, "CMD  ACK OK   /10  ERR OK   /10"
+	#prt 9, 0, "     SEQ    ACK    ERR    STAT"
+	#prt 11, 0, "DF00"
+	#prt 12, 0, "DF1C"
+	#prt 13, 0, "DF50"
+	#prt 14, 0, "DF58"
+	#prt 15, 0, "DF60"
+	#prt 16, 0, "DF68"
+	#prt 18, 0, "VERDICT"
+	#prt 21, 0, "HDMI: SNIFF/SWEEP LINES EVERY SECOND"
+	#prt 22, 0, "PHOTOGRAPH BOTH SCREENS"
+
+mainloop
+	inc round
+	#hexat 0, 36, round
+
+; ---------------------------------------------------------------- READ
+	lda #0
+	sta cntA
+	sta cntA+1
+	sta cntB
+	sta cntB+1
+	ldx #0
+rdA	lda CONST_A
+	cmp #$a5
+	beq rdAok
+	sta lastA
+	jmp rdAnx
+rdAok	inc cntA
+	bne rdAnx
+	inc cntA+1
+rdAnx	dex
+	bne rdA
+
+	ldx #0
+rdB	lda CONST_B
+	cmp #$5a
+	beq rdBok
+	sta lastB
+	jmp rdBnx
+rdBok	inc cntB
+	bne rdBnx
+	inc cntB+1
+rdBnx	dex
+	bne rdB
+
+	#hexat 2, 17, cntA+1
+	#hexat 2, 19, cntA
+	#hexat 2, 33, lastA
+	#hexat 3, 17, cntB+1
+	#hexat 3, 19, cntB
+	#hexat 3, 33, lastB
+
+; ---------------------------------------------------------- SYNC/DATA
+	lda #15
+	sta blocks
+blk	sta SNSYNC
+	inc sentSync
+	ldx #0
+pat	lda pattern,x
+	sta SNDATA
+	inc sentData
+	inx
+	cpx #16
+	bne pat
+	dec blocks
+	bne blk
+
+	lda SYNCS
+	sta seenSync
+	lda DATAS
+	sta seenData
+	#hexat 5, 10, sentSync
+	#hexat 5, 18, seenSync
+	#hexat 6, 10, sentData
+	#hexat 6, 18, seenData
+
+; ---------------------------------------------------------------- CMD
+	lda #0
+	sta ackOk
+	sta errOk
+	lda #16
+	sta blocks
+cmd	inc seqN
+	lda seqN
+	sta SEQ
+	lda #2			; invalid on purpose: answers BAD_ARGS, hides nothing
+	sta ARG0
+	lda #0
+	sta CMD_HI
+	lda #OP_LOG_ENABLE
+	sta CMD_LO
+	lda SEQACK
+	sta lastAck
+	cmp seqN
+	bne cmdE
+	inc ackOk
+cmdE	lda ERRCODE
+	sta lastErr
+	cmp #ERR_BAD_ARGS
+	bne cmdN
+	inc errOk
+cmdN	dec blocks
+	bne cmd
+	lda STATUS
+	sta lastStat
+
+	#hexat 8, 12, ackOk
+	#hexat 8, 26, errOk
+	#hexat 9, 9, seqN
+	#hexat 9, 16, lastAck
+	#hexat 9, 23, lastErr
+	#hexat 9, 31, lastStat
+
+; ---------------------------------------------------------------- RAW
+	ldx #5
+	ldy #11
+	jsr setcur
+	ldx #0
+raw0	lda $df00,x
+	jsr prhexs
+	inx
+	cpx #11
+	bne raw0
+
+	ldx #5
+	ldy #12
+	jsr setcur
+	ldx #0
+raw1	lda $df1c,x
+	jsr prhexs
+	inx
+	cpx #4
+	bne raw1
+
+	lda #13
+	sta rawRow
+	lda #$50
+	sta rawLo
+rawRows	ldx #5
+	ldy rawRow
+	jsr setcur
+	ldx rawLo
+	ldy #8
+raw2	lda $df00,x
+	jsr prhexs
+	inx
+	dey
+	bne raw2
+	stx rawLo
+	inc rawRow
+	lda rawRow
+	cmp #17
+	bne rawRows
+
+; ------------------------------------------------------------ VERDICT
+	lda cntA+1		; 256 exact answers = $0100, both
+	and cntB+1
+	beq readsBad
+	lda cntA
+	ora cntB
+	bne readsBad
+	; reads are fine
+	lda sentData
+	cmp seenData
+	bne rOkWBad
+	lda ackOk
+	cmp #16
+	bne rOkWBad
+	#prt 18, 8, "ALL OK                          "
+	jmp waitRound
+rOkWBad
+	#prt 18, 8, "READS OK, WRITES LOST - SEE HDMI"
+	jmp waitRound
+readsBad
+	lda seenData
+	ora seenSync
+	bne partial
+	#prt 18, 8, "NOTHING REACHES GPU64 - SETTINGS"
+	jmp waitRound
+partial
+	#prt 18, 8, "PARTIAL - PHOTO BOTH SCREENS    "
+
+; One round a second, so the HDMI report (also once a second) moves with
+; it and the round counter shows the program is alive.
+waitRound
+	lda JIFFY
+	clc
+	adc #50
+wtLoop	cmp JIFFY
+	bne wtLoop
+	jmp mainloop
+
+; ----------------------------------------------------------- routines
+
+; Cursor := $0400 + Y*40 + X.
+setcur	lda #0
+	sta CUR
+	lda #4
+	sta CUR+1
+	cpy #0
+	beq scCol
+scRow	lda CUR
+	clc
+	adc #40
+	sta CUR
+	bcc scNx
+	inc CUR+1
+scNx	dey
+	bne scRow
+scCol	txa
+	clc
+	adc CUR
+	sta CUR
+	bcc scDone
+	inc CUR+1
+scDone	rts
+
+; Print the zero-terminated string that follows the JSR; return past it.
+prinl	pla
+	sta STR
+	pla
+	sta STR+1
+	ldy #0
+plLoop	inc STR
+	bne plRd
+	inc STR+1
+plRd	lda (STR),y
+	beq plEnd
+	sta (CUR),y
+	inc CUR
+	bne plLoop
+	inc CUR+1
+	jmp plLoop
+plEnd	lda STR+1
+	pha
+	lda STR
+	pha
+	rts
+
+; A as two hex digits at the cursor, cursor advanced. Keeps X and Y.
+prhex	sty saveY
+	pha
+	lsr a
+	lsr a
+	lsr a
+	lsr a
+	jsr prnib
+	pla
+	and #15
+	jsr prnib
+	ldy saveY
+	rts
+
+; ... followed by a space.
+prhexs	jsr prhex
+	sty saveY
+	lda #$20
+	ldy #0
+	sta (CUR),y
+	inc CUR
+	bne phsD
+	inc CUR+1
+phsD	ldy saveY
+	rts
+
+prnib	tay
+	lda hexdig,y
+	ldy #0
+	sta (CUR),y
+	inc CUR
+	bne pnD
+	inc CUR+1
+pnD	rts
+
+hexdig	.text "0123456789ABCDEF"
+
+; Must match GPU64_SNIFF_PATTERN in gpu64_sniff.h.
+pattern	.byte $00, $ff, $55, $aa, $01, $02, $04, $08
+	.byte $10, $20, $40, $80, $0f, $f0, $33, $cc
+
+round	.byte 0
+cntA	.word 0
+cntB	.word 0
+lastA	.byte 0
+lastB	.byte 0
+sentSync .byte 0
+sentData .byte 0
+seenSync .byte 0
+seenData .byte 0
+seqN	.byte 0
+ackOk	.byte 0
+errOk	.byte 0
+lastAck	.byte 0
+lastErr	.byte 0
+lastStat .byte 0
+blocks	.byte 0
+rawRow	.byte 0
+rawLo	.byte 0
+saveY	.byte 0

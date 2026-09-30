@@ -46,8 +46,6 @@ IM_ARM     = 20			; ticks before a press counts: ~2 s
 MSG_FRAMES = 60			; how long a counter message stays up
 MSG_ROW    = 3
 
-TUNE_E1_INIT = $a900		; E-Quake tune 1
-TUNE_E1_PLAY = $a903
 
 ; ----------------------------------------------------------------------
 ; Level load: a trigger_counter record. Called from etTrig with the record
@@ -201,6 +199,8 @@ exSec
 	inc playSec+1
 	jmp exSec
 exMsg
+	lda tick			; MSG_FRAMES are game ticks
+	beq +
 	lda msgT
 	beq +
 	dec msgT
@@ -263,7 +263,10 @@ mfFrame
 	bne mfRts
 +	lda mfT
 	beq mfWantOff
+	ldx tick			; FLASH_FRAMES are game ticks
+	beq +
 	dec mfT
++
 	lda mfOn
 	bne mfRts			; lit already; the eye has barely moved
 	ldx #11
@@ -375,9 +378,9 @@ imStopped
 +	lda imT
 	sta imSec
 
-	lda #<TUNE_E1_INIT
-	ldx #>TUNE_E1_INIT
-	ldy #<TUNE_E1_PLAY
+	lda #<TUNE_INIT
+	ldx #>TUNE_INIT
+	ldy #<TUNE_PLAY
 	jsr tiMusicAt
 
 	jsr teleShown
@@ -389,7 +392,11 @@ imStopped
 	lda #6
 	jsr dmRow
 	jsr dmText
-	.text "          E1M1 COMPLETED"
+	.text "          "
+	.byte 0
+	jsr lvName
+	jsr dmText
+	.text " COMPLETED"
 	.byte 0
 	lda #10
 	jsr dmRow
@@ -466,12 +473,34 @@ fnQuick		.byte 0
 imLeave
 	jsr tiMusicOff
 	jsr sfxInit
-	jsr clkFrame			; re-mark: the stats screen is not a frame
-	jsr restart
-	jsr teleShown
-	lda #1
-	sta mfLost			; the flash node is checked again
-	rts
+	; The next level: E1M1's exit leads to E1M2, and E1M2's back to E1M1
+	; (there is no E1M3 on the card). The whole per-level setup runs again
+	; from SCENE_RESET, which LOAD_LEVEL needs anyway -- it replaces every
+	; resource and node the Pi holds. The loop is already stopped (imStop).
+	lda lvSlot
+	eor #1
+	sta lvSlot
+	ldx #0				; the stats off the C64 screen
+	lda #$20
+-	sta SCREEN,x
+	sta SCREEN+$100,x
+	sta SCREEN+$200,x
+	sta SCREEN+$2e8,x
+	inx
+	bne -
+	pla				; intermission's return into the frame
+	pla				; loop: levelSetup ends by entering it
+	jmp levelSetup
+
+; The level's name at the cursor: E1M1 or E1M2.
+lvName
+	jsr dmText
+	.text "E1M"
+	.byte 0
+	lda lvSlot
+	clc
+	adc #'1'
+	jmp imChar
 
 ; A = character, printed at the cursor.
 imChar

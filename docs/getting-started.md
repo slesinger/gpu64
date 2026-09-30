@@ -11,11 +11,17 @@ gpu64's registers are `$DF50`–`$DF68` in IO2 (REU keeps `$DF00`–`$DF0A`;
 `$DF0B`–`$DF4F` is left to other hardware; IO1, `$DE00`–`$DEFF`, is
 untouched).
 
-**On a C64 Ultimate / Ultimate 64 / 1541 Ultimate** gpu64 coexists with the
+**On a C64 Ultimate**, enable only the external cartridge on the
+cartridge bus; with other bus options on, gpu64 sees none of the C64's
+register accesses. **On any Ultimate** (C64 Ultimate, Ultimate 64,
+1541 Ultimate) gpu64 coexists with the
 Ultimate's Command Interface (`$DF1B`–`$DF1F`, fine to leave enabled), but two
 other Ultimate features must be **off**: its own REU emulation (gpu64 provides
 the REU at `$DF00`–`$DF0A`) and *Map Ultimate Audio `$DF20`-`$DFFF`*, which
-covers gpu64's registers.
+covers gpu64's registers. If the HDMI boot log is still showing after your
+program has started, no command has reached gpu64. Run
+`gpu64_probe_ultimate.prg`: its VERDICT line says whether the machine's I/O2
+routing or the bus timing is at fault.
 
 **If gpu64 hangs on your machine** while 3D rendering runs, add
 `GPU64_BURST_BYTES 128` to `SD:RAD/rad.cfg` (range 64–448, default 256). It

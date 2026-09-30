@@ -20,7 +20,8 @@
 ; Everything after the logo is Quake's own art out of the pak file
 ; (tools/quake_pics.py): conback for the title; the faded conback, the
 ; plaque, "SINGLE PLAYER", four skill labels in the console font and the
-; spinning menu dot for the menu, as Quake's M_Draw lays them out. The C64
+; spinning menu dot for the menu, as Quake's M_Draw lays them out. A fifth
+; line, CONTROLS, opens the key bindings (gpu64_game_controls.inc). The C64
 ; carries a text version of each, so either screen alone is enough to
 ; play the menu.
 ;
@@ -36,11 +37,11 @@
 ;
 ; MUSIC
 ;
-; Quake.sid plays from the KERNAL's IRQ, sped up to 50 Hz, until the
-; loading plaque. The three tunes live at $A000-$C483 (tools/sidreloc.py
-; moved them there and proved every SID write of 15000 frames unchanged),
+; E-Quake tune 1 plays from the KERNAL's IRQ, sped up to 50 Hz, until the
+; loading plaque. It lives at $A000-$A98C (tools/sidreloc.py moved it there
+; and proved every SID write of 20000 frames unchanged),
 ; so BASIC is banked out ($01 = $36) for the whole run and `finish` puts
-; it back. The tunes' zero page is $FA-$FF, which overlaps SRC/DST: the
+; it back. The tune's zero page is $FA-$FF, which overlaps SRC/DST: the
 ; IRQ swaps those six bytes in and out around every call into a tune.
 ;
 ; runsim.py skips all of this unless given --title: it pokes SIM_TITLE_ON
@@ -53,9 +54,9 @@ SIM_TITLE    = $02ab
 SIM_TITLE_ON = $ab
 SIM_SKILL    = $02ac
 
-TUNE_QUAKE_INIT = $b300
-TUNE_QUAKE_PLAY = $b303
-LOGO_RLE        = $c484
+TUNE_INIT       = $a000		; E-Quake tune 1, the only tune
+TUNE_PLAY       = $a003
+LOGO_RLE        = $aa00
 LOGO_SCREEN     = $cc00		; VIC bank 3: screen $cc00, bitmap $e000
 LOGO_BITMAP     = $e000
 LOGO_ROW0       = 6		; cell rows 6..17 hold the logo
@@ -494,7 +495,7 @@ tiMenu
 	pla
 	tax
 	inx
-	cpx #4
+	cpx #5
 	bne -
 	lda #21
 	jsr dmRow
@@ -538,7 +539,7 @@ tiMenuTick
 	jsr tiPic
 	ldx tiI
 	inx
-	cpx #4
+	cpx #5				; four skills, then CONTROLS
 	bne -
 	lda tiTick			; (time * 10) % 6, as M_Draw
 	clc
@@ -563,14 +564,14 @@ tiMenuTick
 	bcc +
 	dec skill			; up
 	bpl +
-	lda #3
+	lda #4
 	sta skill
 +	lda tiNew
 	and #2
 	beq +
 	inc skill			; down
 	lda skill
-	cmp #4
+	cmp #5
 	bcc +
 	lda #0
 	sta skill
@@ -578,9 +579,15 @@ tiMenuTick
 	and #4
 	bne +
 	jmp tiMenuTick
++	lda skill			; the fifth line is the controls menu,
+	cmp #4				; not a skill: `skill` is the cursor
+	bne +				; here, and only 0-3 ever leave
+	jsr ctMenu
+	jmp tiMenu
 +	rts
 
 tiMenuY	.byte MENU_Y, MENU_Y + MENU_DY, MENU_Y + 2 * MENU_DY, MENU_Y + 3 * MENU_DY
+	.byte MENU_Y + 4 * MENU_DY
 
 ; The C64 menu: a cursor and a highlight on the current line.
 tiMenuC64
@@ -613,7 +620,7 @@ tmcLoop
 	cpy #25
 	bne -
 	inx
-	cpx #4
+	cpx #5
 	bne tmcLoop
 	rts
 
@@ -632,8 +639,8 @@ tiSkillName
 	bne -
 +	rts
 
-tiSkillText	.byte 0, 5, 12, 17
-tiSkillStr	.text "EASY", 0, "NORMAL", 0, "HARD", 0, "NIGHTMARE", 0
+tiSkillText	.byte 0, 5, 12, 17, 27
+tiSkillStr	.text "EASY", 0, "NORMAL", 0, "HARD", 0, "NIGHTMARE", 0, "CONTROLS", 0
 
 ; ======================================================================
 ; The loading plaque: the menu's faded background, Quake's LOADING, and a
@@ -816,13 +823,13 @@ tiWait
 	dec tiT0+1
 +	rts
 
-; Music from the KERNAL's IRQ at 50 Hz: Quake.sid, or with tiMusicAt any
-; of the three tunes -- A/X = init, Y = the low byte of play, whose high
+; Music from the KERNAL's IRQ at 50 Hz: the tune, or with tiMusicAt any
+; tune -- A/X = init, Y = the low byte of play, whose high
 ; byte is init's (every tune's play is init + 3).
 tiMusicOn
-	lda #<TUNE_QUAKE_INIT
-	ldx #>TUNE_QUAKE_INIT
-	ldy #<TUNE_QUAKE_PLAY
+	lda #<TUNE_INIT
+	ldx #>TUNE_INIT
+	ldy #<TUNE_PLAY
 tiMusicAt
 	sta tmInit+1
 	stx tmInit+2
@@ -833,7 +840,7 @@ tiMusicAt
 	lda #0
 	tax
 	tay
-tmInit	jsr TUNE_QUAKE_INIT
+tmInit	jsr TUNE_INIT
 	jsr tiZpOut
 	lda $0314
 	sta tiOldIrq
@@ -878,7 +885,7 @@ tiMusicOff
 
 tiIrq
 	jsr tiZpIn
-tiPlay	jsr TUNE_QUAKE_PLAY
+tiPlay	jsr TUNE_PLAY
 	jsr tiZpOut
 	jmp $ea31
 

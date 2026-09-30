@@ -222,7 +222,8 @@ TURN  = 512
 ; 60ms, so below ~17 frames a second the game does slow down again -- that
 ; is also the most a single trace should be asked to cover. DT_MIN keeps a
 ; frame with no measured time (one that did not commit) from standing still.
-; Timers -- think cadence, attack cooldowns, door waits -- stay in frames.
+; Timers -- think cadence, attack cooldowns, door waits -- count game ticks,
+; one per DT_REF ms of real time (tickFrame), not frames.
 DT_REF = 32
 DT_MIN = 8
 DT_MAX = 60
@@ -273,6 +274,8 @@ KB_4    = $08
 KD_CBM  = $20		; C= fires, as do B, joystick 2's button and the mouse's
 KF_B    = $10		; column 3's B; it is also the row joystick 1's fire pulls
 COL_F   = %11110111	; PA3: B
+COL_G   = %11101111	; PA4 and PA6: only for keys the controls menu
+COL_H   = %10111111	; may bind (gpu64_game_controls.inc)
 KD_LARR = $02		; <- : the stage D test HURT key
 
 ; The mouse: a 1351 in port 1. PA7:6 = 01 connects port 1's pots to the
@@ -463,11 +466,12 @@ K_TRIG_ONCE   = 21
 K_TRIG_MULTI  = 22
 K_TRIG_SECRET = 23
 
-; How many of each this program can hold. E1M1 needs 29 and 26; anything
+; How many of each this program can hold. E1M1 needs 29 and 26, E1M2 32
+; and 25 (MAX_MOV was 32 until E1M2 filled it exactly); anything
 ; past these is counted in DROP on row 16 rather than silently ignored,
 ; because "the level had more doors than the program" is a fact a reader of
 ; the screen needs and not an error.
-MAX_MOV = 32
+MAX_MOV = 40
 MAX_TRG = 32
 FIRE_Q  = 8			; targetnames queued in one frame
 
@@ -550,9 +554,20 @@ HB_EVERY = 64
 	jsr sfxInit			; the KERNAL's 60 Hz IRQ is back
 
 	lda #0
+	sta lvSlot
+
+; The level change comes back here from the intermission (gpu64_game_exit.inc)
+; with lvSlot flipped: everything from SCENE_RESET on is per level, and running
+; all of it again is what guarantees nothing of E1M1 leaks into E1M2.
+levelSetup
+	lda #0
 	jsr dmRow
 	jsr dmText
-	.text "GPU64 E1M1 - THE DOORS WORK"
+	.text "GPU64 "
+	.byte 0
+	jsr lvName
+	jsr dmText
+	.text " - QUAKE ON A C64"
 	.byte 0
 
 ; ======================================================================
@@ -602,16 +617,37 @@ HB_EVERY = 64
 	.text "LOAD    "
 	.byte 0
 
+loadLevel
 	#argw 0, MESH_BASE
 	#argw 2, NODE_BASE
 	#argw 4, CAM_ID
+	; ARG6 is the Pi's preloaded file: 0 is RAD/level.g64lev (E1M1), 1 is
+	; RAD/level2.g64lev (E1M2). ARG7 = ARG6 ^ $5A or the Pi takes slot 0.
+	lda lvSlot
+	sta ARG+6
+	eor #$5a
+	sta ARG+7
 	lda #KEY_DESTRUCTIVE
 	sta ARG+15
 	lda #OP_LOAD_LEVEL
 	jsr cmd1
 	sta loadErr
 	beq loadArmed
-	jsr showLoadErr
+	; A card without level2.g64lev answers BAD_ARGS for slot 1: play E1M1
+	; again rather than end the game at its exit.
+	ldx lvSlot
+	beq +
+	cmp #ERR_BAD_ARGS
+	bne +
+	lda #0
+	sta lvSlot
+	lda #0
+	jsr dmRow
+	jsr dmText
+	.text "GPU64 E1M1 - NO RAD/LEVEL2.G64LEV   "
+	.byte 0
+	jmp loadLevel
++	jsr showLoadErr
 	jmp finish
 
 loadArmed
@@ -808,6 +844,7 @@ setupShown
 ; sent in.
 ; ======================================================================
 frame
+	jsr clkPace
 	jsr clkFrame
 	jsr exFrame			; the play time, the message row
 	jsr simWarp
@@ -817,15 +854,22 @@ frame
 	jsr gameTouch			; what the new position opens
 	jsr combatTouch			; what it picks up
 	jsr envFrame			; what it is standing in
+	lda tick			; the rest of the logic runs on ticks
+	beq frNoTick1			; (tickFrame)
+	jsr tickLogic
 	jsr gameAnimate			; state machines, and the new ofs
+frNoTick1
 	ldx #MS_GAME
 	jsr clkLap
 	jsr sendMovers			; SET_POSITION for what moved
+	lda tick
+	beq frNoTick2
 	jsr combatFrame			; weapons, a shot's traces, the HUD
 	jsr aiFrame			; monsters think; their traces and moves
 	jsr actFrame			; animate, repair one, WORLD_TICK
 	jsr combatResolve		; the shot, from the traces' answers
 	jsr aiResolve			; the monsters', from theirs
+frNoTick2
 	jsr sendCamera
 	jsr sendView			; SET_PERSPECTIVE, if + or - moved it
 	jsr doRefresh			; one piece of retained state, re-sent
@@ -1492,7 +1536,10 @@ cmAir
 	; The void. Outside the map's hull nothing is solid and nothing is a
 	; floor, so the player falls at terminal speed for the rest of the
 	; session -- run 39's black HDMI screen with the C64 still counting,
-	; at Y -205. No real drop in E1M1 takes VOID_FRAMES.
+	; at Y -205. No real drop in E1M1 takes VOID_FRAMES. Counted in
+	; ticks, so the limit is the same time at any frame rate.
+	lda tick
+	beq cmDone
 	inc airFrames
 	lda airFrames
 	cmp #VOID_FRAMES
@@ -1836,6 +1883,18 @@ rkNoPots
 	ora CIA_PRB
 	ora p1Mask
 	sta keyF
+	lda #COL_G
+	sta CIA_PRA
+	lda CIA_PRB
+	ora CIA_PRB
+	ora p1Mask
+	sta keyG
+	lda #COL_H
+	sta CIA_PRA
+	lda CIA_PRB
+	ora CIA_PRB
+	ora p1Mask
+	sta keyH
 
 	lda #$ff
 	sta CIA_PRA
@@ -1844,6 +1903,11 @@ rkNoPots
 	lda #COL_POT1		; port 1's pots measure until the next frame
 	sta CIA_PRA
 	cli
+
+	; The controls menu's bindings, onto the default keys' bits -- so
+	; everything below and after reads W/S/A/D/Q/E/SHIFT/SPACE as before.
+	; Before the stick, which replaces the keyboard with those same bits.
+	jsr kbRemap
 
 	; The stick: off centre, it replaces the keyboard.
 	lda joy2
@@ -4265,6 +4329,29 @@ clkLap
 +
 	rts
 
+; The frame limiter: a frame never takes less than PACE_MS. The game's
+; pace no longer depends on it -- motion is scaled by dt and everything that
+; counts runs on the game tick (tickFrame) -- so this only keeps a turbo CPU
+; (the C64U's 64MHz mode, or any accelerator) from spinning faster than
+; HDMI's 60 Hz can show, and keeps dtMs above DT_MIN. The CIAs keep their
+; 1MHz clock in turbo, so this wait is in real milliseconds. At 1MHz a
+; frame is already longer and the wait falls straight through. Only the
+; main loop paces; clkFrame's other callers just re-mark.
+PACE_MS = 16
+	.cerror PACE_MS < DT_MIN, "a paced frame must measure at least DT_MIN"
+clkPace
+	jsr clkNow
+	lda msFrameMark
+	sec
+	sbc msNow
+	tax
+	lda msFrameMark+1
+	sbc msNow+1
+	bne +				; 256ms or more: long past the limit
+	cpx #PACE_MS
+	bcc clkPace
++	rts
+
 ; The frame period, measured start to start, and the one reading here that
 ; is not a phase: it includes whatever the loop spends outside the four
 ; phases as well. Re-marks BOTH clocks, so the first phase of the new frame
@@ -4311,7 +4398,8 @@ dtFrame
 	bcc +
 	lda #DT_MAX
 +	sta dtMs
-	tax
+	jsr tickFrame
+	ldx dtMs
 	lda walkT,x
 	sta walkStep
 	lda runT,x
@@ -4335,6 +4423,49 @@ dtFrame
 	rol turnD+1
 	.endrept
 	sta turnD
+	rts
+
+; The game tick. Logic that counts FRAMES -- door waits, weapon cooldowns,
+; the AI's think cadence, actor animation, the message and flash timers,
+; the void counter -- runs only on a tick frame, once per DT_REF ms of real
+; time, and sees a dt of DT_REF (tickLogic). Everything a frame SHOWS --
+; the player's move, the camera, water, the render -- runs every frame on
+; the real dtMs. So the render rate is free (60 Hz on a fast enough turbo)
+; and the game's pace is bound to time at any clock.
+;
+; A frame of DT_REF or longer is a tick of its own length, exactly as every
+; frame was before the tick existed: at 1 MHz, and in runsim at
+; --frame-ms=32, every frame ticks and nothing changes. Shorter frames add
+; up in tickAcc until DT_REF is due.
+tickFrame
+	lda dtMs
+	cmp #DT_REF
+	bcc +
+	sta tickDt			; a slow frame: one tick, its own length
+	lda #1
+	sta tick
+	rts
++	adc tickAcc			; (C clear)
+	cmp #DT_REF
+	bcc +
+	sbc #DT_REF			; (C set)
+	sta tickAcc
+	lda #DT_REF
+	sta tickDt
+	lda #1
+	sta tick
+	rts
++	sta tickAcc
+	lda #0
+	sta tick
+	rts
+
+; On a tick frame, after the player's own move: the tick's dt replaces the
+; frame's for everything logic scales (dtMul, the doors).
+tickLogic
+	lda tickDt
+	sta dtMs
+	sta doorStep
 	rts
 
 ; The per-frame steps by dtMs, rounded down as dtMul would.
@@ -5267,6 +5398,7 @@ resErr		.byte 0
 camErr		.byte 0
 loopErr		.byte 0
 loadErr		.byte 0
+lvSlot		.byte 0		; the Pi's level file: 0 E1M1, 1 E1M2
 stepErr		.byte 0
 stepPct		.byte 0
 stepCt		.word 0
@@ -5319,6 +5451,9 @@ keyD		.byte 0
 stepLo		.byte 0
 bmChk		.byte 0
 dtMs		.byte DT_REF
+tick		.byte 1			; this frame is a game tick (tickFrame)
+tickAcc		.byte 0			; ms toward the next tick, < DT_REF
+tickDt		.byte DT_REF		; the tick's dt
 dtX		.byte 0
 dtR		.fill 3, 0
 walkStep	.byte WALK
@@ -5626,6 +5761,8 @@ lastNodeH	.byte 0
 keyA		.byte 0
 keyE		.byte 0
 keyF		.byte 0
+keyG		.byte 0
+keyH		.byte 0
 port1		.byte $ff
 mouseSeen	.byte 0
 mouseProbe	.byte 0		; 0: the first frame probes
@@ -5691,22 +5828,20 @@ sinHi
 	.include "gpu64_demo_rt.inc"
 
 ; ----------------------------------------------------------------------
-; Past the code: the three SID tunes, relocated by tools/sidreloc.py so
-; they sit together under BASIC, and the RLE-packed HONDANI logo
-; (tools/hondani.py). The PRG loads contiguously up to the logo's end;
-; the logo unpacks into VIC bank 3 ($cc00 / $e000), which nothing else
-; uses. The .bin files carry a two-byte load address, skipped here.
+; Past the code: E-Quake tune 1, relocated to $a000 by tools/sidreloc.py
+; so it sits under BASIC, and the RLE-packed HONDANI logo (tools/hondani.py).
+; The one tune plays on the title and at the intermission. The PRG loads
+; contiguously up to the logo's end; the logo unpacks into VIC bank 3
+; ($cc00 / $e000), which nothing else uses. The tune's .bin carries a
+; two-byte load address, skipped here.
 ; ----------------------------------------------------------------------
-	.cerror * > $a000, "the game's code has grown into the tunes at $a000"
-	* = $a000
-	.binary "gpu64_tune_a000.bin", 2	; E-Quake tune 2, init $a000
-	.cerror * > $a900
-	* = $a900
-	.binary "gpu64_tune_a900.bin", 2	; E-Quake tune 1, init $a900
-	.cerror * > $b300
-	* = $b300
-	.binary "gpu64_tune_b300.bin", 2	; Quake.sid, init $b300
+	.cerror * > $a000, "the game's code has grown into the tune at $a000"
+	* = TUNE_INIT
+	.binary "gpu64_tune_e1.bin", 2	; E-Quake tune 1, init $a000
 	.cerror * > LOGO_RLE
 	* = LOGO_RLE
 	.binary "gpu64_hondani.bin"
-	.cerror * > LOGO_SCREEN, "the logo's RLE runs into its own screen"
+	; The controls menu and the key remap, also under BASIC -- which is
+	; banked out from `title` to `finish`, the only span that calls them.
+	.include "gpu64_game_controls.inc"
+	.cerror * > LOGO_SCREEN, "the logo and the controls run into the logo's screen"
