@@ -178,6 +178,16 @@ class Level:
             'ofs': (ox, oy, oz), 'kind': kind,
         }
 
+    def map_ent(self, i):
+        """Entity i as the .map numbers it: the gpu64_bank records the
+        converter puts first (tools/quake_assets.py, build_bank) skipped."""
+        if not hasattr(self, 'nbank'):
+            self.nbank = 0
+            while (self.nbank < self.nent and
+                   self.ent(self.nbank)['classname'] == 'gpu64_bank'):
+                self.nbank += 1
+        return self.ent(self.nbank + i)
+
     def player_start(self):
         """(x, y, z, yaw) at eye height, 16.16 -- levelPlayerStart() in the
         firmware. None if the level has no info_player_start."""

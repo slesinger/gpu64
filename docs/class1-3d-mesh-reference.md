@@ -462,10 +462,10 @@ in handshake mode there is no moment between its frames at which the C64 may
 draw into the page that is about to be shown: a class 0 framebuffer op
 issued against a running loop is racing core 1's render of that same page.
 So a HUD, a weapon sprite, a status bar — anything that used to be drawn
-over a finished 3D view with class 0 — cannot be done this way. Either put
-it in the scene (a `SPRITE` node with the unlit flag, positioned in front of
-the camera) or keep it on the C64's own screen, which is where the class-1
-Quake demo puts its report. This is a real limitation of the stage-16 loop,
+over a finished 3D view with class 0 — cannot be done this way. Put it in
+the scene as a view-space node (see [View space](#view-space-the-gun-and-the-status-bar)),
+which is how the Quake game draws its gun and status bar, or keep it on
+the C64's own screen. This is a real limitation of the stage-16 loop,
 not an oversight; immediate mode (`DRAW_MESH`/`DRAW_NODE` with the loop
 stopped) has no such restriction and can still be overlaid freely.
 
@@ -535,6 +535,85 @@ poll of `STATUS` bit 4 is a plain read that costs nothing. So the dispatch
 column is also the count of times per frame the C64 stops dead — and the
 frame those six commands describe is rendered on core 1 while the C64 keeps
 running, which is the part immediate mode cannot do at any price.
+
+*The room predates view space.* Its class 2 HUD had no class 1 equivalent
+when it was measured, so its class 1 port left the HUD out. A view-space
+node now draws a HUD inside the scene; see
+[Porting a class 2 program](#porting-a-class-2-program) for what a full
+game costs.
+
+## Porting a class 2 program
+
+This section maps each class 2 idea to its class 1 equivalent and lists
+the extra work a retained scene asks of your program. The worked example
+is the Quake game (`Source/Demos/gpu64_demo_game.a`), written for class 1
+from the start. It does everything the class 2 Quake demo did and much
+more.
+
+**Do not port column-cast programs.** `DRAW_COLUMNS`, `DRAW_WALLS` and
+`DRAW_SECTORS` have no class 1 equivalent and will not get one. The
+Doom-style demos stay on class 2, which is frozen but not removed.
+
+### Construct by construct
+
+| Class 2, every frame | Class 1, once, then only on change |
+|---|---|
+| `FILL_VIEW` to start the frame | Nothing. The loop clears the view and depth buffer itself. |
+| `SET_CAMERA3D` | A camera node: `CREATE_CAMERA`, then `SET_POSITION` / `SET_ORIENTATION` when the eye moves. |
+| `UPLOAD_POLYS` + `DRAW_WORLD` over the visible range | A mesh uploaded once and an object node per piece, or the whole level with `LOAD_LEVEL` / `LEVEL_STEP`. The Pi culls by Quake's PVS itself, so there is no visible range to compute. |
+| `DRAW_THINGS` batch | One `SPRITE` node per thing (`CREATE_SPRITE`, `SET_SPRITE`). Directional things use flag bit 0. A thing that walks costs one `SET_POSITION`. |
+| `SET_LIGHT` slot | A `LIGHT` node (`CREATE_LIGHT`, `SET_POINT_LIGHT`), switched with `SET_VISIBLE`. |
+| Class 0 HUD drawn over the view | A view-space node (pose flag `$02`), unlit. Class 0 drawing is `BUSY` while the loop runs. |
+| `PAGE_FLIP` + vblank wait | `SCENE_COMMIT`, paced by `STATUS` bit 4 (`FRAME_READY`). |
+| Many movers, sent one by one | One `WORLD_TICK` block per frame (`$6C`): actors, movers, line-of-sight traces and monster steps together. |
+
+### What a retained scene asks of you
+
+Immediate mode repairs itself: a lost write spoils one frame, and the next
+frame sends everything again. A retained scene keeps a lost write
+**forever**, because nothing re-sends it. That shifts some work onto your
+program.
+
+- **Pace on `FRAME_READY`.** Commit once per ready frame, and poll
+  `STATUS`, which is a plain read that does not halt the C64. If you commit
+  flat out, about four commits in five are refused with `BUSY`.
+- **Check `SEQACK` on every node update, and resend the whole command.**
+  Do not retry `SCENE_COMMIT` itself; a commit that did land would answer
+  `BUSY`.
+- **Refresh from a shadow copy.** Keep your own copy of every retained
+  value, and rewrite a few entries of it each frame, round-robin. That
+  gives any lost write a bounded lifetime. See
+  [state-refresh.md](state-refresh.md).
+- **Key the destructive opcodes.** `SCENE_RESET`, `LOOP_STOP`,
+  `FREE_RESOURCE`, `DESTROY_NODE` and `LOAD_LEVEL` need `ARG15` = `$A5`
+  (see "The key byte"). A phantom one would otherwise wipe the scene.
+- **Bound every answer you read back.** A dropped argument byte can make a
+  well-formed reply mean the wrong thing. Range-check it before you act on
+  it.
+
+### What it costs
+
+The measurement below is the Quake game on E1M1, from `tools/prgsim`. It
+is marginal: a 200-frame run subtracted from a 400-frame one, at a fixed
+32 ms frame.
+
+| Per frame | Dispatches | Register writes |
+|---|---|---|
+| Class 1 | 7.9 | 90 |
+| Class 0 (`GET_HEALTH`) | 0.14 | 0.9 |
+
+The traffic is the same whether the player stands still or moves. That is
+deliberate: the game spends its bus budget on robustness rather than
+saving it.
+- The camera goes out twice a frame, so one lost write cannot move the eye.
+- Two refresh rings each rotate one entry a frame.
+- The `WORLD_TICK` block carries every monster, door and trace.
+
+Compare the class 2 room: 11 dispatches and 102 writes per frame, for one
+room, two monsters and no doors, and every one of those frames halted the
+C64 while it was drawn. The class 1 game draws a whole Quake level with
+its monsters, doors, lights, gun and status bar on core 1, and the C64
+keeps running while it does.
 
 ## Mesh format
 

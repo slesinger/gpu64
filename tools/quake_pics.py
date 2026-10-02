@@ -131,6 +131,13 @@ def build(pak_f, pak_ents, pak_read):
     add('PAUSE', pause)
     sym['PAUSE_X'] = (320 - pause[0]) // 2
     add('PM_RESUME', text(font, 'RESUME'))
+    # The skill menu's start-level line, one picture per pack slot: the
+    # game draws PIC_LV_E1M1 + slot.
+    for i in range(8):
+        add('LV_E1M%d' % (i + 1), text(font, 'LEVEL E1M%d' % (i + 1)))
+    # The pause menu's third line, back to the skill menu. After the level
+    # lines so every earlier picture keeps its number.
+    add('PM_MAINMENU', text(font, 'MAIN MENU'))
     sym['PIC_COUNT'] = len(pics)
     # Where the logo sits on both screens, and its palette base.
     sym['LOGO_X'], sym['LOGO_Y'] = hondani.X, hondani.Y

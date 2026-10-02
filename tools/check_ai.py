@@ -104,7 +104,7 @@ def main():
     lev = gpu64level.Level(open(level, 'rb').read())
 
     def spawn(i, cls):
-        e = lev.ent(i)
+        e = lev.map_ent(i)
         if e['classname'] != cls:
             sys.exit('check_ai.py: entity %d is %s, not %s'
                      % (i, e['classname'], cls))

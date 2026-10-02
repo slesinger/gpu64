@@ -823,6 +823,224 @@ FULL_RESET or CREATE) marks it lost, and it is re-created on the next frame.
   `finish` with its RUN/STOP waits skipped. Its matrix scans run the whole
   `--stop-after` schedule through at once.
 
+## Episode 1 in the pack, and a start-level line (2026-09-30)
+
+Progress tracker section 96 has the run log.
+
+**The pack.** It holds E1M1-E1M8 in slots 0-7, about 12.5 MB, so RAD sizes
+the REU to 16 MB. That is RAD's largest REU and the firmware's slot limit,
+so there is no room for start.bsp as a ninth level. E1M7 exits to slot 0.
+
+**Exits follow the map.**
+- The converter writes each trigger_changelevel's `map` into P1 as the
+  number N of `e1mN`, or 0 for anything else.
+- `etTrig` keeps it in `trDest`, and `exTrig` copies it into `exitDest`
+  when the trigger fires.
+- `imLeave` loads slot `exitDest - 1`, or slot 0 when it is 0.
+- E1M4's secret exit therefore goes to E1M8, and E1M8's exit goes back to
+  E1M5, as in Quake.
+- A slot the pack does not hold makes LOAD_LEVEL answer BAD_ARGS. The game
+  then loads E1M1 and says so on row 0.
+
+**Table limits.** The largest map needs are 58 movers (E1M6), 45 triggers
+(E1M4) and 4 counters (E1M4). The limits are now MAX_MOV = 60 and
+MAX_TRG = 48; MAX_CNT stays 4.
+- A mover costs 62 bytes and a trigger 17.
+- The main block had no room for both. The seventeen trigger tables moved above
+  the tune, after the pause menu: `$BA26-$BD55`, checked against PM_SCR.
+- The main block ends at `$9C6B`, 916 bytes below the tune at `$A000`.
+
+**Buttons with no travel.** E1M3's pressure plate (entity 202) and E1M4's
+two shootable buttons (458, 459) are 4 units thick with lip 4. Quake's
+formula gives them zero travel, and `etMover` drops zero-travel movers, so
+nothing could fire them. The converter gives such a button 1 unit of travel.
+
+**The start-level line.** The skill menu has six lines:
+1. EASY
+2. NORMAL
+3. HARD
+4. NIGHTMARE
+5. LEVEL E1Mn
+6. CONTROLS
+
+Fire on the level line steps `lvSlot` through 0-7. Fire on a skill starts
+the chosen level.
+- On HDMI the line is `PIC_LV_E1M1 + lvSlot`, eight pictures in the
+  converter's picture section.
+- On the C64 it is printed with `lvName`.
+- `title` resets `lvSlot` to 0, so every power-on starts on E1M1.
+
+**MAIN MENU in the pause menu.** The pause menu's third line returns to the
+skill menu, so the skill or the start level can be changed without a reset.
+- `pmMainMenu` drops `pauseCheck`'s return address, as the intermission's
+  `imLeave` does, then runs the title's tail: `tiSaveVic`, `tiMusicOn`,
+  `tiMenu`, `tiLoading`, `tiMusicOff`, `tiRestoreVic`, `tiSkillSet`, `sfxInit`,
+  and `jmp levelSetup`.
+- The loop is already stopped by the pause, which is what `levelSetup` needs.
+  The C64 screen saved at `$C400` is abandoned; `levelSetup` draws its own.
+- `combatInit` resets the player there, so it is a new game, not a level skip
+  that keeps the weapons.
+- The menu opens with the cursor on the current skill and the current
+  `lvSlot`, which the intermission advances, so the level line shows the level
+  being played.
+- Its HDMI label is `PIC_PM_MAINMENU` (121), appended after the level names so
+  the earlier picture ids hold. CAT_HASH is now `$89f1`.
+- The block sits after `pmResume`: placed before it, it pushed the menu
+  loop's `beq pmResume` branches out of range.
+
+**Testing it.**
+- runsim `--reu` fills every pack slot.
+- `--level-slot=N` pokes `SIM_LEVEL` (`$02AE`), which the skipped title
+  uses as the start slot.
+
+**Textures.** Quake has non-power-of-two textures:
+- 128x192 doors
+- 48x48 buttons
+- 240x192 and 256x192 walls
+
+gpu64 cannot sample them, and they used to fall back to a flat colour. That
+flat colour was E1M2's light-blue doors. The converter now resamples each
+one to the nearest power of two on a log scale, and scales its UVs to
+match.
+
+**Monsters.** At first only grunts and dogs had assets and AI. The
+monster expansion below added ogres, knights, fiends and shamblers. Zombies
+and scrags still do not spawn.
+
+## Monster expansion stage 1 as built (2026-10-02)
+
+**Why per-level banks.** A fixed catalogue carrying all eight monster types'
+frames would push mesh indices past the u8 the C64 stores, and would load
+every type into every level. Instead, each level carries only what its map
+places:
+
+- `quake_assets.build_bank()` appends the types after the fixed catalogue.
+- One `gpu64_bank` entity per type (kind 18) names them.
+- The firmware passes the payload through `LEVEL_ENT` untouched, so the
+  firmware did not change.
+
+The payload is 24 bytes, in origin then ofs/travel:
+
+| Bytes | Content |
+|---|---|
+| 0..15 | per slot (STAND, RUN, MELEE, LEAP, SHOOT, PAIN, DEATH, DEATHB): first mesh u8, then count u8 |
+| 16 | MELEE hit frame (in kept frames) |
+| 17 | SHOOT hit frame (in kept frames) |
+| 18 | frame step |
+
+Bank records are first in the entity table, ahead of any monster;
+`gpu64level.Level.map_ent()` gives tools the Quake entity numbering back.
+
+**Why every other frame.** The new four keep half their frames (step 2), and
+the C64 halves their animation rate (`mtSlowMask`), so an animation lasts as
+long as Quake's. Grunt and dog stay at step 1, which leaves E1M1
+byte-for-byte the same in behaviour. Every level stays under 2 MB, and no
+textures had to be shared.
+
+**Why attacks are slots.** The C64 has three attack behaviours: the grunt's
+hitscan volley, the dog's bite, and the dog's leap. A type has an attack
+when its bank fills that slot, and how hard it hits comes from per-type
+tables in `gpu64_game_monsters.inc`. So:
+
+| Type | Attacks | Stage 2 replaces |
+|---|---|---|
+| ogre | chainsaw (MELEE) and a 3-pellet volley (SHOOT) | the volley, with grenades |
+| knight | sword (MELEE) | |
+| fiend | claws (MELEE) and a leap (LEAP) | |
+| shambler | smash (MELEE) and a 3-pellet volley (SHOOT) | the volley, with lightning |
+
+HP is 16-bit, because the shambler has 600. The large hull (ogre, fiend,
+shambler) widens the fire cone and the pellet box.
+
+**Stage 2** (below) replaced the ogre's volley with grenades; the shambler
+keeps its volley by decision.
+
+**Known limit.** The 61 world actor slots fill on E1M2, E1M4 and E1M5, so a
+few monsters late in the entity order are not placed (see
+progress_tracker §100).
+
+## Monster expansion stage 2 as built (2026-10-02)
+
+Scope as agreed: projectiles (the ogre's grenade, the scrag's spike, the
+zombie's gib), the scrag's flight, the zombie's rules, and zombies and scrags
+spawning through their banks. The shambler keeps its hitscan volley; its
+lightning is not a projectile.
+
+**Missiles are actor slots.** `gpu64_game_proj.inc` reserves `PJ_N` = 4
+slots after the level's own (`pjInit` after `entScan`, kind `K_PROJ` = 29,
+under every item kind so no pickup, respawn or backpack logic takes one).
+They are created hidden at setup like any other actor, so `WORLD_TICK`
+poses them and nothing new crosses the bus. `MAX_ACT` went 80 → 84 and
+`actTake` stops at `MAX_ACT - PJ_N`, so the level still gets 61 world
+slots; actor node ids are now 2..85, still under `NODE_BASE` 100.
+
+**The C64 flies them; the Pi only says where they stop.** Per frame each
+live missile moves by its velocity times `dtMs/32` (`dtMulS`) and is tested
+against the player's box on the C64. A missile with no answer yet asks one
+hull-0 trace from where it is along 64 frames of its velocity, riding the
+AI's trace budget in the same `WORLD_TICK` block: `pjFrame` runs first in
+`aiFrame`, so missiles take precedence over monster traces.
+`AI_MAXTR` went 4 → 5 to make room, and the query budget
+(`CB_NCAND + AI_MAXTR + AI_MAXMV` = 14 ≤ 15) is now cerror-guarded. The
+answer's fraction becomes the flight's remaining life. A dropped or junk
+answer just means it asks again next frame, so a bus fault costs at most a
+frame of not knowing about a wall.
+
+| Kind | Mesh | Flight | On the player | At the end |
+|---|---|---|---|---|
+| grenade (ogre) | `M_GRENADE` | lobbed, stops where the player stood | bursts | bursts: 40 − d/16 within 640 fine (80 QU), through walls; `SFX_BOOM`; the muzzle-flash light at the blast for 6 frames |
+| gib (zombie) | `M_ZOM_GIB` | lobbed, stops where the player stood | 10 | vanishes |
+| spike (scrag, 2 a burst) | `M_W_SPIKE` | straight | 9 | vanishes |
+
+Speed is Quake's 600 QU/s (`PJ_SPEED` 154 fine per 32 ms frame). The flight
+time is (horizontal distance + |dy|/2) / speed, which is the true distance to
+within 7% on the level and up to half short when steep. The lob is drawn
+over the straight line: upward speed `PJ_G·(T−1)/2` falling by `PJ_G` per
+32 ms, so it is back on the line at T. The arc itself is not traced, so a lob
+can graze a low ceiling, and a grenade does not bounce.
+
+**Shots are counted.** `aoShoot` fires on `mtShootF + acFired` while
+`acFired < mbShots`, which is how the scrag gets two spikes from one SHOOT
+animation; `mbProj` picks a missile kind or the hitscan volley.
+
+**Scrag flight.** A flyer's move is mode $01, a slide that does not settle on
+a floor. Each move also climbs or sinks `FLY_STEP` (64 fine) to keep its
+origin `FLY_LO..FLY_HI` (64..144 fine) over the player's eye, and it skips
+the ONGROUND rejection. A dead flyer gets `acLeapT = FALL_N` (30) and spends
+it on `aiFallReq`, one `FALL_STEP` (256 fine) move straight down, mode $05,
+every other frame. It stops when the move lands or is refused (SOLID or
+the bound).
+
+**Zombie rules.** A zombie never loses HP. Damage ≥ `ZB_KILL` in one hit
+kills it; ≥ `ZB_DOWN` (25) plays its DEATHB, which in Quake is the whole
+fall-and-rise, as a one-shot pain; less flinches; a hit while already in
+pain is ignored. **Deviation:** Quake's threshold is 60 (a rocket or
+grenade). There are no player explosives here and the super shotgun peaks at
+56, so 48 makes it killable by a point-blank super shotgun. The dead zombie
+is forced onto DEATH, never DEATHB, which gets up.
+
+**Memory.** The under-BASIC block was 1050 B over after the first version.
+Two fixes closed it: a compact rewrite (`pjGet`/`pjPut` and loops instead of
+unrolled per-axis code), and moving the trigger tables plus all missile
+state into a `.virtual` block at `LOGO_SCREEN` ($cc00-$cfe7, `PJ_VARS` =
+$cf30). That screen is only read by the title (`tiLogo` → `tiUnpackLogo`),
+which runs before `entScan`/`pjInit` write those tables, so the overlap is
+safe as long as that order holds; a cerror guards `LOGO_SCREEN + 1000`.
+Main code ends at $9e80 (384 B free), and the under-BASIC block at ~$c30f
+(~240 B below `PM_SCR`).
+
+**Verified on the PC** (runsim `--log-node`/`--log-mem`, both added for this):
+
+- On E1M3, gibs fly as `M_ZOM_GIB` and land for 10.
+- Ogre grenades burst at the end of flight for 31-32, with light 90 at 6/6400
+  for 6 frames.
+- Scrag spikes come in pairs and land for 9.
+- A shot-down scrag falls 2.7 units to the floor.
+- A shotgunned zombie (24 max) flinches indefinitely.
+- check_monsters passes E1M3 and E1M7; on E1M2 only the fiend fails (it
+  is in a closet).
+- check_sfx passes.
+
 ## Risks
 
 - **Frame rate.** The game renders at about 32 fps on the bench. A room of

@@ -29,6 +29,7 @@ u32       gpu64LevelSlotCount = 0;
 static const char GPU64_LEVEL_DRIVE[]     = "SD:";
 static const char GPU64_LEVEL_FILENAME[]  = "SD:RAD/level.g64lev";
 static const char GPU64_LEVEL_FILENAME2[] = "SD:RAD/level2.g64lev";
+static const char GPU64_LEVEL_PACKFILE[]  = "SD:REU/quake.reu";
 
 // One file into one buffer; returns its size, or 0 if it was not loaded.
 static u32 levelPreloadOne( const char *pName, u8 *pBuf, boolean bRequired )
@@ -90,21 +91,18 @@ static u32 levelFnv( const u8 *p, u32 n )
 	return h;
 }
 
-// The level pack: every level in one .reu image, selected as the REU image
-// in the RAD menu, which rad_main.cpp has read into reuMemory by the time
-// this runs. The slots point straight into it -- the levels are used where
-// they lie, so a program that DMAs into REU space over them destroys them
-// (the game never touches the REU). Returns the slots filled, 0 when the
-// REU holds no pack or a broken one; a broken pack fills nothing, rather
-// than some levels, so a bad image is never half-believed.
-static u32 levelFromPack( void )
+// The level pack: every level in one .reu image, either selected as the
+// REU image in the RAD menu -- which rad_main.cpp has read into reuMemory by
+// the time this runs -- or read from the card by levelPackFromSd(). The
+// slots point straight into it: the levels are used where they lie, so a
+// program that DMAs into REU space over them destroys them (the game never
+// touches the REU). Returns the slots filled, 0 when pImg holds no pack or
+// a broken one; a broken pack fills nothing, rather than some levels, so a
+// bad image is never half-believed.
+static u32 levelFromPack( const u8 *pImg, u32 nSize )
 {
 	extern CLogger *logger;
-	extern u8 *reuMemory;
-	extern u32 REU_SIZE_KB;
 
-	const u8 *pImg  = reuMemory;
-	const u32 nSize = REU_SIZE_KB * 1024;
 	if ( pImg == 0 || nSize < GPU64_PACK_HEADER
 	     || gpu64_levelRd32( pImg ) != GPU64_PACK_MAGIC )
 		return 0;
@@ -119,8 +117,8 @@ static u32 levelFromPack( void )
 	        != gpu64_levelRd32( pImg + 12 ) )
 	{
 		logger->Write( "gpu64", LogNotice,
-			"Level pack: bad header (v%u, %u levels, %u bytes in a %u KB REU)"
-			" -- using the SD files", nVer, nCount, nImg, (unsigned)REU_SIZE_KB );
+			"Level pack: bad header (v%u, %u levels, %u bytes in %u KB)"
+			" -- using the SD files", nVer, nCount, nImg, (unsigned)( nSize / 1024 ) );
 		return 0;
 	}
 
@@ -152,6 +150,76 @@ static u32 levelFromPack( void )
 	return nCount;
 }
 
+// The pack straight off the card, for when the REU image is not one. The
+// menu forgets its image selection every time it opens (initMenu()), and
+// T, + and - clear it too, so "select quake.reu, then launch the game" held
+// only when both happened in one menu visit -- and STARTUP REU1M boots with
+// no image at all. The bench never had the pack: slots 2-7 answered
+// BAD_ARGS and every start level became E1M1 (2026-09-30).
+//
+// Read once, at Pi start-up (rad_main.cpp, right after readConfig()), never
+// from the launch path: there the read sits between the C64's reset release
+// and the READY-prompt wait, and at 12.5 MB it left the bench at a BASIC
+// screen with the game never injected (2026-09-30, second round).
+//
+// It sits at the top of mempool, above everything the C64 can reach for REU
+// sizes up to 2 MB: REU DMA wraps at the REU size, and at 512 KB for the
+// 128-512 KB sizes. A larger REU, a blank REU's memset, a loaded image or
+// GeoRAM can all overwrite it, which is why levelPackHeld() re-verifies
+// every checksum on each use instead of trusting the boot read.
+static u32 s_PackBase  = 0;
+static u32 s_PackBytes = 0;
+
+void gpu64_levelPackReadAtBoot( void )
+{
+	extern CLogger *logger;
+	extern u8 mempool[];
+	extern u32 mempoolBytes;
+
+	u32 nBytes = 0;
+	if ( !getFileSize( logger, GPU64_LEVEL_DRIVE, GPU64_LEVEL_PACKFILE, &nBytes ) )
+		return;
+	if ( nBytes < GPU64_PACK_HEADER || nBytes > mempoolBytes - 8192 - 0x80000 )
+	{
+		logger->Write( "gpu64", LogNotice, "Level pack: %s is %u KB -- does not fit, not read",
+			GPU64_LEVEL_PACKFILE, (unsigned)( nBytes / 1024 ) );
+		return;
+	}
+
+	const u32 nBase = ( mempoolBytes - 8192 - nBytes ) & ~4095u;	// below the pool's 8 KB slack
+	u32 nRead = 0;
+	if ( !readFile( logger, GPU64_LEVEL_DRIVE, GPU64_LEVEL_PACKFILE, mempool + nBase, &nRead )
+	     || nRead != nBytes )
+		return;
+
+	s_PackBase  = nBase;
+	s_PackBytes = nBytes;
+	logger->Write( "gpu64", LogNotice, "Level pack: %s read from the card, %u KB at +%u KB",
+		GPU64_LEVEL_PACKFILE, (unsigned)( nBytes / 1024 ), (unsigned)( nBase / 1024 ) );
+}
+
+static u32 levelPackHeld( void )
+{
+	extern CLogger *logger;
+	extern u8 mempool[];
+	extern u32 REU_SIZE_KB;
+
+	if ( s_PackBytes == 0 )
+		return 0;
+
+	u32 nReach = REU_SIZE_KB * 1024;
+	if ( nReach < 0x80000 )
+		nReach = 0x80000;
+	if ( s_PackBase < nReach )
+	{
+		logger->Write( "gpu64", LogNotice,
+			"Level pack: a %u KB REU overlaps the card's pack -- using the SD files",
+			(unsigned)REU_SIZE_KB );
+		return 0;
+	}
+	return levelFromPack( mempool + s_PackBase, s_PackBytes );
+}
+
 // Slot 1 is optional: it is the level a game changes to (E1M2), held in RAM
 // from boot for the same reason slot 0 is -- the card cannot be touched once
 // the polling loop runs. LOAD_LEVEL picks the slot (gpu64_3d_class1.cpp).
@@ -166,7 +234,11 @@ void gpu64_levelPreload( void )
 		gpu64LevelSlotBytes[ i ] = 0;
 	}
 
-	gpu64LevelSlotCount = levelFromPack();
+	extern u8 *reuMemory;
+	extern u32 REU_SIZE_KB;
+	gpu64LevelSlotCount = levelFromPack( reuMemory, REU_SIZE_KB * 1024 );
+	if ( gpu64LevelSlotCount == 0 )
+		gpu64LevelSlotCount = levelPackHeld();
 	if ( gpu64LevelSlotCount )
 		return;
 

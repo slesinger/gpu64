@@ -5,9 +5,9 @@
 ;
 ; <- held for PAUSE_HOLD frames stops the render loop (as the intermission
 ; does: LEVEL_PICTURE answers BUSY under a running loop) and draws Quake's
-; menu over the faded console -- the plaque, PAUSED, RESUME and CONTROLS
-; with the spinning dot -- redrawn whole every tick so a lost picture is
-; back a tick later. The C64 shows the same menu in text; its game screen
+; menu over the faded console -- the plaque, PAUSED, RESUME, CONTROLS and
+; MAIN MENU with the spinning dot -- redrawn whole every tick so a lost
+; picture is back a tick later. The C64 shows the same menu in text; its game screen
 ; is saved to $c400/$c800 first and put back on the way out.
 ;
 ; RESUME, or <- pressed again, goes back to the frame loop: LOOP_START,
@@ -15,6 +15,10 @@
 ; enormous frame of motion. Nothing in the retained scene is touched --
 ; LOOP_STOP only stops the loop, and the next commit draws the level
 ; exactly where it was. CONTROLS is the skill menu's controls screen.
+; MAIN MENU is the skill menu itself, to change the skill or the level:
+; it leaves the frame loop for good, as the intermission's next level
+; does, and comes back in through levelSetup -- a new game, since
+; combatInit resets the player there.
 ;
 ; A pick by fire or SPACE waits (at most PM_LEAVE ticks) for the key to be
 ; let go, so the press that resumes does not also fire or jump; <- is
@@ -32,6 +36,8 @@ PM_DEB     = 16			; menu scans in a row that make a <- edge
 PM_LEAVE   = 10			; ticks a pick waits for its key's release
 PM_SCR     = $c400		; the C64 game screen, saved
 PM_COL     = $c800		; ... and its colours
+PM_ITEMS   = 3			; RESUME, CONTROLS, MAIN MENU
+PM_MAIN    = 2
 
 ; ----------------------------------------------------------------------
 ; Once a frame, after the commit.
@@ -106,10 +112,20 @@ pmTick
 	bcc pmTick
 pmKeys
 	lda pmNew
-	and #3				; up or down: two lines, either swaps
+	lsr a
+	bcc +
+	dec pmCur			; up
+	bpl +
+	lda #PM_ITEMS-1
+	sta pmCur
++	lda pmNew
+	and #2
 	beq +
+	inc pmCur			; down
 	lda pmCur
-	eor #1
+	cmp #PM_ITEMS
+	bcc +
+	lda #0
 	sta pmCur
 +	lda pmNew
 	and #4
@@ -119,6 +135,8 @@ pmKeys
 	inc pmLeave			; RESUME
 	bne pmTick
 pmControls
+	cmp #PM_MAIN
+	beq pmMainMenu
 	jsr ctMenu
 	lda #$ff
 	sta tiIn
@@ -141,6 +159,26 @@ pmResume
 	sta msMark+1
 	sta msFrameMark+1
 	rts
+
+; MAIN MENU: the title's own sequence from the skill menu on, then the
+; whole per-level setup. The loop is already stopped (pmStop), and the
+; C64 screen save is simply abandoned -- levelSetup draws its own.
+pmMainMenu
+	pla				; pauseCheck's return into the frame
+	pla				; loop: levelSetup ends by entering it
+	lda #$80			; <- latched until it is seen up
+	sta pmHold
+	lda #$ff			; the pick's fire is not a press
+	sta tiIn
+	jsr tiSaveVic
+	jsr tiMusicOn
+	jsr tiMenu
+	jsr tiLoading
+	jsr tiMusicOff
+	jsr tiRestoreVic
+	jsr tiSkillSet
+	jsr sfxInit
+	jmp levelSetup
 
 ; One tick: IM_TICK_MS, or IM_POLLS scans. pmNew = the menu bits that
 ; went down during it; pmBack = <- pressed (after being seen released).
@@ -236,6 +274,12 @@ pmHdmi
 	jsr tiPicAt
 	lda #1
 	jsr tiPic
+	lda #PIC_PM_MAINMENU
+	ldx #MENU_X
+	ldy #MENU_Y + 2 * MENU_DY + 4
+	jsr tiPicAt
+	lda #1
+	jsr tiPic
 	lda tiTick
 	clc
 	adc #PIC_DOT0
@@ -273,6 +317,11 @@ pmC64Static
 	jsr dmText
 	.text "               CONTROLS"
 	.byte 0
+	lda #13
+	jsr dmRow
+	jsr dmText
+	.text "               MAIN MENU"
+	.byte 0
 	lda #20
 	jsr dmRow
 	jsr dmText
@@ -290,7 +339,7 @@ pmC64Static
 	.byte 0
 	rts
 
-; The cursor and the highlight, rows 9 and 11.
+; The cursor and the highlight, rows 9, 11 and 13.
 pmC64Lines
 	ldx #0
 pclLoop
@@ -319,7 +368,7 @@ pclLoop
 	cpy #25
 	bne -
 	inx
-	cpx #2
+	cpx #PM_ITEMS
 	bne pclLoop
 	rts
 
@@ -368,7 +417,7 @@ pmRestore
 	bne -
 	rts
 
-pmRows		.byte 9, 11
+pmRows		.byte 9, 11, 13
 pmHold		.byte 0		; frames <- down; bit 7: latched after a resume
 pmCur		.byte 0
 pmArm		.byte 0		; <- has been seen released in the menu

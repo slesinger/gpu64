@@ -26,7 +26,7 @@ Options:
                         which commands the bus budget is actually spent on
     --level2=FILE       RAD/level2.g64lev: LOAD_LEVEL slot 1 (ARG6=1, ARG7=$5B)
     --reu=FILE          a level pack (tools/pack_levels.py) as the REU image:
-                        its levels become slots 0 and 1, replacing --level/2
+                        its levels become slots 0..7, replacing --level/2
     --level=FILE        stand in for RAD/level.g64lev on the Pi's SD card, so
                         LOAD_LEVEL/LEVEL_STEP build a real level. Without it
                         LOAD_LEVEL answers BAD_ARGS, as it does on a card that
@@ -133,6 +133,8 @@ Options:
                     for the menu's column-7 reads.
     --skill=N       the skill the skipped menu returns: 0 easy, 1 normal
                     (default), 2 hard, 3 nightmare.
+    --level-slot=N  the start level the skipped menu returns: slot N of
+                    the --reu pack, E1M(N+1). Default 0.
     --hurt=F,F,...  gpu64_demo_game.a: 20 damage to the player at each frame
                     listed (the old <- test key; <- is the pause menu now).
     --sid-log=PATH  write every SID register write ($D400-$D418) to PATH,
@@ -176,6 +178,14 @@ Options:
                     number and a delta.
     --log-light=ID  append scene node ID's light strength/radius to every
                     --frame-log line, as [L<ID> s/r] (- while it is absent)
+    --log-node=ID,..
+                    append each listed scene node's visibility, position (in
+                    whole units) and mesh to every --frame-log line, as
+                    [N<ID> v x,y,z m<mesh>] -- a missile's flight, frame by frame
+    --log-mem=ADDR:N[,ADDR:N..]
+                    append N bytes of C64 RAM at hex ADDR to every --frame-log
+                    line, as [$ADDR hh hh ..] -- take ADDR from the 64tass -L
+                    listing
     --log-rows=A-B  the screen rows a --frame-log line quotes (default
                     20-24), for a demo whose interesting rows are elsewhere
     --ppm-frame=N:PATH
@@ -256,7 +266,8 @@ class Machine:
                  ppm_frames=None, key_script=None, c1_stream=None,
                  level=None, level2=None, reu=None, joy_script=None, mouse_script=None,
                  notarget=False, warp=None, hops=(), frame_ms=None,
-                 telemetry=True, title=False, skill=1, sid_log=None, hurts=()):
+                 telemetry=True, title=False, skill=1, sid_log=None, hurts=(),
+                 level_slot=0):
         self.mem = bytearray(65536)
         self.mem[0x0314], self.mem[0x0315] = 0x31, 0xEA
         self.irq_wait = 0
@@ -269,6 +280,7 @@ class Machine:
         if not title:
             self.mem[0x02AB] = 0xAB
         self.mem[0x02AC] = skill & 3
+        self.mem[0x02AE] = level_slot & 7
         self.gpu = Gpu64Model(self.raw_read, self.raw_write, calibrated=calibrated)
         self.cpu = Cpu6502(self.read, self.write)
         self.stop_polls = 0
@@ -279,6 +291,8 @@ class Machine:
         self.frame_log = frame_log
         self.log_rows = (20, 25)
         self.log_light = None
+        self.log_nodes = []
+        self.log_mem = []
         self.ppm_frames = ppm_frames or {}
         self.frame = 0
         self.cia_pra = 0xFF
@@ -315,6 +329,7 @@ class Machine:
                 slots = pack_levels.unpack(f.read())
             self.gpu.c1_level_data = slots[0][1]
             self.gpu.c1_level_data2 = slots[1][1] if len(slots) > 1 else None
+            self.gpu.c1_level_more = [d for _, d in slots[2:]]
         self.c1_stream = None
         if c1_stream:
             self.c1_stream = open(c1_stream, 'w')
@@ -671,6 +686,16 @@ class Machine:
                                       '%d/%d' % (lit[0].light_strength,
                                                  lit[0].light_radius)
                                       if lit else '-')
+        for nid in self.log_nodes:
+            nd = [n for n in self.gpu.c1_scene.node
+                  if n.type != 0 and n.id == nid]
+            status += '  [N%d %s]' % (nid, '%d %.1f,%.1f,%.1f m%d' % (
+                1 if nd[0].visible else 0, nd[0].pos[0] / 65536.0,
+                nd[0].pos[1] / 65536.0, nd[0].pos[2] / 65536.0,
+                nd[0].mesh_id) if nd else '-')
+        for a, n in self.log_mem:
+            status += '  [$%04x %s]' % (a, ' '.join(
+                '%02x' % self.mem[(a + k) & 0xffff] for k in range(n)))
         print("frame %4d  ink %6d  %s" % (self.frame, ink, status))
 
     def load_prg(self, path):
@@ -909,6 +934,13 @@ def main(argv):
     chain = [o.split('=', 1)[1] for o in opts if o.startswith('--chain=')]
     title = '--title' in opts
     skill = 1
+    level_slot = 0
+    for o in opts:
+        if o.startswith('--level-slot='):
+            level_slot = int(o.split('=', 1)[1])
+            if not 0 <= level_slot <= 7:
+                print('--level-slot is 0 (E1M1) .. 7 (E1M8)')
+                return 2
     for o in opts:
         if o.startswith('--skill='):
             skill = int(o.split('=', 1)[1])
@@ -944,7 +976,7 @@ def main(argv):
                 joy_script=joy_script, mouse_script=mouse_script,
                 notarget='--notarget' in opts, warp=warp, hops=hops,
                 frame_ms=frame_ms, telemetry='--telemetry-off' not in opts,
-                title=title, skill=skill, hurts=hurts,
+                title=title, skill=skill, hurts=hurts, level_slot=level_slot,
                 sid_log=next((o.split('=', 1)[1] for o in opts
                               if o.startswith('--sid-log=')), None))
     m.gpu.c1_clip_fault = clip_fault
@@ -957,6 +989,11 @@ def main(argv):
             m.log_rows = (int(a), int(b) + 1)
         if o.startswith('--log-light='):
             m.log_light = int(o.split('=', 1)[1])
+        if o.startswith('--log-node='):
+            m.log_nodes = [int(v) for v in o.split('=', 1)[1].split(',')]
+        if o.startswith('--log-mem='):
+            m.log_mem = [(int(a, 16), int(n)) for a, n in
+                         (v.split(':') for v in o.split('=', 1)[1].split(','))]
     m.gpu.c1_clip_fault_kind = clip_fault_kind
     m.bus_fault_kind = bus_fault_kind
     if bus_fault_kind:

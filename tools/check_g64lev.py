@@ -162,6 +162,8 @@ def main(path):
         # A door whose travel is zero is a door that cannot open, and the
         # only way to find that out later is at the bench. kinds 11-14 are
         # the four brush movers; see ENT_KIND in tools/gen_quakelevel.py.
+        # (E1M3's and E1M4's 4-unit buttons get no travel from Quake's own
+        # formula; the converter gives them a token unit so they are kept.)
         if kind in (11, 12, 13, 14) and (ox, oy, oz) == (0, 0, 0):
             fail('entity %d (%s, kind %d) is a mover with no travel' % (i, nm, kind))
         if kind == 0:
@@ -289,29 +291,38 @@ def main(path):
         fail('the player start is in contents %d, not empty space -- the hull'
              ' conversion has an axis or a sign wrong' % c)
 
-    # And a second point that must NOT be empty, or "empty" proves nothing:
-    # straight down from the start is floor.
-    below = (start[0], start[1] - (64 << 16) // scale, start[2])
-    cb = contents(root, below)
-    if cb == -1:
-        fail('64 Quake units below the player start is also empty -- the hull'
-             ' is not describing this level')
-    print('trace   player start is empty (%d), 64qu below is solid (%d)  OK'
-          % (c, cb))
+    # And a point that must NOT be empty, or "empty" proves nothing:
+    # straight down from the start is floor. How far down is the level's
+    # business -- E1M8 starts the player 636 units above the floor (its
+    # low-gravity drop), and E1M5/E1M6 put thin floors over rooms -- so walk
+    # down in 4-unit steps to the first non-empty point instead of probing
+    # one fixed depth. 1024 units of nothing is not a floor.
+    def floor_below(node, top):
+        for qu in range(4, 1028, 4):
+            pt = (top[0], top[1] - (qu << 16) // scale, top[2])
+            k = contents(node, pt)
+            if k != -1:
+                return qu, k
+        return None, -1
+    dq, cb = floor_below(root, start)
+    if dq is None:
+        fail('1024 Quake units below the player start are all empty -- the'
+             ' hull is not describing this level')
+    print('trace   player start is empty (%d), %dqu below is %d  OK'
+          % (c, dq, cb))
 
     # Hull 0, the point hull the shots trace against, is built by the
     # converter rather than carried from the BSP, so it gets the same pair
-    # of tests at the eye: empty there, solid under the floor. The eye is
-    # 46 units above the floor, so 64 below the origin is inside it.
+    # of tests at the eye: empty there, something under the floor.
     root0 = hulls[0][8]
     if not 0 <= root0 < nclip:
         fail('worldspawn hull 0 head %d is not a clipnode' % root0)
     c0 = contents(root0, eye)
-    cb0 = contents(root0, below)
-    if c0 != -1 or cb0 == -1:
-        fail('hull 0: eye contents %d, below-floor contents %d' % (c0, cb0))
-    print('trace   hull 0: eye is empty (%d), 64qu below is solid (%d)  OK'
-          % (c0, cb0))
+    dq0, cb0 = floor_below(root0, eye)
+    if c0 != -1 or dq0 is None:
+        fail('hull 0: eye contents %d, nothing below it for 1024qu' % c0)
+    print('trace   hull 0: eye is empty (%d), %dqu below the eye is %d  OK'
+          % (c0, dq0, cb0))
 
     # --- visibility (v6) ------------------------------------------------
     #

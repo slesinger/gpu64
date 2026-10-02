@@ -127,7 +127,19 @@ class Bsp:
             w, h = struct.unpack_from('<2i', self.d, base + 16)
             off0 = struct.unpack_from('<i', self.d, base + 24)[0]
             px = self.d[base + off0: base + off0 + w * h] if off0 else b''
-            out.append(dict(name=name, w=w, h=h, px=px))
+            # gpu64 textures are powers of two. Quake's are not always: E1M2's
+            # doors are 128x192 and its buttons 48x48, and rejecting them
+            # drew those faces as flat colour. Resample to the nearest power
+            # of two (log scale, as the model skins are) and keep the scale,
+            # which collect() applies to the face's texel coordinates.
+            sx = sy = 1.0
+            if px and (shift_of(w) is None or shift_of(h) is None):
+                import quake_assets
+                nw, nh = quake_assets.pow2_near(w), quake_assets.pow2_near(h)
+                px = quake_assets.resample(px, w, h, nw, nh)
+                sx, sy = nw / w, nh / h
+                w, h = nw, nh
+            out.append(dict(name=name, w=w, h=h, px=px, sx=sx, sy=sy))
         return out
 
     def entities(self):
@@ -346,7 +358,8 @@ def collect(bsp, model, flip_winding, stats, owner=None):
         if len(poly) < 3:
             stats['degenerate'] += 1
             continue
-        raw = [tex_uv(p, ti) for p in poly]
+        raw = [(u * tex['sx'], v * tex['sy'])
+               for u, v in (tex_uv(p, ti) for p in poly)]
         # Bias into the texture's own tile so the bytes start small. A whole
         # number of tiles cannot change how the face lines up with neighbours.
         bu = int(min(u for u, _ in raw) // tex['w']) * tex['w']
@@ -567,6 +580,14 @@ def open_ofs(e, mdl, bsp, stats):
             # little backwards (E1M2's entity 511, a button). Clamping it to
             # zero made a mover that could not move.
             stats['mover_travel_negative'] += 1
+        if abs(travel) < 0.5 / QU_PER_WU and cls == 'func_button':
+            # E1M3's 4-unit pressure plate and E1M4's two 4-unit shootable
+            # buttons: Quake's formula gives them no travel, and the game
+            # drops a mover that has nowhere to go -- so they could never
+            # be pressed. One Quake unit keeps them in the table and is too
+            # small to see.
+            travel = 1.0 / QU_PER_WU
+            stats['mover_button_token_travel'] += 1
         return tuple(d[k] * travel for k in range(3))
 
     if cls == 'func_plat':
@@ -614,7 +635,7 @@ ENT_PARAMS = {
     'light_globe':      ('light', 'style'),
     'light_torch_small_walltorch': ('light', 'style'),
     'trigger_multiple': ('wait', 'sounds'),
-    'trigger_changelevel': ('sounds', 'sounds'),
+    'trigger_changelevel': ('sounds', 'sounds'),  # p1 replaced: the exit's slot
 }
 ENT_DEFAULT_PARAMS = ('health', 'count')
 
@@ -693,6 +714,14 @@ def build_entities(bsp, stats):
             x = y = z = 0.0
         pk = ENT_PARAMS.get(cls, ENT_DEFAULT_PARAMS)
         p0, p1 = (num(e.get(pk[0]), 0), num(e.get(pk[1]), 0))
+        if cls == 'trigger_changelevel':
+            # p1 = where the exit leads, as a level-pack slot plus one:
+            # 'e1m5' is 5, i.e. slot 4, because the pack holds E1M1..E1M8
+            # in order. 0 is anything else -- 'start', the end of the
+            # episode -- and the game takes that back to E1M1.
+            mp = e.get('map', '').lower()
+            p1 = int(mp[3:]) if (len(mp) == 4 and mp[:3] == 'e1m'
+                                 and mp[3].isdigit()) else 0
         ofs = open_ofs(e, mdl, bsp, stats)
         if any(ofs):
             stats['ent_mover'] += 1
@@ -993,7 +1022,7 @@ def main():
     # The level's textures and meshes follow at ids that vary by map, which
     # nothing outside this file names. They get no nodes -- the game creates
     # actor nodes itself. See quake_assets.py.
-    atex, amesh, sym, pics = [], [], None, []
+    atex, amesh, sym, pics, banks, bsym = [], [], None, [], [], None
     if not a.no_actors:
         import quake_assets
         # Mesh index 0 is a placeholder nothing names: the game reads a mesh
@@ -1003,6 +1032,14 @@ def main():
         atex, amesh, sym = quake_assets.build(
             f, ents, pak_read, Bsp, collect, pal, 0, 1, stats)
         amesh.insert(0, min(amesh, key=lambda m: len(m[0]) + len(m[1])))
+        # The monster bank: only what this map places, after the fixed
+        # catalogue so the M_* the game is assembled against do not move.
+        kinds = set(ENT_KIND.get(e.get('classname', ''), 0)
+                    for e in bsp.entities())
+        btex, bmesh, banks, bsym = quake_assets.build_bank(
+            f, ents, pak_read, kinds, len(atex), len(amesh), stats)
+        atex += btex
+        amesh += bmesh
         # Format 7: title, menu and intermission pictures, drawn by
         # LEVEL_PICTURE. Their indices hash into the catalogue with the rest.
         import quake_pics
@@ -1044,6 +1081,16 @@ def main():
         nodes.append((len(meshes) - 1, org, mi))
 
     entrecs, entstrs = build_entities(bsp, stats)
+    if not a.no_actors and banks:
+        # The bank records go FIRST, so the game's entity scan has every
+        # monster's frames before it meets the monster. Nothing indexes the
+        # entity table by position except the catalogue, which stays last.
+        so = len(entstrs)
+        entstrs = entstrs + b'gpu64_bank\0'
+        entrecs = [struct.pack('<6H2h3i3iBBH', so, 0, 0, 0, 0, 0, kind, 0,
+                               *struct.unpack('<6i', rec),
+                               quake_assets.BANK_KIND, 0, 0)
+                   for kind, rec in banks] + entrecs
 
     if not a.no_actors:
         # The catalogue record: the last entity, kind 9, spawnflags = a hash
@@ -1057,7 +1104,8 @@ def main():
                                    min(32767, len(texrecs)),
                                    0, 0, 0, 0, 0, 0, 9, 0, 0))
         if a.inc:
-            quake_assets.write_inc(a.inc, sym, len(entrecs) - 1, cat_hash)
+            quake_assets.write_inc(a.inc, sym, len(entrecs) - 1, cat_hash,
+                                   bsym, a.map)
             print('  wrote %s (%d symbols, hash $%04x)'
                   % (a.inc, len(sym), cat_hash))
     planes, hulls, clips = build_collision(bsp, stats)

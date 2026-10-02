@@ -10895,3 +10895,330 @@ decode. `gpu64_probe_ultimate.prg` no longer gets answers from
   onto the card as `kernel_rad.img`.
 - Bench check: a sanity run on each machine. The expected result is the
   same behaviour as src:08ff57f8.
+
+## 96. E1M2's doors, all of episode 1 in the pack, a start-level line (2026-09-30, PC only)
+
+**E1M2's light-blue doors.** Quake draws doors with 128x192 textures,
+buttons with 48x48, and some walls with 240x192 or 256x192. gpu64 textures
+must be powers of two, so the converter had been falling back to a flat
+colour for them. `Bsp._miptex` now resamples each such texture to the
+nearest power of two on a log scale, and `collect()` scales its UVs to
+match. In scenesim renders of the E1M2 doors and the pentagram button,
+before and after, the flat grey became the real texture.
+
+**Eight levels in the pack.**
+- `build/quake.reu` holds E1M1-E1M8, 12.5 MB (13111296 bytes), so RAD sizes
+  the REU to 16 MB: `rad_hijack.cpp` rounds up from the file size, to at
+  most 16 MB.
+- That uses all 8 firmware slots and RAD's largest REU. start.bsp would
+  need a ninth slot, so it is not in the pack.
+- The firmware is unchanged. GPU64_LEVEL_SLOTS was already 8.
+
+**What it took to fit the other six levels in.**
+- **check_g64lev.py hull probes.** The checker looked a fixed distance below
+  the player start and failed on E1M5/E1M6's thin floors and on E1M8, where
+  the start really is 636 units up. Quake's own hull 1 has the same gap. It
+  now scans down in 4-unit steps, up to 1024 units, and reports the
+  distance.
+- **Zero-travel buttons.** E1M3 entity 202 and E1M4 entities 458/459 are
+  4-unit buttons with lip 4, so they have zero travel. `etMover` dropped
+  them, and nothing could press them. The converter now gives them 1 unit.
+- **Tables.** The largest needs are 58 movers (E1M6), 45 triggers (E1M4) and
+  4 counters. The limits are now MAX_MOV = 60 and MAX_TRG = 48. The trigger
+  tables moved to `$BA26-$BD55`, after the pause menu. The main block ends
+  at `$9C6B`.
+- **Exits.** Each trigger_changelevel carries its destination map's number
+  (P1), and the intermission loads that slot:
+
+  | From | To |
+  |---|---|
+  | E1M1 | E1M2 |
+  | E1M2 | E1M3 |
+  | E1M3 | E1M4 |
+  | E1M4 | E1M5, or E1M8 by the secret exit |
+  | E1M5 | E1M6 |
+  | E1M6 | E1M7 |
+  | E1M7 | E1M1 (Quake returns to start) |
+  | E1M8 | E1M5 |
+
+**The start-level line.** The skill menu gained "LEVEL E1Mn" between
+NIGHTMARE and CONTROLS. Fire on it steps E1M1 → E1M8 → E1M1. Every
+power-on starts on E1M1. The level-select pictures changed CAT_HASH to
+`$e0cf`, so **the PRG and all eight levels deploy together**.
+
+**Monsters.** Only grunts and dogs exist in the game. E1M3-E1M8's other
+monsters (ogres, knights, zombies, fiends, scrags, shamblers) do not spawn,
+and E1M7 (Chthon) has none at all.
+
+**PC checks.**
+- All eight levels pass `check_g64lev.py`.
+- `pack_levels.py --list` verifies the pack.
+- `tools/demos.sh game` passes: check_game, combat, AI, env, SFX, exit.
+- `--reu --level-slot=0..7`, 200 frames each: every slot renders its own
+  map. The GAME row matches each map's movers (29/32/52/39/31/58/12/17).
+  DROP is 000 everywhere.
+- A `--title` joystick run: the cursor reaches the level line, two fires
+  give E1M3, and NIGHTMARE starts E1M3 (MOV 052).
+- Exit into the E1M1 changelevel, then fire: E1M2 loads from the pack.
+  Exit into E1M4's entity 450: E1M8 loads.
+
+**To deploy** (the kernel is unchanged):
+- `gpu64_demo_game.prg` (c685dda5…) to `RAD_PRG/`.
+- `build/quake.reu` (e63406b8…) to `REU/`.
+- The SD fallback: `RAD/level.g64lev` = e1m1 (9d34fb18…) and
+  `RAD/level2.g64lev` = e1m2 (1e4909cc…). The old level files fail the new
+  CAT_HASH.
+
+On the bench, the RAD status line should read `quake (REU 16384K)`. The
+boot log should list slots 0-7.
+
+## 97. Class-1 migration write-up; the DMA fill offload closed (2026-09-30, desk only)
+
+**Migration write-up (gap plan stage 17, the last open bullet).**
+`docs/class1-3d-mesh-reference.md` gained "Porting a class 2 program":
+- A construct-by-construct map from class 2 to class 1:
+  - `FILL_VIEW` → the loop clears the view itself.
+  - `SET_CAMERA3D` → a camera node.
+  - `DRAW_WORLD` → nodes or `LOAD_LEVEL`.
+  - `DRAW_THINGS` → sprite nodes.
+  - `SET_LIGHT` → light nodes.
+  - A class 0 HUD → view-space nodes.
+  - A flip → `SCENE_COMMIT` paced on FRAME_READY.
+  - Per-mover commands → `WORLD_TICK`.
+- The duties a retained scene adds: pacing, SEQACK plus a whole-command
+  resend, refresh rings, keyed destructive opcodes, bounded answers.
+- The game's measured per-frame cost.
+
+The same edit corrected the doc's old claim that class 1 cannot draw a HUD.
+View-space nodes can, and the game's gun and status bar are drawn that way.
+
+The game's per-frame cost on E1M1, from prgsim: a 400-frame run minus a
+200-frame run, at 32 ms, with `--notarget`.
+- Class 1: 7.9 dispatches and 90 register writes a frame.
+- Class 0: 0.14 dispatches a frame, which is `GET_HEALTH`.
+- Holding W+A gives identical totals to standing still. The camera is sent
+  twice every frame and the refresh rings always rotate, so the game spends
+  its bus budget on robustness, not on sending only what changed.
+- For comparison, the class 2 room (section 17) cost 11 dispatches and 102
+  writes a frame, for one room, and every one of them halted the C64.
+
+**DMA offload for bulk fills: closed, not built.** Gap plan stage 18 has the
+estimate: about 1% of core 1's frame could be saved. The risks are an
+unpaced 192 KB write burst, an MMIO completion poll from core 1, and a fill
+mode the BCM DMA does not have. Core 1 has no frame-time instrument, so the
+estimate is not measured. Build that instrument first if this is ever
+reopened.
+
+## 98. The pack never reached the bench; the firmware now reads it itself (2026-09-30)
+
+Bench report on the section 96 build: every start level loaded E1M1.
+
+**Cause.** The pack was only read when `REU/quake.reu` had been selected as
+the REU image in the same menu visit that launched the PRG:
+- `initMenu()` clears the selection every time the menu opens, and T, + and -
+  clear it too;
+- the card's `rad.cfg` has `STARTUP REU1M`, which boots with a blank 1 MB REU.
+
+So `levelFromPack()` never found a pack, and the firmware fell back to the SD
+files: slot 0 = `level.g64lev`, slot 1 = `level2.g64lev`. Slots 2-7 answered
+BAD_ARGS and the game fell back to E1M1. Every E1M2 seen on the bench had come
+from `level2.g64lev`, not from the pack.
+
+**Fix, round 1 (src:99d7b725): wrong place.** `gpu64_levelPreload()` read
+`SD:REU/quake.reu` itself, in the launch path. The bench boot log showed all
+eight slots verified, but the game was never injected. The C64 sat at BASIC,
+and HDMI stayed on the log, so `reuUsingPolling()` was never reached. The
+12.5 MB read sat between the C64's reset release and `WAIT_FOR_READY_PROMPT`,
+where the old two-file read had been about 3.4 MB. The launch path stalled
+after it. The exact mechanism is unconfirmed; the fix moves the read out.
+
+**Fix, round 2 (src:c88f0663, kernel md5 65a8c533, deployed 2026-10-01).**
+`gpu64_levelPackReadAtBoot()` runs once, right after `readConfig()` and
+before the Pi's first reset pulse. It puts the pack at the top of `mempool`
+(+3580 KB). That is above everything the C64 can reach for REU sizes up to
+2 MB.
+
+At each launch, `levelPackHeld()` re-verifies every checksum in RAM, with no
+SD access. It refuses the pack if the REU size now overlaps it. A 4 MB+ REU,
+a blank REU's memset, a loaded image or GeoRAM can all overwrite it; the
+checksums catch that, and the SD files are used instead.
+
+A REU image selected in the menu still wins when it is a pack. The boot log
+should say `Level pack: SD:REU/quake.reu read from the card, 12804 KB at
++3580 KB` early, then eight `slot N` lines at each launch.
+
+## 99. MAIN MENU in the pause menu (2026-10-02)
+
+The pause menu (←) had RESUME and CONTROLS. A third line, **MAIN MENU**, goes
+back to the skill menu to change the skill or the start level, with no reset.
+It is a new game, since `levelSetup`'s `combatInit` resets the player.
+
+- `gpu64_game_pause.inc`: `PM_ITEMS = 3`, row 13 on the C64, and
+  `PIC_PM_MAINMENU` on HDMI. `pmMainMenu` drops `pauseCheck`'s return, as
+  `imLeave` does, runs the title's tail from `tiMenu` on, then
+  `jmp levelSetup`.
+- The new picture is id 121, so CAT_HASH went from `$e0cf` to `$89f1`. All
+  eight levels, the pack and the PRG were regenerated, and they deploy
+  together.
+- All eight levels pass `check_g64lev.py`, and `pack_levels.py --list` passes.
+  The main block still ends at `$9C6B`.
+- runsim (`--frame-ms=32 --reu`) was scripted to: pause at frame 34, pick
+  MAIN MENU, step LEVEL to E1M2, start on NORMAL. Play resumed at frame 112
+  with K000/012, which is E1M2's Normal grunt and dog count (E1M1's is 23),
+  and ran clean past frame 17000.
+- runsim note: the menus scan keyboard column 7 continuously, and
+  `--stop-after` counts those reads. A run that has to get through a menu
+  needs `--stop-after` in the hundreds of thousands and `--max` raised to
+  match.
+
+Deployed 2026-10-02:
+
+| File | md5 |
+|---|---|
+| PRG | 9f0450cf |
+| `REU/quake.reu` | 507147b8 |
+| `RAD/level.g64lev` | e5e1cd0d |
+| `RAD/level2.g64lev` | 9d574141 |
+
+The kernel is unchanged (65a8c533).
+
+## 100. Monster expansion stage 1: per-level banks, four new types (2026-10-02, PC only)
+
+Ogres, knights, fiends and shamblers now spawn and fight. Zombies and scrags
+still do not; they belong to stage 2 (projectiles, flying, zombie rules),
+which has not been started.
+
+- **Per-level monster banks.** The fixed catalogue no longer holds monster
+  frames. `quake_assets.build_bank()` puts only the types a map places after
+  the catalogue, deduplicating repeated animations. It emits one
+  `gpu64_bank` entity per type (kind 18, p0 = the monster kind) with a
+  24-byte payload in origin and ofs:
+  - first mesh and frame count for each of the slots STAND, RUN, MELEE,
+    LEAP, SHOOT, PAIN, DEATH and DEATHB;
+  - the MELEE and SHOOT hit frames;
+  - the frame step.
+
+  The firmware passes these through `LEVEL_ENT` untouched; it did not
+  change. Bank records come first in the entity table, so `entScan` sees
+  them before any monster. `CAT_HASH` went from `$89f1` to `$3ca5`.
+- **Every other frame.** The new four keep every other animation frame
+  (step 2) and the C64 plays them at half rate (`mtSlowMask`). Grunt and
+  dog keep step 1, so E1M1 is unchanged. Largest level: E1M2, 1.86 MB.
+  Textures fit without any reuse.
+- **C64 side: `gpu64_game_monsters.inc`, new.** It sits under BASIC after
+  the trigger tables and ends at `$c070`, below `PM_SCR`.
+  - Per-type behaviour tables: HP (now 16-bit, through `acHpH`), step,
+    stop distance, melee and leap ranges and damage, volley pellets,
+    cooldown, pain chance, large hull.
+  - Bank tables filled by `mtBank`.
+  - AI, combat and actor code now ask `mtType`/`mtAnim`/`mtHas` instead of
+    testing for grunt or dog. An attack exists when the bank fills its
+    slot: MELEE, then LEAP, then SHOOT.
+  - The ogre's grenade and the shambler's lightning are volleys for now.
+  - The large hull widens the fire cone by 16 QU, doubles the pellet box
+    width and raises its span to 768 fine.
+  - `K_PACK` moved 53 → 70, because 53 is the ogre.
+- **Entity numbers moved** by the bank count. `gpu64level.Level.map_ent(i)`
+  skips the bank records. `check_ai`, `check_combat`, `check_game` and
+  `check_exit` use it, and `check_combat` reads the `LB_M_SOLDIER_*` bank
+  symbols.
+- **New check: `tools/check_monsters.py`.** For each banked type, it warps
+  the eye beside one of that type's monsters, trying up to three monsters
+  and four sides. It requires the monster to wake, move and hurt the
+  player, to show only its own bank's frames, and to have no move refused.
+
+  | Level | Result |
+  |---|---|
+  | E1M2 | grunt, ogre and knight pass |
+  | E1M3 | ogre and fiend pass; at `--skill=2` the shambler passes too |
+  | E1M4 | ogre and knight pass |
+  | E1M5 | ogre, knight and fiend pass |
+  | E1M7 | shambler passes |
+  | E1M8 | ogre and shambler pass |
+
+  Fails that are about the warp, not the game:
+  - E1M2's one Normal fiend (t73) waits in a closet, and E1M6's lone fiend
+    did not wake from any side.
+  - E1M6's shambler woke and moved but had not reached the player by frame
+    220.
+- `demos.sh game` passes: doors, combat, AI, env, SFX and exit. E1M4 out
+  of the pack (`--reu --level-slot=3`) shows MISSED 0 and STALLS 0. A
+  scenesim render shows the ogre skinned and posed correctly.
+- **Known limit: the actor table.** `MAX_ACT = 80` gives 61 world slots,
+  shared with pickups and movers. With the new types placed, three levels
+  fill it, and the monsters after that point in the entity order are not
+  placed:
+
+  | Level | Monsters placed (Normal skill) |
+  |---|---|
+  | E1M2 | 22 of 24 |
+  | E1M4 | 25 of 32 |
+  | E1M5 | 28 of 35 |
+
+  Raising the limit costs about 40 bytes of C64 RAM per slot, plus scene
+  nodes and bus traffic. It has not been done.
+
+Deployed 2026-10-02:
+
+| File | md5 |
+|---|---|
+| PRG | 0b29e2d7 |
+| `REU/quake.reu` | fb3584e6 |
+| `RAD/level.g64lev` | c3cf7858 |
+| `RAD/level2.g64lev` | 9315a744 |
+
+The kernel is unchanged.
+
+## 101. Monster expansion stage 2: missiles, scrag flight, zombie rules (2026-10-02, PC only)
+
+Zombies and scrags now spawn through their banks, so every Episode 1 monster
+type is in. Design and rationale: `milestone20_quake_combat_design.md`,
+"Monster expansion stage 2 as built".
+
+- **Missiles, new: `gpu64_game_proj.inc`.** Ogre grenades, scrag spikes
+  (two a burst) and zombie gibs are four reserved actor slots (`K_PROJ`),
+  flown on the C64. Each asks the Pi one hull-0 trace through the AI's trace
+  budget to learn where it stops.
+  - A grenade bursts where the player stood or on touch: 40 − d/16 out to
+    80 QU, `SFX_BOOM` (new, effect 21), and the muzzle light at the blast
+    (`mfBoom`).
+  - A gib does 10 and a spike 9.
+  - `MAX_ACT` 80 → 84; world slots are still 61. `AI_MAXTR` 4 → 5 (the missiles need room), and the
+    query budget is cerror-guarded.
+- **The shambler keeps its hitscan volley**, by decision.
+- **Scrag flight.** Moves are slides that hold its origin 64..144 fine over
+  the player's eye. A shot-down scrag falls to the floor (`aiFallReq`, up
+  to 30 moves).
+- **Zombie rules.** It never loses HP. One hit of ≥ 48 kills it (deviation
+  from Quake's 60: no player explosives here), ≥ 25 knocks it down to get
+  up again, and less makes it flinch.
+- **Memory.** The trigger tables and all missile state moved into a
+  `.virtual` block over `LOGO_SCREEN` ($cc00), which only the title reads,
+  before `entScan`.
+- **runsim** gained `--log-node=ID,..` and `--log-mem=ADDR:N,..` for
+  `--frame-log`.
+- **Verified on the PC** (E1M3 unless noted):
+  - Gibs fly and hit for 10.
+  - Grenades burst for 31-32, with light 90 at 6/6400 for 6 frames.
+  - Spikes come in pairs for 9.
+  - A dead scrag falls 2.7 units and settles.
+  - A shotgunned zombie only flinches.
+  - `check_monsters` passes E1M3 and E1M7. On E1M2 it fails only for the
+    closet fiend, as in §100.
+  - `check_sfx` passes.
+
+  check_monsters' "hurt the player" passed on E1M7 because two shamblers
+  killed the player (HT, no missiles). That check cannot tell which
+  monster did the hurting.
+- **Not yet verified:** the knockdown and the ≥ 48 kill, both of which need
+  the super shotgun in hand; a render check of the missile meshes.
+- **Gate:** `tools/demos.sh game` ok.
+- **Bench (2026-10-02): works well**, by the user's report. The four files
+  went to the card together (the CAT_HASH changed); the build md5s are:
+
+  | build file | card path | md5 |
+  |---|---|---|
+  | Source/Demos/gpu64_demo_game.prg | RAD_PRG/gpu64_demo_game.prg | caa2c106b9a572e069b1963df431ebaa |
+  | build/quake.reu | REU/quake.reu | 803e66b26569131aa5de30ac195ec79b |
+  | build/e1m1.g64lev | RAD/level.g64lev | 78e64bb2ee1107973f64764d2138eceb |
+  | build/e1m2.g64lev | RAD/level2.g64lev | b36db7297ef3549c67a3c9f9a4044294 |

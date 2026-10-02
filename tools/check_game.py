@@ -68,7 +68,7 @@ def main():
         sys.exit('check_game.py: --prg, --level and --ent are required')
 
     lev = gpu64level.Level(open(level, 'rb').read())
-    e = lev.ent(ent)
+    e = lev.map_ent(ent)
     if not e['model']:
         sys.exit('check_game.py: entity %d has no brush model' % ent)
     if not any(e['ofs']):

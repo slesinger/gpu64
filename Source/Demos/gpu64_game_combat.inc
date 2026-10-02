@@ -31,9 +31,12 @@ K_QUAD    = 40
 K_SUIT    = 42
 K_SHELLS  = 45
 K_NAILS   = 46
-K_GRUNT   = 51
-K_DOG     = 52
-K_PACK    = 53			; a dead grunt's backpack; not a map kind
+K_GRUNT   = 51			; monsters are K_MON0..K_MON_LAST
+K_ZOMBIE  = 55
+ZB_KILL   = 48			; damage at once that kills a zombie
+ZB_DOWN   = 25			; ... that knocks it flat
+K_DOG     = 52			; (gpu64_game_monsters.inc)
+K_PACK    = 70			; a dead grunt's backpack; not a map kind
 
 W_AXE     = 0
 W_SHOT    = 1
@@ -149,9 +152,9 @@ ccLoop
 	cpx nAct
 	bcs ccDone
 	lda acKind,x
-	cmp #K_GRUNT
+	cmp #K_MON0
 	bcc +
-	cmp #K_DOG+1
+	cmp #K_MON_LAST+1
 	bcs +
 	inc kTotal
 +	inx
@@ -511,9 +514,9 @@ csLoop
 	bcc +
 	rts
 +	lda acKind,x
-	cmp #K_GRUNT
+	cmp #K_MON0
 	bcc csNext
-	cmp #K_DOG+1
+	cmp #K_MON_LAST+1
 	bcs csNext
 	lda acState,x
 	cmp #AS_DEAD
@@ -639,7 +642,8 @@ lb03
 	sta cbT
 	bcc +
 	inc cbT+1
-+	lda cbA+1			; |lat| < limit?
++	jsr cbBigLim			; a large monster: wider
+	lda cbA+1			; |lat| < limit?
 	cmp cbT+1
 	bcc cflYes
 	bne cflNo
@@ -854,7 +858,9 @@ crCand
 lb04
 	sty cbCi
 	lda cVis,y
-	beq crNextCand
+	bne lb20			; (long branch)
+	jmp crNextCand
+lb20
 	; Lateral: lat - fwd * sx within the box's half-width.
 	lda cFwdL,y
 	sta mA
@@ -873,6 +879,7 @@ lb04
 	lda cLatH,y
 	sbc mR+1
 	sta cbT+1
+	jsr crBig			; a large monster: half the miss
 	clc
 	lda cbT
 	adc #PEL_HALF
@@ -894,7 +901,7 @@ lb04
 	adc #<PEL_LOW
 	lda mR+1
 	adc #>PEL_LOW
-	cmp #>PEL_SPAN			; 0 or 1 (unsigned): inside
+	cmp cbSpanH			; under PEL_SPAN (+256 large): inside
 	bcs crNextCand
 	ldy cbCi
 	lda cDmg,y
@@ -954,69 +961,95 @@ monHurt
 	cmp #AS_DEAD
 	beq mhRts			; a corpse
 	jsr aiHurt			; awake, and after the player
+	lda acKind,x
+	cmp #K_ZOMBIE
+	beq mhZombie
 	lda acHp,x
 	sec
 	sbc cbHd
+	sta cbT
+	lda acHpH,x
+	sbc #0
 	bcc mhDie
+	sta acHpH,x
+	ora cbT
 	beq mhDie
+	lda cbT
 	sta acHp,x
 	lda acState,x
 	cmp #AS_PAIN
 	beq mhRts			; already flinching
+	jsr mtType
+	bcs mhRts
+	jsr rnd				; preserves X and Y
+	cmp mbPain,y
+	bcs mhRts			; shrugged off
 	lda #AS_PAIN
 	sta acState,x
 	lda #SFX_MPAIN
 	jsr sfxPlay
 	lda #AM_ONCE
 	sta cbMode
-	lda acKind,x
-	cmp #K_DOG
-	beq +
-	lda #M_SOLDIER_PAIN
-	ldy #N_SOLDIER_PAIN
-	jmp acAnim
-+	lda #M_DOG_PAIN
-	ldy #N_DOG_PAIN
-	jmp acAnim
+	lda #MA_PAIN
+	jmp mtAnim
 mhRts
 	rts
+
+; Quake's zombie keeps its health: only ZB_KILL at once puts it down for
+; good (Quake's 60, a rocket; here the super shotgun's 56 point blank, as
+; there are no explosives). ZB_DOWN or more knocks it flat, and it gets
+; up again; less, a flinch.
+mhZombie
+	lda cbHd
+	cmp #ZB_KILL
+	bcs mhDie
+	lda acState,x
+	cmp #AS_PAIN
+	beq mhRts			; down already, or flinching
+	lda #AS_PAIN
+	sta acState,x
+	lda #SFX_MPAIN
+	jsr sfxPlay
+	lda #AM_ONCE
+	sta cbMode
+	lda cbHd
+	cmp #ZB_DOWN
+	lda #MA_PAIN
+	bcc +
+	lda #MA_DEATHB			; its DEATHB is the whole fall and rise
++	jmp mtAnim
 
 mhDie
 	lda #0
 	sta acHp,x
+	sta acHpH,x
 	lda #AS_DEAD
 	sta acState,x
 	inc kills
 	lda #SFX_MDIE
 	jsr sfxPlay
+	jsr mtType			; a scrag's body falls (aiFallReq)
+	lda mbFly,y
+	beq +
+	lda #FALL_N
++	sta acLeapT,x
 	lda #AM_HOLD
 	sta cbMode
-	stx cbX
-	jsr rnd
-	ldx cbX
-	and #1
-	sta cbT
 	lda acKind,x
-	cmp #K_DOG
-	beq mhDog
-	lda cbT
+	cmp #K_ZOMBIE			; its DEATHB gets up again
 	beq +
-	lda #M_SOLDIER_DEATHC
-	ldy #N_SOLDIER_DEATHC
-	bne ++
-+	lda #M_SOLDIER_DEATH
-	ldy #N_SOLDIER_DEATH
-+	jsr acAnim
+	jsr rnd
+	and #1
+	.byte $2c			; bit abs: over the lda
++	lda #0
+	.cerror MA_DEATHB != MA_DEATH + 1
+	ora #MA_DEATH
+	jsr mtAnim
+	lda acKind,x
+	cmp #K_GRUNT
+	bne +
 	jmp dropPack			; grunts carry shells
-mhDog
-	lda cbT
-	beq +
-	lda #M_DOG_DEATHB
-	ldy #N_DOG_DEATHB
-	jmp acAnim
-+	lda #M_DOG_DEATH
-	ldy #N_DOG_DEATH
-	jmp acAnim
++	rts
 
 ; X = slot, A = first mesh (level index), Y = frames, cbMode = acAnMode.
 ; Preserves X.
@@ -1045,15 +1078,8 @@ acStand
 	sta acState,x
 	lda #AM_LOOP
 	sta cbMode
-	lda acKind,x
-	cmp #K_DOG
-	beq +
-	lda #M_SOLDIER_STAND
-	ldy #N_SOLDIER_STAND
-	jmp acAnim
-+	lda #M_DOG_STAND
-	ldy #N_DOG_STAND
-	jmp acAnim
+	lda #MA_STAND
+	jmp mtAnim
 
 ; X = the dead grunt. A backpack where it fell: a freed pack slot if there
 ; is one (its node still exists), else a new slot, whose node the frame
@@ -1665,8 +1691,10 @@ rsAct
 	sta acKind,x
 	sta acFlags,x
 	beq rsDirty
-+	cmp #K_GRUNT
++	cmp #K_MON0
 	bcc rsItem
+	cmp #K_MON_LAST+1
+	bcs rsItem
 	jsr monSpawn
 	jmp rsDirty
 rsItem
@@ -1689,17 +1717,13 @@ rsDirty
 rsActDone
 	lda #0
 	sta kills
+	jsr pjClear			; nothing left in the air
 	jsr exReset			; secrets, time, counters, the exit
 	jmp plReset
 
 ; X = monster slot: alive, standing, at full health. Preserves X.
 monSpawn
-	lda #30
-	ldy acKind,x
-	cpy #K_DOG
-	bne +
-	lda #25
-+	sta acHp,x
+	jsr mtHealth
 	lda #AF_VIS
 	sta acFlags,x
 	jsr aiRespawn			; asleep, where the level put it

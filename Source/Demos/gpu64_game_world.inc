@@ -16,12 +16,12 @@
 ;
 ; Slot layout: the gun, then the status bar in the order it has to draw
 ; (tiles first, so the digits land on top of them), then the world.
-; Node id = ACT_ID0 + slot; ids 2..81 sit between the camera (1) and the
+; Node id = ACT_ID0 + slot; ids 2..85 sit between the camera (1) and the
 ; level's own nodes (NODE_BASE = 100).
 ; ======================================================================
 
 ACT_ID0   = 2
-MAX_ACT   = 80
+MAX_ACT   = 84			; the last PJ_N are the missiles' (proj.inc)
 
 SL_GUN    = 0
 SL_SBAR   = 1			; five 64-pixel tiles
@@ -133,15 +133,15 @@ hudZHi
 	.byte >round( 0.15625 / tan( ( FOV_DEG0 + i * FOV_STEP ) * pi / 360.0 ) * 65536 )
 	.next
 
-; E1M1's item and monster kinds (gen_quakelevel.py) -> the first mesh of
-; what stands there, level mesh index; 0 = not placed. Kinds 30..52.
+; The item kinds (gen_quakelevel.py) -> the first mesh of what stands
+; there, level mesh index; 0 = not placed. Kinds 30..49. A monster's comes
+; from its level's bank (gpu64_game_monsters.inc).
 KM_FIRST = 30
 kindMesh
 	.byte 0, 0, M_ARMOR, M_ARMOR_S1, M_ARMOR_S2	; 30-34 (31: see actTake)
 	.byte M_G_SHOT, M_G_NAIL, 0, 0, 0		; 35-39
 	.byte M_QUAD, 0, M_SUIT, 0, 0			; 40-44
 	.byte 0, 0, 0, 0, 0				; 45-49 (45, 46: see actTake)
-	.byte 0, M_SOLDIER_STAND, M_DOG_STAND		; 50-52
 KM_LAST = KM_FIRST + * - kindMesh - 1
 
 ; ======================================================================
@@ -279,7 +279,16 @@ actTake
 	beq atShells
 	cmp #46
 	beq atNails
-	cmp #KM_LAST+1
+	cmp #K_MON0
+	bcc +
+	cmp #K_MON_LAST+1
+	bcs atNo
+	sbc #K_MON0 - 1			; C clear: the type
+	tax
+	lda mtFirst+MA_STAND*MT_N,x	; 0: no bank, not placed
+	bne atPlace
+	rts
++	cmp #KM_LAST+1
 	bcs atNo
 	sec
 	sbc #KM_FIRST
@@ -314,7 +323,7 @@ atNails
 	adc #0
 atPlace
 	ldx nAct
-	cpx #MAX_ACT
+	cpx #MAX_ACT - PJ_N
 	bcc +
 	inc actDrop
 	rts
@@ -347,21 +356,13 @@ atPlace
 	sta acState,x
 	lda entBlk+ENT_KIND
 	sta acKind,x
-	cmp #K_GRUNT
-	bne +
-	lda #N_SOLDIER_STAND
+	jsr mtType
+	bcs +
+	lda mtCount+MA_STAND*MT_N,y
 	sta acAnN,x
-	lda #30
-	sta acHp,x
-	lda #K_GRUNT
-+	cmp #K_DOG
-	bne +
-	lda #N_DOG_STAND
-	sta acAnN,x
-	lda #25
-	sta acHp,x
-	lda #K_DOG
-+	cmp #32				; weapons, armour and powerups turn
+	jsr mtHealth
++	lda acKind,x
+	cmp #32				; weapons, armour and powerups turn
 	bcc +
 	cmp #45
 	bcs +
@@ -476,6 +477,7 @@ afLoop
 	beq +
 	ldy #AI_ANIM_MASK
 +	sty acMask
+	jsr mtSlowMask			; a half-rate type: every 2nd of those
 	txa				; each slot every ANIM_MASK+1 frames, staggered
 	eor wtFrame
 	and acMask

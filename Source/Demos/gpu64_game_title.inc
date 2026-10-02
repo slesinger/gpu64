@@ -53,6 +53,7 @@ OP_LEVEL_PICTURE = $1a
 SIM_TITLE    = $02ab
 SIM_TITLE_ON = $ab
 SIM_SKILL    = $02ac
+SIM_LEVEL    = $02ae		; --level-slot: the start level the menu would pick
 
 TUNE_INIT       = $a000		; E-Quake tune 1, the only tune
 TUNE_PLAY       = $a003
@@ -89,6 +90,8 @@ title
 	sta $01
 	lda #SKILL_NORMAL
 	sta skill
+	lda #0
+	sta lvSlot
 	lda SIM_TITLE
 	cmp #SIM_TITLE_ON
 	bne tiRun
@@ -97,6 +100,9 @@ title
 	lda SIM_SKILL
 	and #3
 	sta skill
+	lda SIM_LEVEL
+	and #7
+	sta lvSlot
 	jmp tiSkillSet
 tiRun
 	jsr clkInit
@@ -460,8 +466,14 @@ tiTitleTick
 	rts
 
 ; ======================================================================
-; The skill menu.
+; The skill menu: four skills, then the start level, then CONTROLS.
+; Fire on the level line steps it E1M1 .. E1M8 and stays in the menu (the
+; title reads only up, down and fire). A level the Pi does not have -- no
+; pack in the REU -- is E1M1 when it comes to LOAD_LEVEL.
 ; ======================================================================
+TI_ITEMS = 6
+TI_LEVEL = 4			; the menu line that is the start level
+TI_CTRL  = 5
 tiMenu
 	jsr tiMark
 	jsr tiCls
@@ -495,7 +507,7 @@ tiMenu
 	pla
 	tax
 	inx
-	cpx #5
+	cpx #TI_ITEMS
 	bne -
 	lda #21
 	jsr dmRow
@@ -524,10 +536,12 @@ tiMenuTick
 	jsr tiPic
 	ldx #0
 -	stx tiI
-	txa
+	lda tiItemPic,x
+	cpx #TI_LEVEL
+	bne +
 	clc
-	adc #PIC_SK_EASY
-	pha
+	adc lvSlot
++	pha
 	lda tiMenuY,x
 	clc
 	adc #4				; the labels are 16 high, the dot 24
@@ -539,7 +553,7 @@ tiMenuTick
 	jsr tiPic
 	ldx tiI
 	inx
-	cpx #5				; four skills, then CONTROLS
+	cpx #TI_ITEMS
 	bne -
 	lda tiTick			; (time * 10) % 6, as M_Draw
 	clc
@@ -564,14 +578,14 @@ tiMenuTick
 	bcc +
 	dec skill			; up
 	bpl +
-	lda #4
+	lda #TI_ITEMS-1
 	sta skill
 +	lda tiNew
 	and #2
 	beq +
 	inc skill			; down
 	lda skill
-	cmp #5
+	cmp #TI_ITEMS
 	bcc +
 	lda #0
 	sta skill
@@ -579,15 +593,25 @@ tiMenuTick
 	and #4
 	bne +
 	jmp tiMenuTick
-+	lda skill			; the fifth line is the controls menu,
-	cmp #4				; not a skill: `skill` is the cursor
-	bne +				; here, and only 0-3 ever leave
++	lda skill			; the last two lines are not skills:
+	cmp #TI_LEVEL			; `skill` is the cursor here, and only
+	bne +				; 0-3 ever leave
+	lda lvSlot
+	clc
+	adc #1
+	and #7
+	sta lvSlot
+	jmp tiMenu			; the C64 line has to be redrawn
++	cmp #TI_CTRL
+	bne +
 	jsr ctMenu
 	jmp tiMenu
 +	rts
 
 tiMenuY	.byte MENU_Y, MENU_Y + MENU_DY, MENU_Y + 2 * MENU_DY, MENU_Y + 3 * MENU_DY
-	.byte MENU_Y + 4 * MENU_DY
+	.byte MENU_Y + 4 * MENU_DY, MENU_Y + 5 * MENU_DY
+tiItemPic	.byte PIC_SK_EASY, PIC_SK_NORMAL, PIC_SK_HARD, PIC_SK_NIGHTMARE
+	.byte PIC_LV_E1M1, PIC_SK_CONTROLS
 
 ; The C64 menu: a cursor and a highlight on the current line.
 tiMenuC64
@@ -620,13 +644,19 @@ tmcLoop
 	cpy #25
 	bne -
 	inx
-	cpx #5
+	cpx #TI_ITEMS
 	bne tmcLoop
 	rts
 
-; A = skill: its name at the cursor.
+; A = menu line: its name at the cursor.
 tiSkillName
-	tax
+	cmp #TI_LEVEL
+	bne +
+	jsr dmText			; as the HDMI label
+	.text "LEVEL "
+	.byte 0
+	jmp lvName
++	tax
 	lda tiSkillText,x
 	tax
 	ldy #0
@@ -639,7 +669,7 @@ tiSkillName
 	bne -
 +	rts
 
-tiSkillText	.byte 0, 5, 12, 17, 27
+tiSkillText	.byte 0, 5, 12, 17, 0, 27
 tiSkillStr	.text "EASY", 0, "NORMAL", 0, "HARD", 0, "NIGHTMARE", 0, "CONTROLS", 0
 
 ; ======================================================================
@@ -651,8 +681,9 @@ tiLoading
 	lda #12
 	jsr dmRow
 	jsr dmText
-	.text "             LOADING E1M1"
+	.text "             LOADING "
 	.byte 0
+	jsr lvName
 	lda #PIC_CONFADE
 	ldx #0
 	ldy #0

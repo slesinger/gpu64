@@ -187,14 +187,10 @@ def mdl_verts(vs):
 
 
 # Which MDLs, and which of their animations. None means every frame in file
-# order. The monsters keep only what a simplified Quake AI plays (design doc,
-# "Budgets"); order in each list is the order the .inc names them.
+# order. These are the FIXED catalogue: every level carries them at the same
+# mesh indices, so the game is assembled against their M_* symbols.
 MODELS = [
     # key       file                      animations
-    ('soldier', 'progs/soldier.mdl',  ['stand', 'run', 'shoot', 'pain',
-                                       'death', 'deathc']),
-    ('dog',     'progs/dog.mdl',      ['stand', 'run', 'attack', 'leap',
-                                       'pain', 'death', 'deathb']),
     ('v_axe',   'progs/v_axe.mdl',    None),
     ('v_shot',  'progs/v_shot.mdl',   None),
     ('v_shot2', 'progs/v_shot2.mdl',  None),
@@ -206,7 +202,71 @@ MODELS = [
     ('suit',    'progs/suit.mdl',     None),
     ('spike',   'progs/spike.mdl',    None),
     ('backpack','progs/backpack.mdl', None),
+    # The monsters' missiles (Source/Demos/gpu64_game_proj.inc).
+    ('grenade', 'progs/grenade.mdl',  None),
+    ('w_spike', 'progs/w_spike.mdl',  None),
+    ('zom_gib', 'progs/zom_gib.mdl',  None),
 ]
+
+# The monster bank. Unlike the fixed catalogue, a level carries only the
+# monsters its own map places, so their mesh indices vary by level and the
+# game reads them from the level instead: one gpu64_bank entity per monster
+# kind (bank_entities()), scanned before anything it describes.
+#
+# Eight animation slots, the ones the game's AI plays; a monster without a
+# use for one leaves it empty (count 0). DEATHB may repeat DEATH. A slot
+# given as (animation, n) plays only that animation's first n full-rate
+# frames, sharing its meshes: the zombie's DEATH is the fall of its knock-
+# down (paine1-12) and stays lying, its DEATHB the whole knockdown, which
+# the game plays as the get-up-again, not as a death.
+BANK_SLOTS = ['STAND', 'RUN', 'MELEE', 'LEAP', 'SHOOT', 'PAIN', 'DEATH',
+              'DEATHB']
+BANK_KIND = 18                  # the bank record's entity kind
+# kind: (key, file, frame step, {slot: animation}, {slot: hit frame})
+# The hit frame is a FULL-rate frame index into that animation -- where
+# Quake's own code deals the damage -- and is divided by the step. A step of
+# 2 keeps every other frame, and the game plays those at half rate, so an
+# animation lasts as long as Quake's; the soldier and dog keep every frame
+# (E1M1 is unchanged), and the rest would not fit beside them in the 255
+# mesh indices a one-byte frame number reaches.
+MONSTERS = OrderedDict([
+    (51, ('soldier', 'progs/soldier.mdl', 1,
+          {'STAND': 'stand', 'RUN': 'run', 'SHOOT': 'shoot', 'PAIN': 'pain',
+           'DEATH': 'death', 'DEATHB': 'deathc'},
+          {'SHOOT': 4})),
+    (52, ('dog', 'progs/dog.mdl', 1,
+          {'STAND': 'stand', 'RUN': 'run', 'MELEE': 'attack', 'LEAP': 'leap',
+           'PAIN': 'pain', 'DEATH': 'death', 'DEATHB': 'deathb'},
+          {'MELEE': 3})),
+    (53, ('ogre', 'progs/ogre.mdl', 2,          # ogre_swing's chainsaw,
+          {'STAND': 'stand', 'RUN': 'run', 'MELEE': 'swing',  # ogre_nail4's
+           'SHOOT': 'shoot', 'PAIN': 'pain', 'DEATH': 'death',  # grenade
+           'DEATHB': 'bdeath'},
+          {'MELEE': 6, 'SHOOT': 3})),
+    (54, ('knight', 'progs/knight.mdl', 2,
+          {'STAND': 'stand', 'RUN': 'runb', 'MELEE': 'attackb',
+           'PAIN': 'pain', 'DEATH': 'death', 'DEATHB': 'deathb'},
+          {'MELEE': 6})),
+    (55, ('zombie', 'progs/zombie.mdl', 2,      # atta13's thrown gib
+          {'STAND': 'stand', 'RUN': 'run', 'SHOOT': 'atta',
+           'PAIN': 'paina', 'DEATH': ('paine', 12), 'DEATHB': 'paine'},
+          {'SHOOT': 12})),
+    (56, ('wizard', 'progs/wizard.mdl', 2,      # magatt's two spikes
+          {'STAND': 'hover', 'RUN': 'fly', 'SHOOT': 'magatt',
+           'PAIN': 'pain', 'DEATH': 'death', 'DEATHB': 'death'},
+          {'SHOOT': 4})),
+    (57, ('demon', 'progs/demon.mdl', 2,
+          {'STAND': 'stand', 'RUN': 'run', 'MELEE': 'attacka',
+           'LEAP': 'leap', 'PAIN': 'pain', 'DEATH': 'death',
+           'DEATHB': 'death'},
+          {'MELEE': 4})),
+    (58, ('shambler', 'progs/shambler.mdl', 2,  # smash10, magic's bolt
+          {'STAND': 'stand', 'RUN': 'run', 'MELEE': 'smash',
+           'SHOOT': 'magic', 'PAIN': 'pain', 'DEATH': 'death',
+           'DEATHB': 'death'},
+          {'MELEE': 9, 'SHOOT': 5})),
+])
+BANK_REC = 24                   # payload bytes: origin and ofs, 3 x s32 each
 
 # Brush pickups: Quake draws these as tiny BSP models whose origin is the
 # item's corner, the same point the entity's origin names.
@@ -320,11 +380,7 @@ def build(pak_f, pak_ents, pak_read, Bsp, collect_fn, pal, tex_base, mesh_base,
         m = Mdl(pak_read(pak_f, pak_ents, path), path)
         if m.nverts > MAX_VERTS:
             raise ValueError('%s: %d vertices' % (path, m.nverts))
-        tw, th = pow2_near(m.sw), pow2_near(m.sh)
-        skin_ids = []
-        for si, sk in enumerate(m.skins):
-            skin_ids.append(add_tex('%s_skin%d' % (key, si), tw, th,
-                                    resample(bleed(sk, m.sw, m.sh), m.sw, m.sh, tw, th)))
+        skin_ids, tw, th = model_skin(m, key, add_tex)
         sym['T_%s' % key.upper()] = skin_ids[0]
         if len(skin_ids) > 1:
             for si, t in enumerate(skin_ids):
@@ -413,6 +469,81 @@ def build(pak_f, pak_ents, pak_read, Bsp, collect_fn, pal, tex_base, mesh_base,
     return texs, meshes, sym
 
 
+def model_skin(m, key, add_tex):
+    """Every skin of m as a texture; returns (ids, tw, th)."""
+    tw, th = pow2_near(m.sw), pow2_near(m.sh)
+    ids = []
+    for si, sk in enumerate(m.skins):
+        ids.append(add_tex('%s_skin%d' % (key, si), tw, th,
+                           resample(bleed(sk, m.sw, m.sh), m.sw, m.sh, tw, th)))
+    return ids, tw, th
+
+
+def build_bank(pak_f, pak_ents, pak_read, kinds, tex_base, mesh_base, stats):
+    """The level's own monsters: every kind in `kinds` that MONSTERS knows.
+    Returns (textures, meshes, banks, symbols); banks is [(kind, payload)],
+    the BANK_REC bytes of each gpu64_bank entity:
+
+      0..15   per BANK_SLOTS: first mesh index (u8), frame count (u8)
+      16      the MELEE hit frame, 17 the SHOOT hit frame (kept frames)
+      18      the frame step (1 or 2)
+      19..23  0
+    """
+    texs, meshes, banks, sym = [], [], [], OrderedDict()
+
+    def add_tex(name, w, h, px):
+        texs.append((name, int(math.log2(w)), int(math.log2(h)), px))
+        tid = tex_base + len(texs) - 1
+        if tid > 255:
+            raise ValueError('texture ids ran past 255: a face texid is one byte')
+        return tid
+
+    for kind, (key, path, step, slots, hits) in MONSTERS.items():
+        if kind not in kinds:
+            continue
+        m = Mdl(pak_read(pak_f, pak_ents, path), path)
+        if m.nverts > MAX_VERTS:
+            raise ValueError('%s: %d vertices' % (path, m.nverts))
+        ids, tw, th = model_skin(m, key, add_tex)
+        fb = mdl_faces(m, ids[0], tw, th)
+        groups = m.groups()
+        rec = bytearray(BANK_REC)
+        done = {}
+        for si, slot in enumerate(BANK_SLOTS):
+            a = slots.get(slot)
+            if a is None:
+                continue
+            part = None
+            if isinstance(a, tuple):
+                a, part = a
+            if a not in groups:
+                raise ValueError('%s has no "%s" frames (%s)'
+                                 % (path, a, ', '.join(groups)))
+            if a not in done:
+                done[a] = (mesh_base + len(meshes), len(groups[a][::step]))
+                for fi in groups[a][::step]:
+                    meshes.append((mdl_verts(m.frames[fi][1]), fb))
+            first, n = done[a]
+            if part is not None:
+                n = len(groups[a][:part][::step])
+            if first > 255:
+                raise ValueError('%s: monster frames ran past mesh index 255'
+                                 % path)
+            rec[si * 2] = first
+            rec[si * 2 + 1] = n
+            sym['LB_M_%s_%s' % (key.upper(), slot)] = first
+            sym['LB_N_%s_%s' % (key.upper(), slot)] = n
+        for k, slot in ((16, 'MELEE'), (17, 'SHOOT')):
+            if slot in hits:
+                rec[k] = hits[slot] // step
+                assert rec[k] < rec[BANK_SLOTS.index(slot) * 2 + 1]
+        rec[18] = step
+        banks.append((kind, bytes(rec)))
+        stats['bank_monsters'] += 1
+        stats['bank_frames'] += sum(n for _, n in done.values())
+    return texs, meshes, banks, sym
+
+
 def catalogue_hash(sym):
     """16 bits the game compares against its compiled-in include, so a level
     file from an older converter run is refused instead of drawing a gun
@@ -421,7 +552,7 @@ def catalogue_hash(sym):
     return zlib.crc32(s) & 0xffff
 
 
-def write_inc(path, sym, cat_ent, cat_hash):
+def write_inc(path, sym, cat_ent, cat_hash, bank_sym=None, map_name=''):
     with open(path, 'w') as f:
         f.write('; Generated by tools/gen_quakelevel.py -- do not edit.\n')
         f.write(';\n; Milestone 20 actor catalogue. M_* are level mesh INDICES\n'
@@ -431,3 +562,10 @@ def write_inc(path, sym, cat_ent, cat_hash):
         f.write('CAT_ENT = %d\nCAT_HASH = $%04x\n\n' % (cat_ent, cat_hash))
         for k, v in sym.items():
             f.write('%s = %d\n' % (k, v))
+        if bank_sym:
+            # Not hashed and not for the game, which reads every level's
+            # own bank: the PC checkers' view of this one level's monsters.
+            f.write('\n; %s\'s monster bank, for the PC checkers only.\n'
+                    % map_name.upper())
+            for k, v in bank_sym.items():
+                f.write('%s = %d\n' % (k, v))

@@ -46,6 +46,7 @@ static const char FILENAME_CONFIG[] = "SD:RAD/rad.cfg";
 #define REU_MAX_SIZE_KB	(16384)
 u8 mempool[ REU_MAX_SIZE_KB * 1024 + 8192 ] AAA = {0};
 u8 *mempoolPtr = &mempool[ 0 ];
+u32 mempoolBytes = sizeof( mempool );	// gpu64: the level pack sits above the REU in here
 u8 prgLaunch[ 65536 + 2 ] AAA = {0};
 
 // low-level communication code
@@ -599,6 +600,10 @@ void CRAD::Run( void )
 
 	setDefaultTimings( AUTO_TIMING_RPI3PLUS_C64C128 );
 	readConfig( logger, DRIVE, FILENAME_CONFIG );
+
+	// gpu64: the level pack's one SD read, here and not in the launch path
+	// (gpu64_level.cpp, levelPackHeld()). The C64 is reset just below anyway.
+	gpu64_levelPackReadAtBoot();
 
 	OUT_GPIO( RESET_OUT );
 	CLR_GPIO( bRESET_OUT );

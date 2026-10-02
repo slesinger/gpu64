@@ -123,13 +123,14 @@ def main():
     c = consts(os.path.join(demos, 'gpu64_quake_actors.inc'))
     base = consts(os.path.join(demos, 'gpu64_demo_game.a'))['MESH_BASE']
     lev = gpu64level.Level(open(level, 'rb').read())
-    g = lev.ent(245)
+    g = lev.map_ent(245)
     if g['classname'] != 'monster_army':
         sys.exit('check_combat.py: entity 245 is %s, not the grunt'
                  % g['classname'])
     gpos = (g['x'], g['y'], g['z'])
-    death = (base + c['M_SOLDIER_DEATH'],
-             base + c['M_SOLDIER_DEATHC'] + c['N_SOLDIER_DEATHC'] - 1)
+    # The level's monster bank: DEATH, then DEATHB (Quake's deathc).
+    death = (base + c['LB_M_SOLDIER_DEATH'],
+             base + c['LB_M_SOLDIER_DEATHB'] + c['LB_N_SOLDIER_DEATHB'] - 1)
     pack = base + c['M_BACKPACK']
     v = Verdict()
 

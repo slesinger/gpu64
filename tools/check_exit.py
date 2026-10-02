@@ -75,7 +75,7 @@ def seen(log, text):
 
 def door_moved(lev, nodes):
     """The fraction of its travel door 215's node has covered, or None."""
-    e = lev.ent(DOOR)
+    e = lev.map_ent(DOOR)
     idx = [i for i in range(lev.nnode) if lev.node_model(i) == e['model']]
     if len(idx) != 1 or NODE_BASE + idx[0] not in nodes:
         return None
@@ -105,9 +105,9 @@ def main():
     if not (prg and level):
         sys.exit('check_exit.py: --prg and --level are required')
     lev = gpu64level.Level(open(level, 'rb').read())
-    e = lev.ent(DOOR)
-    if lev.ent(214)['classname'] != 'trigger_counter' or \
-            e['targetname'] != lev.ent(214)['target'] or \
+    e = lev.map_ent(DOOR)
+    if lev.map_ent(214)['classname'] != 'trigger_counter' or \
+            e['targetname'] != lev.map_ent(214)['target'] or \
             not e['ofs'][0] or any(e['ofs'][1:]):
         sys.exit('check_exit.py: entities 214/215 are not the counter and '
                  'its x-travelling door any more')

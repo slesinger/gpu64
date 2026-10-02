@@ -13,8 +13,10 @@
 ;                    A spent trigger_once's door that closed after OPEN_WAIT
 ;                    was closed for good, and a button that popped back out
 ;                    could be pressed again -- which a counter would count.
-;   the exit         trigger_changelevel. E1M1 has one level, so touching it
-;                    is the intermission and then the level again.
+;   the exit         trigger_changelevel: the intermission, then the level
+;                    its 'map' names (the converter puts it in p1 as E1Mn's
+;                    n, so E1M4's secret exit really leads to E1M8). 'start',
+;                    the end of the episode, goes back to E1M1.
 ;   the stats        kills (combat), secrets (trigger_secret) and the time,
 ;                    counted in play, shown on both screens at the exit.
 ;   muzzle flash     one point-light node, lit at the eye for FLASH_FRAMES
@@ -35,8 +37,9 @@ K_TRIG_CHANGE  = 25		; trigger_changelevel
 K_TRIG_COUNTER = 26		; trigger_counter
 MAX_CNT        = 4
 
-FLASH_ID     = 90		; free: actors are 2..81, the level 100 up
+FLASH_ID     = 90		; free: actors are 2..85, the level 100 up
 FLASH_FRAMES = 2
+BOOM_FRAMES  = 6		; a grenade's blast
 FLASH_S      = 6		; colormap levels at the centre
 FLASH_R      = 25 * 256		; 8.8 world units: Quake's 200
 
@@ -158,8 +161,8 @@ msgRow
 	rts
 
 ; ----------------------------------------------------------------------
-; gtTrg: A = the kind of the trigger just touched. Secrets and the exit;
-; returns with A = the kind again.
+; gtTrg: A = the kind of the trigger just touched, X = its index. Secrets
+; and the exit; returns with A = the kind again and X preserved.
 ; ----------------------------------------------------------------------
 exTrig
 	cmp #K_TRIG_SECRET
@@ -172,6 +175,9 @@ exTrig
 +	cmp #K_TRIG_CHANGE
 	bne +
 	sta exitHit
+	lda trDest,x
+	sta exitDest
+	lda #K_TRIG_CHANGE
 +	rts
 
 ; ----------------------------------------------------------------------
@@ -253,7 +259,27 @@ mfShot
 	beq +
 	lda #FLASH_FRAMES
 	sta mfT
+	lda mfAtB			; lit at a blast: moved back to the eye
+	beq +
+	lda #0
+	sta mfAtB
+	sta mfOn
 +	rts
+
+; pjBoom's: the light at pjP, the grenade. Preserves X.
+mfBoom
+	ldy #11
+-	lda pjP,y
+	sta mfPos,y
+	dey
+	bpl -
+	lda #1
+	sta mfAtB
+	lda #0
+	sta mfOn
+	lda #BOOM_FRAMES
+	sta mfT
+	rts
 
 ; Once a frame, before the commit.
 mfFrame
@@ -271,7 +297,10 @@ mfFrame
 	bne mfRts			; lit already; the eye has barely moved
 	ldx #11
 -	lda cam,x
-	sta stBuf,x
+	ldy mfAtB
+	beq +
+	lda mfPos,x
++	sta stBuf,x
 	dex
 	bpl -
 	jsr mfId
@@ -294,6 +323,7 @@ mfWantOff
 	bne mfErr
 	lda #0
 	sta mfOn
+	sta mfAtB
 	rts
 mfErr
 	cmp #ERR_BAD_ID
@@ -473,12 +503,18 @@ fnQuick		.byte 0
 imLeave
 	jsr tiMusicOff
 	jsr sfxInit
-	; The next level: E1M1's exit leads to E1M2, and E1M2's back to E1M1
-	; (there is no E1M3 on the card). The whole per-level setup runs again
-	; from SCENE_RESET, which LOAD_LEVEL needs anyway -- it replaces every
-	; resource and node the Pi holds. The loop is already stopped (imStop).
-	lda lvSlot
-	eor #1
+	; The next level: the one this exit's 'map' names, pack slot n-1 for
+	; E1Mn; 0 is the end of the episode, and that is E1M1 again. A slot
+	; the Pi has no level for (an SD card without a pack) comes back as
+	; BAD_ARGS from LOAD_LEVEL, which falls back to E1M1 itself. The whole
+	; per-level setup runs again from SCENE_RESET, which LOAD_LEVEL needs
+	; anyway -- it replaces every resource and node the Pi holds. The loop
+	; is already stopped (imStop).
+	lda exitDest
+	beq +
+	sec
+	sbc #1
++	and #7
 	sta lvSlot
 	ldx #0				; the stats off the C64 screen
 	lda #$20
@@ -492,7 +528,7 @@ imLeave
 	pla				; loop: levelSetup ends by entering it
 	jmp levelSetup
 
-; The level's name at the cursor: E1M1 or E1M2.
+; The level's name at the cursor: E1M1 .. E1M8.
 lvName
 	jsr dmText
 	.text "E1M"
@@ -729,12 +765,15 @@ mvStay		.fill MAX_MOV, 0
 secFound	.byte 0
 secTotal	.byte 0
 exitHit		.byte 0
+exitDest	.byte 0		; the touched exit's trDest
 playSec		.word 0
 msAcc		.word 0
 msgT		.byte 0
 mfT		.byte 0
 mfOn		.byte 0
 mfLost		.byte 0
+mfAtB		.byte 0			; lit at mfPos, a blast, not the eye
+mfPos		.fill 12, 0
 imT		.word 0
 imMin		.byte 0
 imSec		.byte 0

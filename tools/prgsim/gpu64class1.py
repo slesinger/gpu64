@@ -333,6 +333,7 @@ class Class1Mixin:
         # and is worth being able to simulate.
         self.c1_level_data = None
         self.c1_level_data2 = None      # --level2=, RAD/level2.g64lev
+        self.c1_level_more = []         # slots 2.., from a --reu= level pack
         self.c1_load = None
         self.c1_clip_lib = None
 
@@ -495,9 +496,10 @@ class Class1Mixin:
         # ARG6 is the slot, believed only with ARG7 = ARG6 ^ $5A; see
         # opLoadLevel().
         slot = a6 if (a6 ^ 0x5a) == a7 else 0
-        if slot > 1:
+        slots = [self.c1_level_data, self.c1_level_data2] + self.c1_level_more
+        if slot >= 8 or slot >= len(slots):     # GPU64_LEVEL_SLOTS
             return ERR_BAD_ARGS
-        data = self.c1_level_data2 if slot else self.c1_level_data
+        data = slots[slot]
         if data is None:
             return ERR_BAD_ARGS         # no level file on the card
         if data is not getattr(self, 'c1_level_cur', None):

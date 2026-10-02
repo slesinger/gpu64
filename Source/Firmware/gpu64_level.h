@@ -431,6 +431,7 @@ boolean gpu64_levelTraceEnts( const Gpu64_Level *pL, unsigned nHull,
 // the REU start-up path in rad_main.cpp, before reuUsingPolling().
 #ifndef GPU64_HOSTSIM
 void gpu64_levelPreload( void );
+void gpu64_levelPackReadAtBoot( void );	// once, at Pi start-up
 #endif
 
 // Reads the little-endian scalars a level file is built out of. Public

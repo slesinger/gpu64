@@ -299,7 +299,7 @@ Once Stage 16's loop can run a populated scene end-to-end:
   `DRAW_SECTORS`) demos — per decision 3, that column-cast rendering model
   has no class-1 equivalent and isn't getting one; those demos stay on
   class 2 indefinitely, which is exactly what "frozen, not removed" means.
-- Write up the migration as a short note in `docs/class1-3d-mesh-reference.md`
+- **Done 2026-09-30:** the migration write-up is "Porting a class 2 program" in `docs/class1-3d-mesh-reference.md`, with the room's before/after and the game's per-frame figures. Originally: write up the migration as a short note in `docs/class1-3d-mesh-reference.md`
   once there's a real before/after to point at, rather than guessing at
   the numbers now.
 
@@ -331,6 +331,25 @@ next thing work":
   before trusting the destination. Scope this stage to measuring whether
   it's worth it first (energy/cycle savings vs. ARM `memset`/copy loops,
   on real hardware) before wiring it into the hot path.
+
+  **Closed as not worth building, 2026-09-30 (desk estimate, tracker 97).**
+  With free-running mode dropped, the only bulk fill left is the loop's
+  per-frame clear.
+  - It stores 320x200 colour bytes plus 16-bit depth, 192 KB, in about 760
+    span bursts of 256 bytes, each ended by a DSB.
+  - On a 1.4 GHz A53 that is roughly 0.2-0.4 ms of a ~31 ms frame, so about
+    1% of core 1's frame is all a DMA offload could save.
+  - Against that:
+    - **(a)** A DMA fill is one unbroken 192 KB write stream. Burst length
+      is the one axis milestone 6a proved breaks core 0, and pacing the
+      engine with TI.WAITS or 2D strides would need its own load ladder.
+    - **(b)** The engine reports completion through its CS register, and
+      polling any MMIO register from a second core is the other thing 6a
+      proved breaks core 0. Completion would have to come by interrupt.
+    - **(c)** The BCM DMA has no fill mode. A fill is a non-incrementing
+      128-bit source, which is new and unverified code on the frame path.
+  - Reopen only if a core-1 frame-time instrument shows the clear costs
+    well over a millisecond.
 
 ## What this plan deliberately does not stage
 

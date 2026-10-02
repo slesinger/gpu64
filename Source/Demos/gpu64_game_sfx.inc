@@ -45,7 +45,8 @@ SFX_BUTTON   = 17
 SFX_SECRET   = 18
 SFX_JUMP     = 19
 SFX_SPLASH   = 20
-SFX_COUNT    = 21
+SFX_BOOM     = 21
+SFX_COUNT    = 22
 
 ; (ticks, control, frequency, slide per tick)
 SG_SHOT   = [(3, $81, $3000, -$0600), (12, $80, $1200, -$0080)]
@@ -69,10 +70,11 @@ SG_BUTTON = [(2, $41, $3000, 0), (1, $40, $3000, 0)]
 SG_SECRET = [(6, $11, $22cb, 0), (6, $11, $2bd8, 0), (6, $11, $3426, 0), (20, $11, $4597, 0)]
 SG_JUMP   = [(5, $11, $0a00, $0180), (1, $10, $1100, 0)]
 SG_SPLASH = [(10, $81, $1800, -$0100), (6, $80, $0e00, 0)]
+SG_BOOM   = [(4, $81, $0a00, -$0100), (30, $80, $0600, -$0010)]
 
 ; (priority, AD, SR, pulse width high, segments), in SFX_* order. Priority
 ; 0 would mean "free", so every effect has at least 1.
-SOUNDS = [(6, $09, $08, 0, SG_SHOT), (7, $0a, $09, 0, SG_SSHOT), (3, $05, $00, 8, SG_NAIL), (2, $44, $00, 0, SG_AXE), (4, $06, $a6, 0, SG_HEALTH), (4, $04, $84, 8, SG_ITEM), (5, $06, $a6, 8, SG_WEAPON), (6, $08, $a8, 0, SG_POWER), (6, $08, $00, 0, SG_PAIN), (9, $0b, $0b, 0, SG_DIE), (4, $07, $00, 0, SG_MPAIN), (5, $0a, $09, 0, SG_MDIE), (5, $09, $08, 0, SG_GRUNT), (4, $06, $00, 0, SG_BITE), (4, $2a, $a6, 0, SG_LEAP), (3, $28, $a4, 0, SG_SIGHT), (2, $4a, $a8, 0, SG_DOOR), (3, $03, $00, 8, SG_BUTTON), (8, $09, $a9, 0, SG_SECRET), (2, $06, $00, 0, SG_JUMP), (3, $0a, $08, 0, SG_SPLASH)]
+SOUNDS = [(6, $09, $08, 0, SG_SHOT), (7, $0a, $09, 0, SG_SSHOT), (3, $05, $00, 8, SG_NAIL), (2, $44, $00, 0, SG_AXE), (4, $06, $a6, 0, SG_HEALTH), (4, $04, $84, 8, SG_ITEM), (5, $06, $a6, 8, SG_WEAPON), (6, $08, $a8, 0, SG_POWER), (6, $08, $00, 0, SG_PAIN), (9, $0b, $0b, 0, SG_DIE), (4, $07, $00, 0, SG_MPAIN), (5, $0a, $09, 0, SG_MDIE), (5, $09, $08, 0, SG_GRUNT), (4, $06, $00, 0, SG_BITE), (4, $2a, $a6, 0, SG_LEAP), (3, $28, $a4, 0, SG_SIGHT), (2, $4a, $a8, 0, SG_DOOR), (3, $03, $00, 8, SG_BUTTON), (8, $09, $a9, 0, SG_SECRET), (2, $06, $00, 0, SG_JUMP), (3, $0a, $08, 0, SG_SPLASH), (7, $0a, $0a, 0, SG_BOOM)]
 
 .cerror len(SOUNDS) != SFX_COUNT, "SOUNDS and SFX_* disagree"
 

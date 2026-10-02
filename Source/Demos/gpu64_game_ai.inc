@@ -51,10 +51,16 @@ AI_LEAP   = 4
 
 AI_ANIM_MASK = 1		; awake: an animation frame every 2nd frame
 AI_LOOK_MASK = 3		; asleep: looks every 4th frame
-AI_MAXTR  = 4			; traces a frame (with CB_NCAND and AI_MAXMV,
+AI_MAXTR  = 5			; traces a frame (with CB_NCAND and AI_MAXMV,
 AI_MAXMV  = 6			; moves a frame   at most 15 answers a block)
+	.cerror CB_NCAND + AI_MAXTR + AI_MAXMV > 15, "WORLD_TICK's trailer offset is a byte"
 AI_MAXMON = 32
 AI_EYE    = 200			; fine: Quake's monster view_ofs, 25 QU
+FLY_LO    = 64			; fine: a scrag's origin over the eye
+FLY_HI    = 144
+FLY_STEP  = 64			; fine a move, up or down
+FALL_STEP = 256			; fine a move: its body, falling
+FALL_N    = 30			; moves before a body is left where it is
 AI_SIGHT  = $20			; fine high byte: 32 wu = 1024 QU
 AI_NOISE  = 12			; wu: a gunshot wakes sleepers inside this box
 AI_TURN   = 32			; yaw per think: 45 degrees
@@ -134,17 +140,13 @@ aiiNext
 aiiDone
 	rts
 
-; X = slot. C set if it is a grunt or a dog. Preserves X.
+; X = slot. C set if it is a monster. Preserves X.
 aiIsMon
-	lda acKind,x
-	cmp #K_GRUNT
-	beq aimYes
-	cmp #K_DOG
-	beq aimYes
-	clc
-	rts
-aimYes
+	jsr mtType
+	bcs +
 	sec
+	rts
++	clc
 	rts
 
 ; monSpawn's half. X = monster slot: asleep, where it started. Preserves X.
@@ -228,16 +230,8 @@ aiRun
 	sta acState,x
 	lda #AM_LOOP
 	sta cbMode
-	lda acKind,x
-	cmp #K_DOG
-	beq arDog
-	lda #M_SOLDIER_RUN
-	ldy #N_SOLDIER_RUN
-	jmp acAnim
-arDog
-	lda #M_DOG_RUN
-	ldy #N_DOG_RUN
-	jmp acAnim
+	lda #MA_RUN
+	jmp mtAnim
 
 ; actFrame's end of an AM_ONCE animation (pain, an attack). X = slot.
 ; Preserves X.
@@ -248,12 +242,8 @@ aiAnimEnd
 aeAwake
 	cmp #AI_CHASE
 	beq aiRun			; pain over: back to the chase
-	ldy #GR_COOL			; an attack over: a rest before the next
-	lda acKind,x
-	cmp #K_DOG
-	bne +
-	ldy #DOG_COOL
-+	tya
+	jsr mtType			; an attack over: a rest before the next
+	lda mbCool,y
 	sta acAtkT,x
 	jmp aiRun
 
@@ -265,6 +255,8 @@ aiFrame
 	lda #0
 	sta aiTrN
 	sta aiMvN
+	jsr pjFrame			; the missiles first: their traces before
+					; the monsters' can spend the budget
 	lda aiLoud			; fire's: a gun went off this frame
 	sta aiNoisy
 	lda #0
@@ -303,6 +295,17 @@ aiOne
 	lda acState,x
 	cmp #AS_IDLE			; in pain or dead: nothing to decide
 	beq +
+	cmp #AS_DEAD
+	bne aoNo
+	lda acLeapT,x			; ... but a scrag's body falls
+	beq aoNo
+	txa
+	eor wtFrame
+	and #1
+	bne aoNo
+	dec acLeapT,x
+	jmp aiFallReq
+aoNo
 	rts
 +	lda acAi,x
 	beq aoAsleep
@@ -415,39 +418,48 @@ aoAwake
 
 aoChase
 	; Close in, but not onto the player.
-	ldy #<GR_STOP_F
-	lda #>GR_STOP_F
-	jsr aiKindIsDog
-	bcc +
-	ldy #<DOG_STOP_F
-	lda #>DOG_STOP_F
-+	jsr aiDistLt
+	jsr mtType
+	sty aiTy
+	lda mbStopH,y
+	pha
+	lda mbStopL,y
+	tay
+	pla
+	jsr aiDistLt
 	bcs aocRts
-	lda #GR_STEP
-	jsr aiKindIsDog
-	bcc +
-	lda #DOG_STEP
-+	jmp aiMoveReq
+	ldy aiTy
+	lda mbStep,y
+	jmp aiMoveReq
 aocRts
 	rts
 
+; mbShots of them, from the SHOOT frame on, one an animation frame: a
+; volley, or a missile (gpu64_game_proj.inc).
 aoShoot
-	lda acAnF,x
-	cmp #GR_FIRE_F
+	jsr mtType
+	lda mtShootF,y
+	clc
+	adc acFired,x
+	cmp acAnF,x
 	bne aosRts
 	lda acFired,x
-	bne aosRts
-	lda #1
-	sta acFired,x
+	cmp mbShots,y
+	bcs aosRts
+	inc acFired,x
 	lda #SFX_GRUNT
 	jsr sfxPlay
-	jmp aiVolley
+	lda mbProj,y
+	beq +
+	jmp pjLaunch
++	jmp aiVolley
 aosRts
 	rts
 
 aoBite
+	jsr mtType
+	sty aiTy
 	lda acAnF,x
-	cmp #DOG_BITE_AF
+	cmp mtMeleeF,y
 	bne aobRts
 	lda acFired,x
 	bne aobRts
@@ -455,14 +467,19 @@ aoBite
 	sta acFired,x
 	lda #SFX_BITE
 	jsr sfxPlay
-	ldy #<DOG_BITE_F
-	lda #>DOG_BITE_F
+	ldy aiTy
+	lda mbReachH,y
+	pha
+	lda mbReachL,y
+	tay
+	pla
 	jsr aiDistLt
 	bcc aobRts			; it backed off in time
-	jsr rnd
-	and #7
+	ldy aiTy
+	jsr rnd				; preserves X and Y
+	and mbMRnd,y
 	clc
-	adc #8
+	adc mbMDmg,y
 	jmp aiHit
 aobRts
 	rts
@@ -481,10 +498,11 @@ aoLeap
 	sta acFired,x			; it just falls
 	lda #0
 	sta acLeapT,x
-	jsr rnd
-	and #7
+	jsr mtType
+	jsr rnd				; preserves X and Y
+	and mbLRnd,y
 	clc
-	adc #10
+	adc mbLDmg,y
 	jmp aiHit
 aolMove
 	lda #LEAP_STEP
@@ -513,26 +531,39 @@ aiThink
 atRts
 	rts
 
+; Whichever attacks the type's bank has frames for, in Quake's order:
+; melee in reach, a leap from a little further out, else a shot.
 atChase
-	jsr aiKindIsDog
-	bcc atGrunt
-	; The dog: bite in reach, leap from a little further out.
-	ldy #<DOG_MELEE_F
-	lda #>DOG_MELEE_F
+	jsr mtType
+	sty aiTy
+	lda #MA_MELEE
+	jsr mtHas
+	beq atNoBite
+	ldy aiTy
+	lda mbMeleeH,y
+	pha
+	lda mbMeleeL,y
+	tay
+	pla
 	jsr aiDistLt
 	bcc atNoBite
-	ldy #M_DOG_ATTACK
-	lda #N_DOG_ATTACK
-	sta aiAnN
+	ldy #MA_MELEE
 	lda #AI_BITE
 	jmp atAttack
 atNoBite
+	lda #MA_LEAP
+	jsr mtHas
+	beq atNoLeap
 	lda acSee,x
 	beq atNoLeap
 	lda acAtkT,x
 	bne atNoLeap
-	ldy #<DOG_LEAP_HI
-	lda #>DOG_LEAP_HI
+	ldy aiTy
+	lda mbLeapH,y
+	pha
+	lda mbLeapL,y
+	tay
+	pla
 	jsr aiDistLt
 	bcc atSteer
 	jsr rnd				; preserves X
@@ -541,15 +572,13 @@ atNoBite
 	jsr sfxPlay
 	lda #LEAP_FRAMES
 	sta acLeapT,x
-	ldy #M_DOG_LEAP
-	lda #N_DOG_LEAP
-	sta aiAnN
+	ldy #MA_LEAP
 	lda #AI_LEAP
 	jmp atAttack
 atNoLeap
-	jmp atSteer
-
-atGrunt
+	lda #MA_SHOOT
+	jsr mtHas
+	beq atSteer
 	lda acSee,x
 	beq atSteer
 	lda acAtkT,x
@@ -577,13 +606,11 @@ atRoll
 	jsr rnd
 	cmp aiChance
 	bcs atSteer
-	ldy #M_SOLDIER_SHOOT
-	lda #N_SOLDIER_SHOOT
-	sta aiAnN
+	ldy #MA_SHOOT
 	lda #AI_SHOOT
 	; fall through
 
-; A = acAi, Y = first mesh, aiAnN = frames: face the player and start it.
+; A = acAi, Y = MA_*: face the player and start it.
 atAttack
 	sta acAi,x
 	lda #0
@@ -593,8 +620,7 @@ atAttack
 	lda #AM_ONCE
 	sta cbMode
 	tya
-	ldy aiAnN
-	jmp acAnim
+	jmp mtAnim
 
 ; Where to run: straight at the player, or a detour after a blocked step.
 atSteer
@@ -647,19 +673,6 @@ atDone
 
 ; Off the ideal yaw: 45 and 90 degrees, alternating sides.
 aiDetTab	.byte 32, $100 - 64, 64, $100 - 32
-
-; X = slot. C set if a dog. Preserves A, X and Y.
-aiKindIsDog
-	pha
-	lda acKind,x
-	cmp #K_DOG
-	beq +
-	pla
-	clc
-	rts
-+	pla
-	sec
-	rts
 
 ; A:Y = a distance in fine. C set if aiDist is under it. Preserves X.
 aiDistLt
@@ -1034,7 +1047,64 @@ aiMoveReq
 	ldx #21
 	jsr amPut
 	ldx aiX
+	jsr aiFlyY
 	inc aiMvN
+	rts
+
+; X = slot, aiT = its move's offset, dd = it - the eye: a flyer's move
+; does not settle on a floor, and climbs or sinks FLY_STEP to keep its
+; origin FLY_LO..FLY_HI over the eye -- Quake's scrag, 30-40 QU over the
+; player. Preserves X.
+aiFlyY
+	jsr mtType
+	lda mbFly,y
+	beq afyRts
+	ldy aiT
+	lda #$01			; slide
+	sta aiMvBuf+25,y
+	lda dd+5
+	bmi afyUp
+	ora dd+4
+	bne afyDown
+	lda dd+3
+	cmp #FLY_LO
+	bcc afyUp
+	cmp #FLY_HI+1
+	bcc afyRts
+afyDown
+	lda #<-FLY_STEP
+	sta aiMvBuf+17,y
+	lda #$ff
+	bne afyHi
+afyUp
+	lda #FLY_STEP
+	sta aiMvBuf+17,y
+	lda #0
+afyHi
+	sta aiMvBuf+18,y
+	sta aiMvBuf+19,y
+afyRts
+	rts
+
+; X = aiX, a flyer's body: FALL_STEP straight down, settling on a floor.
+aiFallReq
+	lda aiMvN
+	pha
+	lda #0				; a move of nothing, then made a fall
+	jsr aiMoveReq
+	pla
+	cmp aiMvN
+	beq afrRts			; the budget was spent
+	ldy aiT
+	lda #0
+	sta aiMvBuf+17,y
+	lda #>-FALL_STEP
+	sta aiMvBuf+18,y
+	lda #$ff
+	sta aiMvBuf+19,y
+	lda #$05			; slide, settle
+	sta aiMvBuf+25,y
+afrRts
 	rts
 
 ; mR, fine, sign-extended into aiMvBuf + Y + X .. +X+2.
@@ -1134,7 +1204,12 @@ arTrLoop
 	ldx aiI
 	lda aiTrSl,x
 	tax
-	lda acState,x
+	lda acKind,x
+	cmp #K_PROJ
+	bne +
+	jsr pjAnswer			; a missile's: how far it flies
+	jmp arTrNext
++	lda acState,x
 	cmp #AS_DEAD
 	beq arTrNext
 	lda (DST),y			; flags: CLEAR, STARTSOLID, ALLSOLID
@@ -1188,25 +1263,33 @@ arMvLoop
 	stx aiX
 	lda acState,x
 	cmp #AS_DEAD
-	bne +
-	jmp arMvNext
-+	lda aiFlags
+	bne arAlive
+	lda aiFlags			; a scrag's body, falling
+	and #CLIP_SOLID
+	bne arLand
+	jsr aiBound
+	bcs arLand
+	jsr arTake
+	lda aiFlags
+	and #CLIP_ONGROUND
+	beq arMvNext
+arLand
+	lda #0
+	sta acLeapT,x
+	beq arMvNext
+arAlive
+	lda aiFlags
 	and #CLIP_SOLID
 	bne arBlocked
+	jsr mtType			; a flyer needs no floor
+	lda mbFly,y
+	bne +
 	lda aiFlags
 	and #CLIP_ONGROUND
 	beq arBlocked			; a ledge: not taken
-	jsr aiBound
++	jsr aiBound
 	bcs arRefuse
-	; Taken.
-	ldy aiAns
-	.for k = 0, k < 12, k += 1
-	lda (DST),y
-	sta acPos+k*MAX_ACT,x
-	iny
-	.next
-	lda #1
-	sta acDirty,x
+	jsr arTake
 	lda aiFrac
 	cmp #AI_BLOCK
 	bcs arMvNext
@@ -1226,6 +1309,18 @@ arRefuse
 arMvNext
 	inc aiI
 	jmp arMvLoop
+
+; X = slot: the move's end at (DST),aiAns is where it is now. Preserves X.
+arTake
+	ldy aiAns
+	.for k = 0, k < 12, k += 1
+	lda (DST),y
+	sta acPos+k*MAX_ACT,x
+	iny
+	.next
+	lda #1
+	sta acDirty,x
+	rts
 
 ; A = answer index. Y = its offset + 14 from DST.
 aiAnsOfs
@@ -1305,7 +1400,10 @@ aiVolley
 	sta aiD
 	lda #0
 	sta aiDmg
-	lda #GR_PEL
+	jsr mtType
+	sty aiTy
+	lda mbPel,y
+	beq avRts
 	sta aiPel
 avPel
 	jsr rnd
@@ -1320,9 +1418,10 @@ avPel
 	lda m8H
 	cmp #>GR_SPREAD_Y
 	bcs avMiss
+	ldy aiTy
 	lda aiDmg
 	clc
-	adc #GR_DMG
+	adc mbPelD,y
 	sta aiDmg
 avMiss
 	dec aiPel
@@ -1420,6 +1519,7 @@ aiIdeal		.byte 0
 aiChance	.byte 0
 aiStep		.word 0
 aiAnN		.byte 0
+aiTy		.byte 0
 aiTr0		.byte 0
 aiFrac		.byte 0
 aiFlags		.byte 0
