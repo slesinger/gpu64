@@ -239,6 +239,7 @@ cfNoSimHurt
 	bne cfNoCheat
 	jsr plCheat
 cfNoCheat
+	jsr giveCheat			; I, under BASIC
 
 	jsr weapKeys
 

@@ -78,24 +78,33 @@ cntTwo
 	inc nCnt
 	rts
 
-; X = mover being loaded: mvStay = 1 for a door or button with wait -1.
-; Preserves X.
+; X = mover being loaded. mvStay bit 0 = a door or button with wait -1,
+; bit 7 = a door with START_OPEN (spawnflags 1), which Quake spawns at its
+; open position and moves to the modelled one when fired: mulOfs runs its
+; fraction backwards. Preserves X.
 exStayTake
-	lda #0
-	sta mvStay,x
 	lda entBlk+ENT_P1
 	and entBlk+ENT_P1+1
-	cmp #$ff
-	bne +
-	lda mvKind,x
-	cmp #K_DOOR
+	cmp #$ff			; C: wait -1
+	lda #0
+	rol a
+	ldy mvKind,x
+	cpy #K_BUTTON
 	beq exStay
-	cmp #K_BUTTON
-	bne +
+	cpy #K_DOOR
+	beq +
+	lda #0
+	beq exStay
++	tay
+	lda entBlk+ENT_SPAWN
+	lsr a
+	tya
+	bcc exStay
+	ora #$80
+	inc mvDirty,x			; its first offset is not zero
 exStay
-	lda #1
 	sta mvStay,x
-+	rts
+	rts
 
 ; ----------------------------------------------------------------------
 ; fireTarget's second half: every counter listening for the fired id
@@ -178,7 +187,91 @@ exTrig
 	lda trDest,x
 	sta exitDest
 	lda #K_TRIG_CHANGE
+	rts
++	cmp #K_TRIG_TELE
+	bne +
+	ldy trDest,x
+	beq +				; inert: an ambush's, or the table was full
+	jsr tpGo
+	lda #K_TRIG_MULTI		; and it goes on working
 +	rts
+
+; ----------------------------------------------------------------------
+; trigger_teleport. gen_quakelevel.py puts the destination's eye in the
+; travel field, its yaw in p0 and 1 in p1 when the teleport works; etTrig
+; has just copied p1 into trDest,x. X is the trigger.
+; ----------------------------------------------------------------------
+tpTake
+	lda entBlk+ENT_KIND
+	cmp #K_TRIG_TELE
+	bne tpTkDone
+	lda trDest,x
+	beq tpTkDone
+	lda #0
+	sta trDest,x
+	ldy nTel
+	cpy #MAX_TEL
+	bcs tpTkDone
+	lda entBlk+ENT_TRAVEL+1
+	sta tpL,y
+	lda entBlk+ENT_TRAVEL+2
+	sta tpH,y
+	lda entBlk+ENT_TRAVEL+5
+	sta tpL+MAX_TEL,y
+	lda entBlk+ENT_TRAVEL+6
+	sta tpH+MAX_TEL,y
+	lda entBlk+ENT_TRAVEL+9
+	sta tpL+2*MAX_TEL,y
+	lda entBlk+ENT_TRAVEL+10
+	sta tpH+2*MAX_TEL,y
+	lda entBlk+ENT_P0
+	sta tpL+3*MAX_TEL,y
+	lda entBlk+ENT_P0+1
+	sta tpH+3*MAX_TEL,y
+	iny
+	sty nTel
+	tya
+	sta trDest,x
+tpTkDone
+	rts
+
+; Y = the teleport's slot + 1. The destination becomes the last good place
+; and restoreGood takes the player there, standing still, facing its way.
+tpGo
+	dey
+	ldx #0
+-	lda #0
+	sta lastGood,x
+	lda tpL,y
+	sta lastGood+1,x
+	lda tpH,y
+	sta lastGood+2,x
+	asl				; the sign, into the top byte
+	lda #$ff
+	adc #0
+	eor #$ff
+	sta lastGood+3,x
+	tya
+	clc
+	adc #MAX_TEL
+	tay
+	inx
+	inx
+	inx
+	inx
+	cpx #12
+	bne -
+	lda tpL,y
+	sta camYaw
+	lda tpH,y
+	sta camYaw+1
+	lda #0
+	sta camPitch
+	jsr restoreGood
+	lda #SFX_POWER
+	jsr sfxPlay
+	ldx gtI
+	rts
 
 ; ----------------------------------------------------------------------
 ; Once a frame, after clkFrame: the play time, and the message timer.

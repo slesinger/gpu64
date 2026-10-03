@@ -983,7 +983,7 @@ formula, and a brush model's geometry as a contiguous run of scene node ids.
 | 16-27 | out | `origin` x, y, z — s32 16.16 world units, gpu64 axes |
 | 28-39 | out | `mins` — the brush model's box, zero if it is not a brush model |
 | 40-51 | out | `maxs` |
-| 52-63 | out | `travel` — the closed→open displacement, zero if it is not a mover |
+| 52-63 | out | `travel` — the closed→open displacement, zero if it is not a mover; for a working `trigger_teleport`, the destination's eye position |
 | 64-65 | out | yaw, u16, a full turn is 65536 |
 | 66-67 | out | spawnflags |
 | 68-69 | out | `param0` — s16; which Quake key this is depends on the kind |
@@ -1026,6 +1026,14 @@ the same displacement into the door's mover record in your next `CLIP_MOVE`
 block so the player stops walking through it. The wiring is the ids: a
 `trigger_multiple` whose `target` equals a door's `targetname` is what opens
 that door.
+
+A `trigger_teleport` (kind 24) carries everything a jump needs, so the game
+never has to look up kind 7: `param1` is 1 when the teleport works, `travel`
+is then the absolute eye position at its destination (Quake's
+`info_teleport_destination` plus 27 + 22 units) and `param0` is the yaw, s16,
+to face there. `param1` is 0 for one with a `targetname` — Quake's monster
+ambushes, live only for a moment after they are fired — and for one excluded
+from every skill.
 
 Both obligations are `CLIP_MOVE`'s, for the same reasons: check the output
 magic **and** checksum rather than `ERRCODE`, and set `SET_DMA_WINDOW` around

@@ -57,7 +57,7 @@ SIM_LEVEL    = $02ae		; --level-slot: the start level the menu would pick
 
 TUNE_INIT       = $a000		; E-Quake tune 1, the only tune
 TUNE_PLAY       = $a003
-LOGO_RLE        = $aa00
+LOGO_RLE        = $a990
 LOGO_SCREEN     = $cc00		; VIC bank 3: screen $cc00, bitmap $e000
 LOGO_BITMAP     = $e000
 LOGO_ROW0       = 6		; cell rows 6..17 hold the logo

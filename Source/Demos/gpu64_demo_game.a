@@ -52,12 +52,14 @@
 ;
 ;        W / S   forward / back          A / D   turn left / right
 ;        Q / E   strafe left / right     SHIFT   hold to run
-;                                        SPACE   jump
+;        @ / ;   forward / back, too     SPACE   jump
+;        : / =   strafe left / right, too (fixed: the menu cannot move them)
 ;        F1 / F3 look up / down          F7      level the view
 ;        + / -   widen / narrow the field of view (30-110 degrees, 75 at start)
 ;        C= or B fire                    1-4     pick a weapon
 ;        <-      pause (RESUME / CONTROLS / MAIN MENU; <- again resumes)
 ;        H       health cheat: +100, at most 250, for testing levels
+;        I       weapons cheat: every weapon, full shells and nails
 ;
 ;        Joystick 2: up / down walk, left / right turn, button fires.
 ;        1351 mouse in port 1: sideways turns, forward / back looks up and
@@ -280,6 +282,7 @@ COL_G   = %11101111	; PA4 and PA6: only for keys the controls menu
 COL_H   = %10111111	; may bind (gpu64_game_controls.inc)
 KD_LARR = $02		; <- : the pause menu (gpu64_game_pause.inc)
 KF_H    = $20		; H: the health cheat
+KG_I    = $02		; I: the weapons cheat
 
 ; The mouse: a 1351 in port 1. PA7:6 = 01 connects port 1's pots to the
 ; SID, which finishes a measurement every 512 cycles; a reading is good only
@@ -523,6 +526,7 @@ K_TRIG_2  = 28
 K_TRIG_ONCE   = 21
 K_TRIG_MULTI  = 22
 K_TRIG_SECRET = 23
+K_TRIG_TELE   = 24		; trigger_teleport
 
 ; How many of each this program can hold. The shareware episode's worst
 ; cases are E1M6's 58 movers and E1M4's 45 triggers (E1M1 needs 29 and 26,
@@ -531,6 +535,7 @@ K_TRIG_SECRET = 23
 ; is a fact a reader of the screen needs and not an error.
 MAX_MOV = 60
 MAX_TRG = 48
+MAX_TEL = 8			; working teleports in one level
 FIRE_Q  = 8			; targetnames queued in one frame
 
 ; Mover states.
@@ -3027,6 +3032,7 @@ entScan
 	lda #0
 	sta nMov
 	sta nTrg
+	sta nTel
 	sta nCnt
 	sta secTotal
 	sta entBad
@@ -3256,21 +3262,7 @@ etMover
 	lda entBlk+ENT_TRAVEL+11
 	sta mvTZ3,x
 
-	lda #1
-	sta bmStale
-	lda #0
-	sta mvOX0,x
-	sta mvOX1,x
-	sta mvOX2,x
-	sta mvOX3,x
-	sta mvOY0,x
-	sta mvOY1,x
-	sta mvOY2,x
-	sta mvOY3,x
-	sta mvOZ0,x
-	sta mvOZ1,x
-	sta mvOZ2,x
-	sta mvOZ3,x
+	jsr mulOfs			; frac 0: none, or a START_OPEN door's all
 
 	; The box, in fine units: the two middle bytes of each 16.16 value and
 	; no arithmetic at all. This is the CLOSED box, and it stays the closed
@@ -3331,6 +3323,7 @@ etTrig
 
 	lda entBlk+ENT_P1		; trigger_changelevel's slot + 1
 	sta trDest,x
+	jsr tpTake			; ... or a teleport's
 	lda entBlk+ENT_KIND
 	sta trKind,x
 	cmp #K_TRIG_SECRET
@@ -4085,7 +4078,8 @@ gaOpSet
 
 gaOpen
 	lda mvStay,x
-	bne gaNext			; wait -1: open for good
+	lsr a
+	bcs gaNext			; wait -1: open for good
 	dec mvWait,x
 	bne gaNext
 	lda #MV_CLOSING
@@ -4117,7 +4111,10 @@ mulOfs
 	sta bmStale			; the block's copy is out of date
 	stx moI
 	lda mvFrac,x
-	sta moFrac
+	ldy mvStay,x
+	bpl +
+	eor #$ff			; START_OPEN: closed is all the way out
++	sta moFrac
 
 	lda mvTX0,x
 	sta t0
@@ -5845,15 +5842,12 @@ mvBZ0		.fill MAX_MOV, 0
 mvBZ1		.fill MAX_MOV, 0
 mvBZ2		.fill MAX_MOV, 0
 mvBZ3		.fill MAX_MOV, 0
-mvTX0		.fill MAX_MOV, 0
 mvTX1		.fill MAX_MOV, 0
 mvTX2		.fill MAX_MOV, 0
 mvTX3		.fill MAX_MOV, 0
-mvTY0		.fill MAX_MOV, 0
 mvTY1		.fill MAX_MOV, 0
 mvTY2		.fill MAX_MOV, 0
 mvTY3		.fill MAX_MOV, 0
-mvTZ0		.fill MAX_MOV, 0
 mvTZ1		.fill MAX_MOV, 0
 mvTZ2		.fill MAX_MOV, 0
 mvTZ3		.fill MAX_MOV, 0
@@ -6082,6 +6076,14 @@ sinHi
 	; written by the level scan before anything reads it, and nothing reads
 	; them outside the frame loop, so they live on the logo's screen, which
 	; only the title shows -- and the title is always followed by a scan.
+	; The movers' travel fractions, which only the level scan writes, live
+	; in the cassette buffer: nothing in this game touches tape.
+	.virtual $0334
+mvTX0		.fill MAX_MOV, 0
+mvTY0		.fill MAX_MOV, 0
+mvTZ0		.fill MAX_MOV, 0
+	.cerror * > $0400, "the cassette buffer's tenants outgrew it"
+	.endv
 	.virtual LOGO_SCREEN
 ; A trigger volume is a box, a target and whether it has already gone off.
 trKind		.fill MAX_TRG, 0
@@ -6101,6 +6103,11 @@ trMxYl		.fill MAX_TRG, 0
 trMxYh		.fill MAX_TRG, 0
 trMxZl		.fill MAX_TRG, 0
 trMxZh		.fill MAX_TRG, 0
+; A working teleport's destination: the eye in fine units, axis by axis
+; (X, Y, Z) and then its yaw, MAX_TEL apart. trDest holds slot + 1.
+nTel		.byte 0
+tpL		.fill 4 * MAX_TEL, 0
+tpH		.fill 4 * MAX_TEL, 0
 PJ_VARS					; gpu64_game_proj.inc's state, likewise
 	.endv
 	.include "gpu64_game_monsters.inc"

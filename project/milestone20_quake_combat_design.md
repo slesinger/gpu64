@@ -790,8 +790,17 @@ which is the one row no telemetry writes. They are cleared after
 MSG_FRAMES.
 
 **wait -1.** `exStayTake` reads the mover's `wait` (P1 = $FFFF) at scan
-time into `mvStay`. The door state machine's open-wait countdown skips a
-staying mover, so it never closes. Only doors and buttons take it.
+time into `mvStay` bit 0. The door state machine's open-wait countdown
+skips a staying mover, so it never closes. Only doors and buttons take it.
+
+**START_OPEN.** A door with spawnflags bit 0 gets `mvStay` bit 7. Quake
+spawns such a door at its open position and moves it to the modelled one
+when fired, so `mulOfs` runs its fraction backwards (`frac eor $ff`):
+CLOSED is the full travel, OPEN is where the map drew it. The scan calls
+`mulOfs` instead of zeroing the offsets, and marks the mover dirty so the
+first offset reaches the Pi. With wait -1 it then stays where it was
+fired to, as in Quake: E1M1's platform (*8, fired by button *9) appears
+once and stays.
 
 **Exit and intermission.** A trigger of kind 25 sets `exitHit`. The frame
 loop tests it after the frame is shown, and then `intermission`:

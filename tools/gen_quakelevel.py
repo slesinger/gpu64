@@ -687,6 +687,14 @@ def build_entities(bsp, stats):
         pool[t] = o
         return o
 
+    # trigger_teleport's destination, looked up by name. Quake raises an
+    # info_teleport_destination 27 units when it spawns and sets the
+    # player's origin to it; the eye is view_ofs (22) above that.
+    tdest = {}
+    for e in bsp.entities():
+        if e.get('classname') == 'info_teleport_destination' and e.get('targetname'):
+            tdest[e['targetname']] = e
+
     recs = []
     for e in bsp.entities():
         cls = e.get('classname', '')
@@ -723,7 +731,25 @@ def build_entities(bsp, stats):
             p1 = int(mp[3:]) if (len(mp) == 4 and mp[:3] == 'e1m'
                                  and mp[3].isdigit()) else 0
         ofs = open_ofs(e, mdl, bsp, stats)
-        if any(ofs):
+        if cls == 'trigger_teleport':
+            # The travel field is the destination EYE, p0 its yaw and p1 = 1
+            # says the teleport works. One with a targetname works only for
+            # a moment after it is fired -- monster ambushes -- and one
+            # excluded from every skill is deathmatch-only: both stay inert.
+            d = tdest.get(e.get('target', ''))
+            sf = num(e.get('spawnflags'))
+            p0 = p1 = 0
+            ofs = (0.0, 0.0, 0.0)
+            if d is not None and not e.get('targetname') and (sf & 1792) != 1792:
+                q = [num(v) for v in d.get('origin', '0 0 0').split()[:3]] + [0, 0, 0]
+                ofs = to_gpu64([q[0], q[1], q[2] + 27 + 22])
+                p0 = yaw_of(d)
+                p0 = p0 - 65536 if p0 >= 32768 else p0
+                p1 = 1
+                stats['ent_teleport'] += 1
+            elif d is None:
+                stats['ent_teleport_no_dest'] += 1
+        if any(ofs) and cls != 'trigger_teleport':
             stats['ent_mover'] += 1
         recs.append(struct.pack('<6H2h3i3iBBH',
                                 sput(cls), yaw_of(e), num(e.get('spawnflags')) & 0xffff,

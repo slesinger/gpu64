@@ -18,8 +18,9 @@
 ;
 ; Only the eight movement actions are bindable. The keys the game already
 ; uses for something else are reserved and the menu ignores them: RETURN,
-; F1-F7, 1-4 (weapons), B and C= (fire), <- (pause), H (health cheat),
-; + and - (view), and RUN/STOP. Binding a key another action already has swaps the two, so
+; F1-F7, 1-4 (weapons), B and C= (fire), <- (pause), H and I (cheats),
+; + and - (view), RUN/STOP, and the fixed second movement keys @ ; : =,
+; which altKey adds to whatever W/S/Q/E's actions are bound to. Binding a key another action already has swaps the two, so
 ; no key ever drives two actions and no action is ever left without a key.
 ; Bindings last for the session: they live in the program, so the second
 ; level and every restart keep them, and a reload of the PRG resets them.
@@ -76,7 +77,11 @@ kbRemap
 -	lda bindKey,x
 	jsr kbCell
 	and kbRaw,y
-	cmp #1				; C clear: the bit is 0, i.e. down
+	beq +				; down
+	lda altKey,x			; the fixed second key, 64 = none
+	jsr kbCell
+	and kbRaw,y
++	cmp #1				; C clear: the bit is 0, i.e. down
 	rol kbUp
 	dex
 	bpl -
@@ -101,6 +106,37 @@ kbRemap
 	cpx #CT_N
 	bne -
 	rts
+
+; The weapons cheat (I), for testing levels: every weapon and full shells
+; and nails, once per press -- combatFrame's H cheat, beside it.
+giveCheat
+	lda keyG
+	and #KG_I
+	beq +
+	lda #0
+	sta giveHold
+	rts
++	lda giveHold
+	cmp #KEY_HOLD
+	bcs gcRts
+	inc giveHold
+	lda giveHold
+	cmp #KEY_HOLD
+	bne gcRts
+	lda #1 << W_AXE | 1 << W_SHOT | 1 << W_SSG | 1 << W_NAIL
+	sta plWeaps
+	lda #100
+	sta plShells
+	lda #200
+	sta plNails
+	jsr msgRow
+	jsr dmText
+	.text "         CHEAT: WEAPONS"
+	.byte 0
+	lda #SFX_WEAPON
+	jmp sfxPlay
+gcRts	rts
+giveHold	.byte 0
 
 ; A = key. Y = its column, A = its row's bit. X is kept.
 kbCell
@@ -547,15 +583,18 @@ ctDefOff	.byte 0, 0, 0, keyC - keyB, keyD - keyB, 0, 0, keyD - keyB
 ctDefClr	.byte $ff ^ KB_W, $ff ^ KB_S, $ff ^ KB_A, $ff ^ KC_D
 		.byte $ff ^ KD_Q, $ff ^ KB_E, $ff ^ KB_LSH, $ff ^ KD_SPC
 bindKey		.byte 9, 13, 10, 18, 62, 14, 15, 60
+; Every action's fixed second key, which no binding moves: @ ; for walking,
+; : = for stepping. 64 reads kbRaw+8, which is always released.
+altKey		.byte 46, 50, 64, 64, 45, 53, 64, 64
 
 ; Per column, the rows whose keys the game already uses.
 ctResv		.byte $7a		; RETURN F7 F1 F3 F5
 		.byte $09		; 3 4
 		.byte $00
 		.byte $30		; B H
-		.byte $00
-		.byte $09		; + -
-		.byte $00
+		.byte $02		; I
+		.byte $69		; + - : @
+		.byte $24		; ; =
 		.byte $ab		; 1 <- 2 C= RUN/STOP
 
 kbBits		.byte $01, $02, $04, $08, $10, $20, $40, $80
@@ -658,6 +697,7 @@ msGain		.byte 6, 8, 10, 13, 16, 20, 25, 32, 40
 	.cerror * - msGain != 9 || msGain - msYaw != 9, "nine speeds"
 
 kbRaw		.fill 8, 0
+		.byte $ff		; altKey's "none" column: never down
 kbUp		.byte 0
 kbT		.byte 0
 ctCur		.byte 0
