@@ -29,3 +29,6 @@ __pycache__/
 
 # Quake sounds extracted from PAK0.PAK for auditioning, not part of the project
 /loops/
+
+# 64tass listings (-L), rebuilt with the PRG
+/Source/Demos/*.lst
