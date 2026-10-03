@@ -114,6 +114,9 @@ Options:
         counts a frame (Y positive is away from you) and, with FIRE, hold
         the left button, which grounds $dc01 bit 4 as on hardware. Without
         it $d419/$d41a read $ff, an empty port. Repeatable.
+    --mouse-jiffy   --mouse's DX, DY are counts a jiffy (an IRQ), not a
+                    frame: a hand moving steadily against the 60 Hz clock
+                    the program samples on, instead of in frame-sized steps.
     --notarget      gpu64_demo_game.a: the monsters never notice the
                     player, as Quake's notarget cheat. Route checks that are
                     about doors, not fights, run with it.
@@ -299,6 +302,8 @@ class Machine:
         self.key_script = list(key_script or [])
         self.joy_script = list(joy_script or [])
         self.mouse_script = list(mouse_script or [])
+        self.mouse_jiffy = False
+        self.mouse_pos = [0, 0]
         self.notarget = notarget
         self.telemetry = telemetry
         self.frame_ms = frame_ms
@@ -419,6 +424,12 @@ class Machine:
             return self.cia_pra & ~self.joy() & 0xFF
         if addr in (0xDD06, 0xDD07):
             return self.cia2_timer_b(addr)
+        if addr in (0xDC04, 0xDC05):
+            # Timer A counting down to the next IRQ, on the clock irq()
+            # raises it by (four cycles an instruction). Writes are the latch.
+            latch = self.mem[0xDC04] | self.mem[0xDC05] << 8 or 0x4025
+            v = max(latch - self.irq_wait * 4, 0)
+            return v & 0xFF if addr == 0xDC04 else v >> 8
         if addr in (0xD419, 0xD41A):
             return self.mouse_pot(0 if addr == 0xD419 else 1)
         if addr == 0xFFE1:
@@ -467,10 +478,13 @@ class Machine:
         # has no settling time; the program's wait is simply not needed.
         if not self.mouse_script or (self.cia_pra & 0xC0) != 0x40:
             return 0xFF
-        pos = 0
-        for dx, dy, fire, first, last in self.mouse_script:
-            if self.frame >= first:
-                pos += (dx, dy)[axis] * (min(self.frame, last) - first + 1)
+        if self.mouse_jiffy:
+            pos = self.mouse_pos[axis]
+        else:
+            pos = 0
+            for dx, dy, fire, first, last in self.mouse_script:
+                if self.frame >= first:
+                    pos += (dx, dy)[axis] * (min(self.frame, last) - first + 1)
         return 0x40 + ((pos * 2) & 0x7E) & 0xFF
 
     def mouse_fire(self):
@@ -612,6 +626,11 @@ class Machine:
             return
         self.irq_wait = 0
         self.irqs += 1
+        if self.mouse_jiffy:
+            for dx, dy, fire, first, last in self.mouse_script:
+                if first <= self.frame <= last:
+                    self.mouse_pos[0] += dx
+                    self.mouse_pos[1] += dy
         c.push(c.pc >> 8)
         c.push(c.pc & 0xFF)
         c.push((c.p | FLAG_U) & ~FLAG_B)
@@ -980,6 +999,7 @@ def main(argv):
                 sid_log=next((o.split('=', 1)[1] for o in opts
                               if o.startswith('--sid-log=')), None))
     m.gpu.c1_clip_fault = clip_fault
+    m.mouse_jiffy = '--mouse-jiffy' in opts
     for o in opts:
         if o.startswith('--render-ms='):
             m.gpu.c1_render_us = int(o.split('=', 1)[1]) * 1000

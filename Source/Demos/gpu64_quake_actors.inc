@@ -6,7 +6,7 @@
 ; gpu64_catalog record; its spawnflags must equal CAT_HASH.
 
 CAT_ENT = 371
-CAT_HASH = $1b9a
+CAT_HASH = $cf0b
 
 T_V_AXE = 0
 M_V_AXE = 1
@@ -229,7 +229,8 @@ PIC_LV_E1M6 = 118
 PIC_LV_E1M7 = 119
 PIC_LV_E1M8 = 120
 PIC_PM_MAINMENU = 121
-PIC_COUNT = 122
+PIC_CT_MOUSE = 122
+PIC_COUNT = 123
 LOGO_X = 16
 LOGO_Y = 48
 LOGO_BASE = 192

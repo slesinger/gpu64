@@ -26,7 +26,9 @@ code paths above (wpSfx, pickSfx); tools/sfx/sfxtest.prg plays them all.
 
 It also checks that the effects really play out: every voice that starts
 must drop its gate again within 120 ticks (the longest run is 64), which
-catches an IRQ that stopped chaining or a run with no end row.
+catches an IRQ that stopped chaining or a run with no end row. The log
+counts IRQs, and the game takes MOUSE_SUBS of them a tick (the mouse is
+sampled between ticks), so that is read from the source and divided out.
 
 Usage: tools/check_sfx.py --prg=... --level=build/e1m1.g64lev
 """
@@ -45,6 +47,13 @@ from check_ai import DOG_WARP                           # noqa: E402
 from check_env import SWIMOUT                           # noqa: E402
 
 SFX_INC = os.path.join(REPO, 'Source', 'Demos', 'gpu64_game_sfx.inc')
+GAME_A = os.path.join(REPO, 'Source', 'Demos', 'gpu64_demo_game.a')
+
+
+def irqs_per_tick():
+    m = re.search(r'^MOUSE_SUBS\s*=\s*(\d+)', open(GAME_A,
+                  encoding='latin-1').read(), re.M)
+    return int(m.group(1)) if m else 1
 
 
 def sounds():
@@ -71,9 +80,10 @@ def decode(log, sig):
     """[(frame, name)] per effect started, and the voices that never
     released."""
     writes = []
+    per = irqs_per_tick()
     for line in open(log):
         f, t, reg, val = line.split()
-        writes.append((int(f), int(t), int(reg, 16), int(val, 16)))
+        writes.append((int(f), int(t) // per, int(reg, 16), int(val, 16)))
     out, stuck = [], []
     for i, (f, t, reg, val) in enumerate(writes):
         if reg > 20 or reg % 7 != 4 or val != 0x08:

@@ -7,6 +7,13 @@
 ; gone before this one is installed (tiMusicOff), so the two never share
 ; the chip.
 ;
+; While installed, timer A runs MOUSE_SUBS times faster so the mouse is
+; sampled that often; only every MOUSE_SUBS-th IRQ -- the jiffy -- plays
+; the effects. None goes on to $EA31: every IRQ is acked and leaves by
+; $EA81, because the KERNAL's keyboard scan would disconnect the mouse's
+; port right before a sample, and the game reads neither its keys nor its
+; clock. sfxOff puts the KERNAL's jiffy and IRQ back.
+;
 ; An effect is a priority, an envelope, a pulse width and a run of
 ; segments. A segment is a duration in ticks, a control byte (waveform and
 ; gate), a start frequency and a signed per-tick slide. A zero duration
@@ -97,6 +104,7 @@ SID_VOL = $d418
 sfxInit
 	php
 	sei
+	jsr mouseReset			; nothing was sampled while it was out
 	ldx #$18
 	lda #0
 -	sta $d400,x
@@ -122,6 +130,16 @@ sfxInit
 	lda #>sfxIrq
 	sta $0315
 siDone
+	lda #MOUSE_SUBS - 1		; the next IRQ is not a jiffy ...
+	sta sfxSub
+	ldx #<( TIMER_PAL / MOUSE_SUBS )	; ... and they come this much faster
+	ldy #>( TIMER_PAL / MOUSE_SUBS )
+	lda $02a6			; 1 = PAL
+	bne +
+	ldx #<( TIMER_NTSC / MOUSE_SUBS )
+	ldy #>( TIMER_NTSC / MOUSE_SUBS )
++	stx $dc04
+	sty $dc05
 	plp
 	rts
 
@@ -139,7 +157,15 @@ sfxOff
 	sta $0314
 	lda sfxOld+1
 	sta $0315
-+	ldx #$18
++	ldx #<TIMER_PAL			; the KERNAL's own jiffy again
+	ldy #>TIMER_PAL
+	lda $02a6
+	bne +
+	ldx #<TIMER_NTSC
+	ldy #>TIMER_NTSC
++	stx $dc04
+	sty $dc05
+	ldx #$18
 	lda #0
 -	sta $d400,x
 	dex
@@ -215,10 +241,17 @@ sfpDone
 
 ; ----------------------------------------------------------------------
 ; The tick. Entered from the KERNAL's IRQ entry, A/X/Y already saved; ends
-; in whatever handler was on the vector before (the KERNAL's $EA31).
+; at the KERNAL's own exit, $EA81, after the CIA's ack.
 ; ----------------------------------------------------------------------
 sfxIrq
 	cld
+	dec sfxSub
+	jsr mouseIrq			; first: a jiffy past the last keyboard scan
+	lda sfxSub
+	bmi +
+	jmp sqOut			; a mouse-only IRQ
++	lda #MOUSE_SUBS - 1
+	sta sfxSub
 	ldx #2
 sqVoice
 	lda sfxPri,x
@@ -276,7 +309,9 @@ sqWrite
 sqNext
 	dex
 	bpl sqVoice
-	jmp (sfxOld)
+sqOut
+	lda $dc0d			; the ack, as $EA31 would have
+	jmp $ea81
 
 sqEnd
 	lda #0
@@ -342,6 +377,7 @@ sfxShiT
 ; State.
 ; ----------------------------------------------------------------------
 sfxOld		.word $ea31
+sfxSub		.byte 0			; IRQs to the next jiffy, less one
 sfxId		.byte 0
 sfxSx		.byte 0
 sfxSy		.byte 0

@@ -282,14 +282,63 @@ KD_LARR = $02		; <- : the pause menu (gpu64_game_pause.inc)
 KF_H    = $20		; H: the health cheat
 
 ; The mouse: a 1351 in port 1. PA7:6 = 01 connects port 1's pots to the
-; SID, which finishes a measurement every 512 cycles, so readKeys waits
-; two of them after selecting it. One count of POT X turns 64/65536 of a
-; turn; POT Y is halved into camPitch's 1/256 turns.
+; SID, which finishes a measurement every 512 cycles; a reading is good only
+; two measurements after port 1 was last disconnected. One count of POT X
+; turns 64/65536 of a turn; POT Y is halved into camPitch's 1/256 turns.
+;
+; The pots are sampled by mouseIrq on every IRQ, MOUSE_SUBS a jiffy, not
+; once a frame: a 1351 reports its position modulo 64 counts, so a sample
+; that moves 32 or more reads as a move the other way, and the shorter
+; the interval, the faster a flick fits in it. The movement accumulates
+; in accX/accY and mouseLook takes it once a frame.
+;
+; Nothing may disconnect port 1 within a reading's settling time. While
+; sfxIrq is installed the KERNAL's keyboard scan does not run at all (the
+; game never reads the KERNAL's keyboard), so the only disconnect is
+; readKeys' own column scan, and readKeys waits for the IRQ rather than
+; scan inside the settling time before it. If a scan still ends too
+; close -- the IRQ was held off -- the next sample is skipped (potSkip);
+; that loses nothing, the next delta covers both intervals.
+;
+; A wrap that still happens is the worst thing the mouse can do: a fast
+; turn read as an equally fast turn the other way, then tripled by the
+; acceleration. mouseGuard drops a sample that reverses a fast move
+; outright and repeats the previous one instead (see there).
 POT_X      = $d419
 POT_Y      = $d41a
 COL_POT1   = %01111111
 MOUSE_PROBE = 64		; frames between pot reads with no mouse seen
-MOUSE_SHIFT = 6
+MOUSE_SENS  = 4			; the controls menu's MOUSE SPEED 5, msYaw's x64
+CIA1_TAHI  = $dc05		; timer A, high byte: the IRQ's countdown
+MOUSE_SETTLE = 5		; x256 cycles: a deselect this close to the IRQ
+MOUSE_RKWAIT = MOUSE_SETTLE + 2	; readKeys waits for the IRQ inside this
+MOUSE_REV    = 12		; mouseGuard: |counts| of a suspect reversal
+; The mouse is sampled MOUSE_SUBS times a jiffy: sfxInit runs timer A that
+; much faster and sfxIrq plays the effects on every MOUSE_SUBS-th IRQ
+; only, so they keep 60 Hz. Four samples a jiffy is four times the speed
+; the 1351 can be moved at before a sample wraps; readKeys' wait is what
+; keeps the period from going much shorter (it must stay well over
+; MOUSE_RKWAIT pages).
+MOUSE_SUBS   = 4
+TIMER_PAL    = $4025		; the KERNAL's own jiffy, PAL ...
+TIMER_NTSC   = $4295		; ... and NTSC
+; Turning acceleration. A sample (one jiffy) of up to MOUSE_ACC_T counts
+; turns 1:1, so slow aiming keeps its 0.35 degree step; every count past
+; it turns three. The 1351 still cannot tell more than 31 counts a sample
+; from a wrap, so this is what makes a fast turn possible at all: the
+; same flick needs a third of the mouse speed.
+MOUSE_ACC_T  = 4
+; Caps, so a flick too fast to read turns as far as it can, the right
+; way, instead of somewhere random. MOUSE_YCAP: accelerated counts a frame
+; -- times msYaw's 160 at the top speed it must stay under half a turn, or
+; the turn aliases. MOUSE_PCAP: pitch a frame, in 1/256 turn -- one flick
+; can no longer pin the view to PITCH_LIM, where turning looks like nothing.
+; MOUSE_HOLD: samples mouseGuard holds the previous counts through a
+; reversal -- the length of a flick past the 1351's 31 counts a sample.
+MOUSE_YCAP   = 200
+MOUSE_PCAP   = 6
+MOUSE_HOLD   = 32
+	.cerror MOUSE_YCAP * 160 >= $8000, "the yaw cap aliases at speed 9"
 
 ; RUN/STOP is ignored -- on the bench phantom RUN/STOPs, from ghosting
 ; and from single bad samples, ended the game with nobody asking. Only
@@ -604,10 +653,7 @@ levelSetup
 	lda #0
 	sta camPitch
 	jsr readKeys
-	lda potX
-	sta potOld
-	lda potY
-	sta potOld+1
+	jsr mouseReset
 	jsr rgPersp
 	sta perErr
 
@@ -1811,42 +1857,40 @@ bmLoop
 ; that key into every scan: while the stick is off centre the keyboard is
 ; ignored and the stick alone steers.
 readKeys
+	; Not within MOUSE_RKWAIT pages of a mouse sample: wait the IRQ out
+	; instead, so the scan below cannot make it skip. Timer A reloads at
+	; the IRQ either way, so this ends even with interrupts off.
+-	lda CIA1_TAHI
+	cmp #MOUSE_RKWAIT
+	bcc -
 	sei
 	lda #$ff
 	sta $dc02
 	lda #$00
 	sta $dc03
 
-	; The mouse's pots first. The SID needs port 1 selected for two full
-	; measurements (~1000 cycles) before they are good; the last readKeys
-	; left COL_POT1 in CIA_PRA for the whole frame since, and so does the
-	; KERNAL's keyboard scan (it ends on $7f, the same value), so they are
-	; read at once. Without a mouse only every MOUSE_PROBE frames: with
-	; nothing in port 1 both pots read $ff, and a 1351 never reads that
-	; (its bit 7 is clear). The first reading also becomes potOld, so being
-	; found does not turn the view.
+	; Timer A before the scan, for the guard at the end.
+	lda CIA1_TAHI
+	sta rkTimer
+
+	; Is there a mouse? Only every MOUSE_PROBE frames until there is: with
+	; nothing in port 1 both pots read $ff, and a 1351 never reads that.
+	; After that mouseIrq does all the reading, and
+	; potSync makes its first reading the reference, so being found does
+	; not turn the view.
 	lda mouseSeen
-	bne rkPots
+	bne rkNoPots
 	dec mouseProbe
 	bpl rkNoPots
 	lda #MOUSE_PROBE - 1
 	sta mouseProbe
-rkPots
 	lda POT_X
-	sta potX
-	lda POT_Y
-	sta potY
-	lda mouseSeen
-	bne rkNoPots
-	lda potX
-	and potY
+	and POT_Y
 	cmp #$ff
 	beq rkNoPots
 	inc mouseSeen
-	lda potX
-	sta potOld
-	lda potY
-	sta potOld+1
+	lda #1
+	sta potSync
 rkNoPots
 
 	; Port 1 with no column selected.
@@ -1911,6 +1955,20 @@ rkNoPots
 	sta joy2
 	lda #COL_POT1		; port 1's pots measure until the next frame
 	sta CIA_PRA
+	; The scan disconnected port 1 (COL_H). If the next IRQ's sample would
+	; fall inside the settling time, or that IRQ is already pending -- the
+	; timer reloaded during the scan, so it reads higher than before --
+	; it skips.
+	lda CIA1_TAHI
+	cmp #MOUSE_SETTLE
+	bcc rkSkip
+	lda rkTimer
+	cmp CIA1_TAHI
+	bcs rkCli
+rkSkip
+	lda #1
+	sta potSkip
+rkCli
 	cli
 
 	; The controls menu's bindings, onto the default keys' bits -- so
@@ -2005,41 +2063,66 @@ rkCbm	inc fireDown
 rkNoCbm
 	rts
 
-; The mouse: turn by POT X, look up and down by POT Y. Nothing while dead,
-; like the keys (deadKeys).
+; The mouse: turn by POT X, look up and down by POT Y, from what mouseIrq
+; has gathered since the last frame, both scaled by the controls menu's
+; MOUSE SPEED. Taken while dead too, and dropped, like the keys
+; (deadKeys). An odd POT Y count stays behind for the next frame, so slow
+; movement is halved evenly in both directions.
 mouseLook
+	php
+	sei
+	lda accX
+	sta mdLo
+	lda accX+1
+	sta mdHi
+	lda accY
+	sta mdY
+	and #1
+	sta accY
+	lda #0
+	sta accX
+	sta accX+1
+	plp
 	lda plDead
 	bne mlDone
 
+	lda mdHi			; |counts| <= MOUSE_YCAP
+	beq mlPos
+	cmp #$ff
+	bne mlSat
+	lda mdLo
+	cmp #256-MOUSE_YCAP
+	bcs mlYaw
+	bcc mlSat
+mlPos
+	lda mdLo
+	cmp #MOUSE_YCAP+1
+	bcc mlYaw
+mlSat
+	lda mdHi
+	bmi +
+	lda #MOUSE_YCAP
 	ldx #0
-	lda potX
-	jsr mouseDelta
-	sta mdLo
-	ldy #0
-	cmp #$80
-	bcc +
-	dey
-+	sty mdHi
-	ldx #MOUSE_SHIFT
--	asl mdLo
-	rol mdHi
-	dex
-	bne -
+	beq ++
++	lda #256-MOUSE_YCAP
+	ldx #$ff
++	sta mdLo
+	stx mdHi
+mlYaw
+	ldx mouseSens			; yaw += counts * msYaw, modulo a turn
+	lda msYaw,x
+	jsr msMul16
 	clc
 	lda camYaw
-	adc mdLo
+	adc msRLo
 	sta camYaw
 	lda camYaw+1
-	adc mdHi
+	adc msRHi
 	sta camYaw+1
 
-	ldx #1
-	lda potY
-	jsr mouseDelta
-	cmp #$80			; halved, keeping the sign
-	ror a
+	jsr msPitch			; mdY, scaled: the change in pitch
 	clc
-	adc camPitch			; |sum| < 128: no overflow
+	adc camPitch			; 63 + PITCH_LIM < 128: no overflow
 	bmi mlNeg
 	cmp #PITCH_LIM+1
 	bcc mlSet
@@ -2052,6 +2135,140 @@ mlNeg
 mlSet
 	sta camPitch
 mlDone
+	rts
+	.cerror PITCH_LIM > 64, "mouseLook's pitch sum can overflow"
+
+
+; One sample, from sfxIrq on every IRQ. Runs with the IRQ's registers
+; saved; uses A, X, Y.
+mouseIrq
+	ldy potSkip			; readKeys' verdict on this sample
+	lda #0
+	sta potSkip
+	lda mouseSeen
+	beq miDone
+	tya
+	bne miDone
+	lda POT_X
+	sta potX
+	lda POT_Y
+	sta potY
+	and potX
+	cmp #$ff
+	beq miDone			; port 1 off, or no mouse: both read $ff
+	lda potSync
+	beq miDelta
+	lda #0
+	sta potSync
+	lda potX
+	sta potOld
+	lda potY
+	sta potOld+1
+miDone
+	rts
+miDelta
+	ldx #0
+	lda potX
+	jsr mouseDelta
+	jsr mouseGuard
+	jsr mouseAccel
+	ldy #0
+	cmp #$80
+	bcc +
+	dey
++	clc
+	adc accX
+	sta accX
+	tya
+	adc accX+1
+	sta accX+1
+	ldx #1
+	lda potY
+	jsr mouseDelta
+	clc
+	adc accY
+	bvc +				; saturates: a pitch past the limit anyway
+	lda #$7f
+	bit accY
+	bpl +
+	lda #$80
++	sta accY
+	rts
+
+; A = signed X counts of one sample, -32..31. Returns them accelerated,
+; -88..88, in A with the flags of A.
+mouseAccel
+	sta maSign
+	bpl +
+	eor #$ff
+	clc
+	adc #1
++	cmp #MOUSE_ACC_T+1
+	bcc maSigned
+	sta maTmp			; |d| + 2(|d| - T) = 3|d| - 2T
+	asl a
+	adc maTmp			; |d| <= 32: the asl left C clear
+	sec
+	sbc #2*MOUSE_ACC_T
+maSigned
+	bit maSign
+	bpl +
+	eor #$ff
+	clc
+	adc #1
++	ora #0
+	rts
+
+; A = signed X counts of one sample. A sample that reverses the previous
+; one outright, both at least about MOUSE_REV counts, is taken for a wrap:
+; a hand cannot turn a fast move round within one sample, but a move
+; just past 31 counts reads as exactly that. The previous counts stand in
+; for it, at most MOUSE_HOLD times running: a flick past the limit keeps
+; turning the way it went, and a real reversal is late by that many
+; samples (133 ms) at worst and never refused -- one that slows down on
+; the way, as a hand does, is not late at all.
+mouseGuard
+	sta mgCur
+	eor mgPrev
+	bpl mgTake			; the same way
+	lda mgCur
+	bpl +
+	eor #$ff			; |counts| - 1
++	cmp #MOUSE_REV
+	bcc mgTake
+	lda mgPrev
+	bpl +
+	eor #$ff
++	cmp #MOUSE_REV
+	bcc mgTake
+	lda mgRun
+	cmp #MOUSE_HOLD
+	bcs mgTake
+	inc mgRun
+	lda mgPrev
+	rts
+mgTake
+	lda #0
+	sta mgRun
+	lda mgCur
+	sta mgPrev
+	rts
+
+; Whatever moved before now is forgotten, and the next sample is only the
+; reference. sfxInit calls it: while the IRQ was out, nothing was sampled.
+mouseReset
+	php
+	sei
+	lda #1
+	sta potSync
+	lda #0
+	sta potSkip
+	sta mgPrev
+	sta mgRun
+	sta accX
+	sta accX+1
+	sta accY
+	plp
 	rts
 
 ; The 1351's own recipe. A = the new pot reading, X = 0 (X) or 1 (Y).
@@ -5773,6 +5990,22 @@ potOld		.byte $ff, $ff
 potNew		.byte 0
 mdLo		.byte 0
 mdHi		.byte 0
+mdY		.byte 0
+mouseSens	.byte MOUSE_SENS	; the controls menu's MOUSE SPEED, less one
+mlSign		.byte 0
+msMulT		.byte 0
+msRLo		.byte 0
+msRHi		.byte 0
+mgCur		.byte 0
+mgPrev		.byte 0
+mgRun		.byte 0
+maSign		.byte 0
+maTmp		.byte 0
+accX		.word 0		; mouseIrq's POT X counts since mouseLook
+accY		.byte 0		; ... and POT Y's, saturating
+potSync		.byte 0		; 1: the next sample is only the reference
+potSkip		.byte 0		; 1: the next sample may be unsettled
+rkTimer		.byte 0
 camPitch	.byte 0
 fovIx		.byte 0
 fovDirty	.byte 0

@@ -138,6 +138,9 @@ def build(pak_f, pak_ents, pak_read):
     # The pause menu's third line, back to the skill menu. After the level
     # lines so every earlier picture keeps its number.
     add('PM_MAINMENU', text(font, 'MAIN MENU'))
+    # The controls menu's mouse line, its value drawn with the KEY digit
+    # pictures. Last again, for the same reason.
+    add('CT_MOUSE', text(font, 'mouse speed', 1))
     sym['PIC_COUNT'] = len(pics)
     # Where the logo sits on both screens, and its palette base.
     sym['LOGO_X'], sym['LOGO_Y'] = hondani.X, hondani.Y

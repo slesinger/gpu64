@@ -39,7 +39,8 @@
 ; ======================================================================
 
 CT_N      = 8			; bindable actions
-CT_ITEMS  = CT_N + 2		; + defaults, done
+CT_MOUSE  = CT_N			; then the mouse speed,
+CT_ITEMS  = CT_N + 3		; defaults and done
 CT_LBL_X  = 16			; M_Keys_Draw's columns
 CT_KEY_X  = 140
 CT_CUR_X  = 130
@@ -156,6 +157,8 @@ ctTick
 	lda ctCur
 	cmp #CT_N
 	bcc ctPick
+	beq ctSpeed
+	cmp #CT_MOUSE + 1
 	beq ctDefaults
 	rts				; done
 
@@ -167,12 +170,15 @@ ctPick
 	bne ctTick
 
 ctDefaults
+	lda #MOUSE_SENS
+	sta mouseSens
 	ldx #CT_N - 1
 -	lda ctDefault,x
 	sta bindKey,x
 	dex
 	bpl -
-	bmi ctTick
+ctTickB
+	jmp ctTick			; and a stepping stone for ctGrabTick
 
 ctGrabTick
 	lda #TICK_MS
@@ -182,9 +188,9 @@ ctGrabTick
 	cpx #1
 	bne ctArmed
 	cmp #CT_NONE
-	bne ctTick
+	bne ctTickB
 	inc ctGrab			; all released: now take a key
-	bne ctTick
+	bne ctTickB
 ctArmed
 	cmp #CT_CANCEL
 	beq ctGrabEnd
@@ -203,6 +209,15 @@ ctArmed
 ctNoCand
 	lda #CT_MANY
 	sta ctCand
+	jmp ctTick
+
+ctSpeed					; MOUSE SPEED 1-9, round again
+	ldx mouseSens
+	inx
+	cpx #9
+	bcc +
+	ldx #0
++	stx mouseSens
 	jmp ctTick
 
 ctBind
@@ -324,18 +339,15 @@ ctHdmi
 	ldx #0
 chLoop
 	stx ctI
-	txa
-	clc
-	adc #PIC_CT_ACT0		; ACT0-7, DEFAULTS, DONE are consecutive
+	lda ctPicTab,x
 	ldy ctYTab,x
 	ldx #CT_LBL_X
 	jsr tiPicAt
 	lda #1
 	jsr tiPic
 	ldx ctI
-	cpx #CT_N
+	jsr ctValKey
 	bcs +
-	lda bindKey,x
 	clc
 	adc #PIC_KEY0
 	ldy ctYTab,x
@@ -452,14 +464,13 @@ cclLoop
 +	ldy #1
 	sta (DST),y
 cclNoCur
-	cpx #CT_N
+	jsr ctValKey
 	bcs cclNext
+	tax
 	lda #<ctKeyStr
 	sta SRC
 	lda #>ctKeyStr
 	sta SRC+1
-	lda bindKey,x
-	tax
 	lda #CT_KEYCOL
 	jsr ctNth
 cclNext
@@ -467,6 +478,23 @@ cclNext
 	inx
 	cpx #CT_ITEMS
 	bne cclLoop
+	rts
+
+; X = item: A = the KEY_NAMES index its value is shown with, carry
+; clear; carry set for an item with no value. Keeps X and Y.
+ctValKey
+	cpx #CT_N
+	bcs +
+	lda bindKey,x
+	rts
++	bne +
+	stx ctI2
+	ldx mouseSens
+	lda ctDigit,x
+	ldx ctI2
+	clc
+	rts
++	sec
 	rts
 
 ; Y = row: DST at its start.
@@ -532,12 +560,18 @@ ctResv		.byte $7a		; RETURN F7 F1 F3 F5
 
 kbBits		.byte $01, $02, $04, $08, $10, $20, $40, $80
 ctColSel	.byte $fe, $fd, $fb, $f7, $ef, $df, $bf, $7f
-ctYTab		.byte 48, 56, 64, 72, 80, 88, 96, 104, 120, 128
-ctRowTab	.byte 5, 6, 7, 8, 9, 10, 11, 12, 14, 15
+ctYTab		.byte 48, 56, 64, 72, 80, 88, 96, 104, 120, 136, 144
+ctRowTab	.byte 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 17
+ctPicTab	.byte PIC_CT_ACT0, PIC_CT_ACT1, PIC_CT_ACT2, PIC_CT_ACT3
+		.byte PIC_CT_ACT4, PIC_CT_ACT5, PIC_CT_ACT6, PIC_CT_ACT7
+		.byte PIC_CT_MOUSE, PIC_CT_DEFAULTS, PIC_CT_DONE
+	.cerror * - ctPicTab != CT_ITEMS || ctPicTab - ctRowTab != CT_ITEMS || ctRowTab - ctYTab != CT_ITEMS, "one row per item"
+ctDigit		.byte 56, 59, 8, 11, 16, 19, 24, 27, 32	; "1"-"9" in KEY_NAMES
 
 ctLblStr	.text "WALK FORWARD", 0, "BACKPEDAL", 0, "TURN LEFT", 0
 		.text "TURN RIGHT", 0, "STEP LEFT", 0, "STEP RIGHT", 0
-		.text "RUN", 0, "JUMP / SWIM UP", 0, "DEFAULTS", 0, "DONE", 0
+		.text "RUN", 0, "JUMP / SWIM UP", 0, "MOUSE SPEED", 0
+		.text "DEFAULTS", 0, "DONE", 0
 ctHintStr	.text "RETURN OR FIRE TO CHANGE", 0
 		.text "PRESS A KEY, RETURN CANCELS", 0
 ; tools/quake_pics.py's KEY_NAMES, the same order.
@@ -554,10 +588,80 @@ ctKeyStr	.text "DEL", 0, "RETURN", 0, "CRSR RT", 0, "F7", 0
 		.text "Q", 0, "RUN STOP", 0
 	.cerror ctHintStr - ctLblStr > 256 || * - ctKeyStr > 256, "a string table outgrew ctNth"
 
+; ----------------------------------------------------------------------
+; mouseLook's MOUSE SPEED arithmetic. Up here under BASIC with the menu:
+; only the frame loop and the menu use it.
+; ----------------------------------------------------------------------
+
+; Pitch: the even part of mdY, times msGain / 32 -- half of it at speed
+; 5 -- on its magnitude, so both ways round the same, capped at MOUSE_PCAP, back
+; in A with its sign.
+msPitch
+	lda mdY
+	and #$fe
+	sta mlSign
+	bpl +
+	eor #$ff
+	clc
+	adc #1				; $80 stays $80: 128 unsigned
++	sta mdLo
+	lda #0
+	sta mdHi
+	ldx mouseSens
+	lda msGain,x
+	jsr msMul16
+	ldx #5
+-	lsr msRHi
+	ror msRLo
+	dex
+	bne -
+	lda msRHi
+	bne +
+	lda msRLo
+	cmp #MOUSE_PCAP+1
+	bcc ++
++	lda #MOUSE_PCAP
++	bit mlSign
+	bpl +
+	eor #$ff
+	clc
+	adc #1
++	rts
+
+; msRLo/Hi = mdLo/Hi * A, modulo 65536 -- which is sign-blind, so mdLo/Hi
+; may be negative. X is lost.
+msMul16
+	sta msMulT
+	lda #0
+	sta msRLo
+	sta msRHi
+	ldx #8
+-	asl msRLo
+	rol msRHi
+	asl msMulT
+	bcc +
+	clc
+	lda msRLo
+	adc mdLo
+	sta msRLo
+	lda msRHi
+	adc mdHi
+	sta msRHi
++	dex
+	bne -
+	rts
+
+; MOUSE SPEED 1-9: yaw units a count (64 = 0.35 degrees, the old fixed
+; step) and the pitch gain in 16ths. Speed 5 is what it always was.
+msYaw		.byte 24, 32, 40, 52, 64, 80, 100, 128, 160
+msGain		.byte 6, 8, 10, 13, 16, 20, 25, 32, 40
+	.cerror * - msGain != 9 || msGain - msYaw != 9, "nine speeds"
+
 kbRaw		.fill 8, 0
 kbUp		.byte 0
 kbT		.byte 0
 ctCur		.byte 0
+ctI2		.byte 0
 ctGrab		.byte 0		; 0 menu, 1 waiting for release, 2 taking a key
 ctCand		.byte 0
 ctFound		.byte 0
