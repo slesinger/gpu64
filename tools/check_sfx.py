@@ -46,8 +46,8 @@ from check_combat import KILL, RESPAWN, Verdict        # noqa: E402
 from check_ai import DOG_WARP                           # noqa: E402
 from check_env import SWIMOUT                           # noqa: E402
 
-SFX_INC = os.path.join(REPO, 'Source', 'Demos', 'gpu64_game_sfx.inc')
-GAME_A = os.path.join(REPO, 'Source', 'Demos', 'gpu64_demo_game.a')
+SFX_INC = os.path.join(REPO, 'quake', 'gpu64_game_sfx.inc')
+GAME_A = os.path.join(REPO, 'quake', 'gpu64_demo_game.a')
 
 
 def irqs_per_tick():

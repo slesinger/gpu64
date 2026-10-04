@@ -16,7 +16,7 @@ VERT_STRIDE = 6
 FACE_STRIDE = 12
 MAX_VERTS = 256
 
-HDR = '<4sHH4HHHI5I2I'
+HDR = '<4sHH4HHHI5I2I3iH4BH'
 HDR_LEN = struct.calcsize(HDR)
 TEX_REC = '<HBBII'
 MESH_REC = '<IIII'
@@ -40,15 +40,20 @@ def main(path):
         fail('file is shorter than its header')
 
     (magic, ver, scale, ntex, nmesh, nnode, nent, nplane, nhull, nclip,
-     base, palo, stro, viso, visl, pico, picl) = struct.unpack_from(HDR, d, 0)
+     base, palo, stro, viso, visl, pico, picl, sx, sy, sz, syaw,
+     step_up, eye, feet, waist, sflags) = struct.unpack_from(HDR, d, 0)
     if magic != b'G64L':
         fail('magic is %r, not G64L' % magic)
-    if ver != 7:
-        fail('version %d is not 7' % ver)
+    if ver != 8:
+        fail('version %d is not 8' % ver)
     print('header  ver %d  scale %d qu/wu  tex %d  mesh %d  node %d  ent %d'
           % (ver, scale, ntex, nmesh, nnode, nent))
     print('        collision  %d planes  %d hulls  %d clipnodes'
           % (nplane, nhull, nclip))
+    print('        start %s  body step %d eye %d feet %d waist %d'
+          % ('%.2f %.2f %.2f yaw %04x' % (sx / 65536.0, sy / 65536.0,
+                                         sz / 65536.0, syaw)
+             if sflags & 1 else 'none', step_up, eye, feet, waist))
 
     off = HDR_LEN
     tex_off, off = off, off + ntex * struct.calcsize(TEX_REC)
@@ -196,7 +201,7 @@ def main(path):
             fail('gpu64_catalog says %d meshes %d textures; the file has %d %d'
                  % (cmesh, ctex, nmesh, ntex))
         inc = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
-                           'Source', 'Demos', 'gpu64_quake_actors.inc')
+                           'quake', 'gpu64_quake_actors.inc')
         if os.path.exists(inc):
             sym = {}
             for ln in open(inc):

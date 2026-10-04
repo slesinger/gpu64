@@ -84,4 +84,4 @@ putDec
 
 stI	.byte 0
 
-	.include "../../Source/Demos/gpu64_game_sfx.inc"
+	.include "../../quake/gpu64_game_sfx.inc"

@@ -1,87 +1,24 @@
 //
-// gpu64_level.cpp -- the .g64lev parser and its one SD read.
+// gpu64_level.cpp -- the .g64lev parser and the level pack lookup.
 //
-// See gpu64_level.h for the format and for why the file is read exactly once,
-// before reuUsingPolling() ever runs.
+// See gpu64_level.h for the format and for why the pack is verified exactly
+// once, before reuUsingPolling() ever runs.
 //
 #include "gpu64_level.h"
 #include <circle/util.h>
 
-// The SD read is firmware-only: tools/hostsim/levelsim.cpp links this file for
-// gpu64_levelParse() -- so that there is exactly one .g64lev parser and the
-// pre-bench gate tests the same code the Pi runs -- and has no FatFs, no
-// CLogger and no card to read.
+// The pack lookup is firmware-only: tools/hostsim/levelsim.cpp links this
+// file for gpu64_levelParse() -- so that there is exactly one .g64lev parser
+// and the pre-bench gate tests the same code the Pi runs -- and has no
+// reuMemory and no CLogger.
 #ifndef GPU64_HOSTSIM
-#include "helpers.h"
 #include <circle/logger.h>
 #endif
 
 #ifndef GPU64_HOSTSIM
-u8  gpu64LevelFile[ GPU64_LEVEL_MAX_BYTES ] __attribute__(( aligned( 64 ) ));
-u32 gpu64LevelFileBytes = 0;
-u8  gpu64LevelFile2[ GPU64_LEVEL_MAX_BYTES ] __attribute__(( aligned( 64 ) ));
-u32 gpu64LevelFile2Bytes = 0;
-
 const u8 *gpu64LevelSlot[ GPU64_LEVEL_SLOTS ];
 u32       gpu64LevelSlotBytes[ GPU64_LEVEL_SLOTS ];
 u32       gpu64LevelSlotCount = 0;
-
-static const char GPU64_LEVEL_DRIVE[]     = "SD:";
-static const char GPU64_LEVEL_FILENAME[]  = "SD:RAD/level.g64lev";
-static const char GPU64_LEVEL_FILENAME2[] = "SD:RAD/level2.g64lev";
-static const char GPU64_LEVEL_PACKFILE[]  = "SD:REU/quake.reu";
-
-// One file into one buffer; returns its size, or 0 if it was not loaded.
-static u32 levelPreloadOne( const char *pName, u8 *pBuf, boolean bRequired )
-{
-	extern CLogger *logger;
-
-	// getFileSize() before readFile(), because readFile() reads f_stat's
-	// filesize into the buffer without ever comparing the two: handed a
-	// level larger than the buffer it would write straight past the end of
-	// it. This is the only guard there is.
-	u32 nBytes = 0;
-	if ( !getFileSize( logger, GPU64_LEVEL_DRIVE, pName, &nBytes ) )
-	{
-		if ( bRequired )
-			logger->Write( "gpu64", LogNotice,
-				"Level: no %s -- LOAD_LEVEL will answer BAD_ARGS", pName );
-		return 0;
-	}
-
-	if ( nBytes < GPU64_LEVEL_HEADER_BYTES || nBytes > GPU64_LEVEL_MAX_BYTES )
-	{
-		logger->Write( "gpu64", LogNotice,
-			"Level: %s is %u bytes, buffer holds %u -- not loaded",
-			pName, (unsigned)nBytes, (unsigned)GPU64_LEVEL_MAX_BYTES );
-		return 0;
-	}
-
-	u32 nRead = 0;
-	if ( !readFile( logger, GPU64_LEVEL_DRIVE, pName, pBuf, &nRead ) )
-		return 0;
-
-	// Parse it here as well as at LOAD_LEVEL time. A level that is going to
-	// be refused should say so in the boot log, where there is room for a
-	// reason, rather than as a one-byte ERRCODE half an hour later at the
-	// bench.
-	Gpu64_Level lev;
-	if ( !gpu64_levelParse( &lev, pBuf, nRead ) )
-	{
-		logger->Write( "gpu64", LogNotice,
-			"Level: %s (%u bytes) is not a valid .g64lev v%u -- not loaded",
-			pName, (unsigned)nRead, GPU64_LEVEL_VERSION );
-		return 0;
-	}
-
-	logger->Write( "gpu64", LogNotice,
-		"Level: %s loaded, %u KB -- %u tex, %u meshes, %u nodes, %u ents,"
-		" %u planes, %u hulls, %u clipnodes, %u qu/wu",
-		pName, (unsigned)( nRead / 1024 ),
-		lev.nTex, lev.nMesh, lev.nNode, lev.nEnt,
-		lev.nPlane, lev.nHull, (unsigned)lev.nClip, lev.nScale );
-	return nRead;
-}
 
 static u32 levelFnv( const u8 *p, u32 n )
 {
@@ -91,13 +28,13 @@ static u32 levelFnv( const u8 *p, u32 n )
 	return h;
 }
 
-// The level pack: every level in one .reu image, either selected as the
-// REU image in the RAD menu -- which rad_main.cpp has read into reuMemory by
-// the time this runs -- or read from the card by levelPackFromSd(). The
-// slots point straight into it: the levels are used where they lie, so a
-// program that DMAs into REU space over them destroys them (the game never
-// touches the REU). Returns the slots filled, 0 when pImg holds no pack or
-// a broken one; a broken pack fills nothing, rather than some levels, so a
+// The level pack: the REU image the user selected in the RAD menu, which
+// rad_main.cpp has read into reuMemory by the time this runs. gpu64 knows no
+// file names -- a program ships as a .prg plus its .reu, and the pack is
+// whatever that .reu holds. The slots point straight into it: the levels
+// are used where they lie, so a program that DMAs into REU space over them
+// destroys them. Returns the slots filled, 0 when pImg holds no pack or a
+// broken one; a broken pack fills nothing, rather than some levels, so a
 // bad image is never half-believed.
 static u32 levelFromPack( const u8 *pImg, u32 nSize )
 {
@@ -105,7 +42,12 @@ static u32 levelFromPack( const u8 *pImg, u32 nSize )
 
 	if ( pImg == 0 || nSize < GPU64_PACK_HEADER
 	     || gpu64_levelRd32( pImg ) != GPU64_PACK_MAGIC )
+	{
+		logger->Write( "gpu64", LogNotice,
+			"Level pack: the REU image is not one -- LOAD_LEVEL and"
+			" LEVEL_PICTURE will answer BAD_ARGS" );
 		return 0;
+	}
 
 	const u32 nVer   = gpu64_levelRd16( pImg + 4 );
 	const u32 nCount = gpu64_levelRd16( pImg + 6 );
@@ -118,7 +60,7 @@ static u32 levelFromPack( const u8 *pImg, u32 nSize )
 	{
 		logger->Write( "gpu64", LogNotice,
 			"Level pack: bad header (v%u, %u levels, %u bytes in %u KB)"
-			" -- using the SD files", nVer, nCount, nImg, (unsigned)( nSize / 1024 ) );
+			" -- not used", nVer, nCount, nImg, (unsigned)( nSize / 1024 ) );
 		return 0;
 	}
 
@@ -133,7 +75,7 @@ static u32 levelFromPack( const u8 *pImg, u32 nSize )
 		     || !gpu64_levelParse( &lev, pImg + nOfs, nLen ) )
 		{
 			logger->Write( "gpu64", LogNotice,
-				"Level pack: level %u (%.4s) is damaged -- using the SD files",
+				"Level pack: level %u (%.4s) is damaged -- not used",
 				i, (const char *)( e + 12 ) );
 			return 0;
 		}
@@ -150,84 +92,10 @@ static u32 levelFromPack( const u8 *pImg, u32 nSize )
 	return nCount;
 }
 
-// The pack straight off the card, for when the REU image is not one. The
-// menu forgets its image selection every time it opens (initMenu()), and
-// T, + and - clear it too, so "select quake.reu, then launch the game" held
-// only when both happened in one menu visit -- and STARTUP REU1M boots with
-// no image at all. The bench never had the pack: slots 2-7 answered
-// BAD_ARGS and every start level became E1M1 (2026-09-30).
-//
-// Read once, at Pi start-up (rad_main.cpp, right after readConfig()), never
-// from the launch path: there the read sits between the C64's reset release
-// and the READY-prompt wait, and at 12.5 MB it left the bench at a BASIC
-// screen with the game never injected (2026-09-30, second round).
-//
-// It sits at the top of mempool, above everything the C64 can reach for REU
-// sizes up to 2 MB: REU DMA wraps at the REU size, and at 512 KB for the
-// 128-512 KB sizes. A larger REU, a blank REU's memset, a loaded image or
-// GeoRAM can all overwrite it, which is why levelPackHeld() re-verifies
-// every checksum on each use instead of trusting the boot read.
-static u32 s_PackBase  = 0;
-static u32 s_PackBytes = 0;
-
-void gpu64_levelPackReadAtBoot( void )
-{
-	extern CLogger *logger;
-	extern u8 mempool[];
-	extern u32 mempoolBytes;
-
-	u32 nBytes = 0;
-	if ( !getFileSize( logger, GPU64_LEVEL_DRIVE, GPU64_LEVEL_PACKFILE, &nBytes ) )
-		return;
-	if ( nBytes < GPU64_PACK_HEADER || nBytes > mempoolBytes - 8192 - 0x80000 )
-	{
-		logger->Write( "gpu64", LogNotice, "Level pack: %s is %u KB -- does not fit, not read",
-			GPU64_LEVEL_PACKFILE, (unsigned)( nBytes / 1024 ) );
-		return;
-	}
-
-	const u32 nBase = ( mempoolBytes - 8192 - nBytes ) & ~4095u;	// below the pool's 8 KB slack
-	u32 nRead = 0;
-	if ( !readFile( logger, GPU64_LEVEL_DRIVE, GPU64_LEVEL_PACKFILE, mempool + nBase, &nRead )
-	     || nRead != nBytes )
-		return;
-
-	s_PackBase  = nBase;
-	s_PackBytes = nBytes;
-	logger->Write( "gpu64", LogNotice, "Level pack: %s read from the card, %u KB at +%u KB",
-		GPU64_LEVEL_PACKFILE, (unsigned)( nBytes / 1024 ), (unsigned)( nBase / 1024 ) );
-}
-
-static u32 levelPackHeld( void )
-{
-	extern CLogger *logger;
-	extern u8 mempool[];
-	extern u32 REU_SIZE_KB;
-
-	if ( s_PackBytes == 0 )
-		return 0;
-
-	u32 nReach = REU_SIZE_KB * 1024;
-	if ( nReach < 0x80000 )
-		nReach = 0x80000;
-	if ( s_PackBase < nReach )
-	{
-		logger->Write( "gpu64", LogNotice,
-			"Level pack: a %u KB REU overlaps the card's pack -- using the SD files",
-			(unsigned)REU_SIZE_KB );
-		return 0;
-	}
-	return levelFromPack( mempool + s_PackBase, s_PackBytes );
-}
-
-// Slot 1 is optional: it is the level a game changes to (E1M2), held in RAM
-// from boot for the same reason slot 0 is -- the card cannot be touched once
-// the polling loop runs. LOAD_LEVEL picks the slot (gpu64_3d_class1.cpp).
-// A level pack in the REU wins over both files, and they are then not read.
+// Run at every program launch, before reuUsingPolling(): the checksums are
+// verified once here, not on each use.
 void gpu64_levelPreload( void )
 {
-	gpu64LevelFileBytes  = 0;
-	gpu64LevelFile2Bytes = 0;
 	for ( u32 i = 0; i < GPU64_LEVEL_SLOTS; i++ )
 	{
 		gpu64LevelSlot[ i ]      = 0;
@@ -237,18 +105,6 @@ void gpu64_levelPreload( void )
 	extern u8 *reuMemory;
 	extern u32 REU_SIZE_KB;
 	gpu64LevelSlotCount = levelFromPack( reuMemory, REU_SIZE_KB * 1024 );
-	if ( gpu64LevelSlotCount == 0 )
-		gpu64LevelSlotCount = levelPackHeld();
-	if ( gpu64LevelSlotCount )
-		return;
-
-	gpu64LevelFileBytes  = levelPreloadOne( GPU64_LEVEL_FILENAME, gpu64LevelFile, TRUE );
-	gpu64LevelFile2Bytes = levelPreloadOne( GPU64_LEVEL_FILENAME2, gpu64LevelFile2, FALSE );
-	gpu64LevelSlot[ 0 ]      = gpu64LevelFile;
-	gpu64LevelSlotBytes[ 0 ] = gpu64LevelFileBytes;
-	gpu64LevelSlot[ 1 ]      = gpu64LevelFile2;
-	gpu64LevelSlotBytes[ 1 ] = gpu64LevelFile2Bytes;
-	gpu64LevelSlotCount = 2;
 }
 
 #endif	// GPU64_HOSTSIM
@@ -274,6 +130,16 @@ boolean gpu64_levelParse( Gpu64_Level *pL, const u8 *pFile, u32 nBytes )
 	pL->nPlane = gpu64_levelRd16( pFile + 16 );
 	pL->nHull  = gpu64_levelRd16( pFile + 18 );
 	pL->nClip  = gpu64_levelRd32( pFile + 20 );
+
+	pL->nStartX   = (s32)gpu64_levelRd32( pFile + 52 );
+	pL->nStartY   = (s32)gpu64_levelRd32( pFile + 56 );
+	pL->nStartZ   = (s32)gpu64_levelRd32( pFile + 60 );
+	pL->nStartYaw = gpu64_levelRd16( pFile + 64 );
+	pL->nStepUp   = pFile[ 66 ];
+	pL->nEye      = pFile[ 67 ];
+	pL->nFeet     = pFile[ 68 ];
+	pL->nWaist    = pFile[ 69 ];
+	pL->bHasStart = ( gpu64_levelRd16( pFile + 70 ) & GPU64_LEVEL_HAS_START ) ? TRUE : FALSE;
 
 	const u32 nBase = gpu64_levelRd32( pFile + 24 );
 	pL->nPalOff = gpu64_levelRd32( pFile + 28 );
@@ -1043,7 +909,7 @@ boolean gpu64_levelMoveEnts( const Gpu64_Level *pL, unsigned nModel, unsigned nH
 	}
 
 	const s32 nHead    = hull.nHead[ nHull - 1 ];
-	const s32 nStepUp  = gpu64_levelQU( pL, GPU64_LEVEL_STEP_UP_QU );
+	const s32 nStepUp  = gpu64_levelQU( pL, pL->nStepUp );
 	const s32 nEyeOfs  = gpu64_levelEyeOfs( pL );
 
 	memset( pOut, 0, sizeof( *pOut ) );
@@ -1120,16 +986,15 @@ boolean gpu64_levelMoveEnts( const Gpu64_Level *pL, unsigned nModel, unsigned nH
 			nFlags &= (u8)~GPU64_CLIP_ONGROUND;
 	}
 
-	// What the player is standing in. Not against nHead: the clip hulls
-	// are the level grown by the player's box, and qbsp keeps only solid
-	// and empty in them, so water, slime and lava are simply not there.
-	// Hull 0 has them. Quake's SV_CheckWater, point for point: the type is
-	// the feet's, and the level counts how far up the body the same kind
-	// of liquid reaches.
+	// What the walker is standing in. Not against nHead: the clip hulls
+	// are the level grown by a box, and keep only solid and empty, so
+	// liquids are simply not there. Hull 0 has them. The type is the
+	// feet's (the level's nFeet below the origin), and the level counts
+	// how far up the body -- nWaist, then nEye -- the same liquid reaches.
 	{
 		const s32 nHead0 = hull.nHead0;
 		Gpu64_LevelVec p = down;
-		p.v[ 1 ] -= gpu64_levelQU( pL, GPU64_LEVEL_FEET_QU );
+		p.v[ 1 ] -= gpu64_levelQU( pL, pL->nFeet );
 		const s16 nFeet = gpu64_levelPointContents( pL, nHead0, &p );
 		pOut->nContents = contentsToByte( nFeet );
 		if ( nFeet <= GPU64_LEVEL_CONTENTS_WATER &&
@@ -1137,7 +1002,7 @@ boolean gpu64_levelMoveEnts( const Gpu64_Level *pL, unsigned nModel, unsigned nH
 		{
 			pOut->nWaterLevel = 1;
 			p = down;
-			p.v[ 1 ] += gpu64_levelQU( pL, GPU64_LEVEL_WAIST_QU );
+			p.v[ 1 ] += gpu64_levelQU( pL, pL->nWaist );
 			if ( gpu64_levelPointContents( pL, nHead0, &p ) == nFeet )
 			{
 				pOut->nWaterLevel = 2;

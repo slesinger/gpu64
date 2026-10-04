@@ -23,10 +23,10 @@ version.
 import struct
 
 MAGIC = b'G64L'
-VERSION = 7
+VERSION = 8
 
-HDR = '<4sHH4HHHI5I2I'                  # v6 added visOff, visLen, v7 pics
-HDR_LEN = struct.calcsize(HDR)          # 52
+HDR = '<4sHH4HHHI5I2I3iH4BH'           # v6 visOff/visLen, v7 pics, v8 start+body
+HDR_LEN = struct.calcsize(HDR)          # 72
 TEX_REC = '<HBBII'                      # 12
 MESH_REC = '<IIII'                      # 16
 NODE_REC = '<HiiiH'                     # 16
@@ -36,12 +36,6 @@ PLANE_REC = '<3hiBB'                    # 12
 HULL_REC = '<2i6ii'                     # 36, head0 last (v5)
 HULL_STRIDE = struct.calcsize(HULL_REC)
 CLIP_REC = '<HhhH'                      #  8
-
-# Eye height above an entity origin, in Quake units. GPU64_LEVEL_EYE_QU in
-# Source/Firmware/gpu64_3d_class1.cpp -- the two must agree or the model puts
-# the camera somewhere the Pi does not.
-EYE_QU = 22
-
 
 class LevelError(Exception):
     pass
@@ -58,8 +52,10 @@ class Level:
             raise LevelError('shorter than its header')
         (magic, ver, self.scale, self.ntex, self.nmesh, self.nnode, self.nent,
          self.nplane, self.nhull, self.nclip, self.base, self.palo,
-         self.stro, self.viso, self.visl, self.pico,
-         self.picl) = struct.unpack_from(HDR, data, 0)
+         self.stro, self.viso, self.visl, self.pico, self.picl,
+         sx, sy, sz, syaw, self.step_up, self.eye, self.feet, self.waist,
+         sflags) = struct.unpack_from(HDR, data, 0)
+        self.start = (sx, sy, sz, syaw) if sflags & 1 else None
         if magic != MAGIC:
             raise LevelError('magic %r is not %r' % (magic, MAGIC))
         if ver != VERSION:
@@ -189,12 +185,10 @@ class Level:
         return self.ent(self.nbank + i)
 
     def player_start(self):
-        """(x, y, z, yaw) at eye height, 16.16 -- levelPlayerStart() in the
-        firmware. None if the level has no info_player_start."""
-        for i in range(self.nent):
-            e = self.ent(i)
-            if e['classname'] != 'info_player_start':
-                continue
-            return (e['x'], e['y'] + EYE_QU * 65536 // self.scale, e['z'],
-                    e['yaw'])
-        return None
+        """(x, y, z, yaw) at eye height, 16.16: the header's start raised by
+        its eye -- levelPhaseCamera() in the firmware. None if the level has
+        no start."""
+        if self.start is None:
+            return None
+        x, y, z, yaw = self.start
+        return (x, y + (self.eye << 16) // self.scale, z, yaw)

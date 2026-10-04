@@ -15,7 +15,7 @@
 ;      triangles the 6502 has in its own memory, pushed through UPLOAD_MESH.
 ;      E1M1 is 15601 triangles, 66 textures and 620 KB. That does not fit in
 ;      a C64 and never will, and it should not have to -- it is level data,
-;      not game state. So the Pi reads it off its own SD card, and this
+;      not game state. So it ships in the REU image beside the PRG, and this
 ;      program spends TWO commands on the whole level:
 ;
 ;              LOAD_LEVEL      here is the level, build it
@@ -58,9 +58,10 @@
 ;
 ;      BEFORE RUNNING IT
 ;
-;      build/e1m1.g64lev must be on the SD card as RAD/level.g64lev. The Pi
-;      reads it once at REU start-up -- the boot log says so, with the
-;      counts -- and LOAD_LEVEL answers BAD_ARGS ($04) if it is not there.
+;      Select quake.reu (tools/pack_levels.py) as the REU image in the RAD
+;      menu. The Pi checks the pack when the image loads -- the log says so,
+;      with the counts -- and LOAD_LEVEL answers BAD_ARGS ($04) if the
+;      image is not a level pack.
 ;
 ;      READING THE SCREEN
 ;

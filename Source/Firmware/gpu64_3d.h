@@ -72,9 +72,9 @@
 // 0..256 for a 32 MB arena and so fits the one byte RESULT has.
 #define GPU64_3D_OP_ARENA_STATUS	0x09
 
-// gpu64 (milestone 18): the level loader. LOAD_LEVEL hands the Pi's own
-// .g64lev file to class 1 -- a whole Quake level's geometry, textures,
-// palette and entity table, which at 620 KB the C64 cannot upload and has no
+// gpu64 (milestone 18): the level loader. LOAD_LEVEL hands one .g64lev of
+// the level pack in the selected REU image to class 1 -- a whole level's
+// geometry, textures, palette and entity table, which at 620 KB the C64 cannot upload and has no
 // reason to: it is level data, not game state. LOAD_LEVEL validates and arms;
 // LEVEL_STEP performs one bounded slice of the build and reports progress, so
 // the DMA hold per command stays in the same range as an ordinary REU

@@ -119,7 +119,7 @@ def main():
     if not (prg and level):
         sys.exit('check_combat.py: --prg and --level are required')
 
-    demos = os.path.join(REPO, 'Source', 'Demos')
+    demos = os.path.join(REPO, 'quake')
     c = consts(os.path.join(demos, 'gpu64_quake_actors.inc'))
     base = consts(os.path.join(demos, 'gpu64_demo_game.a'))['MESH_BASE']
     lev = gpu64level.Level(open(level, 'rb').read())

@@ -655,8 +655,8 @@ static u8 opFreeResource( void )
 
 // --- milestone 18: the level loader -------------------------------------
 //
-// LOAD_LEVEL/LEVEL_STEP turn the .g64lev file the Pi read off its own SD card
-// at start-up (gpu64_level.cpp) into textures, meshes and object nodes. It
+// LOAD_LEVEL/LEVEL_STEP turn a .g64lev from the REU image's level pack
+// (gpu64_level.cpp) into textures, meshes and object nodes. It
 // lives here rather than in gpu64_level.cpp because this is the file that
 // owns the resource table, the arena allocator and the scene -- the parser
 // deliberately knows about none of them.
@@ -685,11 +685,6 @@ static u8 opFreeResource( void )
 // 16 KB is roughly one 128x128 texture with its mip chain, or a dozen meshes;
 // at E1M1's 620 KB that is about 40 commands for the whole level.
 #define GPU64_LEVEL_SLICE_BYTES		16384
-
-// Eye height above an entity's origin, in Quake units -- Quake's own view_ofs.
-// At 32 units per world unit this is not negligible: without it the camera
-// sits at knee height and the floor fills half the frame.
-#define GPU64_LEVEL_EYE_QU		22
 
 enum Gpu64_LevelPhase
 {
@@ -804,40 +799,23 @@ static u8 levelBuildNode( unsigned i )
 	return gpu64_3dSceneSetPosition( &s_Scene, id, &pos );
 }
 
-// info_player_start, converted to an eye position and a gpu64 yaw. FALSE if
-// the level has none, which check_g64lev.py already refuses to emit.
-static boolean levelPlayerStart( Gpu64_3dVec *pPos, u16 *pYaw )
-{
-	for ( unsigned i = 0; i < s_Load.lev.nEnt; i++ )
-	{
-		Gpu64_LevelEnt e;
-		if ( !gpu64_levelEnt( &s_Load.lev, i, &e ) )
-			continue;
-		if ( strcmp( e.pClassName, "info_player_start" ) != 0 )
-			continue;
-
-		pPos->x = e.x;
-		pPos->y = e.y + (s32)( GPU64_LEVEL_EYE_QU * 65536 / s_Load.lev.nScale );
-		pPos->z = e.z;
-		*pYaw   = e.nYaw;
-		return TRUE;
-	}
-	return FALSE;
-}
-
-// The camera phase. Creating it here rather than leaving it to the caller is
-// what makes a level self-describing: info_player_start is in the file, and a
-// program that had to find it would need the entity table on the C64 side.
-// ARG4-5 = 0 opts out, for a caller that wants to place its own camera.
+// The camera phase: a camera at the level header's start position, raised
+// by its eye height. The converter chose both; gpu64 only places the camera
+// where the file says. ARG4-5 = 0 opts out, for a caller that wants to place
+// its own camera.
 static u8 levelPhaseCamera( void )
 {
 	if ( s_Load.nCameraId == 0 )
 		return GPU64_ERR_OK;
 
+	if ( !s_Load.lev.bHasStart )
+		return GPU64_ERR_BAD_ARGS;	// the level has no start position
+
 	Gpu64_3dVec pos;
-	u16 yaw;
-	if ( !levelPlayerStart( &pos, &yaw ) )
-		return GPU64_ERR_BAD_ARGS;	// no info_player_start in the file
+	pos.x = s_Load.lev.nStartX;
+	pos.y = s_Load.lev.nStartY + gpu64_levelEyeOfs( &s_Load.lev );
+	pos.z = s_Load.lev.nStartZ;
+	const u16 yaw = s_Load.lev.nStartYaw;
 
 	u8 res = gpu64_3dSceneCreateCamera( &s_Scene, s_Load.nCameraId );
 	if ( res != GPU64_3D_OK )
@@ -924,9 +902,8 @@ static u8 opLoadLevel( void )
 	if ( s_LoopRunning )
 		return GPU64_ERR_BUSY;		// the shadow scene cannot take a whole level
 
-	// ARG6 picks the preloaded level slot: the level pack's Nth level
-	// when the REU image is one, else 0 is SD:RAD/level.g64lev and 1 is
-	// level2.g64lev (gpu64_levelPreload). It counts only when ARG7 is its complement under $5A,
+	// ARG6 picks the level slot: the Nth level of the REU image's pack
+	// (gpu64_levelPreload). It counts only when ARG7 is its complement under $5A,
 	// so a program that never heard of slots -- and leaves whatever an
 	// earlier command put in ARG6/7 -- keeps loading slot 0.
 	u8 nSlot = 0;
@@ -938,7 +915,7 @@ static u8 opLoadLevel( void )
 	u32       nBytes = gpu64LevelSlotBytes[ nSlot ];
 
 	if ( nBytes == 0 )
-		return GPU64_ERR_BAD_ARGS;	// no level file on the card
+		return GPU64_ERR_BAD_ARGS;	// no such level in the REU image
 
 	memset( &s_Load, 0, sizeof( s_Load ) );
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Renders every animation in Source/Demos/gpu64_quake_actors.inc through
+Renders every animation in quake/gpu64_quake_actors.inc through
 tools/hostsim/levelsim -- the firmware's own renderer -- one contact sheet per
 animation, into tools/hostsim/out/actors/. Milestone 20's stage A gate: a
 wrong axis mapping, winding, frame range or skin shows up here, on a PC,
@@ -19,7 +19,7 @@ import os, re, subprocess, sys, tempfile
 from PIL import Image
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-INC = os.path.join(ROOT, 'Source', 'Demos', 'gpu64_quake_actors.inc')
+INC = os.path.join(ROOT, 'quake', 'gpu64_quake_actors.inc')
 SIM = os.path.join(ROOT, 'tools', 'hostsim', 'levelsim')
 OUT = os.path.join(ROOT, 'tools', 'hostsim', 'out', 'actors')
 

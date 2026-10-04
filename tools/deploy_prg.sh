@@ -11,20 +11,21 @@
 # list at the bench is a way to waste a round on a stale program, which has
 # already happened once with a stale kernel image.
 #
-# So this copies every .prg from Source/TestPRG and Source/Demos, and then
-# removes any *gpu64* .prg on the card that this tree does not build. It
-# never touches anything that is not gpu64's: the games, the monitors, the
-# memory tester and readme.txt are left exactly where they are.
+# So this copies every .prg from Source/TestPRG, Source/Demos, quake/ and
+# stunts/, and then removes any *gpu64* .prg on the card that this tree does
+# not build. It never touches anything that is not gpu64's: the games, the
+# monitors, the memory tester and readme.txt are left exactly where they are.
 #
-# It also puts build/e1m1.g64lev on the card as RAD/level.g64lev if that file
-# exists, because the level and the program that loads it are one deploy: the
-# card kept a stale level through a whole bench round once, and a level file
-# that disagrees with the demo looks like a rendering bug and not like a copy
-# that never happened.
+# It also puts the games' REU images (build/quake.reu, stunts/stunts.reu) in
+# the card's REU directory when they exist, because a game ships as its PRG
+# plus its REU image and the two are one deploy: the card kept a stale level
+# through a whole bench round once, and data that disagrees with the program
+# looks like a rendering bug and not like a copy that never happened. The
+# firmware reads levels and pictures from the selected REU image only.
 #
 # It does NOT build anything. Run tools/testprg.sh and tools/demos.sh first
 # if you want the .prg files to be current -- they are what assembles them.
-# tools/gen_quakelevel.py builds the level, and the firmware image is
+# tools/gen_quakelevel.py + pack_levels.py and stunts/gen_stunt.py build the images, and the firmware image is
 # tools/build.sh's job; neither is this one's.
 #
 # Usage:
@@ -64,18 +65,18 @@ fi
 
 # What this tree builds, by basename.
 built=()
-for f in "$REPO_ROOT"/Source/TestPRG/*.prg "$REPO_ROOT"/Source/Demos/*.prg; do
+for f in "$REPO_ROOT"/Source/TestPRG/*.prg "$REPO_ROOT"/Source/Demos/*.prg "$REPO_ROOT"/quake/*.prg "$REPO_ROOT"/stunts/*.prg; do
 	[ -e "$f" ] || continue
 	built+=("$(basename "$f")")
 done
 if [ ${#built[@]} -eq 0 ]; then
-	echo "error: no .prg files in Source/TestPRG or Source/Demos." >&2
+	echo "error: no .prg files in Source/TestPRG, Source/Demos, quake or stunts." >&2
 	echo "Run tools/testprg.sh and tools/demos.sh first." >&2
 	exit 1
 fi
 
 echo "==> copying ${#built[@]} programs to $DEST"
-for f in "$REPO_ROOT"/Source/TestPRG/*.prg "$REPO_ROOT"/Source/Demos/*.prg; do
+for f in "$REPO_ROOT"/Source/TestPRG/*.prg "$REPO_ROOT"/Source/Demos/*.prg "$REPO_ROOT"/quake/*.prg "$REPO_ROOT"/stunts/*.prg; do
 	[ -e "$f" ] || continue
 	if [ $DRY -eq 1 ]; then
 		echo "    would copy $(basename "$f")"
@@ -110,29 +111,33 @@ for f in "$DEST"/*; do
 done
 [ $removed -eq 0 ] && echo "    nothing stale"
 
-# The level. Verified by content, not by exit status: this is the file whose
-# staleness is invisible at the bench -- the demo loads whatever is there and
-# reports success.
-LEVEL_SRC="$REPO_ROOT/build/e1m1.g64lev"
-if [ -f "$LEVEL_SRC" ]; then
-	if [ ! -d "$SDCARD/RAD" ]; then
-		echo "warning: $SDCARD/RAD does not exist -- level not deployed" >&2
+# The REU images. Verified by content, not by exit status: these are the
+# files whose staleness is invisible at the bench -- the game uses whatever
+# image is selected and reports success.
+for REU_SRC in "$REPO_ROOT/build/quake.reu" "$REPO_ROOT/stunts/stunts.reu"; do
+	name="$(basename "$REU_SRC")"
+	if [ ! -f "$REU_SRC" ]; then
+		echo "==> no $name -- left as it is on the card"
+		continue
+	fi
+	if [ ! -d "$SDCARD/REU" ]; then
+		echo "warning: $SDCARD/REU does not exist -- $name not deployed" >&2
 	elif [ $DRY -eq 1 ]; then
-		echo "==> would copy $(basename "$LEVEL_SRC") to RAD/level.g64lev"
+		echo "==> would copy $name to REU/"
+	elif cmp -s "$REU_SRC" "$SDCARD/REU/$name"; then
+		echo "==> REU/$name already current"
 	else
-		echo "==> copying $(basename "$LEVEL_SRC") to RAD/level.g64lev"
-		cp "$LEVEL_SRC" "$SDCARD/RAD/level.g64lev"
+		echo "==> copying $name to REU/"
+		cp "$REU_SRC" "$SDCARD/REU/$name"
 		sync
-		if cmp -s "$LEVEL_SRC" "$SDCARD/RAD/level.g64lev"; then
-			echo "    $(stat -c%s "$LEVEL_SRC") bytes, verified"
+		if cmp -s "$REU_SRC" "$SDCARD/REU/$name"; then
+			echo "    $(stat -c%s "$REU_SRC") bytes, verified"
 		else
-			echo "error: RAD/level.g64lev does not match the build" >&2
+			echo "error: REU/$name does not match the build" >&2
 			exit 1
 		fi
 	fi
-else
-	echo "==> no build/e1m1.g64lev -- level left as it is on the card"
-fi
+done
 
 [ $DRY -eq 0 ] && sync
 echo "==> done"

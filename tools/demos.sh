@@ -2,7 +2,7 @@
 #
 # demos.sh - assemble the gpu64 demonstration programs and check them on a PC.
 #
-# For each Source/Demos/gpu64_demo_*.a:
+# For each gpu64_demo_*.a in Source/Demos, quake/ and stunts/:
 #   1. assemble it with 64tass into the matching .prg
 #   2. run it under tools/prgsim, twice: once modelling a display with a
 #      frame clock and once modelling one without, because a demo that only
@@ -40,6 +40,9 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMODIR="$REPO_ROOT/Source/Demos"
+# The games live in their own top-level folders and still .include the
+# shared Source/Demos/*.inc.
+GAMEDIRS=("$REPO_ROOT/quake" "$REPO_ROOT/stunts")
 OUTDIR="$DEMODIR/out"
 SIM="$REPO_ROOT/tools/prgsim/runsim.py"
 SCENESIM="$REPO_ROOT/tools/hostsim/scenesim"
@@ -72,14 +75,24 @@ else
 		b="$(basename "$f" .a)"
 		names+=("${b#gpu64_demo_}")
 	done
+	for d in "${GAMEDIRS[@]}"; do
+		for f in "$d"/gpu64_demo_*.a; do
+			b="$(basename "$f" .a)"
+			names+=("${b#gpu64_demo_}")
+		done
+	done
 fi
 
 mkdir -p "$OUTDIR"
 
 fail=0
 for n in "${names[@]}"; do
-	src="$DEMODIR/gpu64_demo_$n.a"
-	prg="$DEMODIR/gpu64_demo_$n.prg"
+	srcdir="$DEMODIR"
+	for d in "${GAMEDIRS[@]}"; do
+		[ -f "$d/gpu64_demo_$n.a" ] && srcdir="$d"
+	done
+	src="$srcdir/gpu64_demo_$n.a"
+	prg="$srcdir/gpu64_demo_$n.prg"
 	if [ ! -f "$src" ]; then
 		echo "no such demo: $n"
 		fail=1
@@ -87,7 +100,7 @@ for n in "${names[@]}"; do
 	fi
 
 	lst=$(mktemp)
-	if ! out=$( cd "$DEMODIR" && 64tass --cbm-prg -o "$prg" -L "$lst" "$src" 2>&1 ); then
+	if ! out=$( cd "$srcdir" && 64tass --cbm-prg -I "$DEMODIR" -o "$prg" -L "$lst" "$src" 2>&1 ); then
 		echo "ASSEMBLE FAIL  $n"
 		echo "$out" | grep -v '^$' | tail -20
 		rm -f "$lst"
@@ -215,14 +228,15 @@ for n in "${names[@]}"; do
 		       --key=Q:1000-1080 --key=F3:1200-1260)
 		;;
 	stunt)
-		# The grid countdown is 180 frames. The autopilot (F3) then
-		# drives a lap and a half -- the bridge, the humps and the
-		# jump -- with the cockpit view (F1) through the middle of it,
-		# and the last stretch is driven by hand: throttle held, a
-		# touch of steering, enough to put a car off the edge and
-		# prove the crane.
+		# stunts.reu is the selected REU image: the game's meshes, fonts
+		# and track blocks come out of it. The grid countdown is 180
+		# frames. The autopilot (F3) then drives a lap and a half, and
+		# the last stretch is driven by hand: throttle held, a touch of
+		# steering, enough to put a car off the edge and prove the crane.
 		c1=1
-		extra=(--key=F3:190-195 --key=F1:500-505 --key=F1:700-705
+		extra=(--reu="$REPO_ROOT/stunts/stunts.reu"
+		       --level-slot="${STUNT_TRACK:-0}"
+		       --key=F3:190-195
 		       --key=F3:1000-1005 --key=W:1000-1500
 		       --key=A:1100-1130 --key=D:1250-1320)
 		;;

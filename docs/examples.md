@@ -1,7 +1,7 @@
 # Examples
 
 Ten complete, commented programs are in
-[`Source/Demos/`](../Source/Demos/). See
+[`Source/Demos/`](../Source/Demos/) and [`quake/`](../quake/). See
 [getting-started.md](getting-started.md) for the full table of what each
 one shows and which opcodes it uses. The three below are short enough to
 read inline; they cover the three most common shapes a gpu64 program

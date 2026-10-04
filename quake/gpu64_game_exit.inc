@@ -598,7 +598,7 @@ imLeave
 	jsr sfxInit
 	; The next level: the one this exit's 'map' names, pack slot n-1 for
 	; E1Mn; 0 is the end of the episode, and that is E1M1 again. A slot
-	; the Pi has no level for (an SD card without a pack) comes back as
+	; the Pi has no level for (a smaller pack in the REU) comes back as
 	; BAD_ARGS from LOAD_LEVEL, which falls back to E1M1 itself. The whole
 	; per-level setup runs again from SCENE_RESET, which LOAD_LEVEL needs
 	; anyway -- it replaces every resource and node the Pi holds. The loop

@@ -33,10 +33,17 @@ LUMPS = ['entities','planes','miptex','vertices','visilist','nodes','texinfo',
 
 MAX_VERTS_PER_MESH = 256
 MAX_UV_SPAN        = 255
-LEVEL_VERSION      = 7      # 1 had no entities, 2 no collision,
+LEVEL_VERSION      = 8      # 1 had no entities, 2 no collision,
                             # 3 no entity kind and no mover travel,
                             # 4 no point hull (hull 0), 5 no visibility,
-                            # 6 no pictures
+                            # 6 no pictures, 7 no start or body lengths
+
+# The body the firmware's CLIP_MOVE walks, in Quake units -- the level's own,
+# which nScale converts. gpu64 knows no game, so Quake's numbers travel in
+# the level header: 18 is the tallest step (E1M1's stairs are built to it),
+# 22 is view_ofs, and SV_CheckWater tests the feet at mins+1 (the box runs
+# from 24 below the origin) and the waist at the box's middle, 4 above.
+BODY_STEP_UP, BODY_EYE, BODY_FEET, BODY_WAIST = 18, 22, 23, 4
 
 
 def read_pak(path):
@@ -1207,21 +1214,32 @@ def main():
         htb = b''.join(hulls)
         ctb = b''.join(clips)
 
-        # 52-byte header, then seven tables, then the blob area everything
+        # 72-byte header, then seven tables, then the blob area everything
         # else offsets into. `base` is absolute; every other offset in the
-        # file is relative to it, so the loader adds it exactly once.
-        hdr = struct.pack('<4sHH' '4H' 'HHI' '5I' '2I',
-                          b'G64L', LEVEL_VERSION, int(QU_PER_WU),
-                          len(trec), len(mrec), len(nodes), len(entrecs),
-                          len(planes), len(hulls), len(clips),
-                          0, palo, stro, viso, len(vis), pico, picl)
+        # file is relative to it, so the loader adds it exactly once. The
+        # last 20 bytes are the start (info_player_start's origin and yaw,
+        # where LOAD_LEVEL puts its camera) and the body lengths above.
+        start, sflags = (0, 0, 0, 0), 0
+        for e in bsp.entities():
+            if e.get('classname') == 'info_player_start':
+                q = [num(x) for x in e.get('origin', '0 0 0').split()[:3]]
+                wp = to_gpu64(q)
+                start = tuple(int(round(v * 65536)) for v in wp) + (yaw_of(e),)
+                sflags = 1
+                break
+
+        def header(base):
+            return struct.pack('<4sHH' '4H' 'HHI' '5I' '2I' '3iH4BH',
+                               b'G64L', LEVEL_VERSION, int(QU_PER_WU),
+                               len(trec), len(mrec), len(nodes), len(entrecs),
+                               len(planes), len(hulls), len(clips),
+                               base, palo, stro, viso, len(vis), pico, picl,
+                               *start, BODY_STEP_UP, BODY_EYE, BODY_FEET,
+                               BODY_WAIST, sflags)
+        hdr = header(0)
         base = (len(hdr) + len(tbl) + len(mtb) + len(ntb) + len(etb)
                 + len(ptb) + len(htb) + len(ctb))
-        hdr = struct.pack('<4sHH' '4H' 'HHI' '5I' '2I',
-                          b'G64L', LEVEL_VERSION, int(QU_PER_WU),
-                          len(trec), len(mrec), len(nodes), len(entrecs),
-                          len(planes), len(hulls), len(clips),
-                          base, palo, stro, viso, len(vis), pico, picl)
+        hdr = header(base)
         out = bytearray(hdr) + tbl + mtb + ntb + etb + ptb + htb + ctb + blob
         open(a.out, 'wb').write(out)
         print('  wrote %s (%.1f KB)' % (a.out, len(out) / 1024.0))

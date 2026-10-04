@@ -1,16 +1,17 @@
 //
 // gpu64_level.h
 //
-// The .g64lev level container: a whole Quake level (geometry, textures,
-// entities and collision hulls) in one file the Pi reads off its own SD card,
+// The .g64lev level container: a whole 3D level (geometry, textures,
+// entities and collision hulls) in one file the Pi holds in the REU image,
 // so that putting a level on the HDMI screen costs the C64 two commands
 // instead of 620 KB of REU uploads it does not have room for.
 //
 // Written by tools/gen_quakelevel.py and validated by tools/check_g64lev.py;
 // the same bytes are rendered on a PC by tools/hostsim/levelsim.cpp before
-// any of it goes near the bench. Format version 7 -- version 1 had no
+// any of it goes near the bench. Format version 8 -- version 1 had no
 // entities, 2 no collision, 3 no entity kind, 4 no hull 0, 5 no visibility,
-// 6 no pictures.
+// 6 no pictures, 7 no start position or body lengths (it took them from
+// constants compiled into the firmware).
 //
 // This header is deliberately free of every gpu64 subsystem: it parses and
 // range-checks, and says nothing about resources, scenes or the arena. The
@@ -24,9 +25,16 @@
 
 // 'G','6','4','L' read as a little-endian u32: 0x47, 0x36, 0x34, 0x4c.
 #define GPU64_LEVEL_MAGIC	0x4c343647
-#define GPU64_LEVEL_VERSION	7
+#define GPU64_LEVEL_VERSION	8
 
-#define GPU64_LEVEL_HEADER_BYTES	52
+// 52 bytes of counts and offsets, then (v8) the level's start and body:
+//   52 s32 x 3  start position, 16.16 world units (0 when none)
+//   64 u16      start yaw, gpu64 units
+//   66 u8 x 4   step-up, eye, feet, waist -- in the level's own units (the
+//               ones nScale converts), see Gpu64_Level below
+//   70 u16      flags: bit 0 = the start position is present
+#define GPU64_LEVEL_HEADER_BYTES	72
+#define GPU64_LEVEL_HAS_START		0x0001
 
 // The seven table strides, all of which tools/gen_quakelevel.py packs with
 // struct's '<' so none of them carries padding.
@@ -38,28 +46,13 @@
 #define GPU64_LEVEL_HULL_STRIDE		36	// <2i6ii  head1, head2, mins[3], maxs[3], head0
 #define GPU64_LEVEL_CLIP_STRIDE		 8	// <HhhH   plane, child0, child1, pad
 
-// The file buffer. Read once at REU start-up by gpu64_levelPreload(), which
-// is the only moment the SD card is safe to touch: everything after it runs
-// inside reuUsingPolling(), where an EMMC transfer's MMIO traffic would wreck
-// core 0's per-C64-cycle bus timing (CLAUDE.md, "Multicore"). Two megabytes:
-// E1M1's geometry is 620 KB, and milestone 20 adds the monsters' animation
-// frames, the view-model guns, the pickups and the status-bar art on top,
-// which took it past the one megabyte this used to be. It is BSS inside
-// KERNEL_MAX_SIZE's 160 MB, so the size is not a timing question.
-#define GPU64_LEVEL_MAX_BYTES	( 2 * 1024 * 1024 )
-
 #ifndef GPU64_HOSTSIM
-extern u8  gpu64LevelFile[ GPU64_LEVEL_MAX_BYTES ];
-extern u32 gpu64LevelFileBytes;		// 0 when no level file was found
-// Slot 1, SD:RAD/level2.g64lev: optional, the level LOAD_LEVEL changes to.
-extern u8  gpu64LevelFile2[ GPU64_LEVEL_MAX_BYTES ];
-extern u32 gpu64LevelFile2Bytes;
-
-// What LOAD_LEVEL and LEVEL_PICTURE actually read: slot N's file, wherever it
-// lives. A level pack selected as the REU image in the RAD menu (a .reu that
-// starts with GPU64_PACK_MAGIC, built by tools/pack_levels.py) fills every
-// slot straight out of reuMemory, with no copy; without one, slots 0 and 1
-// are the two SD files above. Bytes 0 = an empty slot.
+// What LOAD_LEVEL and LEVEL_PICTURE read: slot N of the level pack, which is
+// the REU image the user selected in the RAD menu (a .reu that starts with
+// GPU64_PACK_MAGIC, built by tools/pack_levels.py). The slots point straight
+// into reuMemory, with no copy. gpu64 reads nothing else -- no file names,
+// no SD fallback -- so a program and its data ship together as a .prg plus
+// a .reu. Bytes 0 = an empty slot.
 #define GPU64_LEVEL_SLOTS	8
 extern const u8 *gpu64LevelSlot[ GPU64_LEVEL_SLOTS ];
 extern u32       gpu64LevelSlotBytes[ GPU64_LEVEL_SLOTS ];
@@ -84,7 +77,7 @@ typedef struct
 	const u8	*pFile;
 	u32		nFileBytes;
 
-	u16		nScale;		// Quake units per gpu64 world unit
+	u16		nScale;		// level units per gpu64 world unit
 	u16		nTex, nMesh, nNode, nEnt, nPlane, nHull;
 	u32		nClip;
 
@@ -112,6 +105,19 @@ typedef struct
 	// the title, the menu, the intermission. See gpu64_levelPic().
 	u16		nPic;
 	const u8	*pPicTab;	// nPic x <HHI> w, h, blob offset
+
+	// The start and the body (v8). All of it is the converter's to choose:
+	// gpu64 has no idea what game a level belongs to, so where its camera
+	// starts and how tall a walker in it is travel with the level.
+	//   nStepUp  the tallest step CLIP_MOVE's STEP mode climbs
+	//   nEye     the eye above the origin the hulls are built around
+	//   nFeet    below the origin: where a walker's feet test liquid
+	//   nWaist   above the origin: where the second liquid test is
+	// In level units, converted through nScale.
+	boolean		bHasStart;
+	s32		nStartX, nStartY, nStartZ;	// the origin, 16.16
+	u16		nStartYaw;
+	u8		nStepUp, nEye, nFeet, nWaist;
 }
 Gpu64_Level;
 
@@ -212,44 +218,29 @@ boolean gpu64_levelEnt( const Gpu64_Level *pL, unsigned nIndex, Gpu64_LevelEnt *
 #define GPU64_CLIP_CONT_SKY		5
 #define GPU64_CLIP_CONT_UNKNOWN		255
 
-// The three lengths collision is defined in terms of are Quake's, and they
-// are quoted in Quake units because that is where they mean something: 18 is
-// the tallest step in the game and E1M1's stairs are built to it, 22 is
-// view_ofs, and 1/32 is DIST_EPSILON. They are converted through the level's
-// own `nScale` rather than through a baked-in 32, so a level converted at a
-// different scale gets collision at its own scale instead of silently
-// getting E1M1's.
-#define GPU64_LEVEL_STEP_UP_QU		18
-#define GPU64_LEVEL_EYE_QU		22
-// Quake's player box runs from 24 below the origin to 32 above it;
-// SV_CheckWater tests the feet at mins+1 and the waist at the box's middle.
-#define GPU64_LEVEL_FEET_QU		23
-#define GPU64_LEVEL_WAIST_QU		4
-
-// Quake units to 16.16 world units. 18 -> 36864 and 22 -> 45056 at the
-// converter's current 32.
-static inline s32 gpu64_levelQU( const Gpu64_Level *pL, s32 nQuakeUnits )
+// Level units to 16.16 world units: 18 -> 36864 at a scale of 32.
+static inline s32 gpu64_levelQU( const Gpu64_Level *pL, s32 nLevelUnits )
 {
-	return (s32)( ( (s64)nQuakeUnits << 16 ) / (s32)pL->nScale );
+	return (s32)( ( (s64)nLevelUnits << 16 ) / (s32)pL->nScale );
 }
 
 // DIST_EPSILON: a trace stops this far short of the plane it hits so that the
 // endpoint is outside the solid and the next frame's trace does not start
-// inside it. 1/32 of a Quake unit, so 64 at the current scale.
+// inside it. 1/32 of a level unit, so 64 at a scale of 32.
 static inline s32 gpu64_levelEpsilon( const Gpu64_Level *pL )
 {
 	s32 e = gpu64_levelQU( pL, 1 ) / 32;
 	return ( e < 1 ) ? 1 : e;
 }
 
-// The eye sits GPU64_LEVEL_EYE_QU above the player origin the hulls are
-// expanded around, and the level loader already puts the camera there. So a
-// caller that hands its camera position straight to a trace is 22 units too
-// high and walks through the tops of walls. GPU64_CLIP_MODE_EYE exists so it
+// The eye sits the level's nEye above the origin the hulls are expanded
+// around, and the level loader already puts the camera there. So a caller
+// that hands its camera position straight to a trace is that much too high
+// and walks through the tops of walls. GPU64_CLIP_MODE_EYE exists so it
 // does not have to think about it.
 static inline s32 gpu64_levelEyeOfs( const Gpu64_Level *pL )
 {
-	return gpu64_levelQU( pL, GPU64_LEVEL_EYE_QU );
+	return gpu64_levelQU( pL, pL->nEye );
 }
 
 // The recursion and iteration bound. A level file comes off an SD card the
@@ -314,7 +305,7 @@ Gpu64_LevelTrace;
 // Gpu64_LevelMover list.
 typedef struct
 {
-	s32		nHead[ 2 ];	// [0] is hull 1 (player), [1] is hull 2
+	s32		nHead[ 2 ];	// [0] is hull 1, [1] is hull 2 -- the file's two box sizes
 	Gpu64_LevelVec	mins, maxs;
 	// Hull 0, the point hull (v5): the level itself, not shrunk by any
 	// box. What a shot or a line of sight traces against. The converter
@@ -346,7 +337,7 @@ void gpu64_levelTrace( const Gpu64_Level *pL, s32 nHeadNode,
 // position ends up.
 
 #define GPU64_CLIP_MODE_SLIDE	0x01	// slide along a plane instead of stopping
-#define GPU64_CLIP_MODE_STEP	0x02	// climb up to GPU64_LEVEL_STEP_UP_QU
+#define GPU64_CLIP_MODE_STEP	0x02	// climb up to the level's nStepUp
 #define GPU64_CLIP_MODE_FLOOR	0x04	// settle onto the floor after moving
 #define GPU64_CLIP_MODE_EYE	0x08	// positions are eye height, not origin
 #define GPU64_CLIP_MODE_WALK	( GPU64_CLIP_MODE_SLIDE | GPU64_CLIP_MODE_STEP | \
@@ -367,7 +358,7 @@ typedef struct
 	u8		nContents;	// GPU64_CLIP_CONT_* at the end position's feet
 	u8		nFraction;	// 0..255 of the requested displacement
 	u8		nBumps;		// slide iterations used, diagnostic
-	u8		nWaterLevel;	// Quake's waterlevel: 0 dry, 1 feet, 2 waist, 3 eyes
+	u8		nWaterLevel;	// liquid depth: 0 dry, 1 feet, 2 waist, 3 eyes
 }
 Gpu64_LevelMove;
 
@@ -394,7 +385,7 @@ Gpu64_LevelMover;
 // movers in it; the bound exists so the block a caller sends has a size.
 #define GPU64_LEVEL_MAX_MOVERS	16
 
-// nHull is 1 (player) or 2 (the larger monster hull); nModel is 0 for the
+// nHull is 1 or 2, the level's two box hulls; nModel is 0 for the
 // world. FALSE only for arguments the level cannot satisfy -- a hull that
 // does not exist -- never for a move that simply could not happen, which is
 // an ordinary result with flags set.
@@ -426,12 +417,11 @@ boolean gpu64_levelTraceEnts( const Gpu64_Level *pL, unsigned nHull,
 			      const Gpu64_LevelMover *pMovers, unsigned nMovers,
 			      Gpu64_LevelTrace *pTr, u8 *pHit );
 
-// Fills the buffers above from `SD:RAD/level.g64lev` and, if present,
-// `SD:RAD/level2.g64lev`. Call exactly once, from
-// the REU start-up path in rad_main.cpp, before reuUsingPolling().
+// Fills the slots above from the REU image's level pack. Call once per
+// program launch, from the REU start-up path in rad_main.cpp, before
+// reuUsingPolling().
 #ifndef GPU64_HOSTSIM
 void gpu64_levelPreload( void );
-void gpu64_levelPackReadAtBoot( void );	// once, at Pi start-up
 #endif
 
 // Reads the little-endian scalars a level file is built out of. Public

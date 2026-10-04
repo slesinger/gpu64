@@ -105,12 +105,12 @@ class 0, and every opcode reads exactly the byte count in its row.
 | $10 | `UPLOAD_MESH` | 12 | `ARG0-5` vertex blob descriptor, `ARG6-11` face blob descriptor | Uploads into resource RAM under the staged `ID`. Re-upload to a live ID replaces it in place — see Resource lifecycle below. `RESULT` = face count. |
 | $11 | `UPLOAD_TEXTURE` | 8 | `ARG0-5` blob descriptor, `ARG6` w shift, `ARG7` h shift | Dimensions are `1 << shift`, 3..8 (8 to 256 px, power of two). `len` must equal `w*h`; anything else is `BAD_ARGS`. |
 | $12 | `FREE_RESOURCE` | 0 | `ARG15` = `$A5` | Frees the staged `ID`'s table slot. Keyed — see "The key byte"; `BAD_ARGS` without it, and nothing is freed. In phase 1 this does not reclaim arena bytes — see Resource lifecycle. |
-| $13 | `LOAD_LEVEL` | 6 | `ARG0-1` mesh ID base, `ARG2-3` node ID base, `ARG4-5` camera ID, `ARG15` = `$A5` | Begins building a whole level out of the Pi's own SD card. Clears the resource table and the scene first, so it is keyed — see "The key byte". Does no building itself: call `LEVEL_STEP` until it says done. `BUSY` while the loop is running. See "Loading a level" below. |
+| $13 | `LOAD_LEVEL` | 6 | `ARG0-1` mesh ID base, `ARG2-3` node ID base, `ARG4-5` camera ID, `ARG15` = `$A5` | Begins building a whole level out of the REU image selected in the RAD menu. Clears the resource table and the scene first, so it is keyed — see "The key byte". Does no building itself: call `LEVEL_STEP` until it says done. `BUSY` while the loop is running. See "Loading a level" below. |
 | $14 | `LEVEL_STEP` | 0 | — | Builds the next slice of the level begun by `LOAD_LEVEL`. `RESULT` = percent complete 0..99, or `$FF` when the level is fully built — and once done it stays `$FF`, so a lost `RESULT` read can simply step again. `BAD_ARGS` if no load is in progress. If a slice fails, the error is whatever that item's build returned (`OUT_OF_MEMORY`, `BAD_ARGS`, …) and `RESULT` carries the **low byte of the failing item's index**; the load is abandoned. `BUSY` while the loop is running. |
 | $15 | `CLIP_MOVE` | 6 | `ARG0-5` descriptor of a 56-byte block in C64 RAM or REU | Asks where a move actually ends: you send a position and the displacement you want, and gpu64 traces it against the level's Quake clip hulls and answers with the position you end up in. Everything travels in the block, checksummed both ways — see "Walking in a level". `BAD_ARGS` if `len < 56`, if no level is loaded, if the block's magic or checksum is wrong, or if the hull or model is not one this level has. **Not** keyed and **not** `BUSY` while the loop runs: it changes no gpu64 state, so it answers mid-frame. |
 | $16 | `LEVEL_ENT` | 6 | `ARG0-5` descriptor of a 96-byte block in C64 RAM or REU | Hands back one entity of the loaded level — where it is, what kind of thing it is, which scene nodes draw it, and how far it travels if it is a door. Same block discipline as `CLIP_MOVE`: input bytes 0-3, output 16-95, magic and checksum both ways. `RESULT` = the entity's `kind`. `BAD_ARGS` if `len < 96`, if no level is loaded, or if the block's magic or checksum is wrong; `OUT_OF_RANGE` past the last entity. Also not keyed and not `BUSY` while the loop runs. |
 | $17 | `LEVEL_PALETTE` | 0 | — | Puts the loaded level's palette back. Compares the live palette with the level file's and rewrites only the entries that differ; if any did, pushes the palette to the display and rebuilds the colormap. `RESULT` = entries repaired, saturated at 255 — 0 is the normal answer and costs nothing but the compare. For a refresh ring: the level's palette is the one piece of state your program never held a copy of. `BAD_ARGS` until a level load has finished. Not keyed; fine while the loop runs. |
-| $1A | `LEVEL_PICTURE` | 6 | `ARG0` picture index, `ARG1-2` x, `ARG3-4` y (signed, clipped), `ARG5` flags: bit 0 = keyed (index 255 is transparent), bit 1 = install the level file's palette first; other bits must be 0 | Draws one of the level file's 2D pictures (title, menu and intermission art — see "Pictures" below) onto the **class 0 draw page**; `PAGE_FLIP` shows it. Reads the level file the Pi preloaded at boot, so it works **before** `LOAD_LEVEL`, which is what a title screen needs. `BAD_ARGS` for an index past the table, bad flag bits, or a card with no level file. `BUSY` while the loop is running — the loop owns the pages — which also makes a phantom one harmless mid-game. Not keyed. |
+| $1A | `LEVEL_PICTURE` | 6 | `ARG0` picture index, `ARG1-2` x, `ARG3-4` y (signed, clipped), `ARG5` flags: bit 0 = keyed (index 255 is transparent), bit 1 = install the level file's palette first; other bits must be 0 | Draws one of the level file's 2D pictures (title, menu and intermission art — see "Pictures" below) onto the **class 0 draw page**; `PAGE_FLIP` shows it. Reads level slot 0 of the REU image, so it works **before** `LOAD_LEVEL`, which is what a title screen needs. `BAD_ARGS` for an index past the table, bad flag bits, or an REU image that is not a level pack — which is also how a program checks that the player selected its image. `BUSY` while the loop is running — the loop owns the pages — which also makes a phantom one harmless mid-game. Not keyed. |
 | $1C | `LEVEL_NODE` | 1 | `ARG0` bit 0 = also restore the position; other bits must be 0 | Puts one level node back the way `LEVEL_STEP` built it: an object, instancing the level's own mesh, visible, scale 1.0, no rotation — and, with bit 0, at the level file's position. Leave bit 0 clear for a node you move yourself (a door). Staged `ID` = the node id. `RESULT` bit 0 = the node itself was wrong, bit 1 = its position was; 0 is the normal answer. `BAD_ID` past the level's last node, which is also how a program finds where the run ends; `BAD_ARGS` until a level load has finished. If the node had become the active camera, it is not one any more. Not keyed; fine while the loop runs. |
 
 ### Scene nodes — $20-$2F
@@ -483,7 +483,7 @@ implemented; `ARG0=1` is `UNSUPPORTED`.
 
 ## What retaining the scene actually costs
 
-`Source/Demos/gpu64_demo_quake.a` and `Source/Demos/gpu64_demo_quake3d.a`
+`quake/gpu64_demo_quake.a` and `quake/gpu64_demo_quake3d.a`
 are the same room, the same monsters and the same controls, written twice:
 once in class 2's immediate mode, once as a retained class 1 scene driven
 by the handshake loop. The second is the port stage 17 asked for, and it
@@ -546,7 +546,7 @@ game costs.
 
 This section maps each class 2 idea to its class 1 equivalent and lists
 the extra work a retained scene asks of your program. The worked example
-is the Quake game (`Source/Demos/gpu64_demo_game.a`), written for class 1
+is the Quake game (`quake/gpu64_demo_game.a`), written for class 1
 from the start. It does everything the class 2 Quake demo did and much
 more.
 
@@ -688,12 +688,15 @@ size is `BAD_ARGS`.
   work around. Use `ARENA_STATUS` ($09) to watch the free space if your
   program uploads/re-uploads a lot in one session.
 
-## Loading a level from the Pi's SD card
+## Loading a level from the REU image
 
 A level is far too large to upload through the register window — E1M1 is
-620 KB of textures, meshes and world nodes — and it does not have to be. The
-Pi has its own SD card. Put a `.g64lev` file on it as **`RAD/level.g64lev`**,
-and two opcodes turn it into a live scene.
+620 KB of textures, meshes and world nodes — and it does not have to be.
+Your game ships as a pair: the `.prg` and a `.reu` image holding a **level
+pack** (one or more `.g64lev` files). The player selects the `.reu` as the
+REU image in the RAD menu, then runs the `.prg`, and two opcodes turn a
+level of that pack into a live scene. gpu64 reads levels and pictures from
+nowhere else: there is nothing on the Pi's card for you to install.
 
 ```
         ; --- begin ---
@@ -721,9 +724,12 @@ while it happens.
 
 Four things the split implies:
 
-- **The file is read at power-on, not at `LOAD_LEVEL`.** If the card has no
-  `RAD/level.g64lev`, or the file is not a valid level, `LOAD_LEVEL` answers
-  `BAD_ARGS` — and the Pi's boot log says which of the two it was.
+- **The pack is checked when the REU image is loaded, not at `LOAD_LEVEL`.**
+  If the image is not a valid level pack, `LOAD_LEVEL` answers `BAD_ARGS` —
+  and the Pi's log says why the pack was refused. If the player selected
+  another game's image, the slots hold that game's levels: check that the
+  image is yours (a `LEVEL_PICTURE` of a picture only your pack has, or your
+  own marker in REU memory) before relying on it.
 - **`LOAD_LEVEL` resets the arena, the resource table and the scene**, so a
   second level in one session does not leak the first one's 20-odd MB. It does
   **not** touch your viewport, field of view or clip planes: set those up
@@ -731,9 +737,12 @@ Four things the split implies:
 - **Texture IDs are not yours to choose.** They are forced to `0..ntex-1`,
   because a mesh face carries its texture as one byte. Mesh and node ID bases
   are free; pick them clear of `0..ntex-1` and of each other.
-- **The camera comes from the level.** `info_player_start` is in the file, so
-  gpu64 creates the camera there, facing the right way, and makes it active.
-  Pass 0 for the camera ID if you would rather place your own.
+- **The camera comes from the level.** The file's header carries a start
+  position and yaw (for Quake, the converter takes them from
+  `info_player_start`), so gpu64 creates the camera there, at the header's
+  eye height, facing the right way, and makes it active. Pass 0 for the
+  camera ID if you would rather place your own; a level whose header has no
+  start answers `BAD_ARGS` unless you do.
 - **Neither opcode works while the loop is running.** Both answer `BUSY`.
   Load first, then `LOOP_START` — or `LOOP_STOP` before reloading.
 
@@ -748,20 +757,15 @@ arguments, it loads slot 0. A slot with no level answers `BAD_ARGS`.
         lda #1^$5a  : sta ARG+7     ; ...confirmed
 ```
 
-The slots are filled at power-on in one of two ways:
+The slots come from the pack, up to 8 levels. Build the REU image with
+`tools/pack_levels.py game.reu E1M1=e1m1.g64lev E1M2=e1m2.g64lev`; the
+levels become slots 0, 1, … in the order you list them. RAD sizes the REU
+from the file. The Pi uses each level directly from REU memory, so **your
+program must not DMA into that part of the REU** — the rest of the REU,
+past the pack, is yours.
 
-- **Level pack (up to 8 levels).** Build a single REU image with
-  `tools/pack_levels.py quake.reu E1M1=e1m1.g64lev E1M2=e1m2.g64lev`. The
-  levels become slots 0, 1, … in the order you list them. In the RAD menu,
-  select the `.reu` as the REU image (RAD sizes the REU from the file), then
-  launch your program. The Pi uses each level directly from REU memory, so
-  **your program must not DMA into that part of the REU**.
-- **Without a pack, two SD files.** Slot 0 is `RAD/level.g64lev` and slot 1
-  is `RAD/level2.g64lev`.
-
-If a pack fails its checksums, none of it is used and the Pi falls back to
-the SD files. The Pi's boot log lists every slot, or says why the pack was
-refused.
+If a pack fails its checksums, none of it is used and every slot is empty.
+The Pi's log lists every slot, or says why the pack was refused.
 
 A loaded level also culls itself. The file carries Quake's own
 potentially-visible set, baked down to the level's world nodes, and every
@@ -781,7 +785,7 @@ is asked of you. What it covers:
 
 A level file can also carry 2D pictures: the art for a title screen, a menu
 and an intermission. A 320x200 background is 64 KB, which is more than a C64
-has to send it from, so the pictures travel on the Pi's card with the level,
+has to send it from, so the pictures travel in the REU image with the level,
 and `LEVEL_PICTURE` ($1A) draws one by index onto the class 0 draw page.
 
 ```
@@ -805,9 +809,9 @@ and `LEVEL_PICTURE` ($1A) draws one by index onto the class 0 draw page.
   a keyed draw (bit 0) leaves it untouched.
 - **It is a title-screen command.** It answers `BUSY` while the loop runs,
   because the loop owns the pages. Draw your intermission after `LOOP_STOP`.
-- **The format is versioned.** A firmware accepts one level format — v7, the
-  first with pictures — and refuses any other at boot, so a level file and a
-  kernel are deployed together.
+- **The format is versioned.** A firmware accepts one level format — v8,
+  whose header also carries the player start and body sizes — and refuses
+  any other, so a pack built for an older firmware has to be rebuilt.
 
 Nothing above stops the camera leaving the map — placing it is your job, and
 `CLIP_MOVE` below is how you ask whether a place is legal.
@@ -856,7 +860,7 @@ be two dozen independent chances to lose one.
 | 30-31 | — | reserved, not read, not summed |
 | 32-43 | out | `end` x, y, z — where the move really ended |
 | 44 | out | flags, below. Also copied to `RESULT` |
-| 45 | out | contents at the **feet** of `end` (23 Quake units below the origin), from the level's point hull, so water, slime and lava are reported: 0 empty, 1 solid, 2 water, 3 slime, 4 lava, 5 sky, 255 unknown |
+| 45 | out | contents at the **feet** of `end` (the level header's feet depth below the origin — 23 units for a Quake level), from the level's point hull, so water, slime and lava are reported: 0 empty, 1 solid, 2 water, 3 slime, 4 lava, 5 sky, 255 unknown |
 | 46 | out | fraction 0-255 of the *horizontal* displacement actually covered |
 | 47 | out | bumps: slide iterations used, 0-4. Diagnostic |
 | 48 | out | magic `$5C` |
@@ -866,13 +870,13 @@ be two dozen independent chances to lose one.
 | 52-55 | out | zero |
 
 **Mode** (bitwise): `$01` slide along walls instead of stopping dead, `$02`
-step up over obstacles up to 18 Quake units, `$04` settle onto the floor and
+step up over obstacles up to the level header's step height (18 units for a Quake level), `$04` settle onto the floor and
 report standing, `$08` the position you send and get back is the **eye**, not
-the feet — gpu64 subtracts the 22-unit view offset on the way in and adds it
+the feet — gpu64 subtracts the header's eye height (22 units for a Quake level) on the way in and adds it
 back on the way out, so you can hand it your camera's position unchanged.
 `$07` (slide + step + floor) is ordinary walking; `$0f` is ordinary walking
 with a camera-height position. A swimmer drops the floor settle (`$0b`):
-the settle traces 18 units down and would pin them to the bottom.
+the settle traces one step height down and would pin them to the bottom.
 
 **Flags**: `$01` standing on ground, `$02` hit a wall, `$04` hit a ceiling,
 `$08` the move needed a step up, `$10` the *start* was already inside solid
@@ -899,8 +903,8 @@ Three things worth doing, all cheap:
   else — see [state-refresh.md](state-refresh.md).
 - **Bound the answer by the question.** The magic and the checksum are the
   channel; this is the meaning. A move cannot end further from where it
-  started than the displacement you asked for, plus the 18 Quake units of
-  step-up mode `$02` is allowed to add — so compare the returned position
+  started than the displacement you asked for, plus the level's step height (18
+  units for Quake) that step-up mode `$02` is allowed to add — so compare the returned position
   against your own start and reject anything outside that, exactly as you
   reject a bad checksum. It costs a handful of compares on the integer halves
   and it is the only check that is *exact*: an 8-bit XOR over seventeen bytes

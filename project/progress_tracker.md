@@ -11222,3 +11222,275 @@ type is in. Design and rationale: `milestone20_quake_combat_design.md`,
   | build/quake.reu | REU/quake.reu | 803e66b26569131aa5de30ac195ec79b |
   | build/e1m1.g64lev | RAD/level.g64lev | 78e64bb2ee1107973f64764d2138eceb |
   | build/e1m2.g64lev | RAD/level2.g64lev | b36db7297ef3549c67a3c9f9a4044294 |
+
+## 102. The firmware is game-agnostic: the REU image is the only data source (2026-10-03, PC only)
+
+The user's ruling: gpu64 is a graphics card for any application, and other
+developers cannot change its firmware. A game ships as a **PRG + REU image
+pair**. The player selects the image in the RAD menu, and the firmware
+implements only the general API. An image that does not match the PRG may
+hang, and that is the game's problem. An audit found Quake- and
+Stunt-specific code in the firmware, which this entry removes:
+
+- **Gone:**
+  - the SD level files `RAD/level.g64lev`/`level2.g64lev` and their
+    preload
+  - the boot-time read of `SD:REU/quake.reu` (§98,
+    `gpu64_levelPackReadAtBoot`)
+  - the `PACKFILES` name list
+  - `USE_PACK` ($1B), which the Stunt title used to pick `stunts.reu` off
+    the card
+  - the `strcmp("info_player_start")` camera lookup
+  - the Quake body constants (step 18, eye 22, feet 23, waist 4)
+
+  `gpu64_levelPreload()` now takes the slots from the pack in `reuMemory`
+  and from nowhere else.
+- **Level format v8** (`GPU64_LEVEL_VERSION` 8, 72-byte header). After the
+  v7 fields come:
+  - start x/y/z (s32 16.16)
+  - start yaw
+  - step-up, eye, feet and waist in level units
+  - flags bit 0 = has start
+
+  `gen_quakelevel.py` writes the Quake values and `info_player_start`
+  into it. `LOAD_LEVEL`'s camera and the CLIP_MOVE/WORLD_TICK body all
+  come from the header. v7 images are refused, so `quake.reu` and the
+  kernel deploy together.
+- **Kept, as generic data-driven services:** CLIP_MOVE, WORLD_TICK, the
+  BSP hulls, PVS and `LEVEL_PICTURE`. Their comments cite Quake as the
+  algorithm's provenance only.
+- **Stunt title.** It draws its logo picture twice and treats any OK as
+  "my image is selected". Otherwise it prints "SELECT STUNTS.REU IN THE
+  RAD MENU".
+- **Tools.** The following match v8 and the REU-only model:
+  - `check_g64lev.py`
+  - prgsim (`gpu64level.py`, `gpu64class1.py`; `runsim --pack` is gone,
+    and `--reu` is the only source)
+  - `pack_levels.py`
+  - `deploy_prg.sh`, which now copies `build/quake.reu` and
+    `stunts/stunts.reu` to `REU/` with a cmp check
+
+  The SD level copy is gone.
+- **Verified on the PC:**
+  - Every v8 level is byte-identical to its v7 original apart from the
+    header and the base shift.
+  - `check_g64lev` passes on all 8 levels. The E1M1 start is
+    15.00/2.75/-11.00, yaw 0.
+  - `hulltest` passes: 8 doors, 0 failures.
+  - `tools/demos.sh` passes all 16 demos.
+  - The Stunt title with `--reu=stunts/stunts.reu` draws the start art and
+    the credits screen from the pack.
+
+  The card's `RAD/level*.g64lev` files are now unused and can be deleted.
+
+## 103. Stunt Car Racer: cockpit, eight tracks, league, HDMI menus, SFX (2026-10-04, PC only)
+
+The game side only; the firmware is unchanged (§102). Details are in
+`stunts/README.md`; the player's guide is `stunts/PLAYING.md`.
+
+- **Cockpit view only**, with an HDMI dashboard (speed, lap, time, best,
+  boost, position) and a windscreen crack that grows with damage.
+- **Eight tracks** (`stunt_tracks.py`), one level slot each in `stunts.reu`.
+- **The league** (`stunt_league.inc`). There are twelve drivers in four
+  divisions of three. A division has two tracks, and a season is four
+  head-to-head races. A win scores 2 and the fastest lap 1. The rivals'
+  own races are simulated, weighted by skill. At the end of a season,
+  the top driver of each division goes up and the bottom one comes down.
+  A rival's skill sets its AI pace (`rvLead`/`rvBack`).
+- **Every screen is `LEVEL_PICTURE`s.** The screens are the main menu,
+  practice with a track preview, the division table, race result, end of
+  season and controls. The text uses one 9x9 glyph picture per character,
+  in three colours. Led Storm plays in the menus and stops for a race.
+- **The SFX** (`stunt_sfx.inc`) run once a frame from the race loop:
+  - an engine pitch that follows the speed and rises in the air
+  - a boost hiss
+  - crash, scrape, landing, the countdown pips, GO and the lap tone
+- **F3's autopilot** works in practice only.
+- **Verified on the PC:**
+  - All eight tracks run 1500 frames with SETUP OK, ERR 0 and MISSED 0.
+    Lap times are within 0.4 s of the pre-SFX build.
+  - `demos.sh stunt` passes.
+  - The track 0 SID log has the three pips, GO, landings, a crash, the
+    boost and the lap tone at the right frames.
+  - The menus were checked page by page:
+    - A real league race 1 against SPARKY.
+    - A test build (`-D LGTEST=1`: every race is an instant 20.0 vs 25.0
+      win) played five seasons. They went 4 → 3 → 2 → 1, then LEAGUE
+      CHAMPION twice. The other divisions' promotions and relegations
+      showed up correctly in the next season's tables.
+
+## 104. Stunt Car Racer: the original's cockpit, steered wheels, car-to-car collisions (2026-10-04, PC only)
+
+The game side only; the firmware is unchanged.
+
+- **The cockpit is redrawn after the original's layout and colours**
+  (`stunt_cockpit.py`), 24 view-space sprites:
+  - The colours: `patch_pal()` overwrites WHITE levels 1-9 with the
+    original's nine cockpit colours.
+  - Every cockpit texture id is 256-511, so the C64 patches only the low
+    byte. `texTab` now carries the high byte.
+  - The dashboard: `L` lap and `B` boost, the gap to the rival (lap.s.f >> 4,
+    signed, capped at 9999), m:ss.t lap and best times, the speed gauge,
+    and the steering wheel.
+- **The front tyres steer and roll.** Each is its own sprite:
+  - 32x64 texels drawn 64x64, 4 roll phases × 5 steer positions × 2 sides.
+  - `ckSteerIn` steps `ckSteer` toward the stick, or the autopilot's
+    `aiD`, one position a frame.
+  - `ckSpin` adds the speed every frame.
+  - One 256x64 car texture with the tyres baked in would have been 20 of
+    them, which put `stunts.reu` at 1.16 MB, over its 1 MB budget. With the
+    tyres split out it is 930 KB.
+- **Car-to-car collisions** (`bump`). The cars are solid boxes:
+  - The one ahead is pushed forward and both are pushed apart sideways.
+  - Both lose speed.
+  - A hard hit damages both, once per contact.
+  - Fixed the same day: a `.byte $2c` skip over a 3-byte absolute `lda`
+    jumped into garbage on any push to one side. Track 3 found it.
+- **Verified on the PC:**
+  - All eight tracks run 1500 frames with ERR 0, and none faults.
+  - The scenesim renders match the composited preview.
+  - The `-D BUMPTEST=1` build crashes the cars head-on with no fault.
+
+## 105. Stunt Car Racer: realistic physics, a mountain panorama, exhaust flames (2026-10-04, PC only)
+
+The game side only; the firmware is unchanged.
+
+- **Crests depend on speed.** `roadY` rides a quadratic B-spline through
+  the segment midpoints instead of the drawn road's straight segments.
+  - The spline is within 0.04 units of the drawn road.
+  - A crest now pulls down with curvature × v², so a slow car follows it
+    and a fast one takes off. Before, every kink launched the car at any
+    speed.
+  - Next to a gap or a bridge deck, `roadY` falls back to the straight
+    line, so the jump thresholds are unchanged.
+  - GRAV stays at 917. A trial at 700 regressed Stepping Stones (3/4 falls).
+- **Drag is on the ground only.** `v -= v >> 5` (3% a frame) stood for
+  the tyres and drivetrain, but it also ran in the air. A 36-frame flight
+  lost two thirds of its speed and fell short of the gap.
+- **Side contact scrubs speed once per contact**, as damage already did.
+  It used to take 1/16 of the speed every frame. Two cars that reached
+  Roller Coaster's gap side by side braked each other to a stop in the
+  air.
+- **Steering** (`steerRamp`): the wheel winds on at 3 a frame to 120, about
+  a second, and back at 6. The yaw is wheel × grip(v) from
+  `gripLo/gripHi`: 2·min(STEER0 + 4v, GRIP_K / v). The car does not
+  self-centre.
+- **Mountains** (`stunt_mountains.py`).
+  - A ridged-multifractal range 2.5-32 km out is ray-cast voxel-style
+    from 300 m.
+  - It has sun shading, snow by height and slope, forest and meadow in
+    the valleys, and distance haze.
+  - It is dithered (Bayer, a YCbCr metric with chroma weighted 3×) into
+    the palette.
+  - It is drawn on 16 unlit 64×64 panels on a ring of radius 76 that
+    follows the camera's height (`MTN_EYE`). Texels above the ridge are
+    the sky fill's own index.
+- **Exhausts.**
+  - `car()` has four chrome zoomie stacks a side between the engine and
+    the wheels (`STACKS`).
+  - FLAME is a 256×32 sprite with eight flames, two frames, shown on
+    boost.
+  - `stunts.reu` is 1,004,544 bytes, under its 1 MB limit.
+- **The autopilot takes a jump on a bend at $30, not flat out**
+  (`BEND_JUMP`). A car flies straight while the road turns under it.
+  With the scrub fix the cars reached Roller Coaster's gap at $41, flew
+  five segments and landed past the edge. It now boosts only while below
+  its target speed. This covers Big Ramp's gap too.
+- **Verified on the PC:**
+  - The autopilot race on all eight tracks (4000 frames) gives 0 falls
+    for both cars. The baseline had 6 per car: Big Ramp 2, Ski Jump 2,
+    High Jump 2.
+  - All eight tracks run 1500 frames with ERR 0000.
+  - The scenesim renders show the mountains, the stacks, and all eight
+    flames on boost.
+  - `demos.sh stunt` is ok, and the BUMPTEST build gives ERR 0000.
+
+## 106. Stunt Car Racer: the original's eight tracks, a quarter-second wheel (2026-10-04, PC only)
+
+The game side only; the firmware is unchanged.
+
+- **The cockpit** was matched to the user's screenshot (`images/11.png`).
+- **Steering is four times faster.** The wheel winds on at `STEER_IN` 12
+  a frame and comes back at 24, so full lock takes about a quarter second
+  instead of a second.
+- **The tracks are the original's layouts.**
+  - They were read off c64-wiki's `StuntCarRacer_Rennkurse.gif`, which has
+    one oblique preview from the south per track.
+  - A camera was fitted to the previews: off-axis, tilt 0.079, f 729. Each
+    track's plan was then written as straights and arcs in
+    `stunt_tracks.py`, and its features (ramps, gaps, blocks, hump, tower,
+    drawbridge, dips) were keyed along it.
+  - The previews draw heights about 2.5 times exaggerated, so they were
+    compared with `YS=2.5`. The heights stay inside the 8.8 world (12.5 at
+    most).
+- **The original's hairpins are radius 8-10**, against 18 on the old
+  tracks. That needed two changes:
+  - **The turning circle.** The player's full-lock yaw was
+    2·min(STEER0 + 4v, GRIP_K/v). The road turns at dh·v/256, so no speed
+    could follow an r10 bend. It is now `STEER_V` = 8 per vHi, so grip,
+    not geometry, limits a hairpin: slow is drivable and fast is not.
+  - **The autopilot.** `ai_tables` caps every bend with |dh16| ≥ 900
+    (`BEND_SLOW`), from 10 segments ahead, to 85% of the lower of two
+    limits: its own turn limit (`AI_STEER` 320 a frame) and the grip.
+    `ciAuto` now brakes when it is `AI_BRAKE` (6) or more over its
+    target. Before, it only coasted.
+- **High Jump is one gap.** A tower standing between two gaps left the
+  car no run-up for the second hop, so every car fell into the second gap.
+  The ramp is now followed by four gap segments onto the tower, which is
+  the top of the landing ramp.
+- **Draw Bridge** had a 7.5-unit cliff at the end of its left hairpin (a
+  keys slip). It now descends over the hairpin.
+- **Verified on the PC:**
+  - The autopilot race on all eight tracks (4000 frames) gives 0 falls
+    for both cars. The first fit had 3-6 per car on five tracks: hairpins
+    on four of them, plus High Jump's second gap.
+  - All eight tracks run 1500 frames with ERR 0000.
+  - `demos.sh stunt` is ok, and the BUMPTEST build gives ERR 0000.
+  - `stunts.reu` is 939,008 bytes.
+
+## 107. Stunt Car Racer: crests that throw a fast car, sliding brakes, collision sound (2026-10-04, PC only)
+
+The game side only; the firmware is unchanged. This round answers the
+user's first play-through: not jumpy enough, brakes too effective, and
+collisions felt like the car "behaving strange" because they made no sound.
+
+- **Crests.** `crests()` in `stunt_tracks.py` adds two or three short
+  humps (period 10 segments) to the straights of every track except Big
+  Ramp, which already had its bumps. With the B-spline road (§105) a crest
+  launches at vHi ≈ 256·sqrt(0.014/k). These launch at about vHi 52-53:
+  near flat out, above the AI's cruise. The autopilot's airborne frames
+  rose on every track that got crests (Little Ramp 39 → 86, Hump Back
+  54 → 89, Draw Bridge 31 → 80, High Jump 51 → 106, Roller Coaster 0 → 54).
+- **The landing kick.** A landing that costs damage also adds
+  min(2·damage, `KICK_MAX` $0c, about 17 degrees) to the car's heading
+  relative to the road, in the direction it was already off (`landKick`).
+  A fast landing therefore leaves the car out of line, and it has to be
+  caught.
+- **The brakes.** `BRAKE` went from 900 to 256 a frame. Braking with
+  `inThr` = 2 at `SLIDE_V` ($28) or faster halves the grip in
+  `csSteerKeys`, so a car braking in a bend runs wide.
+- **The player's inputs survive the rival's turn.** `inThr` and `inBoost`
+  are per-car scratch that the rival's `carInput` overwrites. They are
+  saved as `pThr` and `pBoost` after the player's. This also fixes a latent
+  bug: the boost hiss had been following the rival's boost.
+- **Sound** (`stunt_sfx.inc`):
+  - Voice 2 squeals (pulse $41 with a four-step pitch waver, `sqTab`)
+    while the player brakes on the ground at `SQUEAL_V` ($20) or faster.
+    The boost hiss takes priority.
+  - `bump()` sets `bmEvt` on a real contact. Voice 3 then plays `FX_HIT`,
+    a noise crunch whose pitch falls 4 a frame (`fxSwp`, per sound). It is
+    ranked between crash and thump, and repeats at most every `HIT_GAP`
+    (16) frames, because contacts flicker every 2-7 frames while the cars
+    rub.
+- **Verified on the PC:**
+  - The autopilot race on all eight tracks (4000 frames) gives 0 falls
+    for both cars.
+  - All eight tracks run 1500 frames with ERR 0000.
+  - `demos.sh stunt` is ok.
+  - The BUMPTEST build gives ERR 0000, and the crunches are 16-24 frames
+    apart in the `--sid-log`.
+  - The squeal (V2 control $41 → $40 below `SQUEAL_V`) was checked in the
+    SID log.
+  - `stunts.reu` is 943,104 bytes.
+- Not yet bench-run. The crest speeds and the brake feel are tuned by
+  numbers, not by hand.

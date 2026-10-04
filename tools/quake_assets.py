@@ -202,7 +202,7 @@ MODELS = [
     ('suit',    'progs/suit.mdl',     None),
     ('spike',   'progs/spike.mdl',    None),
     ('backpack','progs/backpack.mdl', None),
-    # The monsters' missiles (Source/Demos/gpu64_game_proj.inc).
+    # The monsters' missiles (quake/gpu64_game_proj.inc).
     ('grenade', 'progs/grenade.mdl',  None),
     ('w_spike', 'progs/w_spike.mdl',  None),
     ('zom_gib', 'progs/zom_gib.mdl',  None),

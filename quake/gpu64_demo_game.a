@@ -79,8 +79,8 @@
 ;
 ;      BEFORE RUNNING IT
 ;
-;      build/e1m1.g64lev must be on the SD card as RAD/level.g64lev, exactly
-;      as for the level demo.
+;      Select quake.reu (tools/pack_levels.py) as the REU image in the RAD
+;      menu, exactly as for the level demo.
 ;
 ;      READING THE SCREEN
 ;
@@ -679,9 +679,8 @@ loadLevel
 	#argw 0, MESH_BASE
 	#argw 2, NODE_BASE
 	#argw 4, CAM_ID
-	; ARG6 is the Pi's preloaded level: slot n-1 of the REU level pack for
-	; E1Mn, or without a pack 0 is RAD/level.g64lev (E1M1) and 1 is
-	; RAD/level2.g64lev (E1M2). ARG7 = ARG6 ^ $5A or the Pi takes slot 0.
+	; ARG6 is the level slot: slot n-1 of the REU level pack for E1Mn.
+	; ARG7 = ARG6 ^ $5A or the Pi takes slot 0.
 	lda lvSlot
 	sta ARG+6
 	eor #$5a
@@ -692,8 +691,8 @@ loadLevel
 	jsr cmd1
 	sta loadErr
 	beq loadArmed
-	; A slot the Pi has no level for answers BAD_ARGS (no pack in the REU,
-	; and no level2.g64lev for slot 1): play E1M1 rather than end the game.
+	; A slot the Pi has no level for answers BAD_ARGS (a smaller pack in
+	; the REU): play E1M1 rather than end the game.
 	ldx lvSlot
 	beq +
 	cmp #ERR_BAD_ARGS
@@ -2739,8 +2738,8 @@ wrDone
 ;             light, the active camera, the palette, the readback fence
 ;   nodeRefresh  one LEVEL node a frame, all four of its fields
 ;
-; The palette is the one that needed firmware: its truth lives on the Pi's
-; SD card, not in the C64, so LEVEL_PALETTE ($17) asks the Pi to compare
+; The palette is the one that needed firmware: its truth lives in the REU
+; level pack, not in C64 RAM, so LEVEL_PALETTE ($17) asks the Pi to compare
 ; its live palette against the level's and put back whatever differs.
 ; ======================================================================
 doRefresh

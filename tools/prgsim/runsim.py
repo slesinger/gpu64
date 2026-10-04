@@ -24,13 +24,13 @@ Options:
                         (default 50) to the end, and print writes/frame,
                         reads/frame and a per-opcode table to stderr --
                         which commands the bus budget is actually spent on
-    --level2=FILE       RAD/level2.g64lev: LOAD_LEVEL slot 1 (ARG6=1, ARG7=$5B)
-    --reu=FILE          a level pack (tools/pack_levels.py) as the REU image:
-                        its levels become slots 0..7, replacing --level/2
-    --level=FILE        stand in for RAD/level.g64lev on the Pi's SD card, so
-                        LOAD_LEVEL/LEVEL_STEP build a real level. Without it
-                        LOAD_LEVEL answers BAD_ARGS, as it does on a card that
-                        has no level on it
+    --reu=FILE          the REU image selected in the RAD menu: a level pack
+                        (tools/pack_levels.py) whose levels are slots 0..7.
+                        It is the only place gpu64 reads levels and pictures
+                        from; without it LOAD_LEVEL and LEVEL_PICTURE answer
+                        BAD_ARGS, as on the Pi with no pack selected
+    --level=FILE        shorthand: a pack holding just this level, as slot 0
+    --level2=FILE       with --level=, slot 1 (LOAD_LEVEL ARG6=1, ARG7=$5B)
     --clip-fault=N[:KIND]  damage the Nth CLIP_MOVE answer past its checksum:
                         x (default) its x high byte, solid an ALLSOLID answer
                         that stays put; void makes answer N and every one
@@ -129,8 +129,9 @@ Options:
     --hop=F:X,Y,Z,YAW   the same, but nothing restarts: only the eye moves,
                     doors, counters and kills keep their state. Repeatable,
                     so one run can visit rooms that are far apart.
-    --title         gpu64_demo_game.a: run the title (logo sweep, Quake
-                    title, skill menu) instead of skipping it. Frames are
+    --title         gpu64_demo_game.a and gpu64_demo_stunt.a: run the
+                    title (logo sweep, then Quake's title and skill menu
+                    or Stunt's credits) instead of skipping it. Frames are
                     its page flips; the sweep flips none. Not with
                     --frame-ms, and give it a --stop-after large enough
                     for the menu's column-7 reads.
@@ -333,10 +334,16 @@ class Machine:
                 os.path.abspath(__file__)), '..'))
             import pack_levels
             with open(reu, 'rb') as f:
-                slots = pack_levels.unpack(f.read())
+                image = f.read()
+            # The whole image is reuMemory on the Pi: SPACE_REU blob reads
+            # and the C64's own REU controller both see these bytes.
+            self.gpu.reu[:len(image)] = image[:len(self.gpu.reu)]
+            slots = pack_levels.unpack(image)
             self.gpu.c1_level_data = slots[0][1]
             self.gpu.c1_level_data2 = slots[1][1] if len(slots) > 1 else None
             self.gpu.c1_level_more = [d for _, d in slots[2:]]
+        sys.path.insert(0, os.path.join(os.path.dirname(
+            os.path.abspath(__file__)), '..'))
         self.c1_stream = None
         if c1_stream:
             self.c1_stream = open(c1_stream, 'w')

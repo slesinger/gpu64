@@ -601,10 +601,6 @@ void CRAD::Run( void )
 	setDefaultTimings( AUTO_TIMING_RPI3PLUS_C64C128 );
 	readConfig( logger, DRIVE, FILENAME_CONFIG );
 
-	// gpu64: the level pack's one SD read, here and not in the launch path
-	// (gpu64_level.cpp, levelPackHeld()). The C64 is reset just below anyway.
-	gpu64_levelPackReadAtBoot();
-
 	OUT_GPIO( RESET_OUT );
 	CLR_GPIO( bRESET_OUT );
 	DELAY( 1 << 25 );

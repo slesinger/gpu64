@@ -6,8 +6,9 @@
 
 Select OUT.reu as the REU image in the RAD menu (it sizes the REU from the
 file), then launch the game PRG. The firmware takes LOAD_LEVEL slot N from
-the pack's Nth level, in argument order, straight out of REU memory; with no
-pack in the REU it falls back to SD:RAD/level.g64lev and level2.g64lev.
+the pack's Nth level, in argument order, straight out of REU memory. The
+pack is the only place the firmware takes levels and pictures from: a game
+ships as its PRG plus this image.
 
 Format (little-endian, gpu64_level.h GPU64_PACK_*):
   0 'G64P'  4 u16 version 1  6 u16 count  8 u32 image bytes

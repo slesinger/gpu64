@@ -327,13 +327,13 @@ class Class1Mixin:
         self.c1_stream_dir = None
         self.c1_blobs = 0
         self.frame_hook = None
-        # The level file the Pi would have read off its SD card at start-up,
-        # set by the runner from --level=. None models a card with no
-        # RAD/level.g64lev on it, which is what LOAD_LEVEL's BAD_ARGS means
-        # and is worth being able to simulate.
+        # The level pack's slots: the REU image selected in the RAD menu,
+        # set by the runner from --reu= (or --level=/--level2=, shorthand
+        # for a pack holding just those). None models an REU image with no
+        # pack in it, where LOAD_LEVEL and LEVEL_PICTURE answer BAD_ARGS.
         self.c1_level_data = None
-        self.c1_level_data2 = None      # --level2=, RAD/level2.g64lev
-        self.c1_level_more = []         # slots 2.., from a --reu= level pack
+        self.c1_level_data2 = None      # slot 1
+        self.c1_level_more = []         # slots 2..
         self.c1_load = None
         self.c1_clip_lib = None
 

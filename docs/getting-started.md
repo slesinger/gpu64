@@ -94,10 +94,11 @@ Rules that hold for every descriptor, source or destination:
 
 ## The demo programs
 
-Ten C64 programs in [`Source/Demos/`](../Source/Demos/), each showing a
+Ten C64 programs, each showing a
 part of the API doing something you can look at. They are written to be
 read: heavily commented, no shared cleverness beyond an include of the
-register equates, and none of them depends on another.
+register equates, and none of them depends on another. `quake` is in
+[`quake/`](../quake/); the others are in [`Source/Demos/`](../Source/Demos/).
 
 This is not the conformance suite. The suite
 ([`Source/TestPRG/`](../Source/TestPRG/), run by `tools/testprg.sh`)
