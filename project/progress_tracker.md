@@ -11494,3 +11494,37 @@ collisions felt like the car "behaving strange" because they made no sound.
   - `stunts.reu` is 943,104 bytes.
 - Not yet bench-run. The crest speeds and the brake feel are tuned by
   numbers, not by hand.
+
+## 108. Stunt Car Racer: balloons in the sky (2026-10-04, PC only)
+
+The user found the sky empty, and asked for three random balloon sprites
+after the C64 User's Guide's "UP, UP, AND AWAY" example.
+
+- **The sprite.** `gen_stunt.py` decodes the guide's 63 DATA bytes into
+  three 32x32 textures, `TEX_BAL` 21-23, with the feet at the bottom.
+  - The envelope is red, yellow or blue, darker on its right edge.
+  - The holes that the outline encloses above the ropes are the C= logo,
+    in white (red on the yellow balloon).
+  - The ropes are grey and the basket is brown. Index 0 is the sky.
+- **Placement.** `balTab` holds 16 bearings round the camera, each with
+  its own distance (44-64 units) and height (8-18 degrees above the eye).
+  `balPick` chooses three at each race start, seeded from `$d012`, `$dc04`
+  and `frames`, with each one 2-5 bearings on from the last.
+  - They ride with the camera, as the mountains do. They must stay inside
+    the mountains' ring (76), because its panels carry the sky and hide
+    anything beyond.
+  - A shared wind drifts them ±2 units in x over 2048 frames, and each
+    bobs half a unit on its own phase.
+- **Cost.** Nodes `NODE_BAL` 40-42 are sprites created in the refresh ring
+  (`RG_BAL`, `rgBal`: 15x15 units, unlit). Their poses are three
+  world-space actors after the cockpit's 24 in the same `WORLD_TICK`
+  block. The block is DMA'd, so the balloons add no per-frame register
+  writes. They only lengthen the ring by three steps.
+- **Verified on the PC:**
+  - All eight tracks run 1500 frames with ERR 0000.
+  - `ckErrs` stays 0, so the block's checksum, which grew to 27 actors,
+    is right.
+  - `demos.sh stunt` is ok.
+  - In the scenesim frames, balloons show up over every track, behind the
+    track and in front of the mountains.
+  - `stunts.reu` is 946,176 bytes.

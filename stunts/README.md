@@ -48,6 +48,13 @@ under runsim (`$02aa` = `$aa`).
     300 m, lit by a low sun and hazed with distance. It is dithered into
     the game's own palette and drawn unlit on a 16-panel ring that follows
     the camera's height.
+  - three hot-air balloons in the sky (2026-10-04): the C64 User's Guide's
+    "UP, UP, AND AWAY" sprite, C= logo and all, in red, yellow and blue.
+    Each race picks three of 16 bearings round the camera (each 2-5 on
+    from the last), each with its own distance (44-64) and height (8-18
+    degrees up). They ride with the camera inside the mountain ring, drift
+    with a slow wind and bob. They are world-space actors appended to the
+    cockpit's `WORLD_TICK` block, so they add no commands.
   - a khaki road with a yellow edge line broken by dark red
   - the track on a solid embankment: walls from the road down to the
     ground in alternating red and white panels with dark seams. Only the

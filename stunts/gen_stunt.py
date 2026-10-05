@@ -66,6 +66,7 @@ FLAT, DOUBLE, UNLIT = T.FLAT, T.DOUBLE, T.UNLIT
 
 TEX_ROAD, TEX_START, TEX_SIDE, TEX_GRASS = 1, 2, 3, 4
 TEX_MTN = 5                 # MT.PANELS of them: the mountains
+TEX_BAL = TEX_MTN + 16      # BAL_N of them: the balloons
 
 # palette: 8 hues x 32 levels, level 31 the hue itself, level 0 black
 HUES = [               # the original's: flat blue sky, khaki everywhere
@@ -127,6 +128,58 @@ textures = [                # (id, w, h, texels)
     (TEX_SIDE, 32, 32, tex(side)),
     (TEX_GRASS, 32, 32, tex(grass)),
 ] + K.build(col)                # the cockpit's sprites
+
+# the balloons: the C64 User's Guide's sprite (UP, UP, AND AWAY), 24x21,
+# feet at the bottom of a 32x32 texture. The envelope in a hue of its own,
+# the C= logo (the holes it encloses) in a second, the ropes grey and the
+# basket brown; whatever is left is index 0, the sky through it.
+BALLOON = [0, 127, 0, 1, 255, 192, 3, 255, 224, 3, 231, 224, 7, 217, 240, 7, 223, 240,
+           7, 217, 240, 3, 231, 224, 3, 255, 224, 3, 255, 224, 2, 255, 160, 1, 127, 64,
+           1, 62, 64, 0, 156, 128, 0, 156, 128, 0, 73, 0, 0, 73, 0, 0, 62, 0,
+           0, 62, 0, 0, 62, 0, 0, 28, 0]
+BAL_HUES = [(RED, WHITE), (YELLOW, RED), (BLUE, WHITE)]
+BAL_N = len(BAL_HUES)
+
+def balloon(hue, logo):
+    bit = [[(BALLOON[r * 3 + c // 8] >> (7 - c % 8)) & 1 for c in range(24)] for r in range(21)]
+    outside, todo = set(), [(r, c) for r in range(21) for c in (0, 23)]
+    while todo:                                 # the holes the outline encloses
+        r, c = todo.pop()
+        if 0 <= r < 21 and 0 <= c < 24 and not bit[r][c] and (r, c) not in outside:
+            outside.add((r, c))
+            todo += [(r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)]
+    t = bytearray(32 * 32)
+    for r in range(21):
+        run = ''.join('#' if b else '.' for b in bit[r])
+        for c in range(24):
+            if bit[r][c]:
+                if r >= 17:
+                    v = col(EARTH, 11)                      # the basket
+                elif r >= 10 and not ('###' in run[max(0, c - 2):c + 3]):
+                    v = col(GREY, 9)                        # a rope
+                else:                                       # the envelope, lit
+                    edge = c >= len(run.rstrip('.')) - 2    #   from the left
+                    v = col(hue, 18 if r >= 10 or edge else 28)
+            elif (r, c) not in outside and r < 10:
+                v = col(logo, 30)                           # the C= logo
+            else:
+                continue
+            t[(11 + r) * 32 + 4 + c] = v
+    return bytes(t)
+
+textures += [(TEX_BAL + k, 32, 32, balloon(h, l)) for k, (h, l) in enumerate(BAL_HUES)]
+
+# where they can float: BAL_DIRS bearings round the camera, each with its
+# own distance and height above the eye. Inside the mountains' ring (which
+# hides whatever is beyond it), and 8-18 degrees up, clear of the cockpit.
+BAL_DIRS, BAL_SIZE = 16, 15.0
+balRnd = random.Random(1989)
+balTab = []
+for k in range(BAL_DIRS):
+    a = 2 * math.pi * (k + balRnd.uniform(-0.3, 0.3)) / BAL_DIRS
+    d = balRnd.uniform(44, 64)
+    h = d * math.tan(math.radians(balRnd.uniform(8, 18)))
+    balTab.append((q88(d * math.sin(a)), q88(h), q88(d * math.cos(a))))
 
 # ----------------------------------------------------------------- tracks
 tracks = [T.build(t) for t in T.TRACKS]
@@ -373,6 +426,13 @@ emit("TEX_SIDE   = %d" % TEX_SIDE)
 emit("TEX_GRASS  = %d" % TEX_GRASS)
 emit("SKY_COL    = %d" % col(SKY, 26))
 emit("MTN_EYE    = %d" % MT.EYE)
+emit("TEX_BAL    = %d\t\t; + 0..BAL_N-1: the balloons" % TEX_BAL)
+emit("BAL_N      = %d" % BAL_N)
+emit("BAL_DIRS   = %d" % BAL_DIRS)
+emit("BAL_SIZE   = $%04x\t\t; SET_SPRITE width and height (8.8)" % q88(BAL_SIZE))
+for i, nm in enumerate(("balX", "balY", "balZ")):
+    rows(nm + "Lo", [b[i] & 0xff for b in balTab])
+    rows(nm + "Hi", [(b[i] >> 8) & 0xff for b in balTab])
 emit("PANEL_COL  = %d" % PANEL)
 emit("MESH_GROUND = %d" % MESH_GROUND)
 emit("MESH_HILLS  = %d" % MESH_HILLS)

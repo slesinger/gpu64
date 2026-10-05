@@ -109,6 +109,7 @@ NODE_GND  = 4
 NODE_HILL = 5
 NODE_TRK  = 10			; + chunk, as staticTab lists them
 NODE_DECK = 8			; + 0/1: a drawbridge's two decks
+NODE_BAL  = 40			; + 0..BAL_N-1: the balloons
 
 VP_W = 320
 VP_H = 200
@@ -2340,10 +2341,12 @@ shDone
 ; absolute, and the block is checked whole, so a lost one costs a frame of
 ; stale dials; nothing reads the answer.
 ; ======================================================================
-WT_IN	= 16 + CK_N * 20
+WT_IN	= 16 + (CK_N + BAL_N) * 20
 WT_LEN	= WT_IN + 12			; an actors-only answer: 8, then the trailer
 CKA	= wtBlk + 16			; actor k at CKA + 20 * k
-	.cerror CK_N * 10 > 255 || WT_IN / 2 > 255 || CK_N % 2, "the cockpit's loops count in bytes"
+BLA	= CKA + 20 * CK_N		; and the balloons after the cockpit
+	.cerror CK_N * 10 > 255 || CK_N % 2, "the cockpit's loops count in bytes"
+	.cerror CK_N + BAL_N > 32, "WORLD_TICK poses 32 actors at most"
 
 ckTex	.macro	k
 	sta CKA + 20 * \k + 2
@@ -2606,10 +2609,12 @@ ckGap
 	adc #<TX_PAIR
 	#ckTex CK_GAPP
 
+	jsr balPose
+
 	; the header and its sum (bytes 6-7 zero while it is taken)
 	lda #$d8
 	sta wtBlk+0
-	lda #CK_N
+	lda #CK_N + BAL_N
 	sta wtBlk+1
 	lda frames
 	sta wtBlk+5
@@ -2621,7 +2626,7 @@ ckGap
 	sta wtBlk+7
 	; the sum: CK_SUM0 has every fixed byte, header bytes 2-4 and 6-15
 	; are zero, and the rest is added here
-CK_B	= (CK_SUM0 + $d8 + CK_N) & $ffff
+CK_B	= (CK_SUM0 + $d8 + CK_N + BAL_N) & $ffff
 	ldy #>CK_B
 	lda #<CK_B
 	clc
@@ -2638,6 +2643,14 @@ CK_B	= (CK_SUM0 + $d8 + CK_N) & $ffff
 	bcc +
 	iny
 +	.next
+	ldx #0				; the balloons: every byte changes
+-	clc
+	adc BLA,x
+	bcc +
+	iny
++	inx
+	cpx #BAL_N * 20
+	bne -
 	sta wtBlk+6
 	sty wtBlk+7
 
@@ -2665,6 +2678,139 @@ CK_B	= (CK_SUM0 + $d8 + CK_N) & $ffff
 	bne +
 	dec ckErrs
 +	rts
+
+; ======================================================================
+; The balloons: three sprites in the sky, at a bearing, distance and
+; height round the camera picked from balX/Y/Z at the start of a race.
+; Like the mountains they ride with the camera -- inside the mountains'
+; ring, whose panels hide anything beyond it -- so they hang far off on
+; the horizon wherever the track goes. They drift with a slow wind (a
+; triangle of +-2 units over 2048 frames, all of them alike) and each
+; bobs half a unit on its own phase. World-space actors in the cockpit's
+; WORLD_TICK block, so they cost no commands of their own.
+; ======================================================================
+balPose
+	lda frames			; the wind: t = frames & $7ff, folded
+	sta balDLo			;   at $400, less $200
+	lda frames+1
+	and #7
+	cmp #4
+	bcc +
+	eor #7
+	tax
+	lda balDLo
+	eor #$ff
+	sta balDLo
+	txa
++	sec
+	sbc #2
+	sta balDHi
+	.for bk = 0, bk < BAL_N, bk += 1
+	lda #NODE_BAL + bk
+	sta BLA + 20 * bk + 0
+	lda #TEX_BAL + bk
+	sta BLA + 20 * bk + 2
+	lda #0
+	sta BLA + 20 * bk + 1
+	sta BLA + 20 * bk + 3
+	sta BLA + 20 * bk + 5
+	sta BLA + 20 * bk + 6
+	sta BLA + 20 * bk + 7
+	lda #1				; visible, world space
+	sta BLA + 20 * bk + 4
+	ldy balIx + bk
+	clc				; x: the bearing's, and the wind
+	lda balXLo,y
+	adc balDLo
+	sta balT0
+	lda balXHi,y
+	adc balDHi
+	sta balT1
+	lda camXLo
+	sta balT2
+	lda camXHi
+	sta balT3
+	ldx #20 * bk + 8
+	jsr balAxis
+	lda frames			; y: the bearing's, and the bob,
+	lsr a				;   (frames / 2 + phase) folded at $80
+	clc
+	adc #bk * 85
+	bpl +
+	eor #$ff
++	clc
+	adc balYLo,y
+	sta balT0
+	lda balYHi,y
+	adc #0
+	sta balT1
+	lda camYLo
+	sta balT2
+	lda camYHi
+	sta balT3
+	ldx #20 * bk + 12
+	jsr balAxis
+	lda balZLo,y			; z: the bearing's
+	sta balT0
+	lda balZHi,y
+	sta balT1
+	lda camZLo
+	sta balT2
+	lda camZHi
+	sta balT3
+	ldx #20 * bk + 16
+	jsr balAxis
+	.next
+	rts
+
+; balT0-1 + balT2-3, two signed 8.8s, as a 16.16 at BLA + X.
+balAxis
+	lda #0
+	sta BLA + 0,x
+	clc
+	lda balT0
+	adc balT2
+	sta BLA + 1,x
+	lda balT1
+	adc balT3
+	sta BLA + 2,x
+	lda #0				; the sign bytes, and the carry
+	bit balT1
+	bpl +
+	lda #$ff
++	sta balT4
+	lda #0
+	bit balT3
+	bpl +
+	lda #$ff
++	adc balT4
+	sta BLA + 3,x
+	rts
+
+; A new race, a new sky: three of the BAL_DIRS bearings, each two to five
+; on from the last, so they spread over a quarter to half of the horizon.
+balPick
+	lda $d012
+	eor $dc04
+	eor frames
+	sta balT0
+	and #BAL_DIRS - 1
+	sta balIx
+	ldx #1
+-	lda balT0
+	lsr a
+	lsr a
+	sta balT0
+	and #3
+	clc
+	adc #2
+	adc balIx - 1,x
+	and #BAL_DIRS - 1
+	sta balIx,x
+	inx
+	cpx #BAL_N
+	bne -
+	rts
 
 ; A = 0-255 -> X = tens, A = units, of A capped at 99
 dec2
@@ -2734,7 +2880,8 @@ RG_SCENE = 6
 RG_TRK   = RG_SCENE
 RG_MISC  = RG_TRK + STATIC_N
 RG_CK    = RG_MISC + 6		; two cars, the ground, the hills, two decks
-RG_N     = RG_CK + CK_N		; the cockpit's sprites
+RG_BAL   = RG_CK + CK_N		; the cockpit's sprites
+RG_N     = RG_BAL + BAL_N		; the balloons
 
 doRefresh
 	jsr ringStep
@@ -2772,7 +2919,11 @@ rsNode
 	sbc #RG_TRK
 	jmp rgChunk
 rsMisc
-	cmp #RG_CK
+	cmp #RG_BAL
+	bcc +
+	sbc #RG_BAL
+	jmp rgBal
++	cmp #RG_CK
 	bcc +
 	sbc #RG_CK
 	jmp rgCk
@@ -3005,6 +3156,38 @@ rgCk
 	inx
 	cpx #4
 	bne -
+	lda #8				; unlit
+	sta stBuf+4
+	lda #OP_SET_SPRITE
+	ldx #4
+	jsr stage2
+	ora rgErr
+	rts
+
+; A = balloon: CREATE_SPRITE, then SET_SPRITE its size, unlit. Its pose
+; is in every frame's WORLD_TICK.
+rgBal
+	sta tmp0
+	clc
+	adc #NODE_BAL
+	sta stId
+	lda #0
+	sta stId+1
+	sta stBuf+1
+	lda tmp0
+	clc
+	adc #TEX_BAL
+	sta stBuf+0
+	lda #OP_CREATE_SPRITE
+	ldx #1
+	jsr stage2
+	sta rgErr
+	lda #<BAL_SIZE
+	sta stBuf+0
+	sta stBuf+2
+	lda #>BAL_SIZE
+	sta stBuf+1
+	sta stBuf+3
 	lda #8				; unlit
 	sta stBuf+4
 	lda #OP_SET_SPRITE
@@ -3597,6 +3780,7 @@ bsLoop
 	bne bsLoop
 
 	jsr raceReset
+	jsr balPick
 	jsr deckTick
 	jsr physics
 	jsr sendCars
@@ -4517,6 +4701,14 @@ chkRetry	.word 0
 rgIx		.byte 0
 rgY		.byte 0
 rgErr		.byte 0
+balIx		.fill BAL_N, 0
+balDLo		.byte 0
+balDHi		.byte 0
+balT0		.byte 0
+balT1		.byte 0
+balT2		.byte 0
+balT3		.byte 0
+balT4		.byte 0
 rgErrs		.byte 0
 camFix		.byte 0
 bsPass		.byte 0
