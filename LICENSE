@@ -1,8 +1,17 @@
-*** The RAD-hardware (PCB, design) is work licensed under the 
-Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License 
-(commercial use forbidden). ***
+gpu64 -- SDK, examples, games, tests, tools and documentation
 
-The GPL3 (below) applies to my software contributions.
+Copyright (c) 2026 Honza Slesinger
+
+This repository is licensed under the GNU General Public License, version 3
+or (at your option) any later version. The full text is below.
+
+gpu64 is designed for the RAD cartridge (https://github.com/frntc/RAD) by Carsten Dachsbacher.
+RAD's hardware design is licensed CC BY-NC-SA 4.0 and its software GPL-3;
+neither is part of this repository, and this licence does not change theirs.
+
+No third-party game data, music or ROMs are included. The Quake example
+needs your own copy of the game data.
+
 -----------------------------------------------------------------------
 
                     GNU GENERAL PUBLIC LICENSE
